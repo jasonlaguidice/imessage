@@ -30,7 +30,7 @@ After setup, the bridge is running. No scripts, no manual steps.
 
 ### First Login
 
-DM `@imessagebot:matrix.local` (or whatever your bridge bot is named), send `login`, and select **verify**. The bridge confirms it can read your iMessage database and starts bridging.
+DM `@imessagebot:yourserver.tld` (your bridge bot), send `login`, and select **verify**. The bridge confirms it can read your iMessage database and starts bridging.
 
 ### Management
 
