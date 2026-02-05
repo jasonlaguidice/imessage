@@ -28,7 +28,7 @@ import (
 
 	"maunium.net/go/mautrix/id"
 
-	"go.mau.fi/mautrix-imessage/ipc"
+	"github.com/lrhodin/imessage/ipc"
 )
 
 var (

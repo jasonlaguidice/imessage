@@ -21,7 +21,7 @@ import (
 	"fmt"
 	"strings"
 
-	"go.mau.fi/mautrix-imessage/imessage"
+	"github.com/lrhodin/imessage/imessage"
 )
 
 const getAllAccountsJSON = `

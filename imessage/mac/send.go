@@ -28,7 +28,7 @@ import (
 
 	"maunium.net/go/mautrix/id"
 
-	"go.mau.fi/mautrix-imessage/imessage"
+	"github.com/lrhodin/imessage/imessage"
 )
 
 const sendMessage = `

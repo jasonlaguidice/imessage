@@ -28,7 +28,7 @@ import (
 	"runtime"
 	"unsafe"
 
-	"go.mau.fi/mautrix-imessage/imessage"
+	"github.com/lrhodin/imessage/imessage"
 )
 
 type ContactStore struct {

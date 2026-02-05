@@ -29,7 +29,7 @@ import (
 
 	"maunium.net/go/maulogger/v2"
 
-	"go.mau.fi/mautrix-imessage/imessage"
+	"github.com/lrhodin/imessage/imessage"
 )
 
 type AttributeKey string
