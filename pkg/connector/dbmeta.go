@@ -22,7 +22,9 @@ type MessageMetadata struct {
 	HasAttachments bool `json:"has_attachments,omitempty"`
 }
 
-type UserLoginMetadata struct{}
+type UserLoginMetadata struct {
+	ChatsSynced bool `json:"chats_synced,omitempty"`
+}
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{
