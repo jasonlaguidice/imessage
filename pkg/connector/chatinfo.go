@@ -45,8 +45,9 @@ func (c *IMClient) imChatInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 	}
 
 	chatInfo := &bridgev2.ChatInfo{
-		Name:  &info.DisplayName,
-		Topic: ptr.Ptr(""),
+		Name:        &info.DisplayName,
+		Topic:       ptr.Ptr(""),
+		CanBackfill: true,
 	}
 
 	if parsed.IsGroup {

@@ -48,6 +48,13 @@ func (c *IMClient) syncChats(ctx context.Context) {
 		portalKey := makePortalKey(chat.ChatGUID, c.UserLogin.ID)
 		chatInfo := c.imChatInfoToBridgev2(info)
 
+		// Get the latest message timestamp so bridgev2 knows backfill is needed
+		var latestTS time.Time
+		msgs, err := c.imAPI.GetMessagesWithLimit(chat.ChatGUID, 1, "")
+		if err == nil && len(msgs) > 0 {
+			latestTS = msgs[0].Time
+		}
+
 		evt := &simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
@@ -58,6 +65,7 @@ func (c *IMClient) syncChats(ctx context.Context) {
 				},
 			},
 			ChatInfo:        chatInfo,
+			LatestMessageTS: latestTS,
 			GetChatInfoFunc: c.GetChatInfo,
 		}
 		c.UserLogin.QueueRemoteEvent(evt)
