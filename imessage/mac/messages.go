@@ -30,7 +30,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	_ "github.com/mattn/go-sqlite3"
 
-	"go.mau.fi/mautrix-imessage/imessage"
+	"github.com/lrhodin/imessage/imessage"
 )
 
 const baseMessagesQuery = `

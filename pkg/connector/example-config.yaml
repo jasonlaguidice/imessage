@@ -1,0 +1,3 @@
+# Display name template for iMessage contacts
+# Available variables: {{.FirstName}}, {{.LastName}}, {{.Nickname}}, {{.Phone}}, {{.Email}}, {{.ID}}
+displayname_template: "{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastName}}{{end}}{{else if .Nickname}}{{.Nickname}}{{else if .Phone}}{{.Phone}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}"
