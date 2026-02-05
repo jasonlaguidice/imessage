@@ -36,6 +36,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	adapter := newBridgeAdapter(&log)
 	api, err := imessage.NewAPI(adapter)
+	if err != nil && isPermissionError(err) {
+		showDialogAndOpenFDA(log)
+		waitForFDA(log)
+		// Retry after FDA is restored
+		adapter = newBridgeAdapter(&log)
+		api, err = imessage.NewAPI(adapter)
+	}
 	if err != nil {
 		log.Err(err).Msg("Failed to create iMessage API")
 		c.UserLogin.BridgeState.Send(status.BridgeState{
@@ -54,6 +61,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 		err := api.Start(func() {
 			log.Info().Msg("iMessage connector ready, starting event listeners")
 			c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+			// Sync existing chats into Matrix rooms
+			go c.syncChats(log.WithContext(context.Background()))
 			// Start listening for incoming messages and read receipts
 			go c.listenMessages(log)
 			go c.listenReadReceipts(log)
