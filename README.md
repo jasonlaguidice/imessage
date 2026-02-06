@@ -34,10 +34,12 @@ Both connectors can run simultaneously — rustpush handles real-time messaging 
 ### 1. Build
 
 ```bash
-git clone --recurse-submodules https://github.com/lrhodin/imessage.git
+git clone https://github.com/lrhodin/imessage.git
 cd imessage
 make build
 ```
+
+
 
 ### 2. Configure
 
@@ -226,7 +228,7 @@ pkg/rustpushgo/              # Rust FFI wrapper (uniffi)
       ├── local_config.rs    #   LocalMacOSConfig (hardware info, NAC)
       └── hardware_info.m    #   IOKit hardware reader (ObjC)
 nac-validation/              # Local NAC via AAAbsintheContext
-rustpush/                    # OpenBubbles/rustpush (git submodule)
+rustpush/                    # OpenBubbles/rustpush (vendored)
 imessage/                    # macOS chat.db + AppleScript + Contacts
 ```
 

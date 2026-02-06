@@ -17,8 +17,9 @@
 
 # Rust build artifacts
 librustpushgo.a
-pkg/rustpushgo/target/
+**/target/
 state/
+rustpush/certs/fairplay/
 
 
 # Development/test prompt files
