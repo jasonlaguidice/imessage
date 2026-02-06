@@ -517,6 +517,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_loginsession_needs_2fa(uniffiStatus)
+		})
+		if checksum != 10863 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_loginsession_needs_2fa: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_loginsession_submit_2fa(uniffiStatus)
 		})
 		if checksum != 25146 {
@@ -1177,6 +1186,15 @@ func (_self *LoginSession) Finish(config *WrappedOsConfig, connection *WrappedAp
 		})
 }
 
+func (_self *LoginSession) Needs2fa() bool {
+	_pointer := _self.ffiObject.incrementPointer("*LoginSession")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_rustpushgo_fn_method_loginsession_needs_2fa(
+			_pointer, _uniffiStatus)
+	}))
+}
+
 func (_self *LoginSession) Submit2fa(code string) (bool, error) {
 	_pointer := _self.ffiObject.incrementPointer("*LoginSession")
 	defer _self.ffiObject.decrementPointer()
@@ -1595,46 +1613,6 @@ func (c FfiConverterTypeIDSUsersWithIdentityRecord) Write(writer io.Writer, valu
 type FfiDestroyerTypeIdsUsersWithIdentityRecord struct{}
 
 func (_ FfiDestroyerTypeIdsUsersWithIdentityRecord) Destroy(value IdsUsersWithIdentityRecord) {
-	value.Destroy()
-}
-
-type LoginStartResult struct {
-	Needs2fa bool
-	Error    *string
-}
-
-func (r *LoginStartResult) Destroy() {
-	FfiDestroyerBool{}.Destroy(r.Needs2fa)
-	FfiDestroyerOptionalString{}.Destroy(r.Error)
-}
-
-type FfiConverterTypeLoginStartResult struct{}
-
-var FfiConverterTypeLoginStartResultINSTANCE = FfiConverterTypeLoginStartResult{}
-
-func (c FfiConverterTypeLoginStartResult) Lift(rb RustBufferI) LoginStartResult {
-	return LiftFromRustBuffer[LoginStartResult](c, rb)
-}
-
-func (c FfiConverterTypeLoginStartResult) Read(reader io.Reader) LoginStartResult {
-	return LoginStartResult{
-		FfiConverterBoolINSTANCE.Read(reader),
-		FfiConverterOptionalStringINSTANCE.Read(reader),
-	}
-}
-
-func (c FfiConverterTypeLoginStartResult) Lower(value LoginStartResult) RustBuffer {
-	return LowerIntoRustBuffer[LoginStartResult](c, value)
-}
-
-func (c FfiConverterTypeLoginStartResult) Write(writer io.Writer, value LoginStartResult) {
-	FfiConverterBoolINSTANCE.Write(writer, value.Needs2fa)
-	FfiConverterOptionalStringINSTANCE.Write(writer, value.Error)
-}
-
-type FfiDestroyerTypeLoginStartResult struct{}
-
-func (_ FfiDestroyerTypeLoginStartResult) Destroy(value LoginStartResult) {
 	value.Destroy()
 }
 
