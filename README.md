@@ -10,6 +10,9 @@ A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix c
 
 macOS 14.2+ with:
 
+- **Signed into iCloud** on the Mac running the bridge (System Settings → Apple ID). This is required for Apple to recognize the device as trusted and allow login without 2FA prompts.
+- Full Disk Access granted to the bridge app (for chat.db backfill — prompted on first run).
+
 ```bash
 brew install go rust libolm protobuf
 ```
@@ -34,7 +37,7 @@ Once running, DM `@imessagebot:yourdomain` in your Matrix client and send:
 login
 ```
 
-Follow the prompts: Apple ID → password → 2FA code. The bridge registers with Apple's iMessage servers and connects.
+Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with the same Apple ID, login completes without 2FA. The bridge registers with Apple's iMessage servers and connects.
 
 > **Note:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
 
