@@ -509,6 +509,7 @@ pub async fn login_start(
     let result = account.login_email_pass(&user_trimmed, &pw_bytes).await
         .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
 
+    info!("login_email_pass returned: {:?}", result);
     let needs_2fa = match result {
         icloud_auth::LoginState::LoggedIn => {
             info!("Login completed without 2FA");
@@ -518,19 +519,15 @@ pub async fn login_start(
             info!("2FA required (Needs2FAVerification — push already sent by Apple)");
             true
         }
-        icloud_auth::LoginState::NeedsDevice2FA => {
-            info!("2FA required (NeedsDevice2FA — sending push to trusted devices)");
+        icloud_auth::LoginState::NeedsDevice2FA | icloud_auth::LoginState::NeedsSMS2FA => {
+            info!("2FA required — sending trusted device push + SMS fallback");
             match account.send_2fa_to_devices().await {
                 Ok(_) => info!("send_2fa_to_devices succeeded"),
-                Err(e) => error!("send_2fa_to_devices failed: {} — user may not receive 2FA push", e),
+                Err(e) => error!("send_2fa_to_devices failed: {}", e),
             }
-            true
-        }
-        icloud_auth::LoginState::NeedsSMS2FA => {
-            info!("2FA required (NeedsSMS2FA — sending push to trusted devices)");
-            match account.send_2fa_to_devices().await {
-                Ok(_) => info!("send_2fa_to_devices succeeded"),
-                Err(e) => error!("send_2fa_to_devices failed: {} — user may not receive 2FA push", e),
+            match account.send_sms_2fa_to_devices(1).await {
+                Ok(_) => info!("send_sms_2fa_to_devices succeeded (SMS fallback sent)"),
+                Err(e) => error!("send_sms_2fa_to_devices failed: {} — user may not receive 2FA code", e),
             }
             true
         }
