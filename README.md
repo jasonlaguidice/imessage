@@ -40,7 +40,9 @@ Follow the prompts: Apple ID → password → 2FA code. The bridge registers wit
 
 ### Chatting
 
-To message someone:
+Once logged in, incoming iMessages automatically create Matrix rooms — no setup needed per conversation. If you grant Full Disk Access (System Settings → Privacy & Security), existing conversations from Messages.app are also synced.
+
+To start a **new** conversation with someone who hasn't messaged you:
 
 ```
 resolve +15551234567
