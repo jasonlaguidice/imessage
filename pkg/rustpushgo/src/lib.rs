@@ -477,6 +477,7 @@ pub async fn connect(
 pub struct LoginSession {
     account: tokio::sync::Mutex<Option<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
     username: String,
+    password_hash: Vec<u8>,
     needs_2fa: bool,
     sms_verify_body: tokio::sync::Mutex<Option<icloud_auth::VerifyBody>>,
 }
@@ -557,6 +558,7 @@ pub async fn login_start(
     Ok(Arc::new(LoginSession {
         account: tokio::sync::Mutex::new(Some(account)),
         username: user_trimmed,
+        password_hash: pw_bytes,
         needs_2fa,
         sms_verify_body: tokio::sync::Mutex::new(sms_verify_body),
     }))
@@ -603,6 +605,13 @@ impl LoginSession {
 
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+
+        // After SMS 2FA, re-login to get a fully-authenticated session.
+        // The PET from verify_sms_2fa alone gets HTTP 440 from the delegate endpoint.
+        info!("finish: re-authenticating with login_email_pass to refresh tokens...");
+        let relogin_result = account.login_email_pass(&self.username, &self.password_hash).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Re-login failed: {}", e) })?;
+        info!("finish: re-login returned: {:?}", relogin_result);
 
         let pet = account.get_pet()
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
