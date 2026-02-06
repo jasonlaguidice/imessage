@@ -18,7 +18,23 @@ CGO_LDFLAGS := -L/opt/homebrew/lib -L$(shell pwd)
 
 LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
-.PHONY: build clean install uninstall rust bindings
+.PHONY: build clean install uninstall rust bindings check-deps
+
+# Check build dependencies
+check-deps:
+	@missing=""; \
+	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
+	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
+	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
+	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
+	if [ -n "$$missing" ]; then \
+		echo ""; \
+		echo "Missing dependencies:$$missing"; \
+		echo ""; \
+		echo "  brew install$$missing"; \
+		echo ""; \
+		exit 1; \
+	fi
 
 # Build Rust static library
 $(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) pkg/rustpushgo/Cargo.toml
@@ -32,7 +48,7 @@ bindings: $(RUST_LIB)
 	cd pkg/rustpushgo && uniffi-bindgen-go target/release/librustpushgo.a --library --out-dir ..
 	python3 scripts/patch_bindings.py
 
-build: $(RUST_LIB) $(BINARY)
+build: check-deps $(RUST_LIB) $(BINARY)
 	codesign --force --deep --sign - $(APP_BUNDLE)
 	@echo "Built $(APP_BUNDLE) ($(VERSION)-$(COMMIT))"
 
