@@ -41,6 +41,14 @@ Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with
 
 > **Note:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
 
+### SMS Forwarding
+
+To bridge SMS (green bubble) messages, enable the bridge device on your iPhone:
+
+**Settings → Messages → Text Message Forwarding** → toggle on the new device.
+
+Each bridge login registers as a separate device, so you may see multiple entries — enable the latest one.
+
 ### Chatting
 
 Once logged in, incoming iMessages automatically create Matrix rooms — no setup needed per conversation. If you grant Full Disk Access (System Settings → Privacy & Security), existing conversations from Messages.app are also synced.
