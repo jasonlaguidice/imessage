@@ -1057,7 +1057,20 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             );
             headers.insert("Accept", HeaderValue::from_str("text/x-xml-plist").unwrap());
         }
-        // headers.insert("User-Agent", HeaderValue::from_str("Xcode").unwrap());
+
+        // Identify as Xcode — required for Apple to actually deliver the
+        // 2FA push notification to trusted devices.
+        headers.insert("User-Agent", HeaderValue::from_str("Xcode").unwrap());
+        headers.insert("Accept-Language", HeaderValue::from_str("en-us").unwrap());
+        headers.insert(
+            "X-Apple-App-Info",
+            HeaderValue::from_str("com.apple.gs.xcode.auth").unwrap(),
+        );
+        headers.insert(
+            "X-Xcode-Version",
+            HeaderValue::from_str("11.2 (11B41)").unwrap(),
+        );
+
         headers.append(
             "X-Apple-Identity-Token",
             HeaderValue::from_str(&identity_token).unwrap(),
