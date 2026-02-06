@@ -31,17 +31,19 @@ The installer will pause and ask you to register the bridge with your homeserver
 Once running, DM `@imessagebot:yourdomain` in your Matrix client and send:
 
 ```
-!im login
+login
 ```
 
 Follow the prompts: Apple ID → password → 2FA code. The bridge registers with Apple's iMessage servers and connects.
+
+> **Note:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
 
 ### Chatting
 
 To message someone:
 
 ```
-!im resolve +15551234567
+resolve +15551234567
 ```
 
 This creates a portal room. Messages you send there are delivered as iMessages; replies appear in the room.
