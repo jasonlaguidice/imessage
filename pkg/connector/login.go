@@ -11,7 +11,6 @@ package connector
 import (
 	"context"
 	"fmt"
-	"runtime"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -35,7 +34,6 @@ type AppleIDLogin struct {
 	User     *bridgev2.User
 	Main     *IMConnector
 	username string
-	useLocal bool
 	cfg      *rustpushgo.WrappedOsConfig
 	conn     *rustpushgo.WrappedApsConnection
 	session  *rustpushgo.LoginSession
@@ -48,45 +46,20 @@ func (l *AppleIDLogin) Cancel() {}
 func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	rustpushgo.InitLogger()
 
-	// On macOS, use local NAC (no relay needed)
-	if runtime.GOOS == "darwin" {
-		cfg, err := rustpushgo.CreateLocalMacosConfig()
-		if err == nil {
-			l.cfg = cfg
-			l.useLocal = true
-			l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
-
-			return &bridgev2.LoginStep{
-				Type:   bridgev2.LoginStepTypeUserInput,
-				StepID: LoginStepAppleIDPassword,
-				Instructions: "Enter your Apple ID credentials. " +
-					"Registration uses local NAC (no relay needed).",
-				UserInputParams: &bridgev2.LoginUserInputParams{
-					Fields: []bridgev2.LoginInputDataField{{
-						Type: bridgev2.LoginInputFieldTypeEmail,
-						ID:   "username",
-						Name: "Apple ID",
-					}, {
-						Type: bridgev2.LoginInputFieldTypePassword,
-						ID:   "password",
-						Name: "Password",
-					}},
-				},
-			}, nil
-		}
+	cfg, err := rustpushgo.CreateLocalMacosConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize local NAC config: %w", err)
 	}
+	l.cfg = cfg
+	l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
 
-	// Non-macOS or local NAC failed: need a relay code
 	return &bridgev2.LoginStep{
-		Type:         bridgev2.LoginStepTypeUserInput,
-		StepID:       LoginStepAppleIDPassword,
-		Instructions: "Enter your Apple ID credentials and a registration relay code.",
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepAppleIDPassword,
+		Instructions: "Enter your Apple ID credentials. " +
+			"Registration uses local NAC (no relay needed).",
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{{
-				ID:          "relay_code",
-				Name:        "Registration Relay Code",
-				Description: "e.g., XXXX-XXXX-XXXX-XXXX",
-			}, {
 				Type: bridgev2.LoginInputFieldTypeEmail,
 				ID:   "username",
 				Name: "Apple ID",
@@ -111,20 +84,6 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 			return nil, fmt.Errorf("Password is required")
 		}
 		l.username = username
-
-		// Set up config (relay path, if not already done on macOS)
-		if l.cfg == nil {
-			relayCode := input["relay_code"]
-			if relayCode == "" {
-				return nil, fmt.Errorf("Registration relay code is required (not running on macOS)")
-			}
-			cfg, err := rustpushgo.CreateRelayConfig(relayCode)
-			if err != nil {
-				return nil, fmt.Errorf("invalid relay code: %w", err)
-			}
-			l.cfg = cfg
-			l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
-		}
 
 		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
@@ -178,12 +137,8 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 
-	platform := "rustpush"
-	if l.useLocal {
-		platform = "rustpush-local"
-	}
 	meta := &UserLoginMetadata{
-		Platform:    platform,
+		Platform:    "rustpush-local",
 		APSState:    l.conn.State().ToString(),
 		IDSUsers:    result.Users.ToString(),
 		IDSIdentity: result.Identity.ToString(),
