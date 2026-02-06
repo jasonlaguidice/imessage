@@ -477,12 +477,7 @@ pub async fn connect(
 pub struct LoginSession {
     account: tokio::sync::Mutex<Option<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
     username: String,
-}
-
-#[derive(uniffi::Record)]
-pub struct LoginStartResult {
-    pub needs_2fa: bool,
-    pub error: Option<String>,
+    needs_2fa: bool,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -514,22 +509,39 @@ pub async fn login_start(
     let result = account.login_email_pass(&user_trimmed, &pw_bytes).await
         .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
 
-    match result {
+    let needs_2fa = match result {
         icloud_auth::LoginState::LoggedIn => {
             info!("Login completed without 2FA");
+            false
         }
-        icloud_auth::LoginState::Needs2FAVerification
-        | icloud_auth::LoginState::NeedsDevice2FA
-        | icloud_auth::LoginState::NeedsSMS2FA
-        | icloud_auth::LoginState::NeedsSMS2FAVerification(_) => {
-            info!("2FA required");
-            if matches!(result, icloud_auth::LoginState::NeedsDevice2FA | icloud_auth::LoginState::NeedsSMS2FA) {
-                let _ = account.send_2fa_to_devices().await;
+        icloud_auth::LoginState::Needs2FAVerification => {
+            info!("2FA required (Needs2FAVerification — push already sent by Apple)");
+            true
+        }
+        icloud_auth::LoginState::NeedsDevice2FA => {
+            info!("2FA required (NeedsDevice2FA — sending push to trusted devices)");
+            match account.send_2fa_to_devices().await {
+                Ok(_) => info!("send_2fa_to_devices succeeded"),
+                Err(e) => error!("send_2fa_to_devices failed: {} — user may not receive 2FA push", e),
             }
+            true
+        }
+        icloud_auth::LoginState::NeedsSMS2FA => {
+            info!("2FA required (NeedsSMS2FA — sending push to trusted devices)");
+            match account.send_2fa_to_devices().await {
+                Ok(_) => info!("send_2fa_to_devices succeeded"),
+                Err(e) => error!("send_2fa_to_devices failed: {} — user may not receive 2FA push", e),
+            }
+            true
+        }
+        icloud_auth::LoginState::NeedsSMS2FAVerification(_) => {
+            info!("2FA required (NeedsSMS2FAVerification — SMS already sent)");
+            true
         }
         icloud_auth::LoginState::NeedsExtraStep(ref step) => {
             if account.get_pet().is_some() {
                 info!("Login completed (extra step ignored, PET available)");
+                false
             } else {
                 return Err(WrappedError::GenericError { msg: format!("Login requires extra step: {}", step) });
             }
@@ -537,16 +549,21 @@ pub async fn login_start(
         icloud_auth::LoginState::NeedsLogin => {
             return Err(WrappedError::GenericError { msg: "Login failed - bad credentials".to_string() });
         }
-    }
+    };
 
     Ok(Arc::new(LoginSession {
         account: tokio::sync::Mutex::new(Some(account)),
         username: user_trimmed,
+        needs_2fa,
     }))
 }
 
 #[uniffi::export(async_runtime = "tokio")]
 impl LoginSession {
+    pub fn needs_2fa(&self) -> bool {
+        self.needs_2fa
+    }
+
     pub async fn submit_2fa(&self, code: String) -> Result<bool, WrappedError> {
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;

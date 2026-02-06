@@ -27,7 +27,8 @@ import (
 const launchAgentLabel = "com.lrhodin.mautrix-imessage"
 
 func launchAgentPath() string {
-	return filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", launchAgentLabel+".plist")
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
 }
 
 // dialog shows a macOS dialog and returns true if the user clicked the
@@ -50,7 +51,11 @@ func dialogInfo(title, msg string) {
 }
 
 func canReadChatDB() bool {
-	dbPath := filepath.Join(os.Getenv("HOME"), "Library", "Messages", "chat.db")
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	dbPath := filepath.Join(home, "Library", "Messages", "chat.db")
 	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
 	if err != nil {
 		return false
@@ -167,3 +172,5 @@ func isSetupMode() bool {
 	}
 	return false
 }
+
+

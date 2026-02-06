@@ -772,9 +772,13 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             .send().await?;
 
         if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
+            error!("send_2fa_to_devices failed: HTTP {} — body: {}", status, body);
             return Err(Error::AuthSrp);
         }
 
+        debug!("send_2fa_to_devices: trusteddevice request succeeded");
         return Ok(LoginState::Needs2FAVerification);
     }
 

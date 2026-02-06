@@ -18,7 +18,7 @@ CGO_LDFLAGS := -L/opt/homebrew/lib -L$(shell pwd)
 
 LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
-.PHONY: build clean install uninstall rust bindings check-deps
+.PHONY: build clean install install-beeper uninstall rust bindings check-deps
 
 # Check build dependencies
 check-deps:
@@ -58,9 +58,13 @@ $(BINARY): $(shell find . -name '*.go') $(shell find . -name '*.m') $(shell find
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(APP_NAME)/
 
-# Build, configure, and start the bridge
+# Build, configure, and start the bridge (standalone homeserver)
 install: build
 	@scripts/install.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)"
+
+# Build, configure, and start the bridge (Beeper via bbctl)
+install-beeper: build
+	@scripts/install-beeper.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)"
 
 uninstall:
 	-launchctl unload ~/Library/LaunchAgents/$(BUNDLE_ID).plist 2>/dev/null

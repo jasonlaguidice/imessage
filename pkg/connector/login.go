@@ -90,20 +90,26 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
 		}
-		l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
 		l.session = session
 
-		return &bridgev2.LoginStep{
-			Type:         bridgev2.LoginStepTypeUserInput,
-			StepID:       LoginStepTwoFactor,
-			Instructions: "Enter the 2FA code sent to your trusted device or phone.",
-			UserInputParams: &bridgev2.LoginUserInputParams{
-				Fields: []bridgev2.LoginInputDataField{{
-					ID:   "code",
-					Name: "2FA Code",
-				}},
-			},
-		}, nil
+		if session.Needs2fa() {
+			l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
+			return &bridgev2.LoginStep{
+				Type:         bridgev2.LoginStepTypeUserInput,
+				StepID:       LoginStepTwoFactor,
+				Instructions: "Enter the 2FA code sent to your trusted device or phone.",
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					Fields: []bridgev2.LoginInputDataField{{
+						ID:   "code",
+						Name: "2FA Code",
+					}},
+				},
+			}, nil
+		}
+
+		// No 2FA needed — skip straight to IDS registration
+		l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded without 2FA, finishing registration")
+		return l.finishLogin(ctx)
 	}
 
 	// Step 2: 2FA code
@@ -120,7 +126,10 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		return nil, fmt.Errorf("2FA verification failed — invalid code")
 	}
 
-	// Finish: IDS registration
+	return l.finishLogin(ctx)
+}
+
+func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	result, err := l.session.Finish(l.cfg, l.conn)
 	if err != nil {
 		return nil, fmt.Errorf("login completion failed: %w", err)

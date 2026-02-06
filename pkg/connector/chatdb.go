@@ -32,15 +32,15 @@ type chatDB struct {
 // openChatDB attempts to open the local iMessage chat.db database.
 // Returns nil if chat.db is not accessible (e.g., no Full Disk Access).
 func openChatDB(log zerolog.Logger) *chatDB {
-	if !canReadChatDB() {
-		log.Debug().Msg("Chat.db not accessible (no Full Disk Access)")
+	if !canReadChatDB(log) {
+		log.Warn().Msg("Chat.db not accessible — backfill and contact lookup will be unavailable")
 		return nil
 	}
 
 	adapter := newBridgeAdapter(&log)
 	api, err := imessage.NewAPI(adapter)
 	if err != nil {
-		log.Debug().Err(err).Msg("Failed to open chat.db")
+		log.Warn().Err(err).Msg("Failed to initialize chat.db API via imessage.NewAPI")
 		return nil
 	}
 

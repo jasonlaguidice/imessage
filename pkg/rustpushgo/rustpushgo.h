@@ -167,6 +167,11 @@ void* uniffi_rustpushgo_fn_method_loginsession_finish(
 	RustCallStatus* out_status
 );
 
+int8_t uniffi_rustpushgo_fn_method_loginsession_needs_2fa(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_loginsession_submit_2fa(
 	void* ptr,
 	RustBuffer code,
@@ -655,6 +660,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_validate_targets(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_loginsession_finish(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_loginsession_needs_2fa(
 	RustCallStatus* out_status
 );
 
