@@ -606,19 +606,17 @@ impl LoginSession {
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
 
-        // After SMS 2FA, re-login to get a fully-authenticated session.
-        // The PET from verify_sms_2fa alone gets HTTP 440 from the delegate endpoint.
-        info!("finish: re-authenticating with login_email_pass to refresh tokens...");
-        let relogin_result = account.login_email_pass(&self.username, &self.password_hash).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Re-login failed: {}", e) })?;
-        info!("finish: re-login returned: {:?}", relogin_result);
-
         let pet = account.get_pet()
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
         info!("finish: PET token length={}, username={}", pet.len(), self.username);
 
         let spd = account.spd.as_ref().expect("No SPD after login");
         let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap();
+        info!("finish: adsid={}", adsid);
+        info!("finish: token count={}", account.tokens.len());
+        for (k, _v) in &account.tokens {
+            info!("finish: token key={}", k);
+        }
 
         let delegates = login_apple_delegates(
             &self.username,

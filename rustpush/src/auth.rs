@@ -211,7 +211,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     info!("login_apple_delegates: validation data ok (len={}), getting anisette headers...", validation_data.len());
 
     let base_headers = anisette.get_headers().await?;
-    info!("login_apple_delegates: anisette headers ok, making request...");
+    info!("login_apple_delegates: anisette headers ok, making request to {}...", os_config.get_login_url());
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
     if let Some(cookie) = cookie {
