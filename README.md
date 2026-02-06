@@ -1,123 +1,233 @@
 # mautrix-imessage
 
-A Matrix-iMessage puppeting bridge built on the [mautrix bridgev2](https://docs.mau.fi/bridges/) megabridge framework. Reads from the native macOS iMessage database (`~/Library/Messages/chat.db`) and sends via AppleScript.
+A Matrix-iMessage puppeting bridge. Bridges iMessage conversations into Matrix rooms so you can read and reply to iMessages from any Matrix client.
 
-Forked from [mautrix/imessage](https://github.com/mautrix/imessage) and ported from the legacy bridge framework to bridgev2.
+Two connectors are included:
+
+| | **mac** (chat.db) | **rustpush** (direct protocol) |
+|---|---|---|
+| How it works | Reads `~/Library/Messages/chat.db`, sends via AppleScript | Connects directly to Apple's iMessage servers via rustpush |
+| Requires | Full Disk Access | Apple ID login (via bridge bot) |
+| Send messages | ✅ | ✅ |
+| Receive messages | ✅ (polling, ~5s delay) | ✅ (real-time, instant) |
+| Reactions / tapbacks | Receive only | ✅ Send + receive |
+| Edits / unsends | ❌ | ✅ Send + receive |
+| Typing indicators | ❌ | ✅ Send + receive |
+| Read receipts | Receive only | ✅ Send + receive |
+| Attachments | ✅ | ✅ (MMCS) |
+| Message history backfill | ✅ | ❌ |
+| Contact name resolution | ✅ | ❌ |
+
+Both connectors can run simultaneously — rustpush handles real-time messaging while the mac connector provides backfill and contact resolution.
 
 ## Quick Start
 
 ### Prerequisites
 
-- **macOS 13+** (Apple Silicon or Intel)
-- **Go** — `brew install go`
+- **macOS 14+** (Apple Silicon or Intel)
+- **Go 1.24+** — `brew install go`
+- **Rust** (stable) — `brew install rust` or [rustup.rs](https://rustup.rs)
 - **libolm** — `brew install libolm`
-- A running Matrix homeserver (e.g. [Synapse](https://element-hq.github.io/synapse/))
+- **protobuf** — `brew install protobuf`
+- A running **Matrix homeserver** (e.g. [Synapse](https://element-hq.github.io/synapse/))
 
-### Build & Install
-
-```bash
-make build     # build .app bundle
-make install   # build + run setup wizard
-```
-
-`make install` opens a setup wizard that:
-
-1. Checks **Full Disk Access** — if missing, opens System Settings and waits for you to grant it
-2. Requests **Contacts** access — shows the native macOS permission prompt
-3. Installs a **LaunchAgent** so the bridge starts at login and auto-restarts on crash
-
-After setup, the bridge is running. No scripts, no manual steps.
-
-### First Login
-
-DM `@imessagebot:yourserver.tld` (your bridge bot), send `login`, and select **verify**. The bridge confirms it can read your iMessage database and starts bridging.
-
-### Management
+### 1. Build
 
 ```bash
-# The bridge runs automatically via LaunchAgent
-launchctl stop com.lrhodin.mautrix-imessage       # restart (auto-restarts)
-launchctl unload ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist  # fully stop
-launchctl load ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist    # start
-
-make uninstall  # remove LaunchAgent
-make clean      # remove .app bundle
+git clone --recurse-submodules https://github.com/lrhodin/imessage.git
+cd imessage
+make build
 ```
 
-Logs: `mautrix-imessage-data/bridge.stdout.log`
+### 2. Configure
 
-## Configuration
-
-Before running `make install`, set up `mautrix-imessage-data/config.yaml`:
+Generate an example config, then edit it:
 
 ```bash
-# Generate example config
-./mautrix-imessage.app/Contents/MacOS/mautrix-imessage -c mautrix-imessage-data/config.yaml -e
-
-# Generate registration for your homeserver
-./mautrix-imessage.app/Contents/MacOS/mautrix-imessage -c mautrix-imessage-data/config.yaml -g
+mkdir data
+./mautrix-imessage.app/Contents/MacOS/mautrix-imessage -c data/config.yaml -e
 ```
 
-Key config fields:
+Open `data/config.yaml` and set these values:
 
-| Field | Value |
-|-------|-------|
-| `homeserver.address` | Your Synapse URL (e.g. `http://localhost:8008`) |
-| `homeserver.domain` | Your server name (e.g. `matrix.local`) |
-| `database.uri` | Postgres connection string |
-| `bridge.permissions` | Map of Matrix IDs to permission levels |
+```yaml
+# ── These are the only fields you need to change ──
 
-Copy the generated `registration.yaml` to your homeserver's appservice config directory. If Synapse runs in Docker, change the `url` field to `http://host.docker.internal:29332`.
+homeserver:
+    address: http://localhost:8008       # URL where the bridge can reach your homeserver
+    domain: yourserver.tld               # The server_name from your homeserver config
 
-## Capabilities
+bridge:
+    permissions:
+        "@you:yourserver.tld": admin     # Your Matrix ID
 
-| Feature | Receive | Send |
-|---------|---------|------|
-| Text messages | ✅ | ✅ |
-| Attachments (images, files) | ✅ | ✅ |
-| Tapbacks / reactions | ✅ | ❌ |
-| Read receipts | ✅ | ❌ |
-| Group name changes | ✅ | ❌ |
-| Typing notifications | ❌ | ❌ |
-| Message history backfill | ✅ | — |
-| Contact name resolution | ✅ | — |
+network:
+    platform: mac                        # "mac" or "rustpush-local" (see below)
+```
 
-Sending limitations are inherent to the macOS AppleScript connector.
+The defaults work for everything else (SQLite database, port 29332, etc.). See the comments in the generated file for all available options.
+
+#### Choosing a platform
+
+- **`mac`** — Reads iMessages from the local chat.db database. Requires Full Disk Access for the bridge process. Good for: backfill, contact names, simple setup.
+- **`rustpush-local`** — Connects directly to Apple's iMessage service. Requires Apple ID login through the bridge bot. Good for: real-time delivery, reactions, edits, typing indicators.
+- **Both** — Set `platform: mac`, then also log in with Apple ID via the bridge bot. The bridge runs both connectors: rustpush for real-time, mac for backfill. This is the recommended setup.
+
+### 3. Register with your homeserver
+
+Generate the appservice registration file:
+
+```bash
+./mautrix-imessage.app/Contents/MacOS/mautrix-imessage -c data/config.yaml -g
+```
+
+Then register it with your homeserver. For Synapse, add to `homeserver.yaml`:
+
+```yaml
+app_service_config_files:
+  - /path/to/data/registration.yaml
+```
+
+Restart Synapse after adding the registration.
+
+### 4. Start the bridge
+
+**Option A — Setup wizard** (recommended for mac connector):
+
+```bash
+make install
+```
+
+This opens a wizard that checks Full Disk Access, requests Contacts permission, and installs a LaunchAgent so the bridge starts at login and auto-restarts on crash.
+
+**Option B — Run directly:**
+
+```bash
+./mautrix-imessage.app/Contents/MacOS/mautrix-imessage -c data/config.yaml
+```
+
+**Option C — LaunchAgent manually:**
+
+```bash
+# Install LaunchAgent (starts at login, auto-restarts)
+make install
+
+# Or manage it directly
+launchctl load ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist
+launchctl unload ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist
+```
+
+### 5. Login
+
+DM the bridge bot (`@imessagebot:yourserver.tld`) in your Matrix client.
+
+**For the mac connector:**
+
+Send `login` and select **Verify**. The bridge confirms it can read your iMessage database.
+
+**For rustpush:**
+
+Send `login` and select **Apple ID (rustpush)**. Enter your Apple ID email, password, and 2FA code when prompted. The bridge registers with Apple's iMessage servers and starts receiving messages in real-time.
+
+You can do both logins — they run simultaneously.
+
+### 6. Start chatting
+
+To message someone, DM the bridge bot:
+
+```
+resolve +15551234567
+```
+
+or
+
+```
+resolve user@icloud.com
+```
+
+This creates a portal room bridged to that iMessage conversation. Messages you send in the portal room are delivered as iMessages, and their replies appear in the room.
 
 ## Architecture
 
 ```
-Matrix homeserver ◄──appservice──► mautrix-imessage.app
-                                       │
-                    ┌──────────────────┤
-                    ▼                  ▼
-          ~/Library/Messages/    AppleScript
-             chat.db (read)      Messages.app (send)
+Matrix (Element/etc) ←→ Synapse
+                           ↓ appservice
+                     mautrix-imessage
+                           │
+              ┌────────────┴────────────┐
+              │                         │
+    mac connector                rustpush connector
+    (chat.db + AppleScript)      (Apple IDS/APNs)
+                                        │
+                                 local NAC validation
+                                 (AppleAccount.framework)
 ```
 
-The bridge runs as a native macOS `.app` bundle (`LSUIElement` — no Dock icon) with its own TCC identity for Full Disk Access and Contacts permissions. A LaunchAgent keeps it running across reboots.
+## Configuration Reference
+
+The full config is generated by the `-e` flag. Key sections beyond the basics:
+
+| Section | What it controls |
+|---------|-----------------|
+| `database.type` | `sqlite3-fk-wal` (default) or `postgres` |
+| `database.uri` | Database path/connection string |
+| `appservice.address` | Port the bridge listens on (default: `http://localhost:29332`) |
+| `bridge.permissions` | Who can use the bridge (`user`, `admin`) |
+| `encryption` | End-to-bridge encryption settings |
+| `network.platform` | `mac` or `rustpush-local` |
+
+## Management
+
+```bash
+# Logs
+tail -f data/bridge.stdout.log
+
+# Restart (auto-restarts via LaunchAgent)
+launchctl stop com.lrhodin.mautrix-imessage
+
+# Stop completely
+launchctl unload ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist
+
+# Remove LaunchAgent
+make uninstall
+```
 
 ## Development
 
 ```bash
-make build   # build .app bundle to ../mautrix-imessage.app
-make clean   # remove .app bundle
+make build      # Build .app bundle
+make rust       # Build Rust library only
+make bindings   # Regenerate Go FFI bindings (needs uniffi-bindgen-go)
+make clean      # Remove build artifacts
 ```
 
-The Makefile handles CGO flags for Homebrew's libolm, code signing (ad-hoc), and Info.plist bundling.
+After modifying Rust code, you may need to clear Go's build cache:
 
-Source layout:
+```bash
+cargo clean -p rustpushgo   # in pkg/rustpushgo/
+go run -a ./cmd/mautrix-imessage/ -c data/config.yaml   # force rebuild
+```
+
+### Source layout
 
 ```
-cmd/mautrix-imessage/    # entrypoint + setup wizard
-pkg/connector/           # bridgev2 connector (13 files)
-imessage/mac/            # macOS SQLite + AppleScript + Contacts (CGO/Obj-C)
-imessage/interface.go    # platform-agnostic iMessage API interface
-imessage/struct.go       # iMessage data types
-imessage/tapback.go      # tapback/reaction parsing
-ipc/                     # IPC utilities (legacy, minimal use)
-Info.plist               # macOS app bundle metadata
-Makefile                 # build system
+cmd/mautrix-imessage/        # Entrypoint + macOS setup wizard
+pkg/connector/               # bridgev2 connector
+  ├── rustpush_client.go     #   rustpush send/receive/reactions/edits
+  ├── rustpush_login.go      #   Apple ID + 2FA login flow
+  ├── rustpush_capabilities.go
+  ├── client.go              #   mac connector client
+  ├── handleimessage.go      #   incoming message routing
+  ├── connector.go           #   platform routing + dual-connector dedup
+  └── ...
+pkg/rustpushgo/              # Rust FFI wrapper (uniffi)
+  └── src/
+      ├── lib.rs             #   uniffi exports (messages, login, client)
+      ├── local_config.rs    #   LocalMacOSConfig (hardware info, NAC)
+      └── hardware_info.m    #   IOKit hardware reader (ObjC)
+nac-validation/              # Local NAC via AAAbsintheContext
+rustpush/                    # OpenBubbles/rustpush (git submodule)
+imessage/                    # macOS chat.db + AppleScript + Contacts
 ```
 
 ## License
