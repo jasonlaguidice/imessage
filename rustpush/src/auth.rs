@@ -206,9 +206,12 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
         password: pet.to_string()
     };
 
+    info!("login_apple_delegates: generating validation data...");
     let validation_data = os_config.generate_validation_data().await?;
+    info!("login_apple_delegates: validation data ok (len={}), getting anisette headers...", validation_data.len());
 
     let base_headers = anisette.get_headers().await?;
+    info!("login_apple_delegates: anisette headers ok, making request...");
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
     if let Some(cookie) = cookie {
@@ -229,9 +232,9 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     let status = resp.status();
     let text = resp.text().await?;
 
-    debug!("login_apple_delegates response: HTTP {} body_len={}", status, text.len());
+    info!("login_apple_delegates response: HTTP {} body_len={}", status, text.len());
     if text.len() < 2000 {
-        debug!("login_apple_delegates response body: {}", text);
+        info!("login_apple_delegates response body: {}", text);
     }
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
