@@ -533,7 +533,7 @@ pub async fn login_start(
                     info!("send_sms_2fa_to_devices succeeded (SMS fallback sent)");
                     sms_verify_body = Some(body);
                 }
-                Ok(_) => info!("send_sms_2fa_to_devices returned unexpected state"),
+                Ok(other) => info!("send_sms_2fa_to_devices returned unexpected state: {:?}", other),
                 Err(e) => error!("send_sms_2fa_to_devices failed: {} — user may not receive 2FA code", e),
             }
             true
@@ -574,17 +574,33 @@ impl LoginSession {
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
 
+        // Choose verification method: SMS if we have a verify body, otherwise trusted device
         let sms_body = self.sms_verify_body.lock().await.take();
         let result = if let Some(body) = sms_body {
-            info!("Verifying 2FA via SMS (verify_sms_2fa)");
+            info!("Verifying 2FA code via SMS endpoint (verify_sms_2fa)");
             account.verify_sms_2fa(code, body).await
         } else {
-            info!("Verifying 2FA via trusted device (verify_2fa)");
+            info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
             account.verify_2fa(code).await
         }.map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
 
         info!("2FA verification returned: {:?}", result);
         info!("PET token available: {}", account.get_pet().is_some());
+
+        // After verification, if we get NeedsLogin, re-authenticate to get a
+        // delegate-compatible PET.  This is required for SMS 2FA where the
+        // verification just marks the session as trusted but the SMS-scoped PET
+        // doesn't work for loginDelegates.
+        let result = if matches!(result, icloud_auth::LoginState::NeedsLogin) {
+            info!("Re-authenticating after 2FA to get delegate-compatible PET");
+            let re_result = account.login_email_pass(&self.username, &self.password_hash).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("Re-login after 2FA failed: {}", e) })?;
+            info!("Re-login returned: {:?}", re_result);
+            info!("PET token available after re-login: {}", account.get_pet().is_some());
+            re_result
+        } else {
+            result
+        };
 
         match result {
             icloud_auth::LoginState::LoggedIn => Ok(true),
