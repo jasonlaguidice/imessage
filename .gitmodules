@@ -1,3 +1,0 @@
-[submodule "rustpush"]
-	path = rustpush
-	url = git@github.com:lrhodin/rustpush.git
