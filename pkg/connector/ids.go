@@ -10,42 +10,15 @@ package connector
 
 import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
-
-	"github.com/lrhodin/imessage/imessage"
 )
 
-// makeUserID creates a networkid.UserID from an iMessage identifier (phone/email).
+// makeUserID creates a networkid.UserID from an iMessage identifier
+// (e.g., "tel:+1234567890" or "mailto:user@example.com").
 func makeUserID(identifier string) networkid.UserID {
 	return networkid.UserID(identifier)
 }
 
-// makePortalID creates a networkid.PortalID from an iMessage chat GUID.
-// Chat GUIDs are like "iMessage;-;+1234567890" or "iMessage;+;chat123456".
-func makePortalID(chatGUID string) networkid.PortalID {
-	return networkid.PortalID(chatGUID)
-}
-
-// makeMessageID creates a networkid.MessageID from an iMessage message GUID.
+// makeMessageID creates a networkid.MessageID from an iMessage message UUID.
 func makeMessageID(guid string) networkid.MessageID {
 	return networkid.MessageID(guid)
-}
-
-// makePortalKey creates a networkid.PortalKey from a chat GUID.
-// iMessage chats are per-user (single login), so receiver = login ID.
-func makePortalKey(chatGUID string, loginID networkid.UserLoginID) networkid.PortalKey {
-	parsed := imessage.ParseIdentifier(chatGUID)
-	key := networkid.PortalKey{
-		ID: makePortalID(chatGUID),
-	}
-	// DM portals get a receiver (per-user), group chats are shared
-	if !parsed.IsGroup {
-		key.Receiver = loginID
-	}
-	return key
-}
-
-// makeUserLoginID creates a UserLoginID. Since iMessage has only one "login"
-// (the local macOS user), we use a fixed ID.
-func makeUserLoginID() networkid.UserLoginID {
-	return "imessage"
 }

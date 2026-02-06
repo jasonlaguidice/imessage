@@ -11,95 +11,213 @@ package connector
 import (
 	"context"
 	"fmt"
+	"runtime"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/status"
 
-	"github.com/lrhodin/imessage/imessage/mac"
+	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
 const (
-	LoginFlowIDVerify  = "verify"
-	LoginStepVerify    = "fi.mau.imessage.login.verify"
-	LoginStepComplete  = "fi.mau.imessage.login.complete"
+	LoginFlowIDAppleID       = "apple-id"
+	LoginStepAppleIDPassword = "fi.mau.imessage.login.appleid"
+	LoginStepTwoFactor       = "fi.mau.imessage.login.2fa"
+	LoginStepComplete        = "fi.mau.imessage.login.complete"
 )
 
-func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
-		Name:        "Apple ID",
-		Description: "Login with your Apple ID to send and receive iMessages",
-		ID:          LoginFlowIDRustpush,
-	}}
-	// The mac connector (chat.db backfill) is configured via platform: mac in
-	// config.yaml and activated automatically — no login flow needed.
+// AppleIDLogin implements the multi-step login flow:
+// Apple ID + password → 2FA code → IDS registration → connected.
+type AppleIDLogin struct {
+	User     *bridgev2.User
+	Main     *IMConnector
+	username string
+	useLocal bool
+	cfg      *rustpushgo.WrappedOsConfig
+	conn     *rustpushgo.WrappedApsConnection
+	session  *rustpushgo.LoginSession
 }
 
-func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	switch flowID {
-	case LoginFlowIDVerify:
-		return &IMLogin{User: user, Main: c}, nil
-	case LoginFlowIDRustpush:
-		return &RustpushLogin{User: user, Main: c}, nil
-	default:
-		return nil, fmt.Errorf("invalid login flow ID: %s", flowID)
+var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
+
+func (l *AppleIDLogin) Cancel() {}
+
+func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
+	rustpushgo.InitLogger()
+
+	// On macOS, use local NAC (no relay needed)
+	if runtime.GOOS == "darwin" {
+		cfg, err := rustpushgo.CreateLocalMacosConfig()
+		if err == nil {
+			l.cfg = cfg
+			l.useLocal = true
+			l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
+
+			return &bridgev2.LoginStep{
+				Type:   bridgev2.LoginStepTypeUserInput,
+				StepID: LoginStepAppleIDPassword,
+				Instructions: "Enter your Apple ID credentials. " +
+					"Registration uses local NAC (no relay needed).",
+				UserInputParams: &bridgev2.LoginUserInputParams{
+					Fields: []bridgev2.LoginInputDataField{{
+						Type: bridgev2.LoginInputFieldTypeEmail,
+						ID:   "username",
+						Name: "Apple ID",
+					}, {
+						Type: bridgev2.LoginInputFieldTypePassword,
+						ID:   "password",
+						Name: "Password",
+					}},
+				},
+			}, nil
+		}
 	}
+
+	// Non-macOS or local NAC failed: need a relay code
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeUserInput,
+		StepID:       LoginStepAppleIDPassword,
+		Instructions: "Enter your Apple ID credentials and a registration relay code.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:          "relay_code",
+				Name:        "Registration Relay Code",
+				Description: "e.g., XXXX-XXXX-XXXX-XXXX",
+			}, {
+				Type: bridgev2.LoginInputFieldTypeEmail,
+				ID:   "username",
+				Name: "Apple ID",
+			}, {
+				Type: bridgev2.LoginInputFieldTypePassword,
+				ID:   "password",
+				Name: "Password",
+			}},
+		},
+	}, nil
 }
 
-type IMLogin struct {
-	User *bridgev2.User
-	Main *IMConnector
-}
+func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	// Step 1: Apple ID + password
+	if l.session == nil {
+		username := input["username"]
+		if username == "" {
+			return nil, fmt.Errorf("Apple ID is required")
+		}
+		password := input["password"]
+		if password == "" {
+			return nil, fmt.Errorf("Password is required")
+		}
+		l.username = username
 
-var _ bridgev2.LoginProcessDisplayAndWait = (*IMLogin)(nil)
+		// Set up config (relay path, if not already done on macOS)
+		if l.cfg == nil {
+			relayCode := input["relay_code"]
+			if relayCode == "" {
+				return nil, fmt.Errorf("Registration relay code is required (not running on macOS)")
+			}
+			cfg, err := rustpushgo.CreateRelayConfig(relayCode)
+			if err != nil {
+				return nil, fmt.Errorf("invalid relay code: %w", err)
+			}
+			l.cfg = cfg
+			l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
+		}
 
-func (l *IMLogin) Cancel() {}
+		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		if err != nil {
+			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
+			return nil, fmt.Errorf("login failed: %w", err)
+		}
+		l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
+		l.session = session
 
-func (l *IMLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
-	// Check if iMessage database is accessible
-	err := mac.CheckPermissions()
-	if err != nil {
 		return &bridgev2.LoginStep{
-			Type:         bridgev2.LoginStepTypeDisplayAndWait,
-			StepID:       LoginStepVerify,
-			Instructions: fmt.Sprintf("iMessage access check failed: %v. Grant Full Disk Access to this process, then try again.", err),
-			DisplayAndWaitParams: &bridgev2.LoginDisplayAndWaitParams{
-				Type: bridgev2.LoginDisplayTypeNothing,
+			Type:         bridgev2.LoginStepTypeUserInput,
+			StepID:       LoginStepTwoFactor,
+			Instructions: "Enter the 2FA code sent to your trusted device or phone.",
+			UserInputParams: &bridgev2.LoginUserInputParams{
+				Fields: []bridgev2.LoginInputDataField{{
+					ID:   "code",
+					Name: "2FA Code",
+				}},
 			},
 		}, nil
 	}
 
-	// Access verified — create the login
+	// Step 2: 2FA code
+	code := input["code"]
+	if code == "" {
+		return nil, fmt.Errorf("2FA code is required")
+	}
+
+	success, err := l.session.Submit2fa(code)
+	if err != nil {
+		return nil, fmt.Errorf("2FA verification failed: %w", err)
+	}
+	if !success {
+		return nil, fmt.Errorf("2FA verification failed — invalid code")
+	}
+
+	// Finish: IDS registration
+	result, err := l.session.Finish(l.cfg, l.conn)
+	if err != nil {
+		return nil, fmt.Errorf("login completion failed: %w", err)
+	}
+
+	client := &IMClient{
+		Main:          l.Main,
+		config:        l.cfg,
+		users:         result.Users,
+		identity:      result.Identity,
+		connection:    l.conn,
+		recentUnsends: make(map[string]time.Time),
+	}
+
+	loginID := networkid.UserLoginID(result.Users.LoginId(0))
+
+	platform := "rustpush"
+	if l.useLocal {
+		platform = "rustpush-local"
+	}
+	meta := &UserLoginMetadata{
+		Platform:    platform,
+		APSState:    l.conn.State().ToString(),
+		IDSUsers:    result.Users.ToString(),
+		IDSIdentity: result.Identity.ToString(),
+		DeviceID:    l.cfg.GetDeviceId(),
+	}
+
 	ul, err := l.User.NewLogin(ctx, &database.UserLogin{
-		ID:         makeUserLoginID(),
-		RemoteName: "iMessage",
+		ID:         loginID,
+		RemoteName: l.username,
 		RemoteProfile: status.RemoteProfile{
-			Name: "iMessage",
+			Name: l.username,
 		},
-		Metadata: &UserLoginMetadata{},
+		Metadata: meta,
 	}, &bridgev2.NewLoginParams{
 		DeleteOnConflict: true,
+		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
+			client.UserLogin = login
+			login.Client = client
+			return nil
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create user login: %w", err)
 	}
 
-	// Start the client
-	client := ul.Client.(*IMClient)
 	go client.Connect(context.Background())
 
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,
 		StepID:       LoginStepComplete,
-		Instructions: "Successfully verified iMessage access. Bridge is starting.",
+		Instructions: "Successfully logged in to iMessage. Bridge is starting.",
 		CompleteParams: &bridgev2.LoginCompleteParams{
 			UserLoginID: ul.ID,
 			UserLogin:   ul,
 		},
 	}, nil
-}
-
-func (l *IMLogin) Wait(ctx context.Context) (*bridgev2.LoginStep, error) {
-	// If Start didn't complete the login, the user needs to fix permissions and retry
-	return l.Start(ctx)
 }

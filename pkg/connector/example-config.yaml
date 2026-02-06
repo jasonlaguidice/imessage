@@ -1,13 +1,4 @@
-# Platform determines how the bridge connects to iMessage:
-#   "mac"            — Uses local chat.db polling + AppleScript for send/receive.
-#                      Requires Full Disk Access for the bridge process.
-#   "rustpush-local" — Direct iMessage protocol via rustpush with local NAC
-#                      (AAAbsintheContext from AppleAccount.framework).
-#                      Requires Apple ID login via the bridge bot.
-#                      Works alongside "mac" for dual-connector operation:
-#                      rustpush handles real-time messages, mac handles backfill.
-platform: mac
-
-# Display name template for iMessage contacts
-# Available variables: {{.FirstName}}, {{.LastName}}, {{.Nickname}}, {{.Phone}}, {{.Email}}, {{.ID}}
+# Display name template for iMessage contacts.
+# Available variables: {{.FirstName}}, {{.LastName}}, {{.Nickname}},
+# {{.Phone}}, {{.Email}}, {{.ID}}
 displayname_template: "{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastName}}{{end}}{{else if .Nickname}}{{.Nickname}}{{else if .Phone}}{{.Phone}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}"
