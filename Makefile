@@ -11,7 +11,7 @@ INFO_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
 
 RUST_LIB    := librustpushgo.a
 RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find rustpush/src -name '*.rs' 2>/dev/null)
+RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis -name '*.rs' 2>/dev/null)
 
 CGO_CFLAGS  := -I/opt/homebrew/include
 CGO_LDFLAGS := -L/opt/homebrew/lib -L$(shell pwd)
