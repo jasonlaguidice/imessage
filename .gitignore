@@ -18,8 +18,6 @@ librustpushgo.a
 pkg/rustpushgo/target/
 state/
 
-# Local symlinks
-nac-validation
 
 # Development/test prompt files
 ENDTOEND_TEST_PROMPT.md
