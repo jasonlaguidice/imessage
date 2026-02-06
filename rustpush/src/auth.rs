@@ -226,7 +226,13 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
             .body(plist_to_string(&request)?)
             .send()
             .await?;
+    let status = resp.status();
     let text = resp.text().await?;
+
+    debug!("login_apple_delegates response: HTTP {} body_len={}", status, text.len());
+    if text.len() < 2000 {
+        debug!("login_apple_delegates response body: {}", text);
+    }
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
     let parsed_dict = parsed.as_dictionary().unwrap();

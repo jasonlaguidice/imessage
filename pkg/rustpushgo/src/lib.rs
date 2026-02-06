@@ -581,6 +581,9 @@ impl LoginSession {
             account.verify_2fa(code).await
         }.map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
 
+        info!("2FA verification returned: {:?}", result);
+        info!("PET token available: {}", account.get_pet().is_some());
+
         match result {
             icloud_auth::LoginState::LoggedIn => Ok(true),
             icloud_auth::LoginState::NeedsExtraStep(_) => {
@@ -603,6 +606,7 @@ impl LoginSession {
 
         let pet = account.get_pet()
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
+        info!("finish: PET token length={}, username={}", pet.len(), self.username);
 
         let spd = account.spd.as_ref().expect("No SPD after login");
         let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap();
