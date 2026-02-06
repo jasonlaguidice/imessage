@@ -95,9 +95,13 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		if session.Needs2fa() {
 			l.Main.Bridge.Log.Info().Str("username", username).Msg("Login succeeded, waiting for 2FA")
 			return &bridgev2.LoginStep{
-				Type:         bridgev2.LoginStepTypeUserInput,
-				StepID:       LoginStepTwoFactor,
-				Instructions: "Enter the 2FA code sent to your trusted device or phone.",
+				Type:   bridgev2.LoginStepTypeUserInput,
+				StepID: LoginStepTwoFactor,
+				Instructions: "Enter your Apple ID verification code.\n\n" +
+					"You may see a notification on your trusted Apple devices. " +
+					"If not, you can generate a code manually:\n" +
+					"• iPhone/iPad: Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code\n" +
+					"• Mac: System Settings → [Your Name] → Sign-In & Security → Two-Factor Authentication → Get Verification Code",
 				UserInputParams: &bridgev2.LoginUserInputParams{
 					Fields: []bridgev2.LoginInputDataField{{
 						ID:   "code",
