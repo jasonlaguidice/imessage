@@ -59,6 +59,18 @@ def patch(text, key, val):
 text = patch(text, 'address', '$HS_ADDRESS')
 text = patch(text, 'domain', '$HS_DOMAIN')
 
+# Set database to SQLite (simpler default than postgres)
+text = re.sub(
+    r'^(\s+type:\s*)postgres\s*$',
+    r'\1sqlite3-fk-wal',
+    text, count=1, flags=re.MULTILINE
+)
+text = re.sub(
+    r'^(\s+uri:\s*).*$',
+    r'\1file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate',
+    text, count=1, flags=re.MULTILINE
+)
+
 lines = text.split('\n')
 in_perms = False
 for i, line in enumerate(lines):
@@ -115,6 +127,7 @@ DATA_ABS="$(cd "$DATA_DIR" && pwd)"
 LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
+mkdir -p "$(dirname "$PLIST")"
 launchctl unload "$PLIST" 2>/dev/null || true
 
 cat > "$PLIST" << PLIST_EOF
