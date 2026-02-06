@@ -1,0 +1,12 @@
+[package]
+name = "nac-validation"
+version = "0.1.0"
+edition = "2021"
+description = "Generate Apple APNs validation data locally on macOS 26+ (Apple Silicon)"
+
+[dependencies]
+libc = "0.2"
+thiserror = "2"
+
+[build-dependencies]
+cc = "1"
