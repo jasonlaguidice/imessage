@@ -479,7 +479,6 @@ pub struct LoginSession {
     username: String,
     password_hash: Vec<u8>,
     needs_2fa: bool,
-    sms_verify_body: tokio::sync::Mutex<Option<icloud_auth::VerifyBody>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -512,7 +511,6 @@ pub async fn login_start(
         .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
 
     info!("login_email_pass returned: {:?}", result);
-    let mut sms_verify_body: Option<icloud_auth::VerifyBody> = None;
     let needs_2fa = match result {
         icloud_auth::LoginState::LoggedIn => {
             info!("Login completed without 2FA");
@@ -523,18 +521,10 @@ pub async fn login_start(
             true
         }
         icloud_auth::LoginState::NeedsDevice2FA | icloud_auth::LoginState::NeedsSMS2FA => {
-            info!("2FA required — sending trusted device push + SMS fallback");
+            info!("2FA required — sending trusted device push");
             match account.send_2fa_to_devices().await {
                 Ok(_) => info!("send_2fa_to_devices succeeded"),
                 Err(e) => error!("send_2fa_to_devices failed: {}", e),
-            }
-            match account.send_sms_2fa_to_devices(1).await {
-                Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
-                    info!("send_sms_2fa_to_devices succeeded (SMS fallback sent)");
-                    sms_verify_body = Some(body);
-                }
-                Ok(other) => info!("send_sms_2fa_to_devices returned unexpected state: {:?}", other),
-                Err(e) => error!("send_sms_2fa_to_devices failed: {} — user may not receive 2FA code", e),
             }
             true
         }
@@ -560,7 +550,6 @@ pub async fn login_start(
         username: user_trimmed,
         password_hash: pw_bytes,
         needs_2fa,
-        sms_verify_body: tokio::sync::Mutex::new(sms_verify_body),
     }))
 }
 
@@ -574,33 +563,12 @@ impl LoginSession {
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
 
-        // Choose verification method: SMS if we have a verify body, otherwise trusted device
-        let sms_body = self.sms_verify_body.lock().await.take();
-        let result = if let Some(body) = sms_body {
-            info!("Verifying 2FA code via SMS endpoint (verify_sms_2fa)");
-            account.verify_sms_2fa(code, body).await
-        } else {
-            info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
-            account.verify_2fa(code).await
-        }.map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
+        info!("Verifying 2FA code via trusted device endpoint (verify_2fa)");
+        let result = account.verify_2fa(code).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
 
         info!("2FA verification returned: {:?}", result);
         info!("PET token available: {}", account.get_pet().is_some());
-
-        // After verification, if we get NeedsLogin, re-authenticate to get a
-        // delegate-compatible PET.  This is required for SMS 2FA where the
-        // verification just marks the session as trusted but the SMS-scoped PET
-        // doesn't work for loginDelegates.
-        let result = if matches!(result, icloud_auth::LoginState::NeedsLogin) {
-            info!("Re-authenticating after 2FA to get delegate-compatible PET");
-            let re_result = account.login_email_pass(&self.username, &self.password_hash).await
-                .map_err(|e| WrappedError::GenericError { msg: format!("Re-login after 2FA failed: {}", e) })?;
-            info!("Re-login returned: {:?}", re_result);
-            info!("PET token available after re-login: {}", account.get_pet().is_some());
-            re_result
-        } else {
-            result
-        };
 
         match result {
             icloud_auth::LoginState::LoggedIn => Ok(true),

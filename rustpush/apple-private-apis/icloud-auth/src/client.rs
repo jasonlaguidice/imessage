@@ -978,12 +978,9 @@ impl<T: AnisetteProvider> AppleAccount<T> {
             })
         }).collect();
 
-        // Parse PET if present (marks session as trusted), but always return
-        // NeedsLogin so the caller re-calls login_email_pass() to get a
-        // delegate-compatible PET.  The SMS-scoped PET does NOT work for
-        // loginDelegates (HTTP 440).
         if let Some(pet) = res.headers().get("X-Apple-PE-Token") {
             self.parse_pet_header(pet.to_str().unwrap());
+            return Ok(LoginState::LoggedIn);
         }
 
         Ok(LoginState::NeedsLogin)
