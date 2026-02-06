@@ -38,13 +38,29 @@ else
     ADMIN_USER="${ADMIN_USER:-@you:$HS_DOMAIN}"
 
     echo ""
+    echo "Database:"
+    echo "  1) PostgreSQL (recommended)"
+    echo "  2) SQLite"
+    read -p "Choice [1]: " DB_CHOICE
+    DB_CHOICE="${DB_CHOICE:-1}"
+
+    if [ "$DB_CHOICE" = "1" ]; then
+        DB_TYPE="postgres"
+        read -p "PostgreSQL URI [postgres://localhost/mautrix_imessage?sslmode=disable]: " DB_URI
+        DB_URI="${DB_URI:-postgres://localhost/mautrix_imessage?sslmode=disable}"
+    else
+        DB_TYPE="sqlite3-fk-wal"
+        DB_URI="file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate"
+    fi
+
+    echo ""
 
     # ── Generate config ───────────────────────────────────────────
     mkdir -p "$DATA_DIR"
     "$BINARY" -c "$CONFIG" -e 2>/dev/null
     echo "✓ Generated config"
 
-    # Patch the 3 values into the generated config
+    # Patch values into the generated config
     python3 -c "
 import re, sys
 text = open('$CONFIG').read()
@@ -58,18 +74,8 @@ def patch(text, key, val):
 
 text = patch(text, 'address', '$HS_ADDRESS')
 text = patch(text, 'domain', '$HS_DOMAIN')
-
-# Set database to SQLite (simpler default than postgres)
-text = re.sub(
-    r'^(\s+type:\s*)postgres\s*$',
-    r'\1sqlite3-fk-wal',
-    text, count=1, flags=re.MULTILINE
-)
-text = re.sub(
-    r'^(\s+uri:\s*).*$',
-    r'\1file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate',
-    text, count=1, flags=re.MULTILINE
-)
+text = patch(text, 'type', '$DB_TYPE')
+text = patch(text, 'uri', '$DB_URI')
 
 lines = text.split('\n')
 in_perms = False
@@ -85,7 +91,7 @@ text = '\n'.join(lines)
 
 open('$CONFIG', 'w').write(text)
 "
-    echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER"
+    echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
 fi
 
 # ── Read domain from config (works on first run and re-runs) ──
