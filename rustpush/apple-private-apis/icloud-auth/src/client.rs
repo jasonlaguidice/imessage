@@ -765,41 +765,20 @@ impl<T: AnisetteProvider> AppleAccount<T> {
     pub async fn send_2fa_to_devices(&self) -> Result<LoginState, crate::Error> {
         let headers = self.build_2fa_headers(false).await?;
 
-        info!("send_2fa_to_devices: request headers:");
-        for (k, v) in headers.iter() {
-            let val = v.to_str().unwrap_or("<binary>");
-            // Mask identity token for security
-            if k.as_str().to_lowercase().contains("identity") || k.as_str().to_lowercase().contains("token") {
-                info!("  {}: {}...({} chars)", k, &val[..val.len().min(20)], val.len());
-            } else {
-                info!("  {}: {}", k, val);
-            }
-        }
-
         let res = self
             .client
             .get("https://gsa.apple.com/auth/verify/trusteddevice")
             .headers(headers)
             .send().await?;
 
-        let status = res.status();
-        let resp_headers = res.headers().clone();
-        let body = res.text().await.unwrap_or_default();
-
-        info!("send_2fa_to_devices: HTTP {} — body length: {}", status, body.len());
-        if !body.is_empty() {
-            info!("send_2fa_to_devices: response body: {}", body);
-        }
-        info!("send_2fa_to_devices: response headers:");
-        for (k, v) in resp_headers.iter() {
-            info!("  {}: {}", k, v.to_str().unwrap_or("<binary>"));
-        }
-
-        if !status.is_success() {
+        if !res.status().is_success() {
+            let status = res.status();
+            let body = res.text().await.unwrap_or_default();
             error!("send_2fa_to_devices failed: HTTP {} — body: {}", status, body);
             return Err(Error::AuthSrp);
         }
 
+        debug!("send_2fa_to_devices: trusteddevice request succeeded");
         return Ok(LoginState::Needs2FAVerification);
     }
 

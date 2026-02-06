@@ -592,15 +592,9 @@ impl LoginSession {
 
         let pet = account.get_pet()
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
-        info!("finish: PET token length={}, username={}", pet.len(), self.username);
 
         let spd = account.spd.as_ref().expect("No SPD after login");
         let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap();
-        info!("finish: adsid={}", adsid);
-        info!("finish: token count={}", account.tokens.len());
-        for (k, _v) in &account.tokens {
-            info!("finish: token key={}", k);
-        }
 
         let delegates = login_apple_delegates(
             &self.username,
