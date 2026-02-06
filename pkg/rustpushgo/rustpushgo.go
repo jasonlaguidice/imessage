@@ -391,15 +391,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_func_create_relay_config(uniffiStatus)
-		})
-		if checksum != 38216 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_func_create_relay_config: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_init_logger(uniffiStatus)
 		})
 		if checksum != 38755 {
@@ -2650,28 +2641,6 @@ func CreateLocalMacosConfigWithDeviceId(deviceId string) (*WrappedOsConfig, erro
 	} else {
 		return FfiConverterWrappedOSConfigINSTANCE.Lift(_uniffiRV), _uniffiErr
 	}
-}
-
-func CreateRelayConfig(code string) (*WrappedOsConfig, error) {
-	return uniffiRustCallAsyncWithErrorAndResult(
-		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
-			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_func_create_relay_config(rustBufferToC(FfiConverterStringINSTANCE.Lower(code)),
-				status,
-			))
-		},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_pointer(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) unsafe.Pointer {
-			// completeFunc
-			return C.ffi_rustpushgo_rust_future_complete_pointer(unsafe.Pointer(handle), status)
-		},
-		FfiConverterWrappedOSConfigINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_pointer(unsafe.Pointer(rustFuture), status)
-		})
 }
 
 func InitLogger() {

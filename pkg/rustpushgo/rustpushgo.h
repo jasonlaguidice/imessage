@@ -269,11 +269,6 @@ void* uniffi_rustpushgo_fn_func_create_local_macos_config_with_device_id(
 	RustCallStatus* out_status
 );
 
-void* uniffi_rustpushgo_fn_func_create_relay_config(
-	RustBuffer code,
-	RustCallStatus* out_status
-);
-
 void uniffi_rustpushgo_fn_func_init_logger(
 	RustCallStatus* out_status
 );
@@ -604,10 +599,6 @@ uint16_t uniffi_rustpushgo_checksum_func_create_local_macos_config(
 );
 
 uint16_t uniffi_rustpushgo_checksum_func_create_local_macos_config_with_device_id(
-	RustCallStatus* out_status
-);
-
-uint16_t uniffi_rustpushgo_checksum_func_create_relay_config(
 	RustCallStatus* out_status
 );
 
