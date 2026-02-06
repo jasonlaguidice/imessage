@@ -67,26 +67,13 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	var cfg *rustpushgo.WrappedOsConfig
 	var err error
 
-	platform := meta.Platform
-	if platform == "rustpush-local" || platform == "" {
-		if meta.DeviceID != "" {
-			cfg, err = rustpushgo.CreateLocalMacosConfigWithDeviceId(meta.DeviceID)
-		} else {
-			cfg, err = rustpushgo.CreateLocalMacosConfig()
-		}
-		if err != nil {
-			return fmt.Errorf("failed to create local config: %w", err)
-		}
-	} else if platform == "rustpush" {
-		if meta.RelayCode == "" {
-			return fmt.Errorf("login missing relay code")
-		}
-		cfg, err = rustpushgo.CreateRelayConfig(meta.RelayCode)
-		if err != nil {
-			return fmt.Errorf("failed to create relay config: %w", err)
-		}
+	if meta.DeviceID != "" {
+		cfg, err = rustpushgo.CreateLocalMacosConfigWithDeviceId(meta.DeviceID)
 	} else {
-		return fmt.Errorf("unknown platform: %s", platform)
+		cfg, err = rustpushgo.CreateLocalMacosConfig()
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create local config: %w", err)
 	}
 
 	usersStr := &meta.IDSUsers
