@@ -1,5 +1,5 @@
 /**
- * validation_data.m — Generate Apple APNs validation data on macOS 26+ (Apple Silicon)
+ * validation_data.m — Generate Apple APNs validation data on macOS 14.2+ (Sonoma or later)
  *
  * Uses the private AAAbsintheContext class from AppleAccount.framework to call
  * the underlying NAC (Network Attestation Credential) functions. No SIP modification,

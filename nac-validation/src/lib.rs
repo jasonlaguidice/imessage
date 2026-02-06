@@ -1,4 +1,4 @@
-//! Apple APNs validation data generation for macOS 26+ (Apple Silicon)
+//! Apple APNs validation data generation for macOS 14.2+ (Sonoma or later)
 //!
 //! This crate provides `generate_validation_data()` which calls the NAC
 //! (Network Attestation Credential) functions via Apple's private
@@ -6,7 +6,7 @@
 //! opaque validation data blob required for IDS registration.
 //!
 //! # Requirements
-//! - macOS 26+ on Apple Silicon
+//! - macOS 14.2+ (Sonoma or later)
 //! - SIP can remain enabled
 //! - No jailbreak or code injection required
 //! - Network access to Apple's servers
