@@ -26,18 +26,27 @@ const (
 )
 
 func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
+	flows := []bridgev2.LoginFlow{{
 		Name:        "Verify",
 		Description: "Verify iMessage access on this Mac (Full Disk Access required)",
 		ID:          LoginFlowIDVerify,
+	}, {
+		Name:        "Apple ID (rustpush)",
+		Description: "Login with Apple ID via rustpush protocol (no SIP disable needed)",
+		ID:          LoginFlowIDRustpush,
 	}}
+	return flows
 }
 
 func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	if flowID != LoginFlowIDVerify {
-		return nil, fmt.Errorf("invalid login flow ID")
+	switch flowID {
+	case LoginFlowIDVerify:
+		return &IMLogin{User: user, Main: c}, nil
+	case LoginFlowIDRustpush:
+		return &RustpushLogin{User: user, Main: c}, nil
+	default:
+		return nil, fmt.Errorf("invalid login flow ID: %s", flowID)
 	}
-	return &IMLogin{User: user, Main: c}, nil
 }
 
 type IMLogin struct {

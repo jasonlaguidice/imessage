@@ -21,6 +21,22 @@ type IMConnector struct {
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
 
+// hasActiveRustpushLogin returns true if any user login using the rustpush
+// connector is currently connected (i.e., receiving messages via APNs).
+// Used by the mac connector to suppress real-time message forwarding and
+// avoid double-delivery when both connectors are active.
+func (c *IMConnector) hasActiveRustpushLogin() bool {
+	if c.Bridge == nil {
+		return false
+	}
+	for _, login := range c.Bridge.GetAllCachedUserLogins() {
+		if rp, ok := login.Client.(*RustpushClient); ok && rp.IsLoggedIn() {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *IMConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
 		DisplayName:      "iMessage",
@@ -41,6 +57,22 @@ func (c *IMConnector) Start(ctx context.Context) error {
 }
 
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
+	meta := login.Metadata.(*UserLoginMetadata)
+
+	// Route to the correct client based on platform metadata (or config default)
+	platform := meta.Platform
+	if platform == "" {
+		platform = c.Config.Platform
+	}
+	if platform == "" {
+		platform = "mac"
+	}
+
+	if platform == "rustpush" || platform == "rustpush-local" {
+		return c.loadRustpushLogin(ctx, login, meta)
+	}
+
+	// Default: mac connector
 	client := &IMClient{
 		Main:      c,
 		UserLogin: login,

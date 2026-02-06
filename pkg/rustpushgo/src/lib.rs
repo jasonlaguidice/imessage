@@ -1,0 +1,992 @@
+pub mod util;
+pub mod local_config;
+#[cfg(test)]
+mod test_hwinfo;
+
+use std::{io::Cursor, path::PathBuf, str::FromStr, sync::Arc};
+
+use icloud_auth::AppleAccount;
+use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
+use log::{debug, error, info, warn};
+use rustpush::{
+    authenticate_apple, login_apple_delegates, register, APSConnectionResource,
+    APSState, Attachment, AttachmentType, ConversationData, EditMessage, IDSNGMIdentity,
+    IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessagePart,
+    MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType,
+    Reaction, RelayConfig, UnsendMessage, IndexedMessagePart,
+};
+use omnisette::default_provider;
+use std::sync::RwLock;
+use tokio::sync::broadcast;
+use util::{plist_from_string, plist_to_string};
+use uuid::Uuid;
+
+// ============================================================================
+// Wrapper types
+// ============================================================================
+
+#[derive(uniffi::Object)]
+pub struct WrappedAPSState {
+    pub inner: Option<APSState>,
+}
+
+#[uniffi::export]
+impl WrappedAPSState {
+    #[uniffi::constructor]
+    pub fn new(string: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: string
+                .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                .and_then(|s| plist_from_string::<APSState>(&s).ok()),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        plist_to_string(&self.inner).unwrap_or_default()
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedAPSConnection {
+    pub inner: rustpush::APSConnection,
+}
+
+#[uniffi::export]
+impl WrappedAPSConnection {
+    pub fn state(&self) -> Arc<WrappedAPSState> {
+        Arc::new(WrappedAPSState {
+            inner: Some(self.inner.state.blocking_read().clone()),
+        })
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct IDSUsersWithIdentityRecord {
+    pub users: Arc<WrappedIDSUsers>,
+    pub identity: Arc<WrappedIDSNGMIdentity>,
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedIDSUsers {
+    pub inner: Vec<IDSUser>,
+}
+
+#[uniffi::export]
+impl WrappedIDSUsers {
+    #[uniffi::constructor]
+    pub fn new(string: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: string
+                .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                .and_then(|s| plist_from_string(&s).ok())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        plist_to_string(&self.inner).unwrap_or_default()
+    }
+
+    pub fn login_id(&self, i: u64) -> String {
+        self.inner[i as usize].user_id.clone()
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedIDSNGMIdentity {
+    pub inner: IDSNGMIdentity,
+}
+
+#[uniffi::export]
+impl WrappedIDSNGMIdentity {
+    #[uniffi::constructor]
+    pub fn new(string: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: string
+                .and_then(|s| if s.is_empty() { None } else { Some(s) })
+                .and_then(|s| plist_from_string(&s).ok())
+                .unwrap_or_else(|| IDSNGMIdentity::new().expect("Failed to create new identity")),
+        })
+    }
+
+    pub fn to_string(&self) -> String {
+        plist_to_string(&self.inner).unwrap_or_default()
+    }
+}
+
+#[derive(uniffi::Object)]
+pub struct WrappedOSConfig {
+    pub config: Arc<dyn OSConfig>,
+}
+
+#[uniffi::export]
+impl WrappedOSConfig {
+    /// Get the device UUID from the underlying OSConfig.
+    pub fn get_device_id(&self) -> String {
+        self.config.get_device_uuid()
+    }
+}
+
+#[derive(thiserror::Error, uniffi::Error, Debug)]
+pub enum WrappedError {
+    #[error("{msg}")]
+    GenericError { msg: String },
+}
+
+impl From<rustpush::PushError> for WrappedError {
+    fn from(e: rustpush::PushError) -> Self {
+        WrappedError::GenericError { msg: format!("{}", e) }
+    }
+}
+
+// ============================================================================
+// Message wrapper types (flat structs for uniffi)
+// ============================================================================
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedMessage {
+    pub uuid: String,
+    pub sender: Option<String>,
+    pub text: Option<String>,
+    pub subject: Option<String>,
+    pub participants: Vec<String>,
+    pub group_name: Option<String>,
+    pub timestamp_ms: u64,
+    pub is_sms: bool,
+
+    // Tapback
+    pub is_tapback: bool,
+    pub tapback_type: Option<u32>,
+    pub tapback_target_uuid: Option<String>,
+    pub tapback_target_part: Option<u64>,
+    pub tapback_emoji: Option<String>,
+    pub tapback_remove: bool,
+
+    // Edit
+    pub is_edit: bool,
+    pub edit_target_uuid: Option<String>,
+    pub edit_part: Option<u64>,
+    pub edit_new_text: Option<String>,
+
+    // Unsend
+    pub is_unsend: bool,
+    pub unsend_target_uuid: Option<String>,
+    pub unsend_edit_part: Option<u64>,
+
+    // Rename
+    pub is_rename: bool,
+    pub new_chat_name: Option<String>,
+
+    // Participant change
+    pub is_participant_change: bool,
+    pub new_participants: Vec<String>,
+
+    // Attachments
+    pub attachments: Vec<WrappedAttachment>,
+
+    // Reply
+    pub reply_guid: Option<String>,
+    pub reply_part: Option<String>,
+
+    // Typing
+    pub is_typing: bool,
+
+    // Read receipt
+    pub is_read_receipt: bool,
+
+    // Delivered
+    pub is_delivered: bool,
+
+    // Error
+    pub is_error: bool,
+    pub error_for_uuid: Option<String>,
+    pub error_status: Option<u64>,
+    pub error_status_str: Option<String>,
+
+    // Peer cache invalidate
+    pub is_peer_cache_invalidate: bool,
+
+    // Send delivered flag
+    pub send_delivered: bool,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedAttachment {
+    pub mime_type: String,
+    pub filename: String,
+    pub uti_type: String,
+    pub size: u64,
+    pub is_inline: bool,
+    pub inline_data: Option<Vec<u8>>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedConversation {
+    pub participants: Vec<String>,
+    pub group_name: Option<String>,
+    pub sender_guid: Option<String>,
+}
+
+impl From<&ConversationData> for WrappedConversation {
+    fn from(c: &ConversationData) -> Self {
+        Self {
+            participants: c.participants.clone(),
+            group_name: c.cv_name.clone(),
+            sender_guid: c.sender_guid.clone(),
+        }
+    }
+}
+
+impl From<&WrappedConversation> for ConversationData {
+    fn from(c: &WrappedConversation) -> Self {
+        ConversationData {
+            participants: c.participants.clone(),
+            cv_name: c.group_name.clone(),
+            sender_guid: c.sender_guid.clone(),
+            after_guid: None,
+        }
+    }
+}
+
+fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<String>, bool) {
+    let tapback_type = match reaction {
+        Reaction::Heart => Some(0),
+        Reaction::Like => Some(1),
+        Reaction::Dislike => Some(2),
+        Reaction::Laugh => Some(3),
+        Reaction::Emphasize => Some(4),
+        Reaction::Question => Some(5),
+        Reaction::Emoji(_) => Some(6),
+        Reaction::Sticker { .. } => Some(7),
+    };
+    let emoji = match reaction {
+        Reaction::Emoji(e) => Some(e.clone()),
+        _ => None,
+    };
+    (tapback_type, emoji, !enable)
+}
+
+fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
+    let conv = msg.conversation.as_ref();
+
+    let mut w = WrappedMessage {
+        uuid: msg.id.clone(),
+        sender: msg.sender.clone(),
+        text: None,
+        subject: None,
+        participants: conv.map(|c| c.participants.clone()).unwrap_or_default(),
+        group_name: conv.and_then(|c| c.cv_name.clone()),
+        timestamp_ms: msg.sent_timestamp,
+        is_sms: false,
+        is_tapback: false,
+        tapback_type: None,
+        tapback_target_uuid: None,
+        tapback_target_part: None,
+        tapback_emoji: None,
+        tapback_remove: false,
+        is_edit: false,
+        edit_target_uuid: None,
+        edit_part: None,
+        edit_new_text: None,
+        is_unsend: false,
+        unsend_target_uuid: None,
+        unsend_edit_part: None,
+        is_rename: false,
+        new_chat_name: None,
+        is_participant_change: false,
+        new_participants: vec![],
+        attachments: vec![],
+        reply_guid: None,
+        reply_part: None,
+        is_typing: false,
+        is_read_receipt: false,
+        is_delivered: false,
+        is_error: false,
+        error_for_uuid: None,
+        error_status: None,
+        error_status_str: None,
+        is_peer_cache_invalidate: false,
+        send_delivered: msg.send_delivered,
+    };
+
+    match &msg.message {
+        Message::Message(normal) => {
+            w.text = Some(normal.parts.raw_text());
+            w.subject = normal.subject.clone();
+            w.reply_guid = normal.reply_guid.clone();
+            w.reply_part = normal.reply_part.clone();
+            w.is_sms = matches!(normal.service, MessageType::SMS { .. });
+
+            for indexed_part in &normal.parts.0 {
+                if let MessagePart::Attachment(att) = &indexed_part.part {
+                    let (is_inline, inline_data, size) = match &att.a_type {
+                        AttachmentType::Inline(data) => (true, Some(data.clone()), data.len() as u64),
+                        AttachmentType::MMCS(mmcs) => (false, None, mmcs.size as u64),
+                    };
+                    w.attachments.push(WrappedAttachment {
+                        mime_type: att.mime.clone(),
+                        filename: att.name.clone(),
+                        uti_type: att.uti_type.clone(),
+                        size,
+                        is_inline,
+                        inline_data,
+                    });
+                }
+            }
+        }
+        Message::React(react) => {
+            w.is_tapback = true;
+            w.tapback_target_uuid = Some(react.to_uuid.clone());
+            w.tapback_target_part = react.to_part;
+            match &react.reaction {
+                ReactMessageType::React { reaction, enable } => {
+                    let (tt, emoji, remove) = convert_reaction(reaction, *enable);
+                    w.tapback_type = tt;
+                    w.tapback_emoji = emoji;
+                    w.tapback_remove = remove;
+                }
+                ReactMessageType::Extension { .. } => {
+                    // Extension reactions (stickers etc.) — mark as tapback
+                    w.tapback_type = Some(7);
+                }
+            }
+        }
+        Message::Edit(edit) => {
+            w.is_edit = true;
+            w.edit_target_uuid = Some(edit.tuuid.clone());
+            w.edit_part = Some(edit.edit_part);
+            w.edit_new_text = Some(edit.new_parts.raw_text());
+        }
+        Message::Unsend(unsend) => {
+            w.is_unsend = true;
+            w.unsend_target_uuid = Some(unsend.tuuid.clone());
+            w.unsend_edit_part = Some(unsend.edit_part);
+        }
+        Message::RenameMessage(rename) => {
+            w.is_rename = true;
+            w.new_chat_name = Some(rename.new_name.clone());
+        }
+        Message::ChangeParticipants(change) => {
+            w.is_participant_change = true;
+            w.new_participants = change.new_participants.clone();
+        }
+        Message::Typing(typing, _) => {
+            w.is_typing = *typing;
+        }
+        Message::Read => {
+            w.is_read_receipt = true;
+        }
+        Message::Delivered => {
+            w.is_delivered = true;
+        }
+        Message::Error(err) => {
+            w.is_error = true;
+            w.error_for_uuid = Some(err.for_uuid.clone());
+            w.error_status = Some(err.status);
+            w.error_status_str = Some(err.status_str.clone());
+        }
+        Message::PeerCacheInvalidate => {
+            w.is_peer_cache_invalidate = true;
+        }
+        _ => {}
+    }
+
+    w
+}
+
+// ============================================================================
+// Callback interfaces
+// ============================================================================
+
+#[uniffi::export(callback_interface)]
+pub trait MessageCallback: Send + Sync {
+    fn on_message(&self, msg: WrappedMessage);
+}
+
+#[uniffi::export(callback_interface)]
+pub trait UpdateUsersCallback: Send + Sync {
+    fn update_users(&self, users: Arc<WrappedIDSUsers>);
+}
+
+// ============================================================================
+// Top-level functions
+// ============================================================================
+
+#[uniffi::export]
+pub fn init_logger() {
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    let _ = pretty_env_logger::try_init();
+
+    // Initialize the keystore with a file-backed software keystore.
+    // This must be called before any rustpush operations (APNs connect, login, etc.).
+    let state_path = "state/keystore.plist";
+    let _ = std::fs::create_dir_all("state");
+    let state: SoftwareKeystoreState = std::fs::read(state_path)
+        .ok()
+        .and_then(|data| plist::from_bytes(&data).ok())
+        .unwrap_or_default();
+    let path_for_closure = state_path.to_string();
+    init_keystore(SoftwareKeystore {
+        state: RwLock::new(state),
+        update_state: Box::new(move |s| {
+            let _ = plist::to_file_xml(&path_for_closure, s);
+        }),
+        encryptor: NoEncryptor,
+    });
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn create_relay_config(code: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    let host = "https://registration-relay.beeper.com".to_string();
+    let token = Some("5c175851953ecaf5209185d897591badb6c3e712".to_string());
+    let dev_uuid = Uuid::new_v4().to_string();
+    let config: Arc<RelayConfig> = Arc::new(RelayConfig {
+        version: RelayConfig::get_versions(&host, &code, &token)
+            .await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get relay versions: {}", e) })?,
+        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        dev_uuid: dev_uuid.clone(),
+        protocol_version: 1640,
+        host,
+        code,
+        beeper_token: token,
+        udid: Some(dev_uuid),
+    });
+
+    Ok(Arc::new(WrappedOSConfig { config }))
+}
+
+/// Create a local macOS config that reads hardware info from IOKit
+/// and uses AAAbsintheContext for NAC validation (no SIP disable, no relay needed).
+#[uniffi::export]
+pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    let config = local_config::LocalMacOSConfig::new()
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?;
+    Ok(Arc::new(WrappedOSConfig {
+        config: Arc::new(config),
+    }))
+}
+
+/// Create a local macOS config with a persisted device ID.
+#[uniffi::export]
+pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    let config = local_config::LocalMacOSConfig::new()
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+        .with_device_id(device_id);
+    Ok(Arc::new(WrappedOSConfig {
+        config: Arc::new(config),
+    }))
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn connect(
+    config: &WrappedOSConfig,
+    state: &WrappedAPSState,
+) -> Arc<WrappedAPSConnection> {
+    let config = config.config.clone();
+    let state = state.inner.clone();
+    let (connection, error) = APSConnectionResource::new(config, state).await;
+    if let Some(error) = error {
+        error!("APS connection error (non-fatal, will retry): {}", error);
+    }
+    Arc::new(WrappedAPSConnection { inner: connection })
+}
+
+/// Login session object that holds state between login steps.
+#[derive(uniffi::Object)]
+pub struct LoginSession {
+    account: tokio::sync::Mutex<Option<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
+    username: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct LoginStartResult {
+    pub needs_2fa: bool,
+    pub error: Option<String>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn login_start(
+    apple_id: String,
+    password: String,
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+) -> Result<Arc<LoginSession>, WrappedError> {
+    let os_config = config.config.clone();
+    let conn = connection.inner.clone();
+
+    let user_trimmed = apple_id.trim().to_string();
+    // Apple's GSA SRP expects the password to be pre-hashed with SHA-256.
+    // See upstream test.rs: sha256(password.as_bytes())
+    let pw_bytes = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(password.trim().as_bytes());
+        hasher.finalize().to_vec()
+    };
+
+    let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
+    let anisette = default_provider(client_info.clone(), PathBuf::from_str("state/anisette").unwrap());
+
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+
+    let result = account.login_email_pass(&user_trimmed, &pw_bytes).await
+        .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
+
+    match result {
+        icloud_auth::LoginState::LoggedIn => {
+            info!("Login completed without 2FA");
+        }
+        icloud_auth::LoginState::Needs2FAVerification
+        | icloud_auth::LoginState::NeedsDevice2FA
+        | icloud_auth::LoginState::NeedsSMS2FA
+        | icloud_auth::LoginState::NeedsSMS2FAVerification(_) => {
+            info!("2FA required");
+            if matches!(result, icloud_auth::LoginState::NeedsDevice2FA | icloud_auth::LoginState::NeedsSMS2FA) {
+                let _ = account.send_2fa_to_devices().await;
+            }
+        }
+        icloud_auth::LoginState::NeedsExtraStep(ref step) => {
+            if account.get_pet().is_some() {
+                info!("Login completed (extra step ignored, PET available)");
+            } else {
+                return Err(WrappedError::GenericError { msg: format!("Login requires extra step: {}", step) });
+            }
+        }
+        icloud_auth::LoginState::NeedsLogin => {
+            return Err(WrappedError::GenericError { msg: "Login failed - bad credentials".to_string() });
+        }
+    }
+
+    Ok(Arc::new(LoginSession {
+        account: tokio::sync::Mutex::new(Some(account)),
+        username: user_trimmed,
+    }))
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl LoginSession {
+    pub async fn submit_2fa(&self, code: String) -> Result<bool, WrappedError> {
+        let mut guard = self.account.lock().await;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+
+        let result = account.verify_2fa(code).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
+
+        match result {
+            icloud_auth::LoginState::LoggedIn => Ok(true),
+            icloud_auth::LoginState::NeedsExtraStep(_) => {
+                Ok(account.get_pet().is_some())
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub async fn finish(
+        &self,
+        config: &WrappedOSConfig,
+        connection: &WrappedAPSConnection,
+    ) -> Result<IDSUsersWithIdentityRecord, WrappedError> {
+        let os_config = config.config.clone();
+        let conn = connection.inner.clone();
+
+        let mut guard = self.account.lock().await;
+        let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
+
+        let pet = account.get_pet()
+            .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
+
+        let spd = account.spd.as_ref().expect("No SPD after login");
+        let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap();
+
+        let delegates = login_apple_delegates(
+            &self.username,
+            &pet,
+            adsid,
+            None,
+            &mut *account.anisette.lock().await,
+            &*os_config,
+            &[LoginDelegate::IDS],
+        ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get IDS delegate: {}", e) })?;
+
+        let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
+        let user = authenticate_apple(ids_delegate, &*os_config).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("IDS authentication failed: {}", e) })?;
+
+        let identity = IDSNGMIdentity::new()
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create identity: {}", e) })?;
+
+        let mut users = vec![user];
+
+        if users[0].registration.is_empty() {
+            info!("Registering new identity...");
+            register(
+                &*os_config,
+                &*conn.state.read().await,
+                &[&MADRID_SERVICE],
+                &mut users,
+                &identity,
+            ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
+        }
+
+        Ok(IDSUsersWithIdentityRecord {
+            users: Arc::new(WrappedIDSUsers { inner: users }),
+            identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
+        })
+    }
+}
+
+// ============================================================================
+// Attachment download helper
+// ============================================================================
+
+/// Download any MMCS (non-inline) attachments from the message and convert them
+/// to inline data in the wrapped message, so the Go side can upload them to Matrix.
+async fn download_mmcs_attachments(
+    wrapped: &mut WrappedMessage,
+    msg_inst: &MessageInst,
+    conn: &rustpush::APSConnectionResource,
+) {
+    if let Message::Message(normal) = &msg_inst.message {
+        let mut att_idx = 0;
+        for indexed_part in &normal.parts.0 {
+            if let MessagePart::Attachment(att) = &indexed_part.part {
+                if let AttachmentType::MMCS(_) = &att.a_type {
+                    if att_idx < wrapped.attachments.len() {
+                        let mut buf: Vec<u8> = Vec::new();
+                        match att.get_attachment(conn, &mut buf, |_, _| {}).await {
+                            Ok(()) => {
+                                info!(
+                                    "Downloaded MMCS attachment: {} ({} bytes)",
+                                    att.name,
+                                    buf.len()
+                                );
+                                wrapped.attachments[att_idx].is_inline = true;
+                                wrapped.attachments[att_idx].inline_data = Some(buf);
+                            }
+                            Err(e) => {
+                                error!("Failed to download MMCS attachment {}: {}", att.name, e);
+                            }
+                        }
+                    }
+                }
+                att_idx += 1;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Client
+// ============================================================================
+
+#[derive(uniffi::Object)]
+pub struct Client {
+    client: Arc<IMClient>,
+    conn: rustpush::APSConnection,
+    receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn new_client(
+    connection: &WrappedAPSConnection,
+    users: &WrappedIDSUsers,
+    identity: &WrappedIDSNGMIdentity,
+    config: &WrappedOSConfig,
+    message_callback: Box<dyn MessageCallback>,
+    update_users_callback: Box<dyn UpdateUsersCallback>,
+) -> Result<Arc<Client>, WrappedError> {
+    let conn = connection.inner.clone();
+    let users_clone = users.inner.clone();
+    let identity_clone = identity.inner.clone();
+    let config_clone = config.config.clone();
+
+    let _ = std::fs::create_dir_all("state");
+
+    let client = Arc::new(
+        IMClient::new(
+            conn.clone(),
+            users_clone,
+            identity_clone,
+            &[&MADRID_SERVICE],
+            "state/id_cache.plist".into(),
+            config_clone,
+            Box::new(move |updated_keys| {
+                update_users_callback.update_users(Arc::new(WrappedIDSUsers {
+                    inner: updated_keys,
+                }));
+                debug!("Updated IDS keys");
+            }),
+        )
+        .await,
+    );
+
+    // Start receive loop
+    let client_for_recv = client.clone();
+    let callback = Arc::new(message_callback);
+
+    let receive_handle = tokio::spawn({
+        let conn = connection.inner.clone();
+        let conn_for_download = connection.inner.clone();
+        async move {
+            let mut recv = conn.messages_cont.subscribe();
+            loop {
+                match recv.recv().await {
+                    Ok(msg) => {
+                        match client_for_recv.handle(msg).await {
+                            Ok(Some(msg_inst)) => {
+                                if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
+                                    let mut wrapped = message_inst_to_wrapped(&msg_inst);
+                                    // Download MMCS attachments so Go receives inline data
+                                    download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                    callback.on_message(wrapped);
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                error!("Error handling message: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("Message receiver lagged by {} messages", n);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("Message channel closed, stopping receive loop");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Arc::new(Client {
+        client,
+        conn: connection.inner.clone(),
+        receive_handle: tokio::sync::Mutex::new(Some(receive_handle)),
+    }))
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl Client {
+    pub async fn get_handles(&self) -> Vec<String> {
+        self.client.identity.get_handles().await
+    }
+
+    pub async fn validate_targets(
+        &self,
+        targets: Vec<String>,
+        handle: String,
+    ) -> Vec<String> {
+        self.client
+            .identity
+            .validate_targets(&targets, "com.apple.madrid", &handle)
+            .await
+            .unwrap_or_default()
+    }
+
+    pub async fn send_message(
+        &self,
+        conversation: WrappedConversation,
+        text: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Message(NormalMessage::new(text, MessageType::IMessage)),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_tapback(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        target_part: u64,
+        reaction: u32,
+        emoji: Option<String>,
+        remove: bool,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let reaction_val = match (reaction, &emoji) {
+            (0, _) => Reaction::Heart,
+            (1, _) => Reaction::Like,
+            (2, _) => Reaction::Dislike,
+            (3, _) => Reaction::Laugh,
+            (4, _) => Reaction::Emphasize,
+            (5, _) => Reaction::Question,
+            (6, Some(em)) => Reaction::Emoji(em.clone()),
+            _ => Reaction::Heart,
+        };
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::React(ReactMessage {
+                to_uuid: target_uuid,
+                to_part: Some(target_part),
+                reaction: ReactMessageType::React { reaction: reaction_val, enable: !remove },
+                to_text: String::new(),
+                embedded_profile: None,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send tapback: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_typing(
+        &self,
+        conversation: WrappedConversation,
+        typing: bool,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::Typing(typing, None));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send typing: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_read_receipt(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::Read);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send read receipt: {}", e) })?;
+        Ok(())
+    }
+
+    pub async fn send_edit(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        edit_part: u64,
+        new_text: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Edit(EditMessage {
+                tuuid: target_uuid,
+                edit_part,
+                new_parts: MessageParts(vec![IndexedMessagePart {
+                    part: MessagePart::Text(new_text, Default::default()),
+                    idx: None,
+                    ext: None,
+                }]),
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send edit: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_unsend(
+        &self,
+        conversation: WrappedConversation,
+        target_uuid: String,
+        edit_part: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Unsend(UnsendMessage {
+                tuuid: target_uuid,
+                edit_part,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unsend: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn send_attachment(
+        &self,
+        conversation: WrappedConversation,
+        data: Vec<u8>,
+        mime: String,
+        uti_type: String,
+        filename: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+
+        // Prepare and upload the attachment via MMCS
+        let cursor = Cursor::new(&data);
+        let prepared = MMCSFile::prepare_put(cursor).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare MMCS upload: {}", e) })?;
+
+        let cursor2 = Cursor::new(&data);
+        let attachment = Attachment::new_mmcs(
+            &self.conn,
+            &prepared,
+            cursor2,
+            &mime,
+            &uti_type,
+            &filename,
+            |_current, _total| {},
+        ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload attachment: {}", e) })?;
+
+        let parts = vec![IndexedMessagePart {
+            part: MessagePart::Attachment(attachment),
+            idx: None,
+            ext: None,
+        }];
+
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::Message(NormalMessage {
+                parts: MessageParts(parts),
+                effect: None,
+                reply_guid: None,
+                reply_part: None,
+                service: MessageType::IMessage,
+                subject: None,
+                app: None,
+                link_meta: None,
+                voice: false,
+                scheduled: None,
+                embedded_profile: None,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    pub async fn stop(&self) {
+        let mut handle = self.receive_handle.lock().await;
+        if let Some(h) = handle.take() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Ok(mut handle) = self.receive_handle.try_lock() {
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+        }
+    }
+}
+
+uniffi::setup_scaffolding!();
