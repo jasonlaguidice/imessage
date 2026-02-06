@@ -58,7 +58,12 @@ func (db *chatDB) Close() {
 func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
 	portalID := string(params.Portal.ID)
 	chatGUID := portalIDToChatGUID(portalID)
+
+	log := zerolog.Ctx(ctx)
+	log.Info().Str("portal_id", portalID).Str("chat_guid", chatGUID).Bool("forward", params.Forward).Msg("FetchMessages called")
+
 	if chatGUID == "" {
+		log.Warn().Str("portal_id", portalID).Msg("portalIDToChatGUID returned empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
@@ -80,8 +85,11 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		messages, err = db.api.GetMessagesWithLimit(chatGUID, count, "")
 	}
 	if err != nil {
+		log.Error().Err(err).Str("chat_guid", chatGUID).Msg("Failed to fetch messages from chat.db")
 		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", err)
 	}
+
+	log.Info().Str("chat_guid", chatGUID).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
 
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
 	for _, msg := range messages {
@@ -135,14 +143,18 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 // ============================================================================
 
 // portalIDToChatGUID converts a clean portal ID (e.g., "mailto:user@example.com")
-// to a chat.db GUID (e.g., "iMessage;-;user@example.com").
+// to a chat.db GUID (e.g., "any;-;user@example.com").
+// Modern macOS (Ventura+) uses "any" as the service prefix for all chats.
 func portalIDToChatGUID(portalID string) string {
 	localID := stripIdentifierPrefix(portalID)
 	if localID == "" {
 		return ""
 	}
-	// Try iMessage service first (most common)
-	return "iMessage;-;" + localID
+	// Group chats already contain the full GUID format
+	if strings.HasPrefix(portalID, "any;") {
+		return portalID
+	}
+	return "any;-;" + localID
 }
 
 // identifierToPortalID converts a chat.db Identifier to a clean portal ID.
