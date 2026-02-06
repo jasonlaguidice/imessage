@@ -9,14 +9,11 @@
 package connector
 
 import (
-	"context"
-
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 )
 
-var imessageCaps = &event.RoomFeatures{
+var caps = &event.RoomFeatures{
 	ID: "fi.mau.imessage.capabilities.2024_01",
 
 	Formatting: map[event.FormattingFeature]event.CapabilitySupportLevel{
@@ -52,35 +49,30 @@ var imessageCaps = &event.RoomFeatures{
 		},
 	},
 	MaxTextLength:       -1,
-	Reply:               event.CapLevelUnsupported, // mac connector doesn't support replies
-	Edit:                event.CapLevelUnsupported,
-	Delete:              event.CapLevelUnsupported,
-	Reaction:            event.CapLevelUnsupported, // mac connector can't send tapbacks
-	ReadReceipts:        false,
-	TypingNotifications: false,
+	Reply:               event.CapLevelFullySupported,
+	Edit:                event.CapLevelFullySupported,
+	Delete:              event.CapLevelFullySupported,
+	Reaction:            event.CapLevelFullySupported,
+	ReactionCount:       1,
+	ReadReceipts:        true,
+	TypingNotifications: true,
 }
 
-var imessageCapsDM *event.RoomFeatures
+var capsDM *event.RoomFeatures
 
 func init() {
-	imessageCapsDM = &(*imessageCaps)
-	imessageCapsDM.ID = "fi.mau.imessage.capabilities.2024_01+dm"
+	c := *caps
+	capsDM = &c
+	capsDM.ID = "fi.mau.imessage.capabilities.2024_01+dm"
 }
 
-func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
-	if portal.RoomType == database.RoomTypeDM {
-		return imessageCapsDM
-	}
-	return imessageCaps
-}
-
-var imessageGeneralCaps = &bridgev2.NetworkGeneralCapabilities{
+var generalCaps = &bridgev2.NetworkGeneralCapabilities{
 	DisappearingMessages: false,
 	AggressiveUpdateInfo: false,
 }
 
 func (c *IMConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
-	return imessageGeneralCaps
+	return generalCaps
 }
 
 func (c *IMConnector) GetBridgeInfoVersion() (info, capabilities int) {

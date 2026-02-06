@@ -23,14 +23,17 @@ type MessageMetadata struct {
 }
 
 type UserLoginMetadata struct {
-	Platform    string `json:"platform,omitempty"`     // "mac", "rustpush", or "rustpush-local"
+	// Platform records how this login connects to Apple's servers.
+	// "rustpush-local" (macOS with local NAC) or "rustpush" (relay).
+	Platform    string `json:"platform,omitempty"`
 	ChatsSynced bool   `json:"chats_synced,omitempty"`
-	// rustpush state (persisted across restarts):
+
+	// Persisted rustpush state (restored across restarts)
 	APSState    string `json:"aps_state,omitempty"`
 	IDSUsers    string `json:"ids_users,omitempty"`
 	IDSIdentity string `json:"ids_identity,omitempty"`
-	RelayCode   string `json:"relay_code,omitempty"`
 	DeviceID    string `json:"device_id,omitempty"`
+	RelayCode   string `json:"relay_code,omitempty"`
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {

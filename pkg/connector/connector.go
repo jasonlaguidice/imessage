@@ -10,8 +10,12 @@ package connector
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
+
+	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
 type IMConnector struct {
@@ -20,22 +24,6 @@ type IMConnector struct {
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
-
-// hasActiveRustpushLogin returns true if any user login using the rustpush
-// connector is currently connected (i.e., receiving messages via APNs).
-// Used by the mac connector to suppress real-time message forwarding and
-// avoid double-delivery when both connectors are active.
-func (c *IMConnector) hasActiveRustpushLogin() bool {
-	if c.Bridge == nil {
-		return false
-	}
-	for _, login := range c.Bridge.GetAllCachedUserLogins() {
-		if rp, ok := login.Client.(*RustpushClient); ok && rp.IsLoggedIn() {
-			return true
-		}
-	}
-	return false
-}
 
 func (c *IMConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
@@ -56,27 +44,65 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	return nil
 }
 
+func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
+	return []bridgev2.LoginFlow{{
+		Name:        "Apple ID",
+		Description: "Log in with your Apple ID to send and receive iMessages",
+		ID:          LoginFlowIDAppleID,
+	}}
+}
+
+func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
+	if flowID != LoginFlowIDAppleID {
+		return nil, fmt.Errorf("unknown login flow: %s", flowID)
+	}
+	return &AppleIDLogin{User: user, Main: c}, nil
+}
+
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	meta := login.Metadata.(*UserLoginMetadata)
 
-	// Route to the correct client based on platform metadata (or config default)
+	rustpushgo.InitLogger()
+
+	var cfg *rustpushgo.WrappedOsConfig
+	var err error
+
 	platform := meta.Platform
-	if platform == "" {
-		platform = c.Config.Platform
-	}
-	if platform == "" {
-		platform = "mac"
+	if platform == "rustpush-local" || platform == "" {
+		if meta.DeviceID != "" {
+			cfg, err = rustpushgo.CreateLocalMacosConfigWithDeviceId(meta.DeviceID)
+		} else {
+			cfg, err = rustpushgo.CreateLocalMacosConfig()
+		}
+		if err != nil {
+			return fmt.Errorf("failed to create local config: %w", err)
+		}
+	} else if platform == "rustpush" {
+		if meta.RelayCode == "" {
+			return fmt.Errorf("login missing relay code")
+		}
+		cfg, err = rustpushgo.CreateRelayConfig(meta.RelayCode)
+		if err != nil {
+			return fmt.Errorf("failed to create relay config: %w", err)
+		}
+	} else {
+		return fmt.Errorf("unknown platform: %s", platform)
 	}
 
-	if platform == "rustpush" || platform == "rustpush-local" {
-		return c.loadRustpushLogin(ctx, login, meta)
-	}
+	usersStr := &meta.IDSUsers
+	identityStr := &meta.IDSIdentity
+	apsStateStr := &meta.APSState
 
-	// Default: mac connector
 	client := &IMClient{
-		Main:      c,
-		UserLogin: login,
+		Main:          c,
+		UserLogin:     login,
+		config:        cfg,
+		users:         rustpushgo.NewWrappedIdsUsers(usersStr),
+		identity:      rustpushgo.NewWrappedIdsngmIdentity(identityStr),
+		connection:    rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr)),
+		recentUnsends: make(map[string]time.Time),
 	}
+
 	login.Client = client
 	return nil
 }
