@@ -218,12 +218,10 @@ func (c *IMClient) UpdateUsers(users *rustpushgo.WrappedIdsUsers) {
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
 	c.users = users
 
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-	meta.IDSUsers = users.ToString()
-	if err := c.UserLogin.Save(context.Background()); err != nil {
-		log.Err(err).Msg("Failed to save updated IDS users")
-	}
-	log.Debug().Msg("IDS users updated and saved")
+	// Persist all state (APS tokens, IDS keys, identity, device ID) — not just
+	// IDSUsers — so a crash between periodic saves doesn't lose APS state.
+	c.persistState(log)
+	log.Debug().Msg("IDS users updated, full state persisted")
 }
 
 // ============================================================================
