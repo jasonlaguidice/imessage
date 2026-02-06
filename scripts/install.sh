@@ -17,11 +17,14 @@ echo "════════════════════════�
 echo ""
 
 # ── Prompt for config values ──────────────────────────────────
+FIRST_RUN=false
 if [ -f "$CONFIG" ]; then
     echo "Config already exists at $CONFIG"
     echo "Skipping configuration prompts. Delete it to re-configure."
     echo ""
 else
+    FIRST_RUN=true
+
     read -p "Homeserver URL [http://localhost:8008]: " HS_ADDRESS
     HS_ADDRESS="${HS_ADDRESS:-http://localhost:8008}"
 
@@ -42,13 +45,11 @@ else
     echo "✓ Generated config"
 
     # Patch the 3 values into the generated config
-    # Use python for reliable YAML patching (ships with macOS)
     python3 -c "
 import re, sys
 text = open('$CONFIG').read()
 
 def patch(text, key, val):
-    # Match indented 'key: old_value' and replace value
     return re.sub(
         r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$',
         r'\1 ' + val,
@@ -58,7 +59,6 @@ def patch(text, key, val):
 text = patch(text, 'address', '$HS_ADDRESS')
 text = patch(text, 'domain', '$HS_DOMAIN')
 
-# Replace the first permissions entry
 lines = text.split('\n')
 in_perms = False
 for i, line in enumerate(lines):
@@ -76,6 +76,14 @@ open('$CONFIG', 'w').write(text)
     echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER"
 fi
 
+# ── Read domain from config (works on first run and re-runs) ──
+HS_DOMAIN=$(python3 -c "
+import re
+text = open('$CONFIG').read()
+m = re.search(r'^\s+domain:\s*(\S+)', text, re.MULTILINE)
+print(m.group(1) if m else 'yourserver')
+")
+
 # ── Generate registration ────────────────────────────────────
 if [ -f "$REGISTRATION" ]; then
     echo "✓ Registration already exists"
@@ -84,20 +92,22 @@ else
     echo "✓ Generated registration"
 fi
 
-# ── Register with homeserver ──────────────────────────────────
-REG_PATH="$(cd "$DATA_DIR" && pwd)/registration.yaml"
-echo ""
-echo "┌─────────────────────────────────────────────┐"
-echo "│  Register with your homeserver:             │"
-echo "│                                             │"
-echo "│  Add to homeserver.yaml:                    │"
-echo "│    app_service_config_files:                │"
-echo "│      - $REG_PATH"
-echo "│                                             │"
-echo "│  Then restart your homeserver.              │"
-echo "└─────────────────────────────────────────────┘"
-echo ""
-read -p "Press Enter once your homeserver is restarted..."
+# ── Register with homeserver (first run only) ─────────────────
+if [ "$FIRST_RUN" = true ]; then
+    REG_PATH="$(cd "$DATA_DIR" && pwd)/registration.yaml"
+    echo ""
+    echo "┌─────────────────────────────────────────────┐"
+    echo "│  Register with your homeserver:             │"
+    echo "│                                             │"
+    echo "│  Add to homeserver.yaml:                    │"
+    echo "│    app_service_config_files:                │"
+    echo "│      - $REG_PATH"
+    echo "│                                             │"
+    echo "│  Then restart your homeserver.              │"
+    echo "└─────────────────────────────────────────────┘"
+    echo ""
+    read -p "Press Enter once your homeserver is restarted..."
+fi
 
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
@@ -137,8 +147,6 @@ PLIST_EOF
 launchctl load "$PLIST"
 echo "✓ Bridge started (LaunchAgent installed)"
 echo ""
-echo "Logs: tail -f $LOG_OUT"
-echo ""
 
 # ── Wait for bridge to connect ────────────────────────────────
 echo "Waiting for bridge to start..."
@@ -152,6 +160,7 @@ for i in $(seq 1 15); do
         echo "  Pick: Apple ID (rustpush)"
         echo "═══════════════════════════════════════════════"
         echo ""
+        echo "Logs: tail -f $LOG_OUT"
         exit 0
     fi
     sleep 1
