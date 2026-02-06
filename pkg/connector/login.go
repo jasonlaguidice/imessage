@@ -26,16 +26,13 @@ const (
 )
 
 func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	flows := []bridgev2.LoginFlow{{
-		Name:        "Verify",
-		Description: "Verify iMessage access on this Mac (Full Disk Access required)",
-		ID:          LoginFlowIDVerify,
-	}, {
-		Name:        "Apple ID (rustpush)",
-		Description: "Login with Apple ID via rustpush protocol (no SIP disable needed)",
+	return []bridgev2.LoginFlow{{
+		Name:        "Apple ID",
+		Description: "Login with your Apple ID to send and receive iMessages",
 		ID:          LoginFlowIDRustpush,
 	}}
-	return flows
+	// The mac connector (chat.db backfill) is configured via platform: mac in
+	// config.yaml and activated automatically — no login flow needed.
 }
 
 func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
