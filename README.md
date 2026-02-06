@@ -45,7 +45,7 @@ The installer will pause and ask you to register the bridge with your homeserver
 Once running, DM `@imessagebot:yourdomain` in your Matrix client and send:
 
 ```
-!im login rustpush
+!im login
 ```
 
 Follow the prompts to enter your Apple ID, password, and 2FA code.
