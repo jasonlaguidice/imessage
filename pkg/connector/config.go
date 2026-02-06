@@ -21,6 +21,7 @@ import (
 var ExampleConfig string
 
 type IMConfig struct {
+	Platform            string `yaml:"platform"`
 	DisplaynameTemplate string `yaml:"displayname_template"`
 	displaynameTemplate *template.Template
 }
@@ -64,6 +65,7 @@ func (c *IMConfig) FormatDisplayname(params DisplaynameParams) string {
 }
 
 func upgradeConfig(helper up.Helper) {
+	helper.Copy(up.Str, "platform")
 	helper.Copy(up.Str, "displayname_template")
 }
 

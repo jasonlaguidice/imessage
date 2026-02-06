@@ -33,32 +33,34 @@ var _ bridgev2.NetworkAPI = (*IMClient)(nil)
 func (c *IMClient) Connect(ctx context.Context) {
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnecting})
-
-	adapter := newBridgeAdapter(&log)
-	api, err := imessage.NewAPI(adapter)
-	if err != nil && isPermissionError(err) {
-		showDialogAndOpenFDA(log)
-		waitForFDA(log)
-		// Retry after FDA is restored
-		adapter = newBridgeAdapter(&log)
-		api, err = imessage.NewAPI(adapter)
-	}
-	if err != nil {
-		log.Err(err).Msg("Failed to create iMessage API")
-		c.UserLogin.BridgeState.Send(status.BridgeState{
-			StateEvent: status.StateBadCredentials,
-			Message:    fmt.Sprintf("Failed to connect to iMessage: %v", err),
-		})
-		return
-	}
-	c.imAPI = api
 	c.stopChan = make(chan struct{})
 
-	// Start the mac connector's polling loop in a goroutine.
-	// It watches ~/Library/Messages/chat.db via fsnotify and calls readyCallback
-	// when it's ready to receive messages.
+	// Run the entire mac connector setup in a goroutine so it doesn't block
+	// other logins (e.g., rustpush) from connecting.
 	go func() {
-		err := api.Start(func() {
+		adapter := newBridgeAdapter(&log)
+		api, err := imessage.NewAPI(adapter)
+		if err != nil && isPermissionError(err) {
+			showDialogAndOpenFDA(log)
+			waitForFDA(log)
+			// Retry after FDA is restored
+			adapter = newBridgeAdapter(&log)
+			api, err = imessage.NewAPI(adapter)
+		}
+		if err != nil {
+			log.Err(err).Msg("Failed to create iMessage API")
+			c.UserLogin.BridgeState.Send(status.BridgeState{
+				StateEvent: status.StateBadCredentials,
+				Message:    fmt.Sprintf("Failed to connect to iMessage: %v", err),
+			})
+			return
+		}
+		c.imAPI = api
+
+		// Start the mac connector's polling loop.
+		// It watches ~/Library/Messages/chat.db via fsnotify and calls readyCallback
+		// when it's ready to receive messages.
+		err = api.Start(func() {
 			log.Info().Msg("iMessage connector ready, starting event listeners")
 			c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 			// Sync existing chats into Matrix rooms

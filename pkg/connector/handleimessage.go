@@ -23,6 +23,14 @@ import (
 )
 
 func (c *IMClient) handleIMessage(log zerolog.Logger, msg *imessage.Message) {
+	// When a rustpush login is active, skip real-time message forwarding from
+	// the mac connector to avoid double-delivery. Rustpush handles real-time
+	// messages faster and with richer feature support (edits, unsends, etc.).
+	// The mac connector still provides backfill and chat sync.
+	if c.Main.hasActiveRustpushLogin() {
+		log.Debug().Str("guid", msg.GUID).Msg("Skipping mac connector message (rustpush active)")
+		return
+	}
 	if msg.ItemType == imessage.ItemTypeName {
 		c.handleGroupNameChange(log, msg)
 		return
@@ -40,6 +48,12 @@ func (c *IMClient) handleIMessage(log zerolog.Logger, msg *imessage.Message) {
 	}
 	if msg.Tapback != nil {
 		c.handleTapback(log, msg)
+		return
+	}
+
+	// Skip "from me" messages with no text — these are echoes of messages sent
+	// by another connector (e.g., rustpush) that appear in chat.db without body text.
+	if msg.IsFromMe && msg.Text == "" && msg.Subject == "" && len(msg.Attachments) == 0 {
 		return
 	}
 
@@ -241,14 +255,28 @@ func (c *IMClient) handleGroupNameChange(log zerolog.Logger, msg *imessage.Messa
 }
 
 func (c *IMClient) handleIMessageReadReceipt(log zerolog.Logger, receipt *imessage.ReadReceipt) {
+	if c.Main.hasActiveRustpushLogin() {
+		return
+	}
 	portalKey := makePortalKey(receipt.ChatGUID, c.UserLogin.ID)
+	senderID := receipt.SenderGUID
+	if receipt.IsFromMe && senderID == "" {
+		senderID = string(c.UserLogin.ID)
+	} else if senderID != "" {
+		// SenderGUID may be a chat GUID (e.g. "any;-;user@example.com") when
+		// the mac connector infers the sender from a DM read receipt.
+		// Extract the actual user identifier so the correct ghost is used.
+		if parsed := imessage.ParseIdentifier(senderID); parsed.LocalID != "" {
+			senderID = parsed.LocalID
+		}
+	}
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
 			PortalKey: portalKey,
 			Sender: bridgev2.EventSender{
 				IsFromMe: receipt.IsFromMe,
-				Sender:   makeUserID(receipt.SenderGUID),
+				Sender:   makeUserID(senderID),
 			},
 			Timestamp: receipt.ReadAt,
 		},
@@ -258,10 +286,12 @@ func (c *IMClient) handleIMessageReadReceipt(log zerolog.Logger, receipt *imessa
 
 func (c *IMClient) makeEventSender(msg *imessage.Message) bridgev2.EventSender {
 	if msg.IsFromMe {
+		// Use the login ID as the sender to ensure a valid ghost reference.
+		// The bridgev2 framework will double-puppet the event using the user's MXID.
 		return bridgev2.EventSender{
 			IsFromMe:    true,
 			SenderLogin: c.UserLogin.ID,
-			Sender:      makeUserID(""),
+			Sender:      makeUserID(string(c.UserLogin.ID)),
 		}
 	}
 	return bridgev2.EventSender{
