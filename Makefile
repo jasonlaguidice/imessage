@@ -3,9 +3,9 @@ BUNDLE_ID   := com.lrhodin.mautrix-imessage
 VERSION     := 0.1.0
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-DATA_DIR    := $(realpath ../mautrix-imessage-data)
+DATA_DIR    ?= $(shell pwd)/data
 
-APP_BUNDLE  := ../$(APP_NAME).app
+APP_BUNDLE  := $(APP_NAME).app
 BINARY      := $(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)
 INFO_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
 

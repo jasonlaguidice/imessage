@@ -11,7 +11,9 @@
 *.log
 
 /mautrix-imessage
+/mautrix-imessage.app
 /start
+/data/
 
 # Rust build artifacts
 librustpushgo.a
