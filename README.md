@@ -42,14 +42,20 @@ This builds the bridge, asks you three questions (homeserver URL, domain, your M
 
 The installer will pause and ask you to register the bridge with your homeserver — it tells you exactly what to add to `homeserver.yaml`.
 
-Once running, DM `@imessagebot:yourdomain` in your Matrix client, send `login`, and follow the prompts to connect your Apple ID.
+Once running, DM `@imessagebot:yourdomain` in your Matrix client and send:
+
+```
+!im login rustpush
+```
+
+Follow the prompts to enter your Apple ID, password, and 2FA code.
 
 ### Chatting
 
-To message someone, DM the bridge bot:
+To message someone, send to the bridge bot:
 
 ```
-resolve +15551234567
+!im resolve +15551234567
 ```
 
 This creates a portal room. Messages you send there are delivered as iMessages, and replies appear in the room.
