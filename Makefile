@@ -42,8 +42,9 @@ $(BINARY): $(shell find . -name '*.go') $(shell find . -name '*.m') $(shell find
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(APP_NAME)/
 
+# Build, configure, and start the bridge
 install: build
-	open $(APP_BUNDLE) --args --setup -c $(DATA_DIR)/config.yaml
+	@scripts/install.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)"
 
 uninstall:
 	-launchctl unload ~/Library/LaunchAgents/$(BUNDLE_ID).plist 2>/dev/null
