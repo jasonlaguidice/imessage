@@ -478,6 +478,7 @@ pub struct LoginSession {
     account: tokio::sync::Mutex<Option<AppleAccount<omnisette::DefaultAnisetteProvider>>>,
     username: String,
     needs_2fa: bool,
+    sms_verify_body: tokio::sync::Mutex<Option<icloud_auth::VerifyBody>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -510,6 +511,7 @@ pub async fn login_start(
         .map_err(|e| WrappedError::GenericError { msg: format!("Login failed: {}", e) })?;
 
     info!("login_email_pass returned: {:?}", result);
+    let mut sms_verify_body: Option<icloud_auth::VerifyBody> = None;
     let needs_2fa = match result {
         icloud_auth::LoginState::LoggedIn => {
             info!("Login completed without 2FA");
@@ -526,7 +528,11 @@ pub async fn login_start(
                 Err(e) => error!("send_2fa_to_devices failed: {}", e),
             }
             match account.send_sms_2fa_to_devices(1).await {
-                Ok(_) => info!("send_sms_2fa_to_devices succeeded (SMS fallback sent)"),
+                Ok(icloud_auth::LoginState::NeedsSMS2FAVerification(body)) => {
+                    info!("send_sms_2fa_to_devices succeeded (SMS fallback sent)");
+                    sms_verify_body = Some(body);
+                }
+                Ok(_) => info!("send_sms_2fa_to_devices returned unexpected state"),
                 Err(e) => error!("send_sms_2fa_to_devices failed: {} — user may not receive 2FA code", e),
             }
             true
@@ -552,6 +558,7 @@ pub async fn login_start(
         account: tokio::sync::Mutex::new(Some(account)),
         username: user_trimmed,
         needs_2fa,
+        sms_verify_body: tokio::sync::Mutex::new(sms_verify_body),
     }))
 }
 
@@ -565,8 +572,14 @@ impl LoginSession {
         let mut guard = self.account.lock().await;
         let account = guard.as_mut().ok_or(WrappedError::GenericError { msg: "No active session".to_string() })?;
 
-        let result = account.verify_2fa(code).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
+        let sms_body = self.sms_verify_body.lock().await.take();
+        let result = if let Some(body) = sms_body {
+            info!("Verifying 2FA via SMS (verify_sms_2fa)");
+            account.verify_sms_2fa(code, body).await
+        } else {
+            info!("Verifying 2FA via trusted device (verify_2fa)");
+            account.verify_2fa(code).await
+        }.map_err(|e| WrappedError::GenericError { msg: format!("2FA verification failed: {}", e) })?;
 
         match result {
             icloud_auth::LoginState::LoggedIn => Ok(true),
