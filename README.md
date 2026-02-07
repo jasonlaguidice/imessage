@@ -107,9 +107,12 @@ The bridge connects directly to Apple's iMessage servers using [rustpush](https:
 
 ```mermaid
 flowchart LR
-    Client[Matrix client] <--> HS[Homeserver]
-    HS -- appservice --> Bridge[mautrix-imessage]
-    Bridge -- FFI --> RP[rustpush]
+    subgraph Your Mac
+        HS[Homeserver]
+        HS -- appservice --> Bridge[mautrix-imessage]
+        Bridge -- FFI --> RP[rustpush]
+    end
+    Client[Matrix client] <--> HS
     RP <--> Apple[Apple IDS / APNs]
 ```
 
