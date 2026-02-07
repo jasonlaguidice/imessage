@@ -1,3 +1,6 @@
+# Ensure Homebrew binaries are on PATH (needed after fresh install)
+export PATH := /opt/homebrew/bin:/opt/homebrew/sbin:$(PATH)
+
 APP_NAME    := mautrix-imessage-v2
 CMD_PKG     := mautrix-imessage
 BUNDLE_ID   := com.lrhodin.mautrix-imessage
