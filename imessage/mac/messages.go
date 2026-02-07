@@ -123,11 +123,14 @@ LIMIT 1
 `
 
 const recentChatsQuery = `
-SELECT DISTINCT chat.guid, chat.group_id FROM message
+SELECT chat.guid, chat.group_id FROM message
 JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
 JOIN chat              ON chat_message_join.chat_id = chat.ROWID
 WHERE message.date>$1
-ORDER BY message.date DESC
+  AND message.item_type = 0
+  AND COALESCE(message.associated_message_guid, '') = ''
+GROUP BY chat.guid, chat.group_id
+ORDER BY MAX(message.date) DESC
 `
 
 const newReceiptsQuery = `
@@ -323,6 +326,7 @@ func (mac *macOSDatabase) scanMessages(res *sql.Rows) (messages []*imessage.Mess
 			message.Tapback, err = tapback.Parse()
 			if err != nil {
 				mac.log.Warnfln("Failed to parse tapback in %s: %v", message.GUID, err)
+				err = nil // Non-fatal: skip this tapback but continue scanning
 			}
 		}
 		messages = append(messages, &message)

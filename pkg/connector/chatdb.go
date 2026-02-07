@@ -11,7 +11,6 @@ package connector
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -55,88 +54,6 @@ func (db *chatDB) Close() {
 	}
 }
 
-// GetMissingMessages compares message GUIDs in chat.db against the bridge
-// database and returns full message objects for any that are present in
-// chat.db but missing from the bridge. The since parameter bounds the
-// chat.db scan for performance (not correctness).
-func (db *chatDB) GetMissingMessages(ctx context.Context, chatGUID string, portalKey networkid.PortalKey, bridge *bridgev2.Bridge, since time.Duration) ([]*imessage.Message, error) {
-	minDate := time.Now().Add(-since)
-
-	// 1. Get GUIDs from chat.db (only real messages, no tapbacks/group actions)
-	chatGUIDs, err := db.api.GetMessageGUIDsSince(chatGUID, minDate)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get message GUIDs from chat.db: %w", err)
-	}
-	if len(chatGUIDs) == 0 {
-		return nil, nil
-	}
-
-	// 2. Get already-bridged message IDs from the bridge database
-	bridgedIDs, err := getBridgedMessageIDs(ctx, portalKey, bridge)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get bridged message IDs: %w", err)
-	}
-
-	// 3. Set diff: chat.db GUIDs minus bridge DB IDs
-	var missingGUIDs []string
-	for _, guid := range chatGUIDs {
-		if _, ok := bridgedIDs[guid]; !ok {
-			missingGUIDs = append(missingGUIDs, guid)
-		}
-	}
-	if len(missingGUIDs) == 0 {
-		return nil, nil
-	}
-
-	// 4. Fetch full message objects only for missing GUIDs, filtering out
-	//    unbridgeable messages (empty text + no attachments) to avoid
-	//    false positives that would trigger unnecessary portal re-syncs.
-	var messages []*imessage.Message
-	for _, guid := range missingGUIDs {
-		msg, err := db.api.GetMessage(guid)
-		if err != nil {
-			zerolog.Ctx(ctx).Warn().Err(err).Str("guid", guid).Msg("Failed to fetch missing message from chat.db")
-			continue
-		}
-		if msg == nil {
-			continue
-		}
-		// Skip messages that have no bridgeable content
-		if msg.Text == "" && len(msg.Attachments) == 0 {
-			continue
-		}
-		messages = append(messages, msg)
-	}
-
-	// Sort chronologically
-	sort.Slice(messages, func(i, j int) bool {
-		return messages[i].Time.Before(messages[j].Time)
-	})
-
-	return messages, nil
-}
-
-// getBridgedMessageIDs returns a set of all message IDs already bridged in a portal.
-func getBridgedMessageIDs(ctx context.Context, portalKey networkid.PortalKey, bridge *bridgev2.Bridge) (map[string]struct{}, error) {
-	rows, err := bridge.DB.Database.Query(ctx,
-		"SELECT DISTINCT id FROM message WHERE bridge_id=$1 AND room_id=$2 AND (room_receiver=$3 OR room_receiver='')",
-		bridge.ID, portalKey.ID, portalKey.Receiver,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	ids := make(map[string]struct{})
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return ids, err
-		}
-		ids[id] = struct{}{}
-	}
-	return ids, nil
-}
-
 // FetchMessages retrieves historical messages from chat.db for backfill.
 func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
 	portalID := string(params.Portal.ID)
@@ -165,9 +82,10 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
 		}
 	} else {
-		// For fresh portals (no anchor), fetch messages from the last 7 days
-		// to align with the health check's startup window.
-		minDate := time.Now().Add(-7 * 24 * time.Hour)
+		// For fresh portals (no anchor), fetch messages within the configured
+		// initial sync window (default 365 days).
+		days := c.Main.Config.GetInitialSyncDays()
+		minDate := time.Now().AddDate(0, 0, -days)
 		messages, err = db.api.GetMessagesSinceDate(chatGUID, minDate, "")
 	}
 	if err != nil {
