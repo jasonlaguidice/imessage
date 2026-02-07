@@ -106,27 +106,32 @@ The bridge connects directly to Apple's iMessage servers using [rustpush](https:
 #### Self-hosted
 
 ```mermaid
-flowchart LR
-    subgraph Your Mac
-        HS[Homeserver]
-        HS -- appservice --> Bridge[mautrix-imessage]
+flowchart TB
+    subgraph mac[Your Mac]
+        HS[Homeserver] -- appservice --> Bridge[mautrix-imessage]
         Bridge -- FFI --> RP[rustpush]
     end
+    subgraph cloud[Cloud]
+        Apple[Apple IDS / APNs]
+    end
     Client[Matrix client] <--> HS
-    RP <--> Apple[Apple IDS / APNs]
+    RP <--> Apple
 ```
 
 #### Beeper
 
 ```mermaid
-flowchart LR
-    subgraph Your Mac
-        Bridge[mautrix-imessage]
-        Bridge -- FFI --> RP[rustpush]
+flowchart TB
+    subgraph mac[Your Mac]
+        Bridge[mautrix-imessage] -- FFI --> RP[rustpush]
     end
-    Client[Beeper app] <--> Beeper[Beeper cloud]
+    subgraph cloud[Cloud]
+        Beeper[Beeper cloud]
+        Apple[Apple IDS / APNs]
+    end
+    Client[Beeper app] <--> Beeper
     Beeper -- websocket --> Bridge
-    RP <--> Apple[Apple IDS / APNs]
+    RP <--> Apple
 ```
 
 ### Real-time and backfill
