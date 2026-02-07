@@ -112,14 +112,10 @@ flowchart TB
     subgraph bp[Beeper · Your Mac]
         Bridge2[mautrix-imessage] -- FFI --> RP2[rustpush]
     end
-    subgraph cloud[Cloud]
-        Beeper[Beeper cloud]
-        Apple[Apple IDS / APNs]
-    end
     Client1[Matrix client] <--> HS
-    Client2[Beeper app] <--> Beeper
+    Client2[Beeper app] <--> Beeper[Beeper cloud]
     Beeper -- websocket --> Bridge2
-    RP1 <--> Apple
+    RP1 <--> Apple[Apple IDS / APNs]
     RP2 <--> Apple
 ```
 
