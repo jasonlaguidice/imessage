@@ -117,13 +117,7 @@ Matrix client ←→ homeserver
 
 **Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
 
-**Backfill** fills in anything rustpush misses by reading the local macOS `chat.db`. On startup, the bridge creates portals for all chats with activity in the last `initial_sync_days` and backfills their messages. A health check then runs every 5 minutes:
-
-1. Query chat.db for all message GUIDs in the last 24 hours
-2. Compare against messages already bridged (set-diff by GUID)
-3. If any are missing, nuke the portal and re-create it with a full chronological backfill
-
-This nuke-and-resync approach guarantees correct chronological order, since Matrix APIs can only append events — they can't insert into the middle of history. The check is idempotent; if nothing is missing, it's a no-op.
+**Backfill** runs once on first login: the bridge reads the local macOS `chat.db` and creates portals for all chats with activity in the last `initial_sync_days` (default: 1 year, configurable). After that, everything is real-time only via rustpush.
 
 ### Source layout
 
