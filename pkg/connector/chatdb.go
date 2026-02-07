@@ -57,13 +57,13 @@ func (db *chatDB) Close() {
 // FetchMessages retrieves historical messages from chat.db for backfill.
 func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
 	portalID := string(params.Portal.ID)
-	chatGUID := portalIDToChatGUID(portalID)
+	chatGUIDs := portalIDToChatGUIDs(portalID)
 
 	log := zerolog.Ctx(ctx)
-	log.Info().Str("portal_id", portalID).Str("chat_guid", chatGUID).Bool("forward", params.Forward).Msg("FetchMessages called")
+	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages called")
 
-	if chatGUID == "" {
-		log.Warn().Str("portal_id", portalID).Msg("portalIDToChatGUID returned empty")
+	if len(chatGUIDs) == 0 {
+		log.Warn().Str("portal_id", portalID).Msg("portalIDToChatGUIDs returned empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
@@ -74,26 +74,38 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	var messages []*imessage.Message
 	var err error
+	var usedGUID string
 
-	if params.AnchorMessage != nil {
-		if params.Forward {
-			messages, err = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
+	// Try each possible GUID format until we find messages.
+	// macOS Tahoe+ uses "any;-;" while older versions use "iMessage;-;" or "SMS;-;".
+	for _, chatGUID := range chatGUIDs {
+		if params.AnchorMessage != nil {
+			if params.Forward {
+				messages, err = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
+			} else {
+				messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
+			}
 		} else {
-			messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
+			// For fresh portals (no anchor), fetch messages within the configured
+			// initial sync window (default 365 days).
+			days := c.Main.Config.GetInitialSyncDays()
+			minDate := time.Now().AddDate(0, 0, -days)
+			messages, err = db.api.GetMessagesSinceDate(chatGUID, minDate, "")
 		}
-	} else {
-		// For fresh portals (no anchor), fetch messages within the configured
-		// initial sync window (default 365 days).
-		days := c.Main.Config.GetInitialSyncDays()
-		minDate := time.Now().AddDate(0, 0, -days)
-		messages, err = db.api.GetMessagesSinceDate(chatGUID, minDate, "")
+		if err == nil && len(messages) > 0 {
+			usedGUID = chatGUID
+			break
+		}
+	}
+	if usedGUID == "" && len(chatGUIDs) > 0 {
+		usedGUID = chatGUIDs[0]
 	}
 	if err != nil {
-		log.Error().Err(err).Str("chat_guid", chatGUID).Msg("Failed to fetch messages from chat.db")
+		log.Error().Err(err).Str("chat_guid", usedGUID).Msg("Failed to fetch messages from chat.db")
 		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", err)
 	}
 
-	log.Info().Str("chat_guid", chatGUID).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+	log.Info().Str("chat_guid", usedGUID).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
 
 	// Get an intent for uploading media. The bot intent works for all uploads.
 	intent := c.Main.Bridge.Bot
@@ -151,19 +163,24 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 // chat.db ↔ portal ID conversion
 // ============================================================================
 
-// portalIDToChatGUID converts a clean portal ID (e.g., "mailto:user@example.com")
-// to a chat.db GUID (e.g., "any;-;user@example.com").
-// Modern macOS (Ventura+) uses "any" as the service prefix for all chats.
-func portalIDToChatGUID(portalID string) string {
+// portalIDToChatGUIDs converts a clean portal ID (e.g., "mailto:user@example.com")
+// to possible chat.db GUIDs. Returns multiple candidates to try, since macOS versions
+// differ: Tahoe+ uses "any;-;" while older versions use "iMessage;-;" or "SMS;-;".
+func portalIDToChatGUIDs(portalID string) []string {
 	localID := stripIdentifierPrefix(portalID)
 	if localID == "" {
-		return ""
+		return nil
 	}
 	// Group chats already contain the full GUID format
-	if strings.HasPrefix(portalID, "any;") {
-		return portalID
+	if strings.HasPrefix(portalID, "any;") || strings.HasPrefix(portalID, "iMessage;") || strings.HasPrefix(portalID, "SMS;") {
+		return []string{portalID}
 	}
-	return "any;-;" + localID
+	// Try multiple service prefixes for compatibility across macOS versions
+	return []string{
+		"any;-;" + localID,
+		"iMessage;-;" + localID,
+		"SMS;-;" + localID,
+	}
 }
 
 // identifierToPortalID converts a chat.db Identifier to a clean portal ID.
