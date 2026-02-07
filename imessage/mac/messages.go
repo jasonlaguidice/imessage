@@ -85,6 +85,17 @@ ORDER BY message.date DESC
 LIMIT $2
 `
 
+var messageGUIDsSinceQuery = `
+SELECT message.guid FROM message
+JOIN chat_message_join ON chat_message_join.message_id = message.ROWID
+JOIN chat              ON chat_message_join.chat_id = chat.ROWID
+WHERE chat.guid=$1
+  AND message.item_type = 0
+  AND COALESCE(message.associated_message_guid, '') = ''
+  AND message.date > $2
+ORDER BY message.date ASC
+`
+
 const groupActionQuery = `
 SELECT COALESCE(attachment.filename, ''), COALESCE(attachment.mime_type, ''), attachment.transfer_name
 FROM message
@@ -227,6 +238,10 @@ func (mac *macOSDatabase) prepareMessages() error {
 	mac.recentChatsQuery, err = mac.chatDB.Prepare(recentChatsQuery)
 	if err != nil {
 		return fmt.Errorf("failed to prepare recent chats query: %w", err)
+	}
+	mac.messageGUIDsSinceQuery, err = mac.chatDB.Prepare(messageGUIDsSinceQuery)
+	if err != nil {
+		return fmt.Errorf("failed to prepare message GUIDs since query: %w", err)
 	}
 
 	mac.Messages = make(chan *imessage.Message)
@@ -377,9 +392,26 @@ func (mac *macOSDatabase) GetMessage(guid string) (*imessage.Message, error) {
 		return nil, err
 	}
 	if len(msgs) > 0 {
-		return msgs[1], nil
+		return msgs[0], nil
 	}
 	return nil, nil
+}
+
+func (mac *macOSDatabase) GetMessageGUIDsSince(chatID string, minDate time.Time) ([]string, error) {
+	res, err := mac.messageGUIDsSinceQuery.Query(chatID, minDate.UnixNano()-imessage.AppleEpoch.UnixNano())
+	if err != nil {
+		return nil, fmt.Errorf("error querying message GUIDs since date: %w", err)
+	}
+	defer res.Close()
+	var guids []string
+	for res.Next() {
+		var guid string
+		if err := res.Scan(&guid); err != nil {
+			return guids, fmt.Errorf("error scanning message GUID row: %w", err)
+		}
+		guids = append(guids, guid)
+	}
+	return guids, nil
 }
 
 func (mac *macOSDatabase) getMessagesSinceRowID(rowID int) ([]*imessage.Message, error) {
