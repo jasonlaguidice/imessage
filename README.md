@@ -113,7 +113,7 @@ Matrix client ←→ homeserver
               Apple IDS / APNs
 ```
 
-### Real-time vs. backfill
+### Real-time and backfill
 
 **Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
 
