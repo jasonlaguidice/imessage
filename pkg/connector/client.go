@@ -163,7 +163,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	if msg.SendDelivered && msg.Sender != nil && !msg.IsDelivered && !msg.IsReadReceipt {
 		go func() {
 			conv := c.makeConversation(msg.Participants, msg.GroupName)
-			if err := c.client.SendReadReceipt(conv, c.handle); err != nil {
+			if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
 				log.Warn().Err(err).Msg("Failed to send delivery receipt")
 			}
 		}()

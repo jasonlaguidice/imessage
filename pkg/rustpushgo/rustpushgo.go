@@ -436,6 +436,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_send_delivery_receipt(uniffiStatus)
+		})
+		if checksum != 54993 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_delivery_receipt: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_send_edit(uniffiStatus)
 		})
 		if checksum != 50609 {
@@ -912,6 +921,31 @@ func (_self *Client) SendAttachment(conversation WrappedConversation, data []byt
 		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) SendDeliveryReceipt(conversation WrappedConversation, handle string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_delivery_receipt(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
 }
 
