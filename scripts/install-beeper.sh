@@ -9,32 +9,77 @@ BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
+# Where we build/cache bbctl
+BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bridge-manager}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/bridge-manager.git}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-add-imessage-v2}"
+
 echo ""
 echo "═══════════════════════════════════════════════"
 echo "  iMessage Bridge Setup (Beeper)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
-# ── Check bbctl ───────────────────────────────────────────────
-BBCTL=""
-for p in bbctl /usr/local/bin/bbctl "$HOME/.local/bin/bbctl"; do
-    if command -v "$p" >/dev/null 2>&1 || [ -x "$p" ]; then
-        BBCTL="$p"
-        break
+# ── Check / install Homebrew deps ─────────────────────────────
+check_brew_dep() {
+    local pkg="$1" check="$2"
+    if ! eval "$check" >/dev/null 2>&1; then
+        echo "  Installing $pkg..."
+        brew install "$pkg"
     fi
-done
-if [ -z "$BBCTL" ]; then
-    echo "ERROR: bbctl not found."
-    echo ""
-    echo "  Install from: https://github.com/beeper/bridge-manager/releases"
-    echo "  Then: chmod +x bbctl && sudo mv bbctl /usr/local/bin/"
-    echo ""
+}
+
+if ! command -v brew >/dev/null 2>&1; then
+    echo "ERROR: Homebrew is required. Install from https://brew.sh"
     exit 1
 fi
-echo "✓ Found bbctl: $BBCTL"
+
+echo "Checking dependencies..."
+check_brew_dep go "command -v go"
+check_brew_dep libolm "[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ]"
+echo "✓ Dependencies OK"
+echo ""
+
+# ── Build bbctl from source ───────────────────────────────────
+BBCTL="$BBCTL_DIR/bbctl"
+
+build_bbctl() {
+    echo "Building bbctl..."
+    mkdir -p "$(dirname "$BBCTL_DIR")"
+    if [ -d "$BBCTL_DIR" ]; then
+        cd "$BBCTL_DIR"
+        git fetch --quiet origin
+        git checkout --quiet "$BBCTL_BRANCH"
+        git reset --hard --quiet "origin/$BBCTL_BRANCH"
+    else
+        git clone --quiet --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+        cd "$BBCTL_DIR"
+    fi
+    go build -o bbctl ./cmd/bbctl/ 2>&1
+    cd - >/dev/null
+    echo "✓ Built bbctl"
+}
+
+if [ ! -x "$BBCTL" ]; then
+    build_bbctl
+else
+    echo "✓ Found bbctl: $BBCTL"
+    # Update if repo has changes
+    if [ -d "$BBCTL_DIR/.git" ]; then
+        cd "$BBCTL_DIR"
+        git fetch --quiet origin 2>/dev/null || true
+        LOCAL=$(git rev-parse HEAD 2>/dev/null)
+        REMOTE=$(git rev-parse "origin/$BBCTL_BRANCH" 2>/dev/null || echo "$LOCAL")
+        cd - >/dev/null
+        if [ "$LOCAL" != "$REMOTE" ]; then
+            echo "  Updating bbctl..."
+            build_bbctl
+        fi
+    fi
+fi
 
 # ── Check bbctl login ────────────────────────────────────────
-if ! "$BBCTL" whoami >/dev/null 2>&1 || "$BBCTL" whoami 2>&1 | grep -q "not logged in"; then
+if ! "$BBCTL" whoami >/dev/null 2>&1 || "$BBCTL" whoami 2>&1 | grep -qi "not logged in"; then
     echo ""
     echo "Not logged into Beeper. Running bbctl login..."
     echo ""
@@ -50,7 +95,7 @@ if [ -f "$CONFIG" ]; then
     echo "  Delete it to regenerate from Beeper."
 else
     echo "Generating Beeper config..."
-    "$BBCTL" config --type bridgev2 sh-imessage > "$CONFIG"
+    "$BBCTL" config --type imessage-v2 -o "$CONFIG" sh-imessage
     echo "✓ Config saved to $CONFIG"
 fi
 
@@ -60,6 +105,26 @@ if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     echo "  Try: rm $CONFIG && re-run make install-beeper"
     echo ""
     exit 1
+fi
+
+# ── Full Disk Access check ────────────────────────────────────
+APP_BUNDLE="$(dirname "$(dirname "$(dirname "$BINARY")")")"
+if ! sqlite3 "$HOME/Library/Messages/chat.db" "SELECT COUNT(*) FROM message LIMIT 1;" >/dev/null 2>&1; then
+    echo ""
+    echo "┌─────────────────────────────────────────────┐"
+    echo "│  Full Disk Access Required                  │"
+    echo "│                                             │"
+    echo "│  1. System Settings → Privacy & Security    │"
+    echo "│     → Full Disk Access                      │"
+    echo "│  2. Click + and add:                        │"
+    echo "│     $APP_BUNDLE"
+    echo "│  3. Also add Terminal.app if not present    │"
+    echo "│                                             │"
+    echo "│  Opening System Settings now...             │"
+    echo "└─────────────────────────────────────────────┘"
+    echo ""
+    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
+    read -p "Press Enter once Full Disk Access is granted..."
 fi
 
 # ── Install LaunchAgent ───────────────────────────────────────
@@ -89,11 +154,23 @@ cat > "$PLIST" << PLIST_EOF
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>Crashed</key>
+        <true/>
+    </dict>
     <key>StandardOutPath</key>
     <string>$LOG_OUT</string>
     <key>StandardErrorPath</key>
     <string>$LOG_ERR</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>CGO_CFLAGS</key>
+        <string>-I/opt/homebrew/include</string>
+        <key>CGO_LDFLAGS</key>
+        <string>-L/opt/homebrew/lib</string>
+    </dict>
 </dict>
 </plist>
 PLIST_EOF
@@ -117,7 +194,10 @@ for i in $(seq 1 15); do
         echo "  Send: login"
         echo "═══════════════════════════════════════════════"
         echo ""
-        echo "Logs: tail -f $LOG_OUT"
+        echo "Logs:    tail -f $LOG_OUT"
+        echo "Stop:    launchctl unload $PLIST"
+        echo "Start:   launchctl load $PLIST"
+        echo "Restart: launchctl unload $PLIST && launchctl load $PLIST"
         exit 0
     fi
     sleep 1
