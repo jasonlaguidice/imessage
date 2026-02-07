@@ -115,8 +115,6 @@ func cncontactToContact(ns *C.CNContact, includeAvatar bool) *imessage.Contact {
 func (cs *ContactStore) GetContactInfo(identifier string) (*imessage.Contact, error) {
 	if !cs.HasContactAccess || len(identifier) == 0 {
 		return nil, nil
-	} else if len(identifier) == 0 {
-		return nil, fmt.Errorf("can't get contact info of empty identifier")
 	}
 
 	// Locking the OS thread seems to prevent random SIGSEGV's from the NSAutoreleasePool being drained.
@@ -125,11 +123,14 @@ func (cs *ContactStore) GetContactInfo(identifier string) (*imessage.Contact, er
 	// This makes a NSAutoreleasePool, which enables Objective-C's memory management.
 	pool := C.meowMakePool()
 
+	cStr := C.CString(identifier)
+	defer C.free(unsafe.Pointer(cStr))
+
 	var cnContact *C.CNContact
 	if identifier[0] == '+' {
-		cnContact = C.meowGetContactByPhone(cs.int, C.CString(identifier))
+		cnContact = C.meowGetContactByPhone(cs.int, cStr)
 	} else {
-		cnContact = C.meowGetContactByEmail(cs.int, C.CString(identifier))
+		cnContact = C.meowGetContactByEmail(cs.int, cStr)
 	}
 	goContact := cncontactToContact(cnContact, true)
 
