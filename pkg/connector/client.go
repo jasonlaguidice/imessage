@@ -28,6 +28,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/lrhodin/imessage/imessage"
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
@@ -412,7 +413,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.receiptPortalKey(msg)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
@@ -425,32 +426,36 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.receiptPortalKey(msg)
-	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventDeliveryReceipt,
-			PortalKey: portalKey,
-			Sender:    c.makeEventSender(msg.Sender),
-			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
-		},
-		LastTarget: makeMessageID(msg.Uuid),
-	})
-}
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	ctx := context.Background()
 
-// receiptPortalKey derives the portal key for a receipt message.
-// Delivery and read receipts often arrive without conversation/participant data,
-// so we fall back to the sender field to identify the DM portal.
-func (c *IMClient) receiptPortalKey(msg rustpushgo.WrappedMessage) networkid.PortalKey {
-	if len(msg.Participants) > 0 {
-		return c.makePortalKey(msg.Participants, msg.GroupName)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		return
 	}
-	if msg.Sender != nil && *msg.Sender != "" {
-		return networkid.PortalKey{
-			ID:       networkid.PortalID(*msg.Sender),
-			Receiver: c.UserLogin.ID,
-		}
+
+	msgID := makeMessageID(msg.Uuid)
+	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
+	if err != nil || len(dbMessages) == 0 {
+		return
 	}
-	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
+
+	senderUserID := makeUserID(ptrStringOr(msg.Sender, ""))
+	ghost, err := c.Main.Bridge.GetGhostByID(ctx, senderUserID)
+	if err != nil || ghost == nil {
+		return
+	}
+
+	for _, dbMsg := range dbMessages {
+		c.Main.Bridge.Matrix.SendMessageStatus(ctx, &bridgev2.MessageStatus{
+			Status:      event.MessageStatusSuccess,
+			DeliveredTo: []id.UserID{ghost.Intent.GetMXID()},
+		}, &bridgev2.MessageStatusEventInfo{
+			RoomID:        portal.MXID,
+			SourceEventID: dbMsg.MXID,
+			Sender:        dbMsg.SenderMXID,
+		})
+	}
 }
 
 func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -1004,6 +1009,22 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string) netwo
 		}
 	}
 
+	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
+}
+
+// makeReceiptPortalKey handles receipt messages where participants may be empty.
+// When participants is empty (rustpush sets conversation: None for receipts),
+// use the sender field to identify the DM portal.
+func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string) networkid.PortalKey {
+	if len(participants) > 0 {
+		return c.makePortalKey(participants, groupName)
+	}
+	if sender != nil && *sender != "" {
+		return networkid.PortalKey{
+			ID:       networkid.PortalID(*sender),
+			Receiver: c.UserLogin.ID,
+		}
+	}
 	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
 }
 
