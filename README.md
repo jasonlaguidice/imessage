@@ -72,7 +72,7 @@ make uninstall
 
 ## Configuration
 
-Config lives in `data/config.yaml` (generated during install). To reconfigure:
+Config lives in `data/config.yaml` (generated during install). To reconfigure from scratch:
 
 ```bash
 rm -rf data
@@ -81,14 +81,13 @@ make install    # or make install-beeper
 
 Key options:
 
-| Field | What it does |
-|-------|-------------|
-| `network.initial_sync_days` | How far back to look for chats on first login (default 365) |
-| `backfill.max_initial_messages` | Max messages per backfill (default 10000) |
-| `backfill.max_catchup_messages` | Max messages for catch-up after restart |
-| `database.type` | `sqlite3-fk-wal` (default) or `postgres` |
-| `encryption` | End-to-bridge encryption settings |
-| `network.displayname_template` | Contact name format |
+| Field | Default | What it does |
+|-------|---------|-------------|
+| `network.initial_sync_days` | `365` | How far back to backfill on first login |
+| `network.displayname_template` | First/Last name | How bridged contacts appear in Matrix |
+| `backfill.max_initial_messages` | `10000` | Max messages to backfill per chat |
+| `encryption.allow` | `true` | Enable end-to-bridge encryption |
+| `database.type` | `sqlite3-fk-wal` | `sqlite3-fk-wal` or `postgres` |
 
 ## Development
 
