@@ -21,7 +21,7 @@ LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime
 
 .PHONY: build clean install install-beeper uninstall rust bindings check-deps
 
-# Check build dependencies
+# Check build dependencies — auto-install via Homebrew if available
 check-deps:
 	@missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
@@ -29,12 +29,17 @@ check-deps:
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
 	if [ -n "$$missing" ]; then \
-		echo ""; \
-		echo "Missing dependencies:$$missing"; \
-		echo ""; \
-		echo "  brew install$$missing"; \
-		echo ""; \
-		exit 1; \
+		if command -v brew >/dev/null 2>&1; then \
+			echo "Installing missing dependencies:$$missing"; \
+			brew install $$missing; \
+		else \
+			echo ""; \
+			echo "Missing dependencies:$$missing"; \
+			echo ""; \
+			echo "  brew install$$missing"; \
+			echo ""; \
+			exit 1; \
+		fi; \
 	fi
 
 # Build Rust static library
