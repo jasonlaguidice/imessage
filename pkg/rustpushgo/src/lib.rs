@@ -890,6 +890,18 @@ impl Client {
         Ok(())
     }
 
+    pub async fn send_delivery_receipt(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::Delivered);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send delivery receipt: {}", e) })?;
+        Ok(())
+    }
+
     pub async fn send_edit(
         &self,
         conversation: WrappedConversation,

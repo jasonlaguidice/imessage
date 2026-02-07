@@ -89,6 +89,13 @@ void* uniffi_rustpushgo_fn_method_client_send_attachment(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_delivery_receipt(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_edit(
 	void* ptr,
 	RustBuffer conversation,
@@ -624,6 +631,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_handles(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_send_attachment(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_send_delivery_receipt(
 	RustCallStatus* out_status
 );
 
