@@ -61,6 +61,7 @@ type API interface {
 	GetMessagesWithLimit(chatID string, limit int, backfillID string) ([]*Message, error)
 	GetChatsWithMessagesAfter(minDate time.Time) ([]ChatIdentifier, error)
 	GetMessage(guid string) (*Message, error)
+	GetMessageGUIDsSince(chatID string, minDate time.Time) ([]string, error)
 	MessageChan() <-chan *Message
 	ReadReceiptChan() <-chan *ReadReceipt
 	TypingNotificationChan() <-chan *TypingNotification

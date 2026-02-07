@@ -47,6 +47,7 @@ type macOSDatabase struct {
 	chatGUIDQuery                *sql.Stmt
 	groupActionQuery             *sql.Stmt
 	recentChatsQuery             *sql.Stmt
+	messageGUIDsSinceQuery       *sql.Stmt
 	groupMemberQuery             *sql.Stmt
 	Messages                     chan *imessage.Message
 	ReadReceipts                 chan *imessage.ReadReceipt

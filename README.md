@@ -75,6 +75,20 @@ Matrix client ←→ Synapse
               Apple IDS / APNs
 ```
 
+### Real-time vs. backfill
+
+**Real-time messages** are handled by rustpush — incoming and outgoing iMessages flow through Apple's push notification service (APNs) and appear in Matrix immediately.
+
+**Backfill** fills in anything rustpush misses by reading the local macOS `chat.db`. On startup, the bridge creates portals for all chats with activity in the last 7 days and backfills their messages. A continuous health check then runs every 5 minutes:
+
+1. Query chat.db for all message GUIDs in the last 24 hours
+2. Compare against message IDs already bridged (set-diff by GUID — no timestamps)
+3. If any messages are missing, **nuke the portal** (delete bridge DB entries + Matrix room) and **re-create it from scratch** with a full chronological backfill
+
+This nuke-and-resync approach guarantees messages always appear in correct chronological order in the Matrix timeline, since standard Matrix APIs can only append events — they can't insert into the middle of history.
+
+The system is idempotent and safe to run repeatedly. If nothing is missing, the health check is a no-op.
+
 ## Management
 
 ```bash
@@ -107,6 +121,8 @@ Key options:
 | `database.type` | `sqlite3-fk-wal` (default) or `postgres` |
 | `encryption` | End-to-bridge encryption settings |
 | `network.displayname_template` | Contact name format |
+| `backfill.max_initial_messages` | Max messages per backfill (default 10000) |
+| `backfill.max_catchup_messages` | Max messages for catch-up after restart |
 
 ## Development
 
@@ -123,8 +139,11 @@ make clean      # Remove build artifacts
 cmd/mautrix-imessage/        # Entrypoint
 pkg/connector/               # bridgev2 connector (unified)
   ├── client.go              #   send/receive/reactions/edits/typing
+  │                          #   + periodic health check & backfill
   ├── login.go               #   Apple ID + 2FA login flow
   ├── chatdb.go              #   chat.db backfill + contacts (macOS)
+  │                          #   + GUID set-diff for missing messages
+  ├── ids.go                 #   identifier/portal ID conversion
   ├── connector.go           #   bridge lifecycle
   └── ...
 pkg/rustpushgo/              # Rust FFI wrapper (uniffi)

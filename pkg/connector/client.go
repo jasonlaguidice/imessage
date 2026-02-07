@@ -105,7 +105,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.chatDB = openChatDB(log)
 	if c.chatDB != nil {
 		log.Info().Msg("Chat.db available for backfill and contacts")
-		go c.syncChatsFromDB(log.WithContext(context.Background()))
+		go c.periodicChatDBSync(log)
 	}
 }
 
@@ -576,7 +576,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
 	portalID := string(portal.ID)
-	isGroup := strings.Contains(portalID, ",")
+	isGroup := strings.Contains(portalID, ",") || strings.HasPrefix(portalID, "any;+;")
 
 	chatInfo := &bridgev2.ChatInfo{
 		CanBackfill: c.chatDB != nil,
@@ -598,6 +598,18 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			},
 		}
 		chatInfo.Members = members
+
+		// Set group name from chat.db
+		if c.chatDB != nil {
+			chatGUID := portalID // group portal IDs are the full GUID
+			if info, err := c.chatDB.api.GetChatInfo(chatGUID, ""); err == nil && info != nil {
+				name := info.DisplayName
+				if name == "" {
+					name = c.buildGroupName(info.Members)
+				}
+				chatInfo.Name = &name
+			}
+		}
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
 		otherUser := makeUserID(portalID)
@@ -620,19 +632,20 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			},
 		}
 
-		// Enrich chat name from contacts if chat.db is available
+		// Always set a room name for DMs so Element doesn't show the ugly MXID.
+		localID := stripIdentifierPrefix(portalID)
+		name := localID // fallback: raw phone number or email
 		if c.chatDB != nil {
-			localID := stripIdentifierPrefix(portalID)
-			if contact, err := c.chatDB.api.GetContactInfo(localID); err == nil && contact != nil {
-				name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+			if contact, err := c.chatDB.api.GetContactInfo(localID); err == nil && contact != nil && contact.HasName() {
+				name = c.Main.Config.FormatDisplayname(DisplaynameParams{
 					FirstName: contact.FirstName,
 					LastName:  contact.LastName,
 					Nickname:  contact.Nickname,
 					ID:        localID,
 				})
-				chatInfo.Name = &name
 			}
 		}
+		chatInfo.Name = &name
 		chatInfo.Members = members
 	}
 
@@ -849,33 +862,113 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	}
 }
 
-// syncChatsFromDB imports existing chats from chat.db into Matrix portals.
-func (c *IMClient) syncChatsFromDB(ctx context.Context) {
+// periodicChatDBSync runs the chat.db health check on a loop. The first
+// invocation is the "initial sync" — it creates portals and scans a wide
+// window (3 months). Subsequent ticks only look at existing portals and
+// backfill any messages that chat.db has but the bridge database doesn't.
+func (c *IMClient) periodicChatDBSync(log zerolog.Logger) {
+	ctx := log.WithContext(context.Background())
+
+	// Initial sync: create portals for chats with recent activity.
+	c.runInitialSync(ctx, log)
+
+	// Then health-check every 5 minutes.
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.runHealthCheck(ctx, log)
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// runInitialSync creates Matrix portals for recent chats (first login only)
+// and then runs a health check to backfill any missing messages.
+func (c *IMClient) runInitialSync(ctx context.Context, log zerolog.Logger) {
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if !meta.ChatsSynced {
+		minDate := time.Now().Add(-7 * 24 * time.Hour)
+		chats, err := c.chatDB.api.GetChatsWithMessagesAfter(minDate)
+		if err != nil {
+			log.Err(err).Msg("Failed to get chat list for initial sync")
+			return
+		}
+
+		log.Info().Int("chat_count", len(chats)).Msg("Creating portals for initial chat sync")
+
+		for _, chat := range chats {
+			info, err := c.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+			if err != nil || info == nil || info.NoCreateRoom {
+				continue
+			}
+
+			parsed := imessage.ParseIdentifier(chat.ChatGUID)
+			if parsed.LocalID == "" {
+				continue
+			}
+
+			portalID := identifierToPortalID(parsed)
+			portalKey := networkid.PortalKey{
+				ID:       portalID,
+				Receiver: c.UserLogin.ID,
+			}
+			if parsed.IsGroup {
+				portalKey.Receiver = ""
+			}
+
+			chatInfo := c.chatDBInfoToBridgev2(info)
+
+			c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
+				EventMeta: simplevent.EventMeta{
+					Type:         bridgev2.RemoteEventChatResync,
+					PortalKey:    portalKey,
+					CreatePortal: true,
+					LogContext: func(lc zerolog.Context) zerolog.Context {
+						return lc.Str("chat_guid", chat.ChatGUID)
+					},
+				},
+				ChatInfo:        chatInfo,
+				GetChatInfoFunc: c.GetChatInfo,
+			})
+		}
+
+		meta.ChatsSynced = true
+		if err := c.UserLogin.Save(ctx); err != nil {
+			log.Err(err).Msg("Failed to save metadata after initial sync")
+		}
+		log.Info().Msg("Initial portal creation complete")
+	}
+
+	// Whether first login or not, run a health check with wide window on startup.
+	c.runHealthCheckWithWindow(ctx, log, 7*24*time.Hour)
+}
+
+// runHealthCheck scans recent chats for messages missing from the bridge.
+func (c *IMClient) runHealthCheck(ctx context.Context, log zerolog.Logger) {
+	c.runHealthCheckWithWindow(ctx, log, 24*time.Hour)
+}
+
+// runHealthCheckWithWindow scans chats with activity in the given window,
+// compares message GUIDs between chat.db and the bridge database, and
+// if any are missing, nukes the portal and re-creates it from scratch
+// so that all messages are inserted in the correct chronological order.
+func (c *IMClient) runHealthCheckWithWindow(ctx context.Context, log zerolog.Logger, window time.Duration) {
 	if c.chatDB == nil {
 		return
 	}
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-	if meta.ChatsSynced {
-		return
-	}
 
-	log := zerolog.Ctx(ctx)
-	minDate := time.Now().AddDate(0, -3, 0)
+	minDate := time.Now().Add(-window)
 	chats, err := c.chatDB.api.GetChatsWithMessagesAfter(minDate)
 	if err != nil {
-		log.Err(err).Msg("Failed to get chat list for initial sync")
+		log.Err(err).Msg("Health check: failed to get recent chats from chat.db")
 		return
 	}
 
-	log.Info().Int("chat_count", len(chats)).Msg("Starting initial chat sync from chat.db")
-
+	resynced := 0
 	for _, chat := range chats {
-		info, err := c.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
-		if err != nil || info == nil || info.NoCreateRoom {
-			continue
-		}
-
-		// Convert chat.db GUID to clean portal ID
 		parsed := imessage.ParseIdentifier(chat.ChatGUID)
 		if parsed.LocalID == "" {
 			continue
@@ -890,13 +983,59 @@ func (c *IMClient) syncChatsFromDB(ctx context.Context) {
 			portalKey.Receiver = ""
 		}
 
-		chatInfo := c.chatDBInfoToBridgev2(info)
-
-		var latestTS time.Time
-		msgs, err := c.chatDB.api.GetMessagesWithLimit(chat.ChatGUID, 1, "")
-		if err == nil && len(msgs) > 0 {
-			latestTS = msgs[0].Time
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if err != nil {
+			continue
 		}
+
+		needsResync := false
+		if portal == nil || portal.MXID == "" {
+			// No portal exists — needs to be created.
+			needsResync = true
+			log.Info().
+				Str("chat_guid", chat.ChatGUID).
+				Msg("Health check: no portal exists, creating")
+		} else {
+			// Portal exists — check for missing messages.
+			missing, err := c.chatDB.GetMissingMessages(ctx, chat.ChatGUID, portalKey, c.Main.Bridge, window)
+			if err != nil {
+				log.Warn().Err(err).Str("chat_guid", chat.ChatGUID).Msg("Health check: failed to get missing messages")
+				continue
+			}
+			if len(missing) > 0 {
+				needsResync = true
+				log.Info().
+					Str("chat_guid", chat.ChatGUID).
+					Int("missing_count", len(missing)).
+					Str("portal_mxid", string(portal.MXID)).
+					Msg("Health check: missing messages detected, nuking and re-creating portal")
+
+				// Delete the Matrix room
+				err = c.Main.Bridge.Bot.DeleteRoom(ctx, portal.MXID, false)
+				if err != nil {
+					log.Err(err).Str("chat_guid", chat.ChatGUID).Msg("Health check: failed to delete Matrix room")
+				}
+
+				// Delete portal from bridge database (messages + portal row)
+				err = portal.Delete(ctx)
+				if err != nil {
+					log.Err(err).Str("chat_guid", chat.ChatGUID).Msg("Health check: failed to delete portal from bridge DB")
+					continue
+				}
+			}
+		}
+
+		if !needsResync {
+			continue
+		}
+
+		// Create (or re-create) via ChatResync — framework will create room + backfill in order
+		info, err := c.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+		if err != nil || info == nil {
+			log.Warn().Err(err).Str("chat_guid", chat.ChatGUID).Msg("Health check: failed to get chat info for re-creation")
+			continue
+		}
+		chatInfo := c.chatDBInfoToBridgev2(info)
 
 		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
@@ -904,20 +1043,21 @@ func (c *IMClient) syncChatsFromDB(ctx context.Context) {
 				PortalKey:    portalKey,
 				CreatePortal: true,
 				LogContext: func(lc zerolog.Context) zerolog.Context {
-					return lc.Str("chat_guid", chat.ChatGUID)
+					return lc.Str("chat_guid", chat.ChatGUID).Str("source", "health_check_resync")
 				},
 			},
 			ChatInfo:        chatInfo,
-			LatestMessageTS: latestTS,
 			GetChatInfoFunc: c.GetChatInfo,
 		})
+
+		resynced++
 	}
 
-	meta.ChatsSynced = true
-	if err := c.UserLogin.Save(ctx); err != nil {
-		log.Err(err).Msg("Failed to save metadata after chat sync")
+	if resynced > 0 {
+		log.Info().Int("portals_resynced", resynced).Int("chats_checked", len(chats)).Msg("Health check complete — nuked and re-created portals with missing messages")
+	} else {
+		log.Debug().Int("chats_checked", len(chats)).Msg("Health check complete — no missing messages")
 	}
-	log.Info().Msg("Initial chat sync complete")
 }
 
 // chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
@@ -927,8 +1067,15 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		parsed = info.Identifier
 	}
 
+	// Build a display name: use chat.db display_name if set,
+	// otherwise build from participant names/numbers.
+	displayName := info.DisplayName
+	if displayName == "" && parsed.IsGroup {
+		displayName = c.buildGroupName(info.Members)
+	}
+
 	chatInfo := &bridgev2.ChatInfo{
-		Name:        &info.DisplayName,
+		Name:        &displayName,
 		CanBackfill: true,
 	}
 
@@ -979,6 +1126,39 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 	}
 
 	return chatInfo
+}
+
+// buildGroupName creates a human-readable group name from member identifiers
+// by resolving contact names where possible, falling back to phone/email.
+func (c *IMClient) buildGroupName(members []string) string {
+	var names []string
+	for _, memberID := range members {
+		if memberID == c.handle {
+			continue // skip self
+		}
+		name := ""
+		if c.chatDB != nil {
+			if contact, err := c.chatDB.api.GetContactInfo(memberID); err == nil && contact != nil && contact.HasName() {
+				name = c.Main.Config.FormatDisplayname(DisplaynameParams{
+					FirstName: contact.FirstName,
+					LastName:  contact.LastName,
+					Nickname:  contact.Nickname,
+					ID:        memberID,
+				})
+			}
+		}
+		if name == "" {
+			name = memberID // raw phone/email
+		}
+		names = append(names, name)
+	}
+	if len(names) == 0 {
+		return "Group Chat"
+	}
+	if len(names) <= 4 {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s, %s, %s +%d more", names[0], names[1], names[2], len(names)-3)
 }
 
 // ============================================================================

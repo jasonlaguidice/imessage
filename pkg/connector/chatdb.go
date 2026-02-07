@@ -11,6 +11,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -54,6 +55,88 @@ func (db *chatDB) Close() {
 	}
 }
 
+// GetMissingMessages compares message GUIDs in chat.db against the bridge
+// database and returns full message objects for any that are present in
+// chat.db but missing from the bridge. The since parameter bounds the
+// chat.db scan for performance (not correctness).
+func (db *chatDB) GetMissingMessages(ctx context.Context, chatGUID string, portalKey networkid.PortalKey, bridge *bridgev2.Bridge, since time.Duration) ([]*imessage.Message, error) {
+	minDate := time.Now().Add(-since)
+
+	// 1. Get GUIDs from chat.db (only real messages, no tapbacks/group actions)
+	chatGUIDs, err := db.api.GetMessageGUIDsSince(chatGUID, minDate)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get message GUIDs from chat.db: %w", err)
+	}
+	if len(chatGUIDs) == 0 {
+		return nil, nil
+	}
+
+	// 2. Get already-bridged message IDs from the bridge database
+	bridgedIDs, err := getBridgedMessageIDs(ctx, portalKey, bridge)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get bridged message IDs: %w", err)
+	}
+
+	// 3. Set diff: chat.db GUIDs minus bridge DB IDs
+	var missingGUIDs []string
+	for _, guid := range chatGUIDs {
+		if _, ok := bridgedIDs[guid]; !ok {
+			missingGUIDs = append(missingGUIDs, guid)
+		}
+	}
+	if len(missingGUIDs) == 0 {
+		return nil, nil
+	}
+
+	// 4. Fetch full message objects only for missing GUIDs, filtering out
+	//    unbridgeable messages (empty text + no attachments) to avoid
+	//    false positives that would trigger unnecessary portal re-syncs.
+	var messages []*imessage.Message
+	for _, guid := range missingGUIDs {
+		msg, err := db.api.GetMessage(guid)
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("guid", guid).Msg("Failed to fetch missing message from chat.db")
+			continue
+		}
+		if msg == nil {
+			continue
+		}
+		// Skip messages that have no bridgeable content
+		if msg.Text == "" && len(msg.Attachments) == 0 {
+			continue
+		}
+		messages = append(messages, msg)
+	}
+
+	// Sort chronologically
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Time.Before(messages[j].Time)
+	})
+
+	return messages, nil
+}
+
+// getBridgedMessageIDs returns a set of all message IDs already bridged in a portal.
+func getBridgedMessageIDs(ctx context.Context, portalKey networkid.PortalKey, bridge *bridgev2.Bridge) (map[string]struct{}, error) {
+	rows, err := bridge.DB.Database.Query(ctx,
+		"SELECT DISTINCT id FROM message WHERE bridge_id=$1 AND room_id=$2 AND (room_receiver=$3 OR room_receiver='')",
+		bridge.ID, portalKey.ID, portalKey.Receiver,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ids := make(map[string]struct{})
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids[id] = struct{}{}
+	}
+	return ids, nil
+}
+
 // FetchMessages retrieves historical messages from chat.db for backfill.
 func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
 	portalID := string(params.Portal.ID)
@@ -82,7 +165,10 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
 		}
 	} else {
-		messages, err = db.api.GetMessagesWithLimit(chatGUID, count, "")
+		// For fresh portals (no anchor), fetch messages from the last 7 days
+		// to align with the health check's startup window.
+		minDate := time.Now().Add(-7 * 24 * time.Hour)
+		messages, err = db.api.GetMessagesSinceDate(chatGUID, minDate, "")
 	}
 	if err != nil {
 		log.Error().Err(err).Str("chat_guid", chatGUID).Msg("Failed to fetch messages from chat.db")
@@ -91,13 +177,16 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 	log.Info().Str("chat_guid", chatGUID).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
 
+	// Get an intent for uploading media. The bot intent works for all uploads.
+	intent := c.Main.Bridge.Bot
+
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
 	for _, msg := range messages {
 		if msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
 			continue
 		}
 		sender := chatDBMakeEventSender(msg, c)
-		cm, err := convertChatDBMessage(ctx, params.Portal, nil, msg)
+		cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg)
 		if err != nil {
 			continue
 		}
@@ -115,8 +204,9 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			if att == nil {
 				continue
 			}
-			attCm, err := convertChatDBAttachment(ctx, params.Portal, nil, msg, att)
+			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att)
 			if err != nil {
+				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
 				continue
 			}
 			partID := fmt.Sprintf("%s_att%d", msg.GUID, i)
@@ -132,9 +222,10 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	}
 
 	return &bridgev2.FetchMessagesResponse{
-		Messages: backfillMessages,
-		HasMore:  len(messages) >= count,
-		Forward:  params.Forward,
+		Messages:                backfillMessages,
+		HasMore:                 len(messages) >= count,
+		Forward:                 params.Forward,
+		AggressiveDeduplication: params.Forward,
 	}, nil
 }
 
@@ -170,7 +261,25 @@ func identifierToPortalID(id imessage.Identifier) networkid.PortalID {
 	if strings.Contains(id.LocalID, "@") {
 		return networkid.PortalID("mailto:" + id.LocalID)
 	}
+	// Short codes and numeric-only identifiers (e.g., "242733") are SMS-based.
+	// Rustpush creates these with "tel:" prefix, so we must match.
+	if isNumeric(id.LocalID) {
+		return networkid.PortalID("tel:" + id.LocalID)
+	}
 	return networkid.PortalID(id.LocalID)
+}
+
+// isNumeric returns true if s is non-empty and contains only digits.
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // stripIdentifierPrefix removes tel:/mailto: prefixes from identifiers.
@@ -178,6 +287,21 @@ func stripIdentifierPrefix(id string) string {
 	id = strings.TrimPrefix(id, "tel:")
 	id = strings.TrimPrefix(id, "mailto:")
 	return id
+}
+
+// addIdentifierPrefix adds the appropriate tel:/mailto: prefix to a raw identifier
+// so it matches the portal/ghost ID format used by rustpush.
+func addIdentifierPrefix(localID string) string {
+	if strings.HasPrefix(localID, "tel:") || strings.HasPrefix(localID, "mailto:") {
+		return localID // already has prefix
+	}
+	if strings.Contains(localID, "@") {
+		return "mailto:" + localID
+	}
+	if strings.HasPrefix(localID, "+") || isNumeric(localID) {
+		return "tel:" + localID
+	}
+	return localID
 }
 
 // identifierToDisplaynameParams creates DisplaynameParams from an identifier string.
@@ -206,7 +330,7 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 	}
 	return bridgev2.EventSender{
 		IsFromMe: false,
-		Sender:   makeUserID(msg.Sender.LocalID),
+		Sender:   makeUserID(addIdentifierPrefix(msg.Sender.LocalID)),
 	}
 }
 
