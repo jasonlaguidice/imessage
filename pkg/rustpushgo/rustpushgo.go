@@ -1676,12 +1676,14 @@ type WrappedConversation struct {
 	Participants []string
 	GroupName    *string
 	SenderGuid   *string
+	IsSms        bool
 }
 
 func (r *WrappedConversation) Destroy() {
 	FfiDestroyerSequenceString{}.Destroy(r.Participants)
 	FfiDestroyerOptionalString{}.Destroy(r.GroupName)
 	FfiDestroyerOptionalString{}.Destroy(r.SenderGuid)
+	FfiDestroyerBool{}.Destroy(r.IsSms)
 }
 
 type FfiConverterTypeWrappedConversation struct{}
@@ -1697,6 +1699,7 @@ func (c FfiConverterTypeWrappedConversation) Read(reader io.Reader) WrappedConve
 		FfiConverterSequenceStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 	}
 }
 
@@ -1708,6 +1711,7 @@ func (c FfiConverterTypeWrappedConversation) Write(writer io.Writer, value Wrapp
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.Participants)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.GroupName)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.SenderGuid)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsSms)
 }
 
 type FfiDestroyerTypeWrappedConversation struct{}

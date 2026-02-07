@@ -52,6 +52,10 @@ type IMClient struct {
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
 	recentUnsendsLock sync.Mutex
+
+	// SMS portal tracking: portal IDs known to be SMS-only contacts
+	smsPortals     map[string]bool
+	smsPortalsLock sync.RWMutex
 }
 
 var _ bridgev2.NetworkAPI = (*IMClient)(nil)
@@ -236,6 +240,11 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 
 	sender := c.makeEventSender(msg.Sender)
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+
+	// Track SMS portals so outbound replies use the correct service type
+	if msg.IsSms {
+		c.markPortalSMS(string(portalKey.ID))
+	}
 
 	if msg.Text != nil && *msg.Text != "" {
 		content := &event.MessageEventContent{
@@ -844,6 +853,7 @@ func (c *IMClient) makeConversation(participants []string, groupName *string) ru
 
 func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.WrappedConversation {
 	portalID := string(portal.ID)
+	isSms := c.isPortalSMS(portalID)
 
 	if strings.Contains(portalID, ",") {
 		participants := strings.Split(portalID, ",")
@@ -854,11 +864,13 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		return rustpushgo.WrappedConversation{
 			Participants: participants,
 			GroupName:    groupName,
+			IsSms:        isSms,
 		}
 	}
 
 	return rustpushgo.WrappedConversation{
 		Participants: []string{c.handle, portalID},
+		IsSms:        isSms,
 	}
 }
 
@@ -1319,6 +1331,18 @@ func mimeToMsgType(mime string) event.MessageType {
 	default:
 		return event.MsgFile
 	}
+}
+
+func (c *IMClient) markPortalSMS(portalID string) {
+	c.smsPortalsLock.Lock()
+	defer c.smsPortalsLock.Unlock()
+	c.smsPortals[portalID] = true
+}
+
+func (c *IMClient) isPortalSMS(portalID string) bool {
+	c.smsPortalsLock.RLock()
+	defer c.smsPortalsLock.RUnlock()
+	return c.smsPortals[portalID]
 }
 
 func (c *IMClient) trackUnsend(uuid string) {

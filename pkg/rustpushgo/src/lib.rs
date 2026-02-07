@@ -224,6 +224,7 @@ pub struct WrappedConversation {
     pub participants: Vec<String>,
     pub group_name: Option<String>,
     pub sender_guid: Option<String>,
+    pub is_sms: bool,
 }
 
 impl From<&ConversationData> for WrappedConversation {
@@ -232,6 +233,7 @@ impl From<&ConversationData> for WrappedConversation {
             participants: c.participants.clone(),
             group_name: c.cv_name.clone(),
             sender_guid: c.sender_guid.clone(),
+            is_sms: false,
         }
     }
 }
@@ -789,14 +791,41 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
+        let service = if conversation.is_sms {
+            MessageType::SMS {
+                is_phone: false,
+                using_number: handle.clone(),
+                from_handle: None,
+            }
+        } else {
+            MessageType::IMessage
+        };
         let mut msg = MessageInst::new(
-            conv,
+            conv.clone(),
             &handle,
-            Message::Message(NormalMessage::new(text, MessageType::IMessage)),
+            Message::Message(NormalMessage::new(text.clone(), service)),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send message: {}", e) })?;
-        Ok(msg.id.clone())
+        match self.client.send(&mut msg).await {
+            Ok(_) => Ok(msg.id.clone()),
+            Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
+                // iMessage failed — no IDS targets. Retry as SMS.
+                info!("No IDS targets, falling back to SMS for {:?}", conv.participants);
+                let sms_service = MessageType::SMS {
+                    is_phone: false,
+                    using_number: handle.clone(),
+                    from_handle: None,
+                };
+                let mut sms_msg = MessageInst::new(
+                    conv,
+                    &handle,
+                    Message::Message(NormalMessage::new(text, sms_service)),
+                );
+                self.client.send(&mut sms_msg).await
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS: {}", e) })?;
+                Ok(sms_msg.id.clone())
+            }
+            Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send message: {}", e) }),
+        }
     }
 
     pub async fn send_tapback(
@@ -919,6 +948,15 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
+        let service = if conversation.is_sms {
+            MessageType::SMS {
+                is_phone: false,
+                using_number: handle.clone(),
+                from_handle: None,
+            }
+        } else {
+            MessageType::IMessage
+        };
 
         // Prepare and upload the attachment via MMCS
         let cursor = Cursor::new(&data);
@@ -937,20 +975,20 @@ impl Client {
         ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload attachment: {}", e) })?;
 
         let parts = vec![IndexedMessagePart {
-            part: MessagePart::Attachment(attachment),
+            part: MessagePart::Attachment(attachment.clone()),
             idx: None,
             ext: None,
         }];
 
         let mut msg = MessageInst::new(
-            conv,
+            conv.clone(),
             &handle,
             Message::Message(NormalMessage {
                 parts: MessageParts(parts),
                 effect: None,
                 reply_guid: None,
                 reply_part: None,
-                service: MessageType::IMessage,
+                service,
                 subject: None,
                 app: None,
                 link_meta: None,
@@ -959,9 +997,43 @@ impl Client {
                 embedded_profile: None,
             }),
         );
-        self.client.send(&mut msg).await
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) })?;
-        Ok(msg.id.clone())
+        match self.client.send(&mut msg).await {
+            Ok(_) => Ok(msg.id.clone()),
+            Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
+                info!("No IDS targets for attachment, falling back to SMS for {:?}", conv.participants);
+                let sms_service = MessageType::SMS {
+                    is_phone: false,
+                    using_number: handle.clone(),
+                    from_handle: None,
+                };
+                let sms_parts = vec![IndexedMessagePart {
+                    part: MessagePart::Attachment(attachment),
+                    idx: None,
+                    ext: None,
+                }];
+                let mut sms_msg = MessageInst::new(
+                    conv,
+                    &handle,
+                    Message::Message(NormalMessage {
+                        parts: MessageParts(sms_parts),
+                        effect: None,
+                        reply_guid: None,
+                        reply_part: None,
+                        service: sms_service,
+                        subject: None,
+                        app: None,
+                        link_meta: None,
+                        voice: false,
+                        scheduled: None,
+                        embedded_profile: None,
+                    }),
+                );
+                self.client.send(&mut sms_msg).await
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS attachment: {}", e) })?;
+                Ok(sms_msg.id.clone())
+            }
+            Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) }),
+        }
     }
 
     pub async fn stop(&self) {

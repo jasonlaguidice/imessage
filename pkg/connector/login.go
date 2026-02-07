@@ -146,6 +146,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		identity:      result.Identity,
 		connection:    l.conn,
 		recentUnsends: make(map[string]time.Time),
+		smsPortals:    make(map[string]bool),
 	}
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
