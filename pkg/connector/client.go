@@ -406,7 +406,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.receiptPortalKey(msg)
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
@@ -419,7 +419,7 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.receiptPortalKey(msg)
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventDeliveryReceipt,
@@ -429,6 +429,22 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 		},
 		LastTarget: makeMessageID(msg.Uuid),
 	})
+}
+
+// receiptPortalKey derives the portal key for a receipt message.
+// Delivery and read receipts often arrive without conversation/participant data,
+// so we fall back to the sender field to identify the DM portal.
+func (c *IMClient) receiptPortalKey(msg rustpushgo.WrappedMessage) networkid.PortalKey {
+	if len(msg.Participants) > 0 {
+		return c.makePortalKey(msg.Participants, msg.GroupName)
+	}
+	if msg.Sender != nil && *msg.Sender != "" {
+		return networkid.PortalKey{
+			ID:       networkid.PortalID(*msg.Sender),
+			Receiver: c.UserLogin.ID,
+		}
+	}
+	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
 }
 
 func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
