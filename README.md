@@ -105,11 +105,11 @@ The bridge connects directly to Apple's iMessage servers using [rustpush](https:
 
 ```mermaid
 flowchart TB
-    subgraph sh[Self-hosted · Your Mac]
+    subgraph sh["🖥 Self-hosted · Your Mac"]
         HS[Homeserver] -- appservice --> Bridge1[mautrix-imessage]
         Bridge1 -- FFI --> RP1[rustpush]
     end
-    subgraph bp[Beeper · Your Mac]
+    subgraph bp["🖥 Beeper · Your Mac"]
         Bridge2[mautrix-imessage] -- FFI --> RP2[rustpush]
     end
     Client1[Matrix client] <--> HS
@@ -117,6 +117,18 @@ flowchart TB
     Beeper -- websocket --> Bridge2
     RP1 <--> Apple[Apple IDS / APNs]
     RP2 <--> Apple
+
+    style sh fill:#f0f4ff,stroke:#4a6fa5,stroke-width:2px,color:#1a1a2e
+    style bp fill:#f0f4ff,stroke:#4a6fa5,stroke-width:2px,color:#1a1a2e
+    style Apple fill:#1a1a2e,stroke:#1a1a2e,color:#fff
+    style Beeper fill:#1a1a2e,stroke:#1a1a2e,color:#fff
+    style Client1 fill:#fff,stroke:#999,color:#333
+    style Client2 fill:#fff,stroke:#999,color:#333
+    style HS fill:#e8f0fe,stroke:#4a6fa5,color:#1a1a2e
+    style Bridge1 fill:#d4e4ff,stroke:#2c5aa0,stroke-width:2px,color:#1a1a2e
+    style Bridge2 fill:#d4e4ff,stroke:#2c5aa0,stroke-width:2px,color:#1a1a2e
+    style RP1 fill:#e8f0fe,stroke:#4a6fa5,color:#1a1a2e
+    style RP2 fill:#e8f0fe,stroke:#4a6fa5,color:#1a1a2e
 ```
 
 ### Real-time and backfill
