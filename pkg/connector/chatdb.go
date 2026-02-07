@@ -54,16 +54,78 @@ func (db *chatDB) Close() {
 	}
 }
 
+// findGroupChatGUID finds a group chat GUID by matching the portal's members.
+// The portalID is comma-separated members like "tel:+1555...,tel:+1555...".
+func (db *chatDB) findGroupChatGUID(portalID string, c *IMClient) string {
+	// Parse members from portal ID (lowercase for case-insensitive matching)
+	portalMembers := strings.Split(portalID, ",")
+	portalMemberSet := make(map[string]struct{})
+	for _, m := range portalMembers {
+		// Strip prefix and normalize to lowercase
+		portalMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+	}
+
+	// Search group chats within the configured sync window
+	minDate := time.Now().AddDate(0, 0, -c.Main.Config.GetInitialSyncDays())
+	chats, err := db.api.GetChatsWithMessagesAfter(minDate)
+	if err != nil {
+		return ""
+	}
+
+	for _, chat := range chats {
+		parsed := imessage.ParseIdentifier(chat.ChatGUID)
+		if !parsed.IsGroup {
+			continue
+		}
+		info, err := db.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+		if err != nil || info == nil {
+			continue
+		}
+
+		// Build member set from chat.db (add self, lowercase for case-insensitive matching)
+		chatMemberSet := make(map[string]struct{})
+		chatMemberSet[strings.ToLower(stripIdentifierPrefix(c.handle))] = struct{}{}
+		for _, m := range info.Members {
+			chatMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+		}
+
+		// Check if members match
+		if len(chatMemberSet) == len(portalMemberSet) {
+			match := true
+			for m := range portalMemberSet {
+				if _, ok := chatMemberSet[m]; !ok {
+					match = false
+					break
+				}
+			}
+			if match {
+				return chat.ChatGUID
+			}
+		}
+	}
+	return ""
+}
+
 // FetchMessages retrieves historical messages from chat.db for backfill.
 func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
 	portalID := string(params.Portal.ID)
-	chatGUIDs := portalIDToChatGUIDs(portalID)
-
 	log := zerolog.Ctx(ctx)
+
+	var chatGUIDs []string
+	if strings.Contains(portalID, ",") {
+		// Group portal: find chat GUID by matching members
+		chatGUID := db.findGroupChatGUID(portalID, c)
+		if chatGUID != "" {
+			chatGUIDs = []string{chatGUID}
+		}
+	} else {
+		chatGUIDs = portalIDToChatGUIDs(portalID)
+	}
+
 	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages called")
 
 	if len(chatGUIDs) == 0 {
-		log.Warn().Str("portal_id", portalID).Msg("portalIDToChatGUIDs returned empty")
+		log.Warn().Str("portal_id", portalID).Msg("Could not find chat GUID for portal")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
@@ -163,19 +225,18 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 // chat.db ↔ portal ID conversion
 // ============================================================================
 
-// portalIDToChatGUIDs converts a clean portal ID (e.g., "mailto:user@example.com")
-// to possible chat.db GUIDs. Returns multiple candidates to try, since macOS versions
-// differ: Tahoe+ uses "any;-;" while older versions use "iMessage;-;" or "SMS;-;".
+// portalIDToChatGUIDs converts a DM portal ID to possible chat.db GUIDs.
+// Returns multiple possible GUIDs to try, since macOS versions differ:
+// Tahoe+ uses "any;-;" while older uses "iMessage;-;" or "SMS;-;".
+//
+// Note: Group portal IDs (comma-separated) are handled by findGroupChatGUID instead.
 func portalIDToChatGUIDs(portalID string) []string {
+
+	// DMs: strip tel:/mailto: prefix and try multiple service prefixes
 	localID := stripIdentifierPrefix(portalID)
 	if localID == "" {
 		return nil
 	}
-	// Group chats already contain the full GUID format
-	if strings.HasPrefix(portalID, "any;") || strings.HasPrefix(portalID, "iMessage;") || strings.HasPrefix(portalID, "SMS;") {
-		return []string{portalID}
-	}
-	// Try multiple service prefixes for compatibility across macOS versions
 	return []string{
 		"any;-;" + localID,
 		"iMessage;-;" + localID,

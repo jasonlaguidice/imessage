@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -627,7 +628,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
 	portalID := string(portal.ID)
-	isGroup := strings.Contains(portalID, ",") || strings.HasPrefix(portalID, "any;+;")
+	// Groups use comma-separated participants (e.g., "tel:+15551234567,tel:+15559876543")
+	isGroup := strings.Contains(portalID, ",")
 
 	chatInfo := &bridgev2.ChatInfo{
 		CanBackfill: c.chatDB != nil,
@@ -635,32 +637,33 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 
 	if isGroup {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
-		members := &bridgev2.ChatMemberList{
-			IsFull: false,
-			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
-				makeUserID(c.handle): {
+		memberList := strings.Split(portalID, ",")
+		memberMap := make(map[networkid.UserID]bridgev2.ChatMember)
+		for _, member := range memberList {
+			userID := makeUserID(member)
+			if member == c.handle {
+				memberMap[userID] = bridgev2.ChatMember{
 					EventSender: bridgev2.EventSender{
 						IsFromMe:    true,
 						SenderLogin: c.UserLogin.ID,
-						Sender:      makeUserID(c.handle),
+						Sender:      userID,
 					},
 					Membership: event.MembershipJoin,
-				},
-			},
-		}
-		chatInfo.Members = members
-
-		// Set group name from chat.db
-		if c.chatDB != nil {
-			chatGUID := portalID // group portal IDs are the full GUID
-			if info, err := c.chatDB.api.GetChatInfo(chatGUID, ""); err == nil && info != nil {
-				name := info.DisplayName
-				if name == "" {
-					name = c.buildGroupName(info.Members)
 				}
-				chatInfo.Name = &name
+			} else {
+				memberMap[userID] = bridgev2.ChatMember{
+					EventSender: bridgev2.EventSender{Sender: userID},
+					Membership:  event.MembershipJoin,
+				}
 			}
 		}
+		chatInfo.Members = &bridgev2.ChatMemberList{
+			IsFull:    true,
+			MemberMap: memberMap,
+		}
+
+		// Build group name from members
+		chatInfo.Name = ptr.Ptr(c.buildGroupName(memberList))
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
 		otherUser := makeUserID(portalID)
@@ -989,8 +992,12 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string) netwo
 	isGroup := len(participants) > 2 || groupName != nil
 
 	if isGroup {
-		portalID := strings.Join(participants, ",")
-		return networkid.PortalKey{ID: networkid.PortalID(portalID)}
+		// Sort for consistent portal ID regardless of participant order
+		sorted := make([]string, len(participants))
+		copy(sorted, participants)
+		sort.Strings(sorted)
+		portalID := strings.Join(sorted, ",")
+		return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
 	}
 
 	for _, p := range participants {
@@ -1108,12 +1115,24 @@ func (c *IMClient) runInitialSync(ctx context.Context, log zerolog.Logger) {
 		if parsed.LocalID == "" {
 			continue
 		}
-		portalKey := networkid.PortalKey{
-			ID:       identifierToPortalID(parsed),
-			Receiver: c.UserLogin.ID,
-		}
+
+		var portalKey networkid.PortalKey
 		if parsed.IsGroup {
-			portalKey.Receiver = ""
+			// For groups, use comma-separated members (matching rustpush format)
+			members := []string{c.handle}
+			for _, m := range info.Members {
+				members = append(members, addIdentifierPrefix(m))
+			}
+			sort.Strings(members)
+			portalKey = networkid.PortalKey{
+				ID:       networkid.PortalID(strings.Join(members, ",")),
+				Receiver: c.UserLogin.ID,
+			}
+		} else {
+			portalKey = networkid.PortalKey{
+				ID:       identifierToPortalID(parsed),
+				Receiver: c.UserLogin.ID,
+			}
 		}
 		entries = append(entries, chatEntry{
 			chatGUID:  chat.ChatGUID,
@@ -1272,19 +1291,21 @@ func (c *IMClient) buildGroupName(members []string) string {
 		if memberID == c.handle {
 			continue // skip self
 		}
+		// Strip tel:/mailto: prefix for contact lookup
+		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
 		if c.chatDB != nil {
-			if contact, err := c.chatDB.api.GetContactInfo(memberID); err == nil && contact != nil && contact.HasName() {
+			if contact, err := c.chatDB.api.GetContactInfo(lookupID); err == nil && contact != nil && contact.HasName() {
 				name = c.Main.Config.FormatDisplayname(DisplaynameParams{
 					FirstName: contact.FirstName,
 					LastName:  contact.LastName,
 					Nickname:  contact.Nickname,
-					ID:        memberID,
+					ID:        lookupID,
 				})
 			}
 		}
 		if name == "" {
-			name = memberID // raw phone/email
+			name = lookupID // raw phone/email without prefix
 		}
 		names = append(names, name)
 	}

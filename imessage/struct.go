@@ -232,10 +232,18 @@ func ParseIdentifier(guid string) Identifier {
 		return Identifier{}
 	}
 	parts := strings.Split(guid, ";")
+	if len(parts) < 3 {
+		return Identifier{LocalID: guid}
+	}
+	localID := parts[2]
+	// Detect groups by LocalID pattern. Group chat IDs start with "chat"
+	// (e.g., "chat8297742220248115273"), while DMs use phone numbers or emails.
+	// Note: chat.db uses "any;-;" for all GUIDs on Tahoe+, so parts[1] is unreliable.
+	isGroup := strings.HasPrefix(localID, "chat")
 	return Identifier{
 		Service: parts[0],
-		IsGroup: parts[1] == "+",
-		LocalID: parts[2],
+		IsGroup: isGroup,
+		LocalID: localID,
 	}
 }
 
