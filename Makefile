@@ -1,4 +1,5 @@
-APP_NAME    := mautrix-imessage
+APP_NAME    := mautrix-imessage-v2
+CMD_PKG     := mautrix-imessage
 BUNDLE_ID   := com.lrhodin.mautrix-imessage
 VERSION     := 0.1.0
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -56,7 +57,7 @@ $(BINARY): $(shell find . -name '*.go') $(shell find . -name '*.m') $(shell find
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
 	@cp Info.plist $(INFO_PLIST)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(APP_NAME)/
+		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 
 # Build, configure, and start the bridge (standalone homeserver)
 install: build
