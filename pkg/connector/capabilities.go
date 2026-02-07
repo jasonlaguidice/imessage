@@ -23,23 +23,17 @@ var caps = &event.RoomFeatures{
 	File: map[event.CapabilityMsgType]*event.FileFeatures{
 		event.MsgImage: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"image/jpeg": event.CapLevelFullySupported,
-				"image/png":  event.CapLevelFullySupported,
-				"image/gif":  event.CapLevelFullySupported,
-				"image/heic": event.CapLevelFullySupported,
+				"*/*": event.CapLevelFullySupported,
 			},
 		},
 		event.MsgVideo: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"video/mp4":       event.CapLevelFullySupported,
-				"video/quicktime": event.CapLevelFullySupported,
+				"*/*": event.CapLevelFullySupported,
 			},
 		},
 		event.MsgAudio: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
-				"audio/mpeg": event.CapLevelFullySupported,
-				"audio/aac":  event.CapLevelFullySupported,
-				"audio/mp4":  event.CapLevelFullySupported,
+				"*/*": event.CapLevelFullySupported,
 			},
 		},
 		event.MsgFile: {
@@ -68,7 +62,7 @@ func init() {
 
 var generalCaps = &bridgev2.NetworkGeneralCapabilities{
 	DisappearingMessages: false,
-	AggressiveUpdateInfo: false,
+	AggressiveUpdateInfo: true,
 }
 
 func (c *IMConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
