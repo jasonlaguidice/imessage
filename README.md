@@ -141,17 +141,16 @@ flowchart TB
 ```
 cmd/mautrix-imessage/        # Entrypoint
 pkg/connector/               # bridgev2 connector
+  ├── connector.go           #   bridge lifecycle + macOS permissions
   ├── client.go              #   send/receive/reactions/edits/typing
-  │                          #   + periodic health check & backfill
   ├── login.go               #   Apple ID + 2FA login flow
   ├── chatdb.go              #   chat.db backfill + contacts (macOS)
-  │                          #   + GUID set-diff for missing messages
   ├── ids.go                 #   identifier/portal ID conversion
-  ├── connector.go           #   bridge lifecycle
-  └── ...
+  ├── capabilities.go        #   supported features
+  └── config.go              #   bridge config schema
 pkg/rustpushgo/              # Rust FFI wrapper (uniffi)
-nac-validation/              # Local NAC via AppleAccount.framework
 rustpush/                    # OpenBubbles/rustpush (vendored)
+nac-validation/              # Local NAC via AppleAccount.framework
 imessage/                    # macOS chat.db + Contacts reader
 ```
 
