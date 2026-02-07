@@ -20,26 +20,6 @@ echo "  iMessage Bridge Setup (Beeper)"
 echo "═══════════════════════════════════════════════"
 echo ""
 
-# ── Check / install Homebrew deps ─────────────────────────────
-check_brew_dep() {
-    local pkg="$1" check="$2"
-    if ! eval "$check" >/dev/null 2>&1; then
-        echo "  Installing $pkg..."
-        brew install "$pkg"
-    fi
-}
-
-if ! command -v brew >/dev/null 2>&1; then
-    echo "ERROR: Homebrew is required. Install from https://brew.sh"
-    exit 1
-fi
-
-echo "Checking dependencies..."
-check_brew_dep go "command -v go"
-check_brew_dep libolm "[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ]"
-echo "✓ Dependencies OK"
-echo ""
-
 # ── Build bbctl from source ───────────────────────────────────
 BBCTL="$BBCTL_DIR/bbctl"
 

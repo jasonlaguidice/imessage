@@ -6,6 +6,8 @@ A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix c
 
 ## Quick Start
 
+macOS 14.2+ required. Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
+
 ### With Beeper
 
 ```bash
@@ -14,26 +16,19 @@ cd imessage
 make install-beeper
 ```
 
-The installer handles everything: dependencies, building, Beeper login, config, and LaunchAgent setup. Once running, DM `@sh-imessagebot:beeper.local` in Beeper and send `login`.
+The installer handles everything: Homebrew, dependencies, building, Beeper login, config, and LaunchAgent setup. Once running, DM `@sh-imessagebot:beeper.local` in Beeper and send `login`.
 
 ### With a Self-Hosted Homeserver
 
 ```bash
-brew install go rust libolm protobuf
 git clone https://github.com/lrhodin/imessage.git
 cd imessage
 make install
 ```
 
-The installer asks three questions (homeserver URL, domain, your Matrix ID), generates config files, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge.
+The installer auto-installs Homebrew and dependencies if needed, asks three questions (homeserver URL, domain, your Matrix ID), generates config files, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge.
 
 Once running, DM `@imessagebot:yourdomain` in your Matrix client and send `login`.
-
-### Prerequisites
-
-- macOS 14.2+
-- **Signed into iCloud** on the Mac running the bridge (Settings → Apple ID). Required for Apple to recognize the device and allow login without 2FA prompts.
-- Full Disk Access for the bridge app (prompted on first run) — needed for chat.db backfill.
 
 ### Login
 
