@@ -117,9 +117,12 @@ flowchart LR
 
 ```mermaid
 flowchart LR
+    subgraph Your Mac
+        Bridge[mautrix-imessage]
+        Bridge -- FFI --> RP[rustpush]
+    end
     Client[Beeper app] <--> Beeper[Beeper cloud]
-    Beeper -- websocket --> Bridge[mautrix-imessage]
-    Bridge -- FFI --> RP[rustpush]
+    Beeper -- websocket --> Bridge
     RP <--> Apple[Apple IDS / APNs]
 ```
 
