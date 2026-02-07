@@ -43,15 +43,24 @@ Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with
 
 ### Setup with Beeper
 
-If you use [Beeper](https://www.beeper.com) instead of a self-hosted homeserver, you can use [`bbctl`](https://github.com/beeper/bridge-manager) to connect the bridge to Beeper's cloud homeserver — no Synapse, no registration file, no `homeserver.yaml` edits:
+If you use [Beeper](https://www.beeper.com) instead of a self-hosted homeserver:
 
 ```bash
+git clone https://github.com/lrhodin/imessage.git
+cd imessage
 make install-beeper
 ```
 
-This runs `bbctl config --type bridgev2 sh-imessage` to generate a config pointing at Beeper, then installs the same LaunchAgent as the regular path.
+That's it. The installer automatically:
+- Checks/installs Homebrew dependencies
+- Builds [`bbctl`](https://github.com/beeper/bridge-manager) from source
+- Logs you into Beeper (prompts for email + code)
+- Generates a config pointing at Beeper's homeserver
+- Builds the bridge and installs a LaunchAgent
 
-Once running, DM `@sh-imessagebot:YOUR_BEEPER_DOMAIN` in Beeper and send `login`.
+No Synapse, no registration file, no `homeserver.yaml` edits.
+
+Once running, DM `@sh-imessagebot:beeper.local` in Beeper and send `login`.
 
 ### SMS Forwarding
 
