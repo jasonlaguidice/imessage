@@ -23,6 +23,10 @@ var ExampleConfig string
 type IMConfig struct {
 	DisplaynameTemplate string `yaml:"displayname_template"`
 	displaynameTemplate *template.Template
+
+	// InitialSyncDays is how far back to look for chats during initial sync.
+	// Default is 365 (1 year).
+	InitialSyncDays int `yaml:"initial_sync_days"`
 }
 
 type umIMConfig IMConfig
@@ -65,6 +69,16 @@ func (c *IMConfig) FormatDisplayname(params DisplaynameParams) string {
 
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
+	helper.Copy(up.Int, "initial_sync_days")
+}
+
+// GetInitialSyncDays returns the configured initial sync window in days,
+// defaulting to 365 (1 year) if not set.
+func (c *IMConfig) GetInitialSyncDays() int {
+	if c.InitialSyncDays <= 0 {
+		return 365
+	}
+	return c.InitialSyncDays
 }
 
 func (c *IMConnector) GetConfig() (string, any, up.Upgrader) {
