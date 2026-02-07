@@ -170,6 +170,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 
 	if msg.IsDelivered {
+		c.handleDeliveryReceipt(log, msg)
 		return
 	}
 
@@ -413,6 +414,20 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 			Sender:    c.makeEventSender(msg.Sender),
 			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
+		LastTarget: makeMessageID(msg.Uuid),
+	})
+}
+
+func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventDeliveryReceipt,
+			PortalKey: portalKey,
+			Sender:    c.makeEventSender(msg.Sender),
+			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
+		},
+		LastTarget: makeMessageID(msg.Uuid),
 	})
 }
 
