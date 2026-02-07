@@ -60,13 +60,13 @@ This creates a portal room. Messages you send there are delivered as iMessages.
 # View logs
 tail -f data/bridge.stdout.log
 
-# Restart
-launchctl stop com.lrhodin.mautrix-imessage
+# Restart (auto-restarts via KeepAlive)
+launchctl kickstart -k gui/$(id -u)/com.lrhodin.mautrix-imessage
 
-# Stop
-launchctl unload ~/Library/LaunchAgents/com.lrhodin.mautrix-imessage.plist
+# Stop until next login
+launchctl bootout gui/$(id -u)/com.lrhodin.mautrix-imessage
 
-# Remove
+# Uninstall
 make uninstall
 ```
 
