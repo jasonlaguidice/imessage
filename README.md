@@ -4,46 +4,9 @@ A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix c
 
 **Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, and contact name resolution.
 
-## Install
+## Quick Start
 
-### Prerequisites
-
-macOS 14.2+ with:
-
-- **Signed into iCloud** on the Mac running the bridge (System Settings → Apple ID). This is required for Apple to recognize the device as trusted and allow login without 2FA prompts.
-- Full Disk Access granted to the bridge app (for chat.db backfill — prompted on first run).
-
-```bash
-brew install go rust libolm protobuf
-```
-
-A running Matrix homeserver ([Synapse](https://element-hq.github.io/synapse/), etc).
-
-### Setup
-
-```bash
-git clone https://github.com/lrhodin/imessage.git
-cd imessage
-make install
-```
-
-This builds the bridge, asks three questions (homeserver URL, domain, your Matrix ID), generates config files, and starts the bridge as a LaunchAgent.
-
-The installer will pause and ask you to register the bridge with your homeserver — it tells you exactly what to add to `homeserver.yaml`.
-
-Once running, DM `@imessagebot:yourdomain` in your Matrix client and send:
-
-```
-login
-```
-
-Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with the same Apple ID, login completes without 2FA. The bridge registers with Apple's iMessage servers and connects.
-
-> **Note:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
-
-### Setup with Beeper
-
-If you use [Beeper](https://www.beeper.com) instead of a self-hosted homeserver:
+### With Beeper
 
 ```bash
 git clone https://github.com/lrhodin/imessage.git
@@ -51,64 +14,50 @@ cd imessage
 make install-beeper
 ```
 
-That's it. The installer automatically:
-- Checks/installs Homebrew dependencies
-- Builds [`bbctl`](https://github.com/beeper/bridge-manager) from source
-- Logs you into Beeper (prompts for email + code)
-- Generates a config pointing at Beeper's homeserver
-- Builds the bridge and installs a LaunchAgent
+The installer handles everything: dependencies, building, Beeper login, config, and LaunchAgent setup. Once running, DM `@sh-imessagebot:beeper.local` in Beeper and send `login`.
 
-No Synapse, no registration file, no `homeserver.yaml` edits.
+### With a Self-Hosted Homeserver
 
-Once running, DM `@sh-imessagebot:beeper.local` in Beeper and send `login`.
+```bash
+brew install go rust libolm protobuf
+git clone https://github.com/lrhodin/imessage.git
+cd imessage
+make install
+```
+
+The installer asks three questions (homeserver URL, domain, your Matrix ID), generates config files, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge.
+
+Once running, DM `@imessagebot:yourdomain` in your Matrix client and send `login`.
+
+### Prerequisites
+
+- macOS 14.2+
+- **Signed into iCloud** on the Mac running the bridge (Settings → Apple ID). Required for Apple to recognize the device and allow login without 2FA prompts.
+- Full Disk Access for the bridge app (prompted on first run) — needed for chat.db backfill.
+
+### Login
+
+Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with the same Apple ID, login completes without 2FA.
+
+> **Tip:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
 
 ### SMS Forwarding
 
-To bridge SMS (green bubble) messages, enable the bridge device on your iPhone:
+To bridge SMS (green bubble) messages, enable forwarding on your iPhone:
 
-**Settings → Messages → Text Message Forwarding** → toggle on the new device.
-
-Each bridge login registers as a separate device, so you may see multiple entries — enable the latest one.
+**Settings → Messages → Text Message Forwarding** → toggle on the bridge device.
 
 ### Chatting
 
-Once logged in, incoming iMessages automatically create Matrix rooms — no setup needed per conversation. If you grant Full Disk Access (System Settings → Privacy & Security), existing conversations from Messages.app are also synced.
+Incoming iMessages automatically create Matrix rooms. If Full Disk Access is granted, existing conversations from Messages.app are also synced.
 
-To start a **new** conversation with someone who hasn't messaged you:
+To start a **new** conversation:
 
 ```
 resolve +15551234567
 ```
 
-This creates a portal room. Messages you send there are delivered as iMessages; replies appear in the room.
-
-## How it works
-
-The bridge connects directly to Apple's iMessage servers using the [rustpush](https://github.com/OpenBubbles/rustpush) library with local NAC validation (no SIP bypass, no relay server). On macOS with Full Disk Access, it also reads `chat.db` for message history backfill and contact name resolution from Contacts.app.
-
-```
-Matrix client ←→ Synapse
-                    ↓ appservice
-              mautrix-imessage
-                    ↓
-              rustpush (Rust FFI)
-                    ↓
-              Apple IDS / APNs
-```
-
-### Real-time vs. backfill
-
-**Real-time messages** are handled by rustpush — incoming and outgoing iMessages flow through Apple's push notification service (APNs) and appear in Matrix immediately.
-
-**Backfill** fills in anything rustpush misses by reading the local macOS `chat.db`. On startup, the bridge creates portals for all chats with activity in the last `initial_sync_days` (default: 365 days / 1 year) and backfills their messages. A continuous health check then runs every 5 minutes:
-
-1. Query chat.db for all message GUIDs in the last 24 hours
-2. Compare against message IDs already bridged (set-diff by GUID — no timestamps)
-3. If any messages are missing, **nuke the portal** (delete bridge DB entries + Matrix room) and **re-create it from scratch** with a full chronological backfill
-
-This nuke-and-resync approach guarantees messages always appear in correct chronological order in the Matrix timeline, since standard Matrix APIs can only append events — they can't insert into the middle of history.
-
-The system is idempotent and safe to run repeatedly. If nothing is missing, the health check is a no-op.
+This creates a portal room. Messages you send there are delivered as iMessages.
 
 ## Management
 
@@ -128,23 +77,23 @@ make uninstall
 
 ## Configuration
 
-Config lives in `data/config.yaml` (generated during `make install`). To reconfigure:
+Config lives in `data/config.yaml` (generated during install). To reconfigure:
 
 ```bash
 rm -rf data
-make install
+make install    # or make install-beeper
 ```
 
 Key options:
 
 | Field | What it does |
 |-------|-------------|
-| `database.type` | `sqlite3-fk-wal` (default) or `postgres` |
-| `encryption` | End-to-bridge encryption settings |
-| `network.displayname_template` | Contact name format |
 | `network.initial_sync_days` | How far back to look for chats on first login (default 365) |
 | `backfill.max_initial_messages` | Max messages per backfill (default 10000) |
 | `backfill.max_catchup_messages` | Max messages for catch-up after restart |
+| `database.type` | `sqlite3-fk-wal` (default) or `postgres` |
+| `encryption` | End-to-bridge encryption settings |
+| `network.displayname_template` | Contact name format |
 
 ## Development
 
@@ -155,11 +104,37 @@ make bindings   # Regenerate Go FFI bindings (needs uniffi-bindgen-go)
 make clean      # Remove build artifacts
 ```
 
+## How It Works
+
+The bridge connects directly to Apple's iMessage servers using [rustpush](https://github.com/OpenBubbles/rustpush) with local NAC validation (no SIP bypass, no relay server). On macOS with Full Disk Access, it also reads `chat.db` for message history backfill and contact name resolution.
+
+```
+Matrix client ←→ homeserver
+                    ↓ appservice
+              mautrix-imessage
+                    ↓ FFI
+                 rustpush
+                    ↓
+              Apple IDS / APNs
+```
+
+### Real-time vs. backfill
+
+**Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
+
+**Backfill** fills in anything rustpush misses by reading the local macOS `chat.db`. On startup, the bridge creates portals for all chats with activity in the last `initial_sync_days` and backfills their messages. A health check then runs every 5 minutes:
+
+1. Query chat.db for all message GUIDs in the last 24 hours
+2. Compare against messages already bridged (set-diff by GUID)
+3. If any are missing, nuke the portal and re-create it with a full chronological backfill
+
+This nuke-and-resync approach guarantees correct chronological order, since Matrix APIs can only append events — they can't insert into the middle of history. The check is idempotent; if nothing is missing, it's a no-op.
+
 ### Source layout
 
 ```
 cmd/mautrix-imessage/        # Entrypoint
-pkg/connector/               # bridgev2 connector (unified)
+pkg/connector/               # bridgev2 connector
   ├── client.go              #   send/receive/reactions/edits/typing
   │                          #   + periodic health check & backfill
   ├── login.go               #   Apple ID + 2FA login flow
