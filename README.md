@@ -103,35 +103,24 @@ make clean      # Remove build artifacts
 
 The bridge connects directly to Apple's iMessage servers using [rustpush](https://github.com/OpenBubbles/rustpush) with local NAC validation (no SIP bypass, no relay server). On macOS with Full Disk Access, it also reads `chat.db` for message history backfill and contact name resolution.
 
-#### Self-hosted
-
 ```mermaid
 flowchart TB
-    subgraph mac[Your Mac]
-        HS[Homeserver] -- appservice --> Bridge[mautrix-imessage]
-        Bridge -- FFI --> RP[rustpush]
+    subgraph sh[Self-hosted · Your Mac]
+        HS[Homeserver] -- appservice --> Bridge1[mautrix-imessage]
+        Bridge1 -- FFI --> RP1[rustpush]
     end
-    subgraph cloud[Cloud]
-        Apple[Apple IDS / APNs]
-    end
-    Client[Matrix client] <--> HS
-    RP <--> Apple
-```
-
-#### Beeper
-
-```mermaid
-flowchart TB
-    subgraph mac[Your Mac]
-        Bridge[mautrix-imessage] -- FFI --> RP[rustpush]
+    subgraph bp[Beeper · Your Mac]
+        Bridge2[mautrix-imessage] -- FFI --> RP2[rustpush]
     end
     subgraph cloud[Cloud]
         Beeper[Beeper cloud]
         Apple[Apple IDS / APNs]
     end
-    Client[Beeper app] <--> Beeper
-    Beeper -- websocket --> Bridge
-    RP <--> Apple
+    Client1[Matrix client] <--> HS
+    Client2[Beeper app] <--> Beeper
+    Beeper -- websocket --> Bridge2
+    RP1 <--> Apple
+    RP2 <--> Apple
 ```
 
 ### Real-time and backfill
