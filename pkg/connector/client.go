@@ -10,11 +10,16 @@ package connector
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
@@ -110,6 +115,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	if c.chatDB != nil {
 		log.Info().Msg("Chat.db available for backfill and contacts")
 		go c.periodicChatDBSync(log)
+		go c.watchContactChanges(log)
 	}
 }
 
@@ -672,20 +678,9 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			},
 		}
 
-		// Always set a room name for DMs so Element doesn't show the ugly MXID.
-		localID := stripIdentifierPrefix(portalID)
-		name := localID // fallback: raw phone number or email
-		if c.chatDB != nil {
-			if contact, err := c.chatDB.api.GetContactInfo(localID); err == nil && contact != nil && contact.HasName() {
-				name = c.Main.Config.FormatDisplayname(DisplaynameParams{
-					FirstName: contact.FirstName,
-					LastName:  contact.LastName,
-					Nickname:  contact.Nickname,
-					ID:        localID,
-				})
-			}
-		}
-		chatInfo.Name = &name
+		// Don't set an explicit room name for DMs. With private_chat_portal_meta
+		// enabled, the framework derives the room name from the ghost's profile
+		// display name, which means it auto-updates when contacts are edited.
 		chatInfo.Members = members
 	}
 
@@ -722,10 +717,12 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 				ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
 			}
 			if len(contact.Avatar) > 0 {
+				avatarHash := sha256.Sum256(contact.Avatar)
+				avatarData := contact.Avatar // capture for closure
 				ui.Avatar = &bridgev2.Avatar{
-					ID: networkid.AvatarID(fmt.Sprintf("contact:%s", identifier)),
+					ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
 					Get: func(ctx context.Context) ([]byte, error) {
-						return contact.Avatar, nil
+						return avatarData, nil
 					},
 				}
 			}
@@ -828,6 +825,141 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 			return
 		}
 	}
+}
+
+// ============================================================================
+// Contact change watcher
+// ============================================================================
+
+// watchContactChanges uses fsnotify to watch the macOS AddressBook database
+// directory for writes. When a contact is added, edited, or deleted, macOS
+// writes to the .abcddb SQLite files, which we detect and use to trigger a
+// full ghost refresh.
+func (c *IMClient) watchContactChanges(log zerolog.Logger) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Warn().Err(err).Msg("Contact watcher: can't get home dir")
+		return
+	}
+
+	abDir := filepath.Join(home, "Library", "Application Support", "AddressBook")
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		log.Warn().Err(err).Msg("Contact watcher: failed to create fsnotify watcher")
+		return
+	}
+	defer watcher.Close()
+
+	// Watch the top-level dir and every Sources/<UUID>/ subdirectory,
+	// since contacts may live in different account containers.
+	if err := watcher.Add(abDir); err != nil {
+		log.Warn().Err(err).Str("path", abDir).Msg("Contact watcher: failed to watch AddressBook dir")
+		return
+	}
+	sourcesDir := filepath.Join(abDir, "Sources")
+	if entries, err := os.ReadDir(sourcesDir); err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				subdir := filepath.Join(sourcesDir, e.Name())
+				if err := watcher.Add(subdir); err != nil {
+					log.Warn().Err(err).Str("path", subdir).Msg("Contact watcher: failed to watch subdirectory")
+				}
+			}
+		}
+	}
+
+	log.Info().Str("path", abDir).Msg("Watching for macOS contact changes via fsnotify")
+
+	// debounceTimer is nil when idle, non-nil when a change was detected and
+	// we're waiting for edits to settle before refreshing.
+	var debounceTimer *time.Timer
+	var debounceCh <-chan time.Time
+
+	for {
+		select {
+		case evt, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			// Only react to writes/creates on the .abcddb files
+			if evt.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+				continue
+			}
+			base := filepath.Base(evt.Name)
+			if !strings.Contains(base, "abcddb") {
+				continue
+			}
+			// Start or reset the 2s debounce timer
+			if debounceTimer == nil {
+				debounceTimer = time.NewTimer(2 * time.Second)
+				debounceCh = debounceTimer.C
+			} else {
+				debounceTimer.Reset(2 * time.Second)
+			}
+
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Warn().Err(err).Msg("Contact watcher: fsnotify error")
+
+		case <-debounceCh:
+			debounceTimer = nil
+			debounceCh = nil
+			c.refreshAllGhosts(log)
+
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// refreshAllGhosts re-resolves contact info for every known ghost and pushes
+// any changes (name, avatar, identifiers) to Matrix.
+func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
+	ctx := log.WithContext(context.Background())
+
+	// Query all ghost IDs from the bridge database.
+	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
+		"SELECT id FROM ghost WHERE bridge_id=$1",
+		c.Main.Bridge.ID,
+	)
+	if err != nil {
+		log.Err(err).Msg("Contact refresh: failed to query ghost IDs")
+		return
+	}
+	defer rows.Close()
+	var ghostIDs []networkid.UserID
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			log.Err(err).Msg("Contact refresh: failed to scan ghost ID")
+			continue
+		}
+		ghostIDs = append(ghostIDs, networkid.UserID(id))
+	}
+	if err := rows.Err(); err != nil {
+		log.Err(err).Msg("Contact refresh: row iteration error")
+	}
+
+	updated := 0
+	for _, ghostID := range ghostIDs {
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, ghostID)
+		if err != nil {
+			log.Warn().Err(err).Str("ghost_id", string(ghostID)).Msg("Contact refresh: failed to load ghost")
+			continue
+		}
+		info, err := c.GetUserInfo(ctx, ghost)
+		if err != nil || info == nil {
+			continue
+		}
+		ghost.UpdateInfo(ctx, info)
+		updated++
+	}
+
+	log.Info().Int("ghosts_checked", len(ghostIDs)).Int("updated", updated).
+		Msg("Contact change detected — refreshed ghost profiles")
 }
 
 // ============================================================================
@@ -1110,16 +1242,19 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		parsed = info.Identifier
 	}
 
-	// Build a display name: use chat.db display_name if set,
-	// otherwise build from participant names/numbers.
-	displayName := info.DisplayName
-	if displayName == "" && parsed.IsGroup {
-		displayName = c.buildGroupName(info.Members)
+	chatInfo := &bridgev2.ChatInfo{
+		CanBackfill: true,
 	}
 
-	chatInfo := &bridgev2.ChatInfo{
-		Name:        &displayName,
-		CanBackfill: true,
+	// Only set an explicit room name for group chats. For DMs, the framework
+	// derives the room name from the ghost's profile (private_chat_portal_meta),
+	// which auto-updates when contacts are edited.
+	if parsed.IsGroup {
+		displayName := info.DisplayName
+		if displayName == "" {
+			displayName = c.buildGroupName(info.Members)
+		}
+		chatInfo.Name = &displayName
 	}
 
 	if parsed.IsGroup {
