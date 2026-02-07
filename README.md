@@ -41,6 +41,30 @@ Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with
 
 > **Note:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
 
+### Setup with Beeper
+
+If you use [Beeper](https://www.beeper.com) instead of a self-hosted homeserver, you can skip the Synapse setup and use [`bbctl`](https://github.com/beeper/bridge-manager) to connect the bridge to Beeper's cloud homeserver:
+
+1. Install `bbctl`:
+   ```bash
+   # Download from https://github.com/beeper/bridge-manager/releases
+   chmod +x bbctl && sudo mv bbctl /usr/local/bin/
+   ```
+
+2. Log in to your Beeper account:
+   ```bash
+   bbctl login
+   ```
+
+3. Build and install:
+   ```bash
+   make install-beeper
+   ```
+
+This runs `bbctl config --type bridgev2 sh-imessage` to generate a config that talks to Beeper's homeserver, then installs the same LaunchAgent as the regular path. No registration file, no `homeserver.yaml` edits.
+
+Once running, DM `@sh-imessagebot:YOUR_BEEPER_DOMAIN` in Beeper and send `login`.
+
 ### SMS Forwarding
 
 To bridge SMS (green bubble) messages, enable the bridge device on your iPhone:
