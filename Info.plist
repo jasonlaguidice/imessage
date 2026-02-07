@@ -9,7 +9,7 @@
     <key>CFBundleDisplayName</key>
     <string>iMessage Bridge</string>
     <key>CFBundleExecutable</key>
-    <string>mautrix-imessage</string>
+    <string>mautrix-imessage-v2</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
