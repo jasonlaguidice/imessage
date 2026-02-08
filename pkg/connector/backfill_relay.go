@@ -208,23 +208,30 @@ func (br *backfillRelay) FetchMessages(ctx context.Context, params bridgev2.Fetc
 		if msg.ItemType != int(imessage.ItemTypeMessage) || msg.TapbackGUID != "" {
 			continue
 		}
+		// Strip U+FFFC (object replacement character) — inline attachment
+		// placeholders from NSAttributedString that render as blank
+		msg.Text = strings.ReplaceAll(msg.Text, "\uFFFC", "")
+		msg.Text = strings.TrimSpace(msg.Text)
 		// Skip messages with no text and no attachments (empty messages
 		// show as "unsupported message" in clients)
 		if msg.Text == "" && msg.Subject == "" && len(msg.Attachments) == 0 {
 			continue
 		}
 		sender := relayMakeEventSender(msg, c)
-		cm := convertRelayMessage(msg)
-
 		msgTime := time.UnixMilli(msg.TimestampMs)
-		backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
-			ConvertedMessage: cm,
-			Sender:           sender,
-			ID:               makeMessageID(msg.GUID),
-			TxnID:            networkid.TransactionID(msg.GUID),
-			Timestamp:        msgTime,
-			StreamOrder:      msg.TimestampMs,
-		})
+
+		// Only create a text part if there's actual text content
+		if msg.Text != "" || msg.Subject != "" {
+			cm := convertRelayMessage(msg)
+			backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
+				ConvertedMessage: cm,
+				Sender:           sender,
+				ID:               makeMessageID(msg.GUID),
+				TxnID:            networkid.TransactionID(msg.GUID),
+				Timestamp:        msgTime,
+				StreamOrder:      msg.TimestampMs,
+			})
+		}
 
 		for i, att := range msg.Attachments {
 			attCm, err := br.convertRelayAttachment(ctx, intent, att)

@@ -459,7 +459,10 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 					Content string `json:"content"`
 				}
 				if json.Unmarshal([]byte(decoded), &ab) == nil && ab.Content != "" {
-					msg.Text = strings.TrimSpace(ab.Content)
+					// Strip U+FFFC (object replacement character) used as
+					// inline attachment placeholders in NSAttributedString
+					cleaned := strings.ReplaceAll(ab.Content, "\uFFFC", "")
+					msg.Text = strings.TrimSpace(cleaned)
 				}
 			}
 		}
