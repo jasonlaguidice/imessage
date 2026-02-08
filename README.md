@@ -145,7 +145,6 @@ launchctl load ~/Library/LaunchAgents/com.imessage.nac-relay.plist
 
 - **No chat.db backfill** — chat history starts from when you log in
 - **No contact name resolution** — contacts appear by phone number / email
-- **No SMS forwarding** — requires a Mac for the initial Text Message Forwarding setup
 
 ## Login
 
