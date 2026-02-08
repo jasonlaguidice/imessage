@@ -105,46 +105,31 @@ The NAC relay is required for **Apple Silicon** Macs. It's a tiny HTTP server th
 **Install as a persistent service (recommended):**
 
 ```bash
-# Build
+# Build and install as a LaunchAgent with .app bundle for TCC permissions
 go build -o ~/bin/nac-relay ./tools/nac-relay/
+~/bin/nac-relay --setup
+```
 
-# Install launchd service
-cat > ~/Library/LaunchAgents/com.imessage.nac-relay.plist << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.imessage.nac-relay</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$HOME/bin/nac-relay</string>
-        <string>-port</string>
-        <string>5001</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/nac-relay.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/nac-relay.log</string>
-</dict>
-</plist>
-EOF
+The `--setup` command creates an `.app` bundle at `~/Applications/nac-relay.app`, installs a LaunchAgent, and starts the service. On first run it will prompt for **Full Disk Access** (needed for chat.db backfill) and **Contacts** access — grant both when the system dialogs appear.
 
-launchctl load ~/Library/LaunchAgents/com.imessage.nac-relay.plist
+```bash
+# Check status
+tail -f /tmp/nac-relay.log
 ```
 
 **Port forwarding**: If your bridge runs outside the LAN (e.g., cloud VM), forward port 5001 TCP to your Mac's local IP. Lock the allowed source IPs to your bridge server for security.
 
 **Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key.
 
-### Linux Limitations
+### Linux Features with NAC Relay
 
-- **No chat.db backfill** — chat history starts from when you log in
-- **No contact name resolution** without the NAC relay — contacts appear by phone number / email. With the relay running, contacts are resolved from the Mac's Contacts.app (grant Contacts access when prompted)
+When the NAC relay is running on a Mac with Full Disk Access and Contacts access granted:
+
+- **Chat history backfill** — messages from the Mac's `chat.db` are synced via the relay, including images and attachments
+- **Contact name resolution** — contacts are resolved from the Mac's Contacts.app, so bridged users appear by name instead of phone number / email
+- **SMS forwarding** — works the same as macOS (enable Text Message Forwarding on your iPhone)
+
+Without the relay (Intel keys only), chat history starts from when you log in and contacts appear by phone number / email.
 
 ## Login
 
@@ -209,7 +194,7 @@ flowchart TB
 
 **Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
 
-**Backfill** (macOS only) runs once on first login: the bridge reads the local macOS `chat.db` and creates portals for all chats with activity in the last `initial_sync_days` (default: 1 year, configurable). After that, everything is real-time only via rustpush.
+**Backfill** runs once on first login: the bridge reads `chat.db` and creates portals for all chats with activity in the last `initial_sync_days` (default: 1 year, configurable). On macOS this reads the local database directly; on Linux with the NAC relay, it proxies queries over HTTP to the Mac. After initial sync, everything is real-time via rustpush.
 
 ## Management
 
@@ -300,7 +285,7 @@ rustpush/                    # OpenBubbles/rustpush (vendored)
 nac-validation/              # Local NAC via AppleAccount.framework (macOS)
 tools/
   ├── extract-key/           # Hardware key extraction (run on Mac)
-  └── nac-relay/             # NAC validation relay server (run on Mac)
+  └── nac-relay/             # NAC validation + contacts + backfill relay (run on Mac)
 imessage/                    # macOS chat.db + Contacts reader
 ```
 
