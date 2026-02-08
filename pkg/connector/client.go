@@ -56,6 +56,9 @@ type IMClient struct {
 	// Contact relay (optional — for Linux with NAC relay)
 	contactRelay *contactRelayClient
 
+	// Backfill relay (optional — for Linux with NAC relay + chat.db access)
+	backfillRelay *backfillRelay
+
 	// Background goroutine lifecycle
 	stopChan chan struct{}
 
@@ -131,6 +134,16 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Info().Str("relay", c.contactRelay.baseURL).Msg("Contact relay available for name resolution")
 			c.contactRelay.SyncContacts(log)
 			go c.periodicContactRelaySync(log)
+
+			// Check if the relay also supports chat.db backfill
+			br := newBackfillRelay(c.contactRelay.baseURL)
+			if br.checkAvailable() {
+				c.backfillRelay = br
+				log.Info().Msg("Backfill relay available — chat.db backfill enabled via relay")
+				go c.periodicRelaySync(log)
+			} else {
+				log.Info().Msg("Backfill relay not available (relay may lack Full Disk Access)")
+			}
 		}
 	}
 }
@@ -646,7 +659,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	isGroup := strings.Contains(portalID, ",")
 
 	chatInfo := &bridgev2.ChatInfo{
-		CanBackfill: c.chatDB != nil,
+		CanBackfill: c.chatDB != nil || c.backfillRelay != nil,
 	}
 
 	if isGroup {
@@ -807,11 +820,13 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 // ============================================================================
 
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
-	if c.chatDB == nil {
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	if c.chatDB != nil {
+		return c.chatDB.FetchMessages(ctx, params, c)
 	}
-
-	return c.chatDB.FetchMessages(ctx, params, c)
+	if c.backfillRelay != nil {
+		return c.backfillRelay.FetchMessages(ctx, params, c)
+	}
+	return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 }
 
 // ============================================================================
@@ -851,6 +866,13 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 			return
 		}
 	}
+}
+
+// periodicRelaySync runs initial sync via the backfill relay (once), then idles.
+func (c *IMClient) periodicRelaySync(log zerolog.Logger) {
+	ctx := log.WithContext(context.Background())
+	c.runInitialSyncViaRelay(ctx, log)
+	<-c.stopChan
 }
 
 // periodicContactRelaySync re-fetches contacts from the relay every 15 minutes.

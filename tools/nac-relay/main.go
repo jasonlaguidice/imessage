@@ -1,14 +1,20 @@
-// nac-relay: Runs on a Mac and serves NAC validation data + contact lookups
-// over HTTP. The Linux bridge calls this instead of running the x86_64 NAC
-// emulator and for contact name resolution.
+// nac-relay: Runs on a Mac and serves NAC validation data, contact lookups,
+// and chat.db backfill over HTTP. The Linux bridge calls this instead of
+// running the x86_64 NAC emulator locally.
 //
 // Usage:
 //   go run tools/nac-relay/main.go [-port 5001] [-addr 0.0.0.0]
 //
 // Endpoints:
-//   POST /validation-data             → base64-encoded validation data
-//   GET  /contact?id=+15551234567     → JSON contact info
-//   GET  /health                      → "ok"
+//   POST /validation-data                        → base64-encoded validation data
+//   GET  /contact?id=+15551234567                → JSON contact info
+//   GET  /contacts                               → all contacts (bulk)
+//   GET  /chats?since_days=365                   → recent chats with members
+//   GET  /chat-info?guid=<chat_guid>             → single chat info + members
+//   GET  /messages?chat_guid=X&since_ts=T        → messages since timestamp (ms)
+//   GET  /messages?chat_guid=X&before_ts=T&limit=N → messages before timestamp
+//   GET  /attachment?path=~/Library/Messages/...  → raw attachment file
+//   GET  /health                                 → "ok"
 package main
 
 /*
@@ -299,6 +305,9 @@ func main() {
 		log.Println("Contacts access: denied (contact lookups will return empty)")
 		log.Println("Grant access in System Settings → Privacy & Security → Contacts")
 	}
+
+	// Initialize chat.db for backfill
+	registerChatDBEndpoints()
 
 	// Test that NAC works on startup
 	log.Println("Testing NAC validation data generation...")
