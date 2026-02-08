@@ -66,8 +66,9 @@ static ContactResult lookupContact(const char *identifier) {
             CNContactEmailAddressesKey, CNContactPhoneNumbersKey,
         ];
 
+        // Try matching by phone or email across all containers
         NSPredicate *predicate;
-        if ([idStr hasPrefix:@"+"]) {
+        if ([idStr hasPrefix:@"+"] || [idStr length] <= 15) {
             CNPhoneNumber *phone = [CNPhoneNumber phoneNumberWithStringValue:idStr];
             predicate = [CNContact predicateForContactsMatchingPhoneNumber:phone];
         } else {
@@ -116,6 +117,80 @@ static void freeContactResult(ContactResult *r) {
 }
 
 static int getContactAccess() { return _contactAccess; }
+
+// Bulk fetch all contacts
+typedef struct {
+    ContactResult *contacts;
+    int count;
+} ContactList;
+
+static ContactList getAllContacts() {
+    ContactList list = {0};
+    if (_contactAccess != 1) return list;
+
+    @autoreleasepool {
+        NSArray *keysToFetch = @[
+            CNContactGivenNameKey, CNContactFamilyNameKey, CNContactNicknameKey,
+            CNContactEmailAddressesKey, CNContactPhoneNumbersKey,
+        ];
+        NSError *error;
+
+        // Fetch from ALL containers (iCloud, Gmail, Exchange, local, etc.)
+        NSMutableArray<CNContact*> *allContacts = [NSMutableArray array];
+        NSArray<CNContainer*> *containers = [_contactStore containersMatchingPredicate:nil error:&error];
+        for (CNContainer *container in containers) {
+            NSPredicate *predicate = [CNContact predicateForContactsInContainerWithIdentifier:container.identifier];
+            NSArray<CNContact*> *contacts = [_contactStore unifiedContactsMatchingPredicate:predicate
+                                                                               keysToFetch:keysToFetch
+                                                                                     error:&error];
+            if (contacts) [allContacts addObjectsFromArray:contacts];
+        }
+        // Deduplicate by contact identifier (unified contacts appear in multiple containers)
+        NSMutableDictionary<NSString*, CNContact*> *uniqueMap = [NSMutableDictionary dictionary];
+        for (CNContact *c in allContacts) {
+            if (!uniqueMap[c.identifier]) {
+                uniqueMap[c.identifier] = c;
+            }
+        }
+        NSArray<CNContact*> *contacts = uniqueMap.allValues;
+        if (contacts.count == 0) return list;
+
+        list.count = (int)contacts.count;
+        list.contacts = (ContactResult *)calloc(list.count, sizeof(ContactResult));
+
+        for (int i = 0; i < list.count; i++) {
+            CNContact *c = contacts[i];
+            list.contacts[i].found = 1;
+            list.contacts[i].first_name = c.givenName.length > 0 ? strdup([c.givenName UTF8String]) : NULL;
+            list.contacts[i].last_name = c.familyName.length > 0 ? strdup([c.familyName UTF8String]) : NULL;
+            list.contacts[i].nickname = c.nickname.length > 0 ? strdup([c.nickname UTF8String]) : NULL;
+
+            list.contacts[i].phone_count = (int)c.phoneNumbers.count;
+            if (list.contacts[i].phone_count > 0) {
+                list.contacts[i].phones = (const char **)malloc(sizeof(char*) * list.contacts[i].phone_count);
+                for (int j = 0; j < list.contacts[i].phone_count; j++) {
+                    list.contacts[i].phones[j] = strdup([c.phoneNumbers[j].value.stringValue UTF8String]);
+                }
+            }
+
+            list.contacts[i].email_count = (int)c.emailAddresses.count;
+            if (list.contacts[i].email_count > 0) {
+                list.contacts[i].emails = (const char **)malloc(sizeof(char*) * list.contacts[i].email_count);
+                for (int j = 0; j < list.contacts[i].email_count; j++) {
+                    list.contacts[i].emails[j] = strdup([c.emailAddresses[j].value UTF8String]);
+                }
+            }
+        }
+    }
+    return list;
+}
+
+static void freeContactList(ContactList *list) {
+    for (int i = 0; i < list->count; i++) {
+        freeContactResult(&list->contacts[i]);
+    }
+    free(list->contacts);
+}
 */
 import "C"
 
@@ -251,6 +326,52 @@ func main() {
 		w.Write([]byte(b64))
 		log.Printf("Served %d bytes of validation data in %v (from %s)",
 			len(data), time.Since(start), r.RemoteAddr)
+	})
+
+	http.HandleFunc("/contacts", func(w http.ResponseWriter, r *http.Request) {
+		contactMu.Lock()
+		runtime.LockOSThread()
+
+		cList := C.getAllContacts()
+
+		var contacts []ContactInfo
+		for i := 0; i < int(cList.count); i++ {
+			cr := cList.contacts
+			// Pointer arithmetic to get the i-th element
+			ptr := (*C.ContactResult)(unsafe.Pointer(uintptr(unsafe.Pointer(cr)) + uintptr(i)*unsafe.Sizeof(*cr)))
+			if ptr.found == 0 {
+				continue
+			}
+			info := ContactInfo{}
+			if ptr.first_name != nil {
+				info.FirstName = C.GoString(ptr.first_name)
+			}
+			if ptr.last_name != nil {
+				info.LastName = C.GoString(ptr.last_name)
+			}
+			if ptr.nickname != nil {
+				info.Nickname = C.GoString(ptr.nickname)
+			}
+			for j := 0; j < int(ptr.phone_count); j++ {
+				p := *(**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr.phones)) + uintptr(j)*unsafe.Sizeof(ptr.phones)))
+				info.Phones = append(info.Phones, C.GoString(p))
+			}
+			for j := 0; j < int(ptr.email_count); j++ {
+				e := *(**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr.emails)) + uintptr(j)*unsafe.Sizeof(ptr.emails)))
+				info.Emails = append(info.Emails, C.GoString(e))
+			}
+			if info.FirstName != "" || info.LastName != "" || info.Nickname != "" {
+				contacts = append(contacts, info)
+			}
+		}
+
+		C.freeContactList(&cList)
+		runtime.UnlockOSThread()
+		contactMu.Unlock()
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(contacts)
+		log.Printf("Served %d contacts", len(contacts))
 	})
 
 	http.HandleFunc("/contact", func(w http.ResponseWriter, r *http.Request) {

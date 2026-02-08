@@ -129,6 +129,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.contactRelay = newContactRelayFromKey(meta.HardwareKey)
 		if c.contactRelay != nil {
 			log.Info().Str("relay", c.contactRelay.baseURL).Msg("Contact relay available for name resolution")
+			c.contactRelay.SyncContacts(log)
 		}
 	}
 }
