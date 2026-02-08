@@ -1,3 +1,5 @@
+//go:build darwin
+
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2021 Tulir Asokan
 //
