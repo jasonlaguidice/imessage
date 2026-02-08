@@ -31,6 +31,10 @@ type UserLoginMetadata struct {
 	IDSUsers    string `json:"ids_users,omitempty"`
 	IDSIdentity string `json:"ids_identity,omitempty"`
 	DeviceID    string `json:"device_id,omitempty"`
+
+	// Hardware key for cross-platform (non-macOS) operation.
+	// Base64-encoded JSON HardwareConfig extracted from a real Mac.
+	HardwareKey string `json:"hardware_key,omitempty"`
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {

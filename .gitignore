@@ -25,3 +25,4 @@ rustpush/certs/fairplay/
 # Development/test prompt files
 ENDTOEND_TEST_PROMPT.md
 RUSTPUSH_INTEGRATION_PROMPT.md
+mautrix-imessage-v2.app/
