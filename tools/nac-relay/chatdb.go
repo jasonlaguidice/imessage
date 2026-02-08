@@ -20,6 +20,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -75,6 +76,150 @@ type RelayChatInfo struct {
 
 var chatDB *sql.DB
 
+// installAppBundle creates a macOS .app bundle at ~/Applications/nac-relay.app.
+// macOS properly tracks .app bundles in TCC (Full Disk Access list) — raw
+// binaries launched by launchd don't appear. The LaunchAgent references the
+// binary inside the .app bundle so TCC grants persist.
+func installAppBundle() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	appDir := filepath.Join(home, "Applications", "nac-relay.app")
+	macosDir := filepath.Join(appDir, "Contents", "MacOS")
+	if err := os.MkdirAll(macosDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create .app bundle: %w", err)
+	}
+
+	// Write Info.plist
+	infoPlist := `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.imessage.nac-relay</string>
+	<key>CFBundleName</key>
+	<string>nac-relay</string>
+	<key>CFBundleDisplayName</key>
+	<string>iMessage Bridge Relay</string>
+	<key>CFBundleExecutable</key>
+	<string>nac-relay</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>LSBackgroundOnly</key>
+	<true/>
+</dict>
+</plist>`
+	if err := os.WriteFile(filepath.Join(appDir, "Contents", "Info.plist"), []byte(infoPlist), 0644); err != nil {
+		return "", fmt.Errorf("failed to write Info.plist: %w", err)
+	}
+
+	// Copy our own binary into the .app bundle
+	selfPath, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("failed to find own executable: %w", err)
+	}
+	selfPath, _ = filepath.EvalSymlinks(selfPath)
+
+	destPath := filepath.Join(macosDir, "nac-relay")
+	srcData, err := os.ReadFile(selfPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read own binary: %w", err)
+	}
+	if err := os.WriteFile(destPath, srcData, 0755); err != nil {
+		return "", fmt.Errorf("failed to write binary to .app bundle: %w", err)
+	}
+
+	// Ad-hoc codesign the .app bundle so macOS treats it as a proper app
+	exec.Command("codesign", "--force", "--sign", "-", appDir).Run()
+
+	log.Printf("Installed .app bundle: %s", appDir)
+	return destPath, nil
+}
+
+// runSetup creates the .app bundle, triggers TCC registration for Full Disk
+// Access, and installs/updates the LaunchAgent to point to the .app binary.
+func runSetup() {
+	log.Println("=== nac-relay setup ===")
+	log.Println()
+
+	// Step 1: Create .app bundle
+	log.Println("Installing .app bundle...")
+	binPath, err := installAppBundle()
+	if err != nil {
+		log.Fatalf("Failed to install .app bundle: %v", err)
+	}
+	log.Printf("✓ Binary installed at %s", binPath)
+	log.Println()
+
+	// Step 2: Full Disk Access — the .app bundle will appear in System Settings
+	log.Println("Checking Full Disk Access...")
+	db, err := openChatDB()
+	if err != nil {
+		promptForFDA()
+		log.Println("Waiting for Full Disk Access to be granted...")
+		log.Println("  Look for 'nac-relay' or 'iMessage Bridge Relay' in the FDA list")
+		for {
+			db, err = openChatDB()
+			if err == nil {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+	db.Close()
+	log.Println("✓ Full Disk Access granted")
+	log.Println()
+
+	// Step 3: Update LaunchAgent to use the .app bundle binary
+	home, _ := os.UserHomeDir()
+	plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.imessage.nac-relay.plist")
+	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.imessage.nac-relay</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>%s</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/tmp/nac-relay.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/nac-relay.log</string>
+</dict>
+</plist>`, binPath)
+
+	// Unload old service if running
+	exec.Command("launchctl", "unload", plistPath).Run()
+
+	if err := os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
+		log.Fatalf("Failed to write LaunchAgent plist: %v", err)
+	}
+	log.Printf("✓ LaunchAgent updated: %s", plistPath)
+
+	// Load the service
+	if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
+		log.Printf("WARNING: failed to load LaunchAgent: %v", err)
+		log.Printf("  Run manually: launchctl load %s", plistPath)
+	} else {
+		log.Println("✓ LaunchAgent started")
+	}
+
+	log.Println()
+	log.Println("=== Setup complete! ===")
+	log.Println("The relay is now running as a background service.")
+	log.Println("Logs: /tmp/nac-relay.log")
+}
+
 func openChatDB() (*sql.DB, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -93,13 +238,21 @@ func openChatDB() (*sql.DB, error) {
 	return db, nil
 }
 
+func promptForFDA() {
+	log.Println("Full Disk Access not granted — prompting user")
+	script := `display dialog "nac-relay needs Full Disk Access to read your iMessage history for backfill.\n\nClick OK to open System Settings, then enable the toggle for nac-relay." with title "iMessage Bridge Relay" buttons {"OK"} default button "OK"`
+	exec.Command("osascript", "-e", script).Run()
+	exec.Command("open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles").Run()
+}
+
+
 func registerChatDBEndpoints() {
 	var err error
 	chatDB, err = openChatDB()
 	if err != nil {
 		log.Printf("WARNING: chat.db not accessible: %v", err)
 		log.Println("  Backfill endpoints will be disabled.")
-		log.Println("  Grant Full Disk Access in System Settings → Privacy & Security → Full Disk Access")
+		log.Println("  Run 'nac-relay --setup' interactively first to grant Full Disk Access.")
 		return
 	}
 	log.Println("chat.db: opened successfully, backfill endpoints available")

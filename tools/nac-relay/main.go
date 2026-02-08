@@ -295,7 +295,13 @@ func main() {
 
 	addr := flag.String("addr", "0.0.0.0", "Address to bind to")
 	port := flag.Int("port", 5001, "Port to listen on")
+	setup := flag.Bool("setup", false, "Run interactive setup (FDA + Contacts prompts), then exit")
 	flag.Parse()
+
+	if *setup {
+		runSetup()
+		return
+	}
 
 	// Initialize contacts
 	C.initContactStore()
