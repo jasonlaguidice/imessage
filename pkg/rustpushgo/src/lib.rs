@@ -491,12 +491,24 @@ pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<Wrapped
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rustpush::macos::{MacOSConfig, HardwareConfig};
 
-    let json_bytes = STANDARD.decode(base64_key.trim())
+    // Strip whitespace/newlines that chat clients may insert when pasting
+    let clean_key: String = base64_key.chars().filter(|c| !c.is_whitespace()).collect();
+    let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
-    let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
 
     let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+
+    // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig
+    let (hw, nac_relay_url) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
+        (full.inner, full.nac_relay_url)
+    } else {
+        let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+            .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+        (hw, None)
+    };
+
+    // Always use known-good values for protocol fields — the extraction tool's
+    // values (e.g. icloud_ua) may not match what the runtime code expects.
     let config = MacOSConfig {
         inner: hw,
         version: "15.3".to_string(),
@@ -505,6 +517,7 @@ pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<Wrapped
         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         udid: None,
+        nac_relay_url,
     };
 
     Ok(Arc::new(WrappedOSConfig {
@@ -519,10 +532,17 @@ pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rustpush::macos::{MacOSConfig, HardwareConfig};
 
-    let json_bytes = STANDARD.decode(base64_key.trim())
+    let clean_key: String = base64_key.chars().filter(|c| !c.is_whitespace()).collect();
+    let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
-    let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+
+    let (hw, nac_relay_url) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
+        (full.inner, full.nac_relay_url)
+    } else {
+        let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+            .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+        (hw, None)
+    };
 
     let config = MacOSConfig {
         inner: hw,
@@ -532,6 +552,7 @@ pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device
         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         udid: None,
+        nac_relay_url,
     };
 
     Ok(Arc::new(WrappedOSConfig {

@@ -22,6 +22,12 @@ pub struct MacOSConfig {
     pub icloud_ua: String,
     pub aoskit_version: String,
     pub udid: Option<String>,
+
+    /// Optional URL to a NAC relay server (for Apple Silicon Macs).
+    /// If set, validation data is fetched from this URL instead of
+    /// running the local x86_64 NAC emulator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nac_relay_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -91,6 +97,24 @@ impl OSConfig for MacOSConfig {
     }
 
     async fn generate_validation_data(&self) -> Result<Vec<u8>, PushError> {
+        // If a NAC relay URL is configured (Apple Silicon), fetch validation
+        // data from the relay instead of running the local x86_64 emulator.
+        if let Some(ref relay_url) = self.nac_relay_url {
+            use base64::{Engine, engine::general_purpose::STANDARD};
+            let resp = REQWEST.post(relay_url)
+                .send().await
+                .map_err(|e| PushError::RelayError(0, format!("NAC relay request failed: {}", e)))?;
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(PushError::RelayError(status, format!("NAC relay error: {}", body)));
+            }
+            let b64 = resp.text().await
+                .map_err(|e| PushError::RelayError(0, format!("NAC relay read error: {}", e)))?;
+            let data = STANDARD.decode(b64.trim())
+                .map_err(|e| PushError::RelayError(0, format!("NAC relay base64 decode error: {}", e)))?;
+            return Ok(data);
+        }
 
         let url = get_bag(IDS_BAG, "id-validation-cert").await?.into_string().unwrap();
         let key = REQWEST.get(url)

@@ -20,7 +20,6 @@ import (
 	"maunium.net/go/mautrix/event"
 
 	"github.com/lrhodin/imessage/imessage"
-	_ "github.com/lrhodin/imessage/imessage/mac" // Register mac platform for chat.db
 )
 
 // chatDB wraps the macOS chat.db iMessage API for backfill and contact

@@ -31,6 +31,9 @@ where
     D: Deserializer<'de>,
 {
     let v = bin_deserialize(d)?;
+    if v.is_empty() {
+        return Ok([0u8; 6]);
+    }
     v.try_into().map_err(|v: Vec<u8>| {
         de::Error::custom(format!("expected 6 bytes for MAC address, got {}", v.len()))
     })
@@ -46,7 +49,7 @@ where
         type Value = Vec<u8>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a byte array or sequence of u8")
+            formatter.write_str("a byte array, sequence of u8, or null")
         }
 
         fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
@@ -74,6 +77,21 @@ where
                 bytes.push(b);
             }
             Ok(bytes)
+        }
+
+        // Handle JSON null → empty Vec (Apple Silicon Macs lack _enc fields)
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(Vec::new())
         }
     }
 
@@ -184,15 +202,28 @@ impl EmuState {
             "4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:ROM".into(),
             CfObj::Data(hw.rom.clone()),
         );
-        iokit.insert("Fyp98tpgj".into(), CfObj::Data(hw.platform_uuid_enc.clone()));
-        iokit.insert(
-            "Gq3489ugfi".into(),
-            CfObj::Data(hw.platform_serial_number_enc.clone()),
-        );
+        // Encrypted/obfuscated IOKit properties — present on Intel Macs.
+        // On Apple Silicon these are empty; skip them so the binary gets NULL
+        // (same as a real Apple Silicon Mac's IOKit registry).
+        if !hw.platform_uuid_enc.is_empty() {
+            iokit.insert("Fyp98tpgj".into(), CfObj::Data(hw.platform_uuid_enc.clone()));
+        }
+        if !hw.platform_serial_number_enc.is_empty() {
+            iokit.insert(
+                "Gq3489ugfi".into(),
+                CfObj::Data(hw.platform_serial_number_enc.clone()),
+            );
+        }
         iokit.insert("IOMACAddress".into(), CfObj::Data(hw.io_mac_address.to_vec()));
-        iokit.insert("abKPld1EcMni".into(), CfObj::Data(hw.mlb_enc.clone()));
-        iokit.insert("kbjfrfpoJU".into(), CfObj::Data(hw.root_disk_uuid_enc.clone()));
-        iokit.insert("oycqAZloTNDm".into(), CfObj::Data(hw.rom_enc.clone()));
+        if !hw.mlb_enc.is_empty() {
+            iokit.insert("abKPld1EcMni".into(), CfObj::Data(hw.mlb_enc.clone()));
+        }
+        if !hw.root_disk_uuid_enc.is_empty() {
+            iokit.insert("kbjfrfpoJU".into(), CfObj::Data(hw.root_disk_uuid_enc.clone()));
+        }
+        if !hw.rom_enc.is_empty() {
+            iokit.insert("oycqAZloTNDm".into(), CfObj::Data(hw.rom_enc.clone()));
+        }
 
         // String properties
         iokit.insert(
