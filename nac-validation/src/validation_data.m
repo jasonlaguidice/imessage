@@ -1,5 +1,5 @@
 /**
- * validation_data.m — Generate Apple APNs validation data on macOS 14.2+ (Sonoma or later)
+ * validation_data.m — Generate Apple APNs validation data on macOS 13+ (Ventura or later)
  *
  * Uses the private AAAbsintheContext class from AppleAccount.framework to call
  * the underlying NAC (Network Attestation Credential) functions. No SIP modification,
@@ -93,7 +93,8 @@ typedef struct {
  *
  * Enumerates all instance methods, filters for the *:error: two-arg pattern,
  * and classifies by return type:
- *   - B (BOOL) return → NACKeyEstablishment (unique)
+ *   - B or c (BOOL) return → NACKeyEstablishment (unique)
+ *     ('B' = _Bool on ARM64, 'c' = signed char on x86_64)
  *   - @ (object) return → NACInit or NACSign (disambiguated by trial call)
  *
  * To distinguish init from sign: creates a temporary context and tries each
@@ -138,7 +139,8 @@ static int discover_nac_selectors(Class cls, NSData *certData, NACSelectors *out
         if (colons != 2) continue;
 
         // Classify by return type (first char of type encoding)
-        if (typeEnc[0] == 'B') {
+        // BOOL is '_Bool' (encoding 'B') on ARM64, but 'signed char' (encoding 'c') on x86_64
+        if (typeEnc[0] == 'B' || typeEnc[0] == 'c') {
             boolSel = sel;
         } else if (typeEnc[0] == '@') {
             if (objCount < 2) {
@@ -150,7 +152,7 @@ static int discover_nac_selectors(Class cls, NSData *certData, NACSelectors *out
 
     if (!boolSel) {
         if (outError) *outError = [NSError errorWithDomain:@"NAC" code:21
-            userInfo:@{NSLocalizedDescriptionKey: @"No BOOL-returning *:error: method found (NACKeyEstablishment)"}];
+            userInfo:@{NSLocalizedDescriptionKey: @"No BOOL-returning (B or c) *:error: method found (NACKeyEstablishment)"}];
         return 21;
     }
     if (objCount != 2) {

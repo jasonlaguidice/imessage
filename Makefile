@@ -43,7 +43,7 @@ check-deps:
 
 # Build Rust static library
 $(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) pkg/rustpushgo/Cargo.toml
-	cd pkg/rustpushgo && MACOSX_DEPLOYMENT_TARGET=14.2 cargo build --release
+	cd pkg/rustpushgo && MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
 rust: $(RUST_LIB)
