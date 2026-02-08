@@ -53,6 +53,9 @@ type IMClient struct {
 	// Chat.db supplement (optional — backfill + contacts)
 	chatDB *chatDB
 
+	// Contact relay (optional — for Linux with NAC relay)
+	contactRelay *contactRelayClient
+
 	// Background goroutine lifecycle
 	stopChan chan struct{}
 
@@ -118,6 +121,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 		log.Info().Msg("Chat.db available for backfill and contacts")
 		go c.periodicChatDBSync(log)
 		go c.watchContactChanges(log)
+	}
+
+	// Set up contact relay if chat.db isn't available (Linux) and we have a relay URL
+	if c.chatDB == nil {
+		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+		c.contactRelay = newContactRelayFromKey(meta.HardwareKey)
+		if c.contactRelay != nil {
+			log.Info().Str("relay", c.contactRelay.baseURL).Msg("Contact relay available for name resolution")
+		}
 	}
 }
 
@@ -707,35 +719,39 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		Identifiers: []string{identifier},
 	}
 
-	// Try contact info from chat.db (Contacts.framework)
+	// Try contact info from chat.db (Contacts.framework) or relay
+	localID := stripIdentifierPrefix(identifier)
+	var contact *imessage.Contact
 	if c.chatDB != nil {
-		localID := stripIdentifierPrefix(identifier)
-		if contact, err := c.chatDB.api.GetContactInfo(localID); err == nil && contact != nil && contact.HasName() {
-			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-				FirstName: contact.FirstName,
-				LastName:  contact.LastName,
-				Nickname:  contact.Nickname,
-				ID:        localID,
-			})
-			ui.Name = &name
-			for _, phone := range contact.Phones {
-				ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
-			}
-			for _, email := range contact.Emails {
-				ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
-			}
-			if len(contact.Avatar) > 0 {
-				avatarHash := sha256.Sum256(contact.Avatar)
-				avatarData := contact.Avatar // capture for closure
-				ui.Avatar = &bridgev2.Avatar{
-					ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
-					Get: func(ctx context.Context) ([]byte, error) {
-						return avatarData, nil
-					},
-				}
-			}
-			return ui, nil
+		contact, _ = c.chatDB.api.GetContactInfo(localID)
+	} else if c.contactRelay != nil {
+		contact, _ = c.contactRelay.GetContactInfo(localID)
+	}
+	if contact != nil && contact.HasName() {
+		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: contact.FirstName,
+			LastName:  contact.LastName,
+			Nickname:  contact.Nickname,
+			ID:        localID,
+		})
+		ui.Name = &name
+		for _, phone := range contact.Phones {
+			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
 		}
+		for _, email := range contact.Emails {
+			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
+		}
+		if len(contact.Avatar) > 0 {
+			avatarHash := sha256.Sum256(contact.Avatar)
+			avatarData := contact.Avatar // capture for closure
+			ui.Avatar = &bridgev2.Avatar{
+				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+				Get: func(ctx context.Context) ([]byte, error) {
+					return avatarData, nil
+				},
+			}
+		}
+		return ui, nil
 	}
 
 	// Fallback: format from identifier
@@ -1294,15 +1310,19 @@ func (c *IMClient) buildGroupName(members []string) string {
 		// Strip tel:/mailto: prefix for contact lookup
 		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
+		var contact *imessage.Contact
 		if c.chatDB != nil {
-			if contact, err := c.chatDB.api.GetContactInfo(lookupID); err == nil && contact != nil && contact.HasName() {
-				name = c.Main.Config.FormatDisplayname(DisplaynameParams{
-					FirstName: contact.FirstName,
-					LastName:  contact.LastName,
-					Nickname:  contact.Nickname,
-					ID:        lookupID,
-				})
-			}
+			contact, _ = c.chatDB.api.GetContactInfo(lookupID)
+		} else if c.contactRelay != nil {
+			contact, _ = c.contactRelay.GetContactInfo(lookupID)
+		}
+		if contact != nil && contact.HasName() {
+			name = c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: contact.FirstName,
+				LastName:  contact.LastName,
+				Nickname:  contact.Nickname,
+				ID:        lookupID,
+			})
 		}
 		if name == "" {
 			name = lookupID // raw phone/email without prefix
