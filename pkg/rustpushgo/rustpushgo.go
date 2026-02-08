@@ -373,6 +373,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_create_config_from_hardware_key(uniffiStatus)
+		})
+		if checksum != 35117 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_create_config_from_hardware_key: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_func_create_config_from_hardware_key_with_device_id(uniffiStatus)
+		})
+		if checksum != 29425 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_func_create_config_from_hardware_key_with_device_id: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_func_create_local_macos_config(uniffiStatus)
 		})
 		if checksum != 37134 {
@@ -2633,6 +2651,30 @@ func Connect(config *WrappedOsConfig, state *WrappedApsState) *WrappedApsConnect
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_pointer(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+func CreateConfigFromHardwareKey(base64Key string) (*WrappedOsConfig, error) {
+	_uniffiRV, _uniffiErr := rustCallWithError(FfiConverterTypeWrappedError{}, func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
+		return C.uniffi_rustpushgo_fn_func_create_config_from_hardware_key(rustBufferToC(FfiConverterStringINSTANCE.Lower(base64Key)), _uniffiStatus)
+	})
+	if _uniffiErr != nil {
+		var _uniffiDefaultValue *WrappedOsConfig
+		return _uniffiDefaultValue, _uniffiErr
+	} else {
+		return FfiConverterWrappedOSConfigINSTANCE.Lift(_uniffiRV), _uniffiErr
+	}
+}
+
+func CreateConfigFromHardwareKeyWithDeviceId(base64Key string, deviceId string) (*WrappedOsConfig, error) {
+	_uniffiRV, _uniffiErr := rustCallWithError(FfiConverterTypeWrappedError{}, func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
+		return C.uniffi_rustpushgo_fn_func_create_config_from_hardware_key_with_device_id(rustBufferToC(FfiConverterStringINSTANCE.Lower(base64Key)), rustBufferToC(FfiConverterStringINSTANCE.Lower(deviceId)), _uniffiStatus)
+	})
+	if _uniffiErr != nil {
+		var _uniffiDefaultValue *WrappedOsConfig
+		return _uniffiDefaultValue, _uniffiErr
+	} else {
+		return FfiConverterWrappedOSConfigINSTANCE.Lift(_uniffiRV), _uniffiErr
+	}
 }
 
 func CreateLocalMacosConfig() (*WrappedOsConfig, error) {

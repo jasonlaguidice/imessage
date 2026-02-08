@@ -11,12 +11,17 @@ package connector
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
+
+func isRunningOnMacOS() bool {
+	return runtime.GOOS == "darwin"
+}
 
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
@@ -41,33 +46,53 @@ func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
-	// Attempt to read chat.db early so macOS registers the app in the
-	// Full Disk Access list.  Without this, the TCC entry only appears
-	// after the first login (when Connect() calls openChatDB()), which
-	// means new users can't grant FDA before logging in.
 	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
-	if !canReadChatDB(log) {
-		showDialogAndOpenFDA(log)
-		waitForFDA(log)
+	if isRunningOnMacOS() {
+		// Attempt to read chat.db early so macOS registers the app in the
+		// Full Disk Access list.  Without this, the TCC entry only appears
+		// after the first login (when Connect() calls openChatDB()), which
+		// means new users can't grant FDA before logging in.
+		if !canReadChatDB(log) {
+			showDialogAndOpenFDA(log)
+			waitForFDA(log)
+		}
+		// Request contact access so macOS prompts early (same as normal install flow).
+		requestContactAccess(log)
+	} else {
+		log.Info().Msg("Running on non-macOS platform — chat.db and contacts unavailable")
 	}
-	// Request contact access so macOS prompts early (same as normal install flow).
-	requestContactAccess(log)
 	return nil
 }
 
 func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
-	return []bridgev2.LoginFlow{{
-		Name:        "Apple ID",
-		Description: "Log in with your Apple ID to send and receive iMessages",
-		ID:          LoginFlowIDAppleID,
-	}}
+	flows := []bridgev2.LoginFlow{}
+	if isRunningOnMacOS() {
+		flows = append(flows, bridgev2.LoginFlow{
+			Name:        "Apple ID",
+			Description: "Log in with your Apple ID to send and receive iMessages",
+			ID:          LoginFlowIDAppleID,
+		})
+	}
+	flows = append(flows, bridgev2.LoginFlow{
+		Name:        "Apple ID (External Key)",
+		Description: "Log in using a hardware key extracted from a Mac. Works on any platform.",
+		ID:          LoginFlowIDExternalKey,
+	})
+	return flows
 }
 
 func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flowID string) (bridgev2.LoginProcess, error) {
-	if flowID != LoginFlowIDAppleID {
+	switch flowID {
+	case LoginFlowIDAppleID:
+		if !isRunningOnMacOS() {
+			return nil, fmt.Errorf("Apple ID login requires macOS. Use 'External Key' login on other platforms.")
+		}
+		return &AppleIDLogin{User: user, Main: c}, nil
+	case LoginFlowIDExternalKey:
+		return &ExternalKeyLogin{User: user, Main: c}, nil
+	default:
 		return nil, fmt.Errorf("unknown login flow: %s", flowID)
 	}
-	return &AppleIDLogin{User: user, Main: c}, nil
 }
 
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
@@ -78,13 +103,25 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	var cfg *rustpushgo.WrappedOsConfig
 	var err error
 
-	if meta.DeviceID != "" {
-		cfg, err = rustpushgo.CreateLocalMacosConfigWithDeviceId(meta.DeviceID)
+	if meta.HardwareKey != "" {
+		// Cross-platform mode: use hardware key with open-absinthe NAC emulation.
+		if meta.DeviceID != "" {
+			cfg, err = rustpushgo.CreateConfigFromHardwareKeyWithDeviceId(meta.HardwareKey, meta.DeviceID)
+		} else {
+			cfg, err = rustpushgo.CreateConfigFromHardwareKey(meta.HardwareKey)
+		}
+	} else if isRunningOnMacOS() {
+		// Local macOS mode: use IOKit + AAAbsintheContext.
+		if meta.DeviceID != "" {
+			cfg, err = rustpushgo.CreateLocalMacosConfigWithDeviceId(meta.DeviceID)
+		} else {
+			cfg, err = rustpushgo.CreateLocalMacosConfig()
+		}
 	} else {
-		cfg, err = rustpushgo.CreateLocalMacosConfig()
+		return fmt.Errorf("no hardware key configured and not running on macOS — re-login with 'External Key' flow")
 	}
 	if err != nil {
-		return fmt.Errorf("failed to create local config: %w", err)
+		return fmt.Errorf("failed to create config: %w", err)
 	}
 
 	usersStr := &meta.IDSUsers

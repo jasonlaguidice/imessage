@@ -272,6 +272,17 @@ void* uniffi_rustpushgo_fn_func_connect(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_func_create_config_from_hardware_key(
+	RustBuffer base64_key,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_func_create_config_from_hardware_key_with_device_id(
+	RustBuffer base64_key,
+	RustBuffer device_id,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_func_create_local_macos_config(
 	RustCallStatus* out_status
 );
@@ -603,6 +614,14 @@ void ffi_rustpushgo_rust_future_complete_void(
 );
 
 uint16_t uniffi_rustpushgo_checksum_func_connect(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_func_create_config_from_hardware_key(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_func_create_config_from_hardware_key_with_device_id(
 	RustCallStatus* out_status
 );
 

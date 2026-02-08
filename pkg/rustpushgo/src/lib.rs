@@ -1,4 +1,5 @@
 pub mod util;
+#[cfg(target_os = "macos")]
 pub mod local_config;
 #[cfg(test)]
 mod test_hwinfo;
@@ -440,21 +441,99 @@ pub fn init_logger() {
 
 /// Create a local macOS config that reads hardware info from IOKit
 /// and uses AAAbsintheContext for NAC validation (no SIP disable, no relay needed).
+/// Only works on macOS — returns an error on other platforms.
 #[uniffi::export]
 pub fn create_local_macos_config() -> Result<Arc<WrappedOSConfig>, WrappedError> {
-    let config = local_config::LocalMacOSConfig::new()
-        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?;
+    #[cfg(target_os = "macos")]
+    {
+        let config = local_config::LocalMacOSConfig::new()
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?;
+        Ok(Arc::new(WrappedOSConfig {
+            config: Arc::new(config),
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(WrappedError::GenericError {
+            msg: "Local macOS config is only available on macOS. Use create_config_from_hardware_key instead.".into(),
+        })
+    }
+}
+
+/// Create a local macOS config with a persisted device ID.
+/// Only works on macOS — returns an error on other platforms.
+#[uniffi::export]
+pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    #[cfg(target_os = "macos")]
+    {
+        let config = local_config::LocalMacOSConfig::new()
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
+            .with_device_id(device_id);
+        Ok(Arc::new(WrappedOSConfig {
+            config: Arc::new(config),
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(WrappedError::GenericError {
+            msg: "Local macOS config is only available on macOS. Use create_config_from_hardware_key_with_device_id instead.".into(),
+        })
+    }
+}
+
+/// Create a cross-platform config from a base64-encoded JSON hardware key.
+///
+/// The hardware key is a JSON-serialized `HardwareConfig` extracted once from
+/// a real Mac (e.g., via copper's QR code tool). This config uses the
+/// open-absinthe NAC emulator to generate fresh validation data on any platform.
+#[uniffi::export]
+pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use rustpush::macos::{MacOSConfig, HardwareConfig};
+
+    let json_bytes = STANDARD.decode(base64_key.trim())
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
+    let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+
+    let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let config = MacOSConfig {
+        inner: hw,
+        version: "15.3".to_string(),
+        protocol_version: 1640,
+        device_id,
+        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        udid: None,
+    };
+
     Ok(Arc::new(WrappedOSConfig {
         config: Arc::new(config),
     }))
 }
 
-/// Create a local macOS config with a persisted device ID.
+/// Create a cross-platform config from a base64-encoded JSON hardware key
+/// with a persisted device ID.
 #[uniffi::export]
-pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
-    let config = local_config::LocalMacOSConfig::new()
-        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to read hardware info: {}", e) })?
-        .with_device_id(device_id);
+pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use rustpush::macos::{MacOSConfig, HardwareConfig};
+
+    let json_bytes = STANDARD.decode(base64_key.trim())
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
+    let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+
+    let config = MacOSConfig {
+        inner: hw,
+        version: "15.3".to_string(),
+        protocol_version: 1640,
+        device_id,
+        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
+        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+        udid: None,
+    };
+
     Ok(Arc::new(WrappedOSConfig {
         config: Arc::new(config),
     }))
