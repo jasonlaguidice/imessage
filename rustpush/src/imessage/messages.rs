@@ -2791,6 +2791,9 @@ impl MessageInst {
                 })
             )?;
             msg.sent_timestamp = system_recv.duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+            // Override sender: the APS wrapper's sender is our own number (iPhone
+            // relaying the SMS), but the actual SMS sender is in the `h` field.
+            msg.sender = Some(format!("tel:{}", loaded.sender));
             return Ok(msg);
         }
         if let Ok(loaded) = plist::from_value::<RawSmsOutgoingMessage>(&value) {
