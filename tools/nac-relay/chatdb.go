@@ -109,8 +109,16 @@ func installAppBundle() (string, error) {
 	<string>APPL</string>
 	<key>CFBundleVersion</key>
 	<string>1.0</string>
-	<key>LSBackgroundOnly</key>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
 	<true/>
+	<key>NSContactsUsageDescription</key>
+	<string>nac-relay needs access to your contacts to provide contact names for bridged iMessage conversations.</string>
 </dict>
 </plist>`
 	if err := os.WriteFile(filepath.Join(appDir, "Contents", "Info.plist"), []byte(infoPlist), 0644); err != nil {
@@ -133,15 +141,17 @@ func installAppBundle() (string, error) {
 		return "", fmt.Errorf("failed to write binary to .app bundle: %w", err)
 	}
 
-	// Ad-hoc codesign the .app bundle so macOS treats it as a proper app
+	// Codesign so macOS recognizes it as a proper app for TCC prompts
 	exec.Command("codesign", "--force", "--sign", "-", appDir).Run()
 
 	log.Printf("Installed .app bundle: %s", appDir)
 	return destPath, nil
 }
 
-// runSetup creates the .app bundle, triggers TCC registration for Full Disk
-// Access, and installs/updates the LaunchAgent to point to the .app binary.
+// runSetup installs the .app bundle and LaunchAgent plist, then starts
+// the service. Permissions (FDA, Contacts) are handled automatically on
+// first run — macOS shows system prompts when the relay tries to access
+// chat.db and contacts.
 func runSetup() {
 	log.Println("=== nac-relay setup ===")
 	log.Println()
@@ -152,29 +162,10 @@ func runSetup() {
 	if err != nil {
 		log.Fatalf("Failed to install .app bundle: %v", err)
 	}
-	log.Printf("✓ Binary installed at %s", binPath)
+	log.Printf("✓ Installed: %s", binPath)
 	log.Println()
 
-	// Step 2: Full Disk Access — the .app bundle will appear in System Settings
-	log.Println("Checking Full Disk Access...")
-	db, err := openChatDB()
-	if err != nil {
-		promptForFDA()
-		log.Println("Waiting for Full Disk Access to be granted...")
-		log.Println("  Look for 'nac-relay' or 'iMessage Bridge Relay' in the FDA list")
-		for {
-			db, err = openChatDB()
-			if err == nil {
-				break
-			}
-			time.Sleep(2 * time.Second)
-		}
-	}
-	db.Close()
-	log.Println("✓ Full Disk Access granted")
-	log.Println()
-
-	// Step 3: Update LaunchAgent to use the .app bundle binary
+	// Step 2: Install LaunchAgent
 	home, _ := os.UserHomeDir()
 	plistPath := filepath.Join(home, "Library", "LaunchAgents", "com.imessage.nac-relay.plist")
 	plistContent := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
@@ -198,26 +189,24 @@ func runSetup() {
 </dict>
 </plist>`, binPath)
 
-	// Unload old service if running
 	exec.Command("launchctl", "unload", plistPath).Run()
-
+	os.MkdirAll(filepath.Dir(plistPath), 0755)
 	if err := os.WriteFile(plistPath, []byte(plistContent), 0644); err != nil {
-		log.Fatalf("Failed to write LaunchAgent plist: %v", err)
+		log.Fatalf("Failed to write LaunchAgent: %v", err)
 	}
-	log.Printf("✓ LaunchAgent updated: %s", plistPath)
+	log.Printf("✓ LaunchAgent: %s", plistPath)
 
-	// Load the service
+	// Step 3: Start the service
 	if err := exec.Command("launchctl", "load", plistPath).Run(); err != nil {
-		log.Printf("WARNING: failed to load LaunchAgent: %v", err)
-		log.Printf("  Run manually: launchctl load %s", plistPath)
+		log.Printf("WARNING: failed to start service: %v", err)
 	} else {
-		log.Println("✓ LaunchAgent started")
+		log.Println("✓ Service started")
 	}
 
 	log.Println()
 	log.Println("=== Setup complete! ===")
-	log.Println("The relay is now running as a background service.")
-	log.Println("Logs: /tmp/nac-relay.log")
+	log.Println("Permissions (FDA, Contacts) will be prompted on first run.")
+	log.Println("Logs: tail -f /tmp/nac-relay.log")
 }
 
 func openChatDB() (*sql.DB, error) {
