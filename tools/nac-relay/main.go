@@ -26,6 +26,7 @@ package main
 
 #import <Contacts/Contacts.h>
 
+
 // Contact store (initialized once)
 static CNContactStore* _contactStore = NULL;
 static int _contactAccess = -1; // -1=unknown, 0=denied, 1=granted
@@ -37,16 +38,19 @@ static void initContactStore() {
     CNAuthorizationStatus status = [CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts];
     if (status == CNAuthorizationStatusAuthorized) {
         _contactAccess = 1;
-    } else if (status == CNAuthorizationStatusNotDetermined) {
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        [_contactStore requestAccessForEntityType:CNEntityTypeContacts completionHandler:^(BOOL granted, NSError *error) {
-            _contactAccess = granted ? 1 : 0;
-            dispatch_semaphore_signal(sem);
-        }];
-        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
     } else {
         _contactAccess = 0;
     }
+}
+
+// requestContactAccess triggers the system prompt. Must be called from
+// a background thread (Go goroutine) so the completion handler doesn't
+// deadlock the main queue.
+static void requestContactAccess() {
+    if (!_contactStore) _contactStore = [[CNContactStore alloc] init];
+    [_contactStore requestAccessForEntityType:CNEntityTypeContacts completionHandler:^(BOOL granted, NSError *error) {
+        _contactAccess = granted ? 1 : 0;
+    }];
 }
 
 // Contact result struct
@@ -123,6 +127,18 @@ static void freeContactResult(ContactResult *r) {
 }
 
 static int getContactAccess() { return _contactAccess; }
+static int getContactAuthStatus() {
+    return (int)[CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts];
+}
+
+static void recheckContactAccess() {
+    CNAuthorizationStatus status = [CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts];
+    _contactAccess = (status == CNAuthorizationStatusAuthorized) ? 1 : 0;
+}
+
+
+
+
 
 // Bulk fetch all contacts
 typedef struct {
@@ -295,7 +311,7 @@ func main() {
 
 	addr := flag.String("addr", "0.0.0.0", "Address to bind to")
 	port := flag.Int("port", 5001, "Port to listen on")
-	setup := flag.Bool("setup", false, "Run interactive setup (FDA + Contacts prompts), then exit")
+	setup := flag.Bool("setup", false, "Install .app bundle and LaunchAgent, then start service")
 	flag.Parse()
 
 	if *setup {
@@ -303,13 +319,58 @@ func main() {
 		return
 	}
 
-	// Initialize contacts
-	C.initContactStore()
-	if C.getContactAccess() == 1 {
+	// Wait for Full Disk Access before doing anything else — same as main app.
+	// FDA must be granted first; contacts prompt only works after FDA is set.
+	db, err := openChatDB()
+	if err != nil {
+		log.Println("Full Disk Access not granted — prompting user")
+		promptForFDA()
+		log.Println("Waiting for Full Disk Access...")
+		for {
+			db, err = openChatDB()
+			if err == nil {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+	db.Close()
+	log.Println("Full Disk Access granted")
+
+	// Request contact access — same pattern as main app:
+	// Check status first, then request from a goroutine (background thread)
+	// so the completion handler doesn't deadlock.
+	authStatus := int(C.getContactAuthStatus())
+	if authStatus == 3 { // CNAuthorizationStatusAuthorized
+		C.initContactStore()
 		log.Println("Contacts access: granted")
+	} else if authStatus == 0 { // CNAuthorizationStatusNotDetermined
+		log.Println("Requesting Contacts access...")
+		done := make(chan struct{})
+		go func() {
+			C.requestContactAccess()
+			// Poll until callback sets the result
+			for C.getContactAccess() == -1 {
+				time.Sleep(100 * time.Millisecond)
+			}
+			close(done)
+		}()
+		// Wait up to 30s for user to respond to prompt
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			log.Println("Contacts prompt timed out")
+		}
+		C.recheckContactAccess()
+		if C.getContactAccess() == 1 {
+			log.Println("Contacts access: granted")
+		} else {
+			log.Println("Contacts access: denied")
+		}
 	} else {
+		C.initContactStore()
 		log.Println("Contacts access: denied (contact lookups will return empty)")
-		log.Println("Grant access in System Settings → Privacy & Security → Contacts")
+		log.Println("Grant in System Settings → Privacy & Security → Contacts")
 	}
 
 	// Initialize chat.db for backfill
