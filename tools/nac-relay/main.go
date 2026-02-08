@@ -213,6 +213,84 @@ static void freeContactList(ContactList *list) {
     }
     free(list->contacts);
 }
+
+// ============================================================================
+// attributedBody decoder — extracts text from NSKeyedArchive blobs
+// ============================================================================
+
+static id jsonSafeObject(id obj);
+
+static NSArray* jsonSafeArray(NSArray* input) {
+    NSMutableArray* output = [[NSMutableArray alloc] initWithCapacity:input.count];
+    for (NSUInteger i = 0; i < input.count; i++) {
+        [output addObject:jsonSafeObject(input[i])];
+    }
+    return output;
+}
+
+static NSDictionary* jsonSafeDict(NSDictionary* input) {
+    NSMutableDictionary* output = [[NSMutableDictionary alloc] init];
+    [input enumerateKeysAndObjectsUsingBlock:^(id key, id obj, BOOL *stop) {
+        [output setObject:jsonSafeObject(obj) forKey:key];
+    }];
+    return output;
+}
+
+static id jsonSafeObject(id obj) {
+    if ([obj isKindOfClass:[NSString class]] || [obj isKindOfClass:[NSNumber class]] || [obj isKindOfClass:[NSNull class]]) {
+        return obj;
+    } else if ([obj isKindOfClass:[NSData class]]) {
+        return [(NSData*)obj base64EncodedStringWithOptions:0];
+    } else if ([obj isKindOfClass:[NSURL class]]) {
+        return ((NSURL*)obj).absoluteString;
+    } else if ([obj isKindOfClass:[NSDictionary class]]) {
+        return jsonSafeDict(obj);
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        return jsonSafeArray(obj);
+    }
+    return @"unknown object";
+}
+
+// decodeAttributedBody takes raw attributedBody bytes and returns a JSON string
+// with {"content":"...","attributes":[...]} or an error string.
+static char* decodeAttributedBody(const void *bytes, int length) {
+    @try {
+        @autoreleasepool {
+            NSData *data = [NSData dataWithBytes:bytes length:length];
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            NSUnarchiver *arch = [[NSUnarchiver alloc] initForReadingWithData:data];
+            NSAttributedString *str = [arch decodeObject];
+            #pragma clang diagnostic pop
+
+            if (!str || str.length == 0) return strdup("");
+
+            NSMutableArray *attrs = [[NSMutableArray alloc] init];
+            [str enumerateAttributesInRange:NSMakeRange(0, [str length])
+                                   options:NSAttributedStringEnumerationLongestEffectiveRangeNotRequired
+                                usingBlock:^(NSDictionary *attributes, NSRange range, BOOL *stop) {
+                [attrs addObject:@{
+                    @"location": [NSNumber numberWithUnsignedInteger:range.location],
+                    @"length": [NSNumber numberWithUnsignedInteger:range.length],
+                    @"values": jsonSafeDict(attributes),
+                }];
+            }];
+
+            NSDictionary *outputDict = @{
+                @"content": str.string,
+                @"attributes": attrs,
+            };
+            NSError *error = NULL;
+            NSData *jsonData = [NSJSONSerialization dataWithJSONObject:outputDict options:0 error:&error];
+            if (!jsonData && error) return strdup("");
+            NSString *jsonString = [[NSString alloc] initWithData:jsonData encoding:NSUTF8StringEncoding];
+            return strdup([jsonString UTF8String]);
+        }
+    }
+    @catch (NSException *err) {
+        return strdup("");
+    }
+}
 */
 import "C"
 
@@ -230,6 +308,20 @@ import (
 	"time"
 	"unsafe"
 )
+
+// decodeAttributedBodyJSON decodes an NSKeyedArchive attributedBody blob
+// and returns the JSON {"content":"...","attributes":[...]} representation.
+func decodeAttributedBodyJSON(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	cResult := C.decodeAttributedBody(unsafe.Pointer(&data[0]), C.int(len(data)))
+	if cResult == nil {
+		return ""
+	}
+	defer C.free(unsafe.Pointer(cResult))
+	return C.GoString(cResult)
+}
 
 var nacMu sync.Mutex // serialize NAC calls (framework may not be thread-safe)
 

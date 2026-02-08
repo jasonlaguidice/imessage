@@ -369,6 +369,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		SELECT
 			message.ROWID, message.guid, message.date,
 			COALESCE(message.subject, ''), COALESCE(message.text, ''),
+			message.attributedBody,
 			chat.guid,
 			COALESCE(sender_handle.id, ''), COALESCE(sender_handle.service, ''),
 			message.is_from_me, message.is_emote, message.is_audio_message,
@@ -425,6 +426,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		var msg RelayMessage
 		var rowID int
 		var dateApple int64
+		var attributedBody []byte
 		var threadOriginatorPart string
 		var tapbackGUID string
 		var tapbackType int
@@ -434,6 +436,7 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		err := rows.Scan(
 			&rowID, &msg.GUID, &dateApple,
 			&msg.Subject, &msg.Text,
+			&attributedBody,
 			&msg.ChatGUID,
 			&senderID, &senderSvc,
 			&msg.IsFromMe, &msg.IsEmote, &msg.IsAudio,
@@ -445,6 +448,20 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Printf("Error scanning message row: %v", err)
 			continue
+		}
+
+		// If text column is empty, decode attributedBody (modern iMessage stores
+		// styled text in an NSKeyedArchive blob instead of the text column)
+		if msg.Text == "" && len(attributedBody) > 0 {
+			decoded := decodeAttributedBodyJSON(attributedBody)
+			if decoded != "" {
+				var ab struct {
+					Content string `json:"content"`
+				}
+				if json.Unmarshal([]byte(decoded), &ab) == nil && ab.Content != "" {
+					msg.Text = strings.TrimSpace(ab.Content)
+				}
+			}
 		}
 
 		msgTime := time.Unix(appleEpoch.Unix(), dateApple)

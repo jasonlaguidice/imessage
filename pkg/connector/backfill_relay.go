@@ -208,6 +208,11 @@ func (br *backfillRelay) FetchMessages(ctx context.Context, params bridgev2.Fetc
 		if msg.ItemType != int(imessage.ItemTypeMessage) || msg.TapbackGUID != "" {
 			continue
 		}
+		// Skip messages with no text and no attachments (empty messages
+		// show as "unsupported message" in clients)
+		if msg.Text == "" && msg.Subject == "" && len(msg.Attachments) == 0 {
+			continue
+		}
 		sender := relayMakeEventSender(msg, c)
 		cm := convertRelayMessage(msg)
 
