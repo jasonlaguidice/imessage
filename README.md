@@ -144,7 +144,7 @@ launchctl load ~/Library/LaunchAgents/com.imessage.nac-relay.plist
 ### Linux Limitations
 
 - **No chat.db backfill** — chat history starts from when you log in
-- **No contact name resolution** — contacts appear by phone number / email
+- **No contact name resolution** without the NAC relay — contacts appear by phone number / email. With the relay running, contacts are resolved from the Mac's Contacts.app (grant Contacts access when prompted)
 
 ## Login
 

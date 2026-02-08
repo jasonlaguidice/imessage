@@ -1,25 +1,127 @@
-// nac-relay: Runs on a Mac and serves NAC validation data over HTTP.
-// The Linux bridge calls this instead of running the x86_64 NAC emulator.
+// nac-relay: Runs on a Mac and serves NAC validation data + contact lookups
+// over HTTP. The Linux bridge calls this instead of running the x86_64 NAC
+// emulator and for contact name resolution.
 //
 // Usage:
 //   go run tools/nac-relay/main.go [-port 5001] [-addr 0.0.0.0]
 //
 // Endpoints:
-//   POST /validation-data → base64-encoded validation data
-//   GET  /health          → "ok"
+//   POST /validation-data             → base64-encoded validation data
+//   GET  /contact?id=+15551234567     → JSON contact info
+//   GET  /health                      → "ok"
 package main
 
 /*
 #cgo CFLAGS: -x objective-c -DNAC_NO_MAIN -fobjc-arc
-#cgo LDFLAGS: -framework Foundation
+#cgo LDFLAGS: -framework Foundation -framework Contacts
 
 // Inline the validation_data.m source
 #include "../../nac-validation/src/validation_data.m"
+
+#import <Contacts/Contacts.h>
+
+// Contact store (initialized once)
+static CNContactStore* _contactStore = NULL;
+static int _contactAccess = -1; // -1=unknown, 0=denied, 1=granted
+
+static void initContactStore() {
+    if (_contactStore) return;
+    _contactStore = [[CNContactStore alloc] init];
+
+    CNAuthorizationStatus status = [CNContactStore authorizationStatusForEntityType:CNEntityTypeContacts];
+    if (status == CNAuthorizationStatusAuthorized) {
+        _contactAccess = 1;
+    } else if (status == CNAuthorizationStatusNotDetermined) {
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [_contactStore requestAccessForEntityType:CNEntityTypeContacts completionHandler:^(BOOL granted, NSError *error) {
+            _contactAccess = granted ? 1 : 0;
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    } else {
+        _contactAccess = 0;
+    }
+}
+
+// Contact result struct
+typedef struct {
+    const char *first_name;
+    const char *last_name;
+    const char *nickname;
+    const char **phones;
+    int phone_count;
+    const char **emails;
+    int email_count;
+    int found;
+} ContactResult;
+
+static ContactResult lookupContact(const char *identifier) {
+    ContactResult r = {0};
+    if (_contactAccess != 1 || !identifier) return r;
+
+    @autoreleasepool {
+        NSString *idStr = [NSString stringWithUTF8String:identifier];
+        NSArray *keysToFetch = @[
+            CNContactGivenNameKey, CNContactFamilyNameKey, CNContactNicknameKey,
+            CNContactEmailAddressesKey, CNContactPhoneNumbersKey,
+        ];
+
+        NSPredicate *predicate;
+        if ([idStr hasPrefix:@"+"]) {
+            CNPhoneNumber *phone = [CNPhoneNumber phoneNumberWithStringValue:idStr];
+            predicate = [CNContact predicateForContactsMatchingPhoneNumber:phone];
+        } else {
+            predicate = [CNContact predicateForContactsMatchingEmailAddress:idStr];
+        }
+
+        NSError *error;
+        NSArray<CNContact*> *contacts = [_contactStore unifiedContactsMatchingPredicate:predicate
+                                                                           keysToFetch:keysToFetch
+                                                                                 error:&error];
+        if (!contacts || contacts.count == 0) return r;
+
+        CNContact *c = contacts[0];
+        r.found = 1;
+        r.first_name = c.givenName ? strdup([c.givenName UTF8String]) : NULL;
+        r.last_name = c.familyName ? strdup([c.familyName UTF8String]) : NULL;
+        r.nickname = c.nickname ? strdup([c.nickname UTF8String]) : NULL;
+
+        r.phone_count = (int)c.phoneNumbers.count;
+        if (r.phone_count > 0) {
+            r.phones = (const char **)malloc(sizeof(char*) * r.phone_count);
+            for (int i = 0; i < r.phone_count; i++) {
+                r.phones[i] = strdup([c.phoneNumbers[i].value.stringValue UTF8String]);
+            }
+        }
+
+        r.email_count = (int)c.emailAddresses.count;
+        if (r.email_count > 0) {
+            r.emails = (const char **)malloc(sizeof(char*) * r.email_count);
+            for (int i = 0; i < r.email_count; i++) {
+                r.emails[i] = strdup([c.emailAddresses[i].value UTF8String]);
+            }
+        }
+    }
+    return r;
+}
+
+static void freeContactResult(ContactResult *r) {
+    if (r->first_name) free((void*)r->first_name);
+    if (r->last_name) free((void*)r->last_name);
+    if (r->nickname) free((void*)r->nickname);
+    for (int i = 0; i < r->phone_count; i++) free((void*)r->phones[i]);
+    for (int i = 0; i < r->email_count; i++) free((void*)r->emails[i]);
+    if (r->phones) free(r->phones);
+    if (r->emails) free(r->emails);
+}
+
+static int getContactAccess() { return _contactAccess; }
 */
 import "C"
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -57,6 +159,53 @@ func generateValidationData() ([]byte, error) {
 	return data, nil
 }
 
+// ContactInfo matches the bridge's imessage.Contact struct
+type ContactInfo struct {
+	FirstName string   `json:"first_name,omitempty"`
+	LastName  string   `json:"last_name,omitempty"`
+	Nickname  string   `json:"nickname,omitempty"`
+	Phones    []string `json:"phones,omitempty"`
+	Emails    []string `json:"emails,omitempty"`
+}
+
+var contactMu sync.Mutex
+
+func lookupContact(identifier string) *ContactInfo {
+	contactMu.Lock()
+	defer contactMu.Unlock()
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	cID := C.CString(identifier)
+	defer C.free(unsafe.Pointer(cID))
+
+	r := C.lookupContact(cID)
+	defer C.freeContactResult(&r)
+
+	if r.found == 0 {
+		return nil
+	}
+
+	info := &ContactInfo{}
+	if r.first_name != nil {
+		info.FirstName = C.GoString(r.first_name)
+	}
+	if r.last_name != nil {
+		info.LastName = C.GoString(r.last_name)
+	}
+	if r.nickname != nil {
+		info.Nickname = C.GoString(r.nickname)
+	}
+	for i := 0; i < int(r.phone_count); i++ {
+		info.Phones = append(info.Phones, C.GoString(*(**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(r.phones)) + uintptr(i)*unsafe.Sizeof(r.phones)))))
+	}
+	for i := 0; i < int(r.email_count); i++ {
+		info.Emails = append(info.Emails, C.GoString(*(**C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(r.emails)) + uintptr(i)*unsafe.Sizeof(r.emails)))))
+	}
+	return info
+}
+
 func main() {
 	if runtime.GOOS != "darwin" {
 		fmt.Fprintln(os.Stderr, "nac-relay must run on macOS")
@@ -66,6 +215,15 @@ func main() {
 	addr := flag.String("addr", "0.0.0.0", "Address to bind to")
 	port := flag.Int("port", 5001, "Port to listen on")
 	flag.Parse()
+
+	// Initialize contacts
+	C.initContactStore()
+	if C.getContactAccess() == 1 {
+		log.Println("Contacts access: granted")
+	} else {
+		log.Println("Contacts access: denied (contact lookups will return empty)")
+		log.Println("Grant access in System Settings → Privacy & Security → Contacts")
+	}
 
 	// Test that NAC works on startup
 	log.Println("Testing NAC validation data generation...")
@@ -93,6 +251,22 @@ func main() {
 		w.Write([]byte(b64))
 		log.Printf("Served %d bytes of validation data in %v (from %s)",
 			len(data), time.Since(start), r.RemoteAddr)
+	})
+
+	http.HandleFunc("/contact", func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			http.Error(w, "missing ?id= parameter", http.StatusBadRequest)
+			return
+		}
+		contact := lookupContact(id)
+		w.Header().Set("Content-Type", "application/json")
+		if contact == nil {
+			w.Write([]byte("null"))
+			return
+		}
+		json.NewEncoder(w).Encode(contact)
+		log.Printf("Contact lookup: %s → %s %s", id, contact.FirstName, contact.LastName)
 	})
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
