@@ -130,6 +130,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		if c.contactRelay != nil {
 			log.Info().Str("relay", c.contactRelay.baseURL).Msg("Contact relay available for name resolution")
 			c.contactRelay.SyncContacts(log)
+			go c.periodicContactRelaySync(log)
 		}
 	}
 }
@@ -847,6 +848,20 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 		case <-c.stopChan:
 			c.persistState(log)
 			log.Debug().Msg("Final state save on disconnect")
+			return
+		}
+	}
+}
+
+// periodicContactRelaySync re-fetches contacts from the relay every 15 minutes.
+func (c *IMClient) periodicContactRelaySync(log zerolog.Logger) {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.contactRelay.SyncContacts(log)
+		case <-c.stopChan:
 			return
 		}
 	}
