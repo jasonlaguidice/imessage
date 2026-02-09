@@ -472,7 +472,7 @@ pub trait UpdateUsersCallback: Send + Sync {
 #[uniffi::export]
 pub fn init_logger() {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "debug");
+        std::env::set_var("RUST_LOG", "info");
     }
     let _ = pretty_env_logger::try_init();
 
