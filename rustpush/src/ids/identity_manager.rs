@@ -368,7 +368,7 @@ impl Resource for IdentityResource {
             debug!("Register failed {}!", err);
             drop(users_lock);
 
-            let needs_relog = matches!(err, PushError::AuthInvalid(6005) | PushError::RegisterFailed(6005));
+            let needs_relog = matches!(err, PushError::AuthInvalid(6005) | PushError::RegisterFailed(6005, _));
             return Err(if needs_relog {
                 info!("Auth returns 6005, relog required!");
                 PushError::DoNotRetry(Box::new(err))
