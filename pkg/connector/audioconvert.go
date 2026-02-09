@@ -87,10 +87,12 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 	var opusHead []byte
 	var channels int
 	var preSkip int
+	var bytesPerPacket int
 	var framesPerPacket int
-	var packetSizes []int
 	var validFrames int64
 	var primingFrames int32
+	var numPackets int64
+	var vlqData []byte
 	var audioData []byte
 
 	// Read chunks
@@ -117,6 +119,7 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 			if formatID != "opus" {
 				return nil, fmt.Errorf("CAF format is %q, not opus", formatID)
 			}
+			bytesPerPacket = int(binary.BigEndian.Uint32(desc[16:20]))
 			framesPerPacket = int(binary.BigEndian.Uint32(desc[20:24]))
 			channels = int(binary.BigEndian.Uint32(desc[24:28]))
 			if chunkSize > 32 {
@@ -144,16 +147,15 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 			if _, err := io.ReadFull(r, paktHdr[:]); err != nil {
 				return nil, err
 			}
-			numPackets := int64(binary.BigEndian.Uint64(paktHdr[0:8]))
+			numPackets = int64(binary.BigEndian.Uint64(paktHdr[0:8]))
 			validFrames = int64(binary.BigEndian.Uint64(paktHdr[8:16]))
 			primingFrames = int32(binary.BigEndian.Uint32(paktHdr[16:20]))
 
 			remaining := chunkSize - 24
-			vlqData := make([]byte, remaining)
+			vlqData = make([]byte, remaining)
 			if _, err := io.ReadFull(r, vlqData); err != nil {
 				return nil, err
 			}
-			packetSizes = decodeCAFVLQs(vlqData, int(numPackets))
 
 		case "data":
 			if chunkSize == -1 {
@@ -180,28 +182,43 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 	if channels == 0 {
 		channels = 1
 	}
-	if framesPerPacket == 0 {
-		framesPerPacket = 960 // 20ms default
-	}
 
 	// Build OpusHead if not found in magic cookie
 	if opusHead == nil {
 		opusHead = buildOpusHead(channels, preSkip)
 	}
 
+	// Decode packet sizes from the pakt chunk (deferred so desc fields are available).
+	// CAF packet table entries contain:
+	//   - byte size (VLQ) if mBytesPerPacket == 0
+	//   - frame count (VLQ) if mFramesPerPacket == 0
+	var packetSizes []int
+	if bytesPerPacket > 0 {
+		// CBR: all packets are the same size, packet table has no byte sizes
+		packetSizes = make([]int, numPackets)
+		for i := range packetSizes {
+			packetSizes[i] = bytesPerPacket
+		}
+	} else if vlqData != nil {
+		hasFrameSize := framesPerPacket == 0
+		packetSizes = decodeCAFPacketSizes(vlqData, int(numPackets), hasFrameSize)
+	} else {
+		return nil, fmt.Errorf("no packet table in CAF")
+	}
+
+	if framesPerPacket == 0 {
+		framesPerPacket = 960 // 20ms default
+	}
+
 	// Split audio data into packets
 	var packets [][]byte
 	offset := 0
-	if len(packetSizes) > 0 {
-		for _, size := range packetSizes {
-			if offset+size > len(audioData) {
-				break
-			}
-			packets = append(packets, audioData[offset:offset+size])
-			offset += size
+	for _, size := range packetSizes {
+		if offset+size > len(audioData) {
+			break
 		}
-	} else {
-		return nil, fmt.Errorf("no packet table in CAF")
+		packets = append(packets, audioData[offset:offset+size])
+		offset += size
 	}
 
 	// Calculate granule position
@@ -219,11 +236,14 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 	}, nil
 }
 
-// decodeCAFVLQs decodes n variable-length quantities from data.
-func decodeCAFVLQs(data []byte, n int) []int {
+// decodeCAFPacketSizes decodes n packet byte-sizes from VLQ-encoded data.
+// When hasFrameSize is true, each entry has two VLQs (byte size + frame count)
+// and the frame count is skipped.
+func decodeCAFPacketSizes(data []byte, n int, hasFrameSize bool) []int {
 	sizes := make([]int, 0, n)
 	pos := 0
 	for i := 0; i < n && pos < len(data); i++ {
+		// Read byte size VLQ
 		val := 0
 		for pos < len(data) {
 			b := data[pos]
@@ -234,6 +254,16 @@ func decodeCAFVLQs(data []byte, n int) []int {
 			}
 		}
 		sizes = append(sizes, val)
+		// Skip frame count VLQ if present
+		if hasFrameSize {
+			for pos < len(data) {
+				b := data[pos]
+				pos++
+				if b&0x80 == 0 {
+					break
+				}
+			}
+		}
 	}
 	return sizes
 }
@@ -294,22 +324,27 @@ func writeOGGOpus(info *oggOpusInfo) ([]byte, error) {
 	writeOGGPage(&buf, serial, seq, 0, 0x00, [][]byte{tags})
 	seq++
 
-	// Audio pages: pack multiple packets per page (max ~48KB per page)
+	// Audio pages: pack multiple packets per page (max ~48KB, max 255 segments)
 	const maxPagePayload = 48000
+	const maxSegments = 255
 	var pagePackets [][]byte
 	var pageSize int
+	var pageSegs int
 	var granule int64
 	framesPerPacket := opusPacketFrames(info.Packets[0])
 
 	for i, pkt := range info.Packets {
-		if pageSize+len(pkt) > maxPagePayload && len(pagePackets) > 0 {
+		pktSegs := len(pkt)/255 + 1
+		if (pageSize+len(pkt) > maxPagePayload || pageSegs+pktSegs > maxSegments) && len(pagePackets) > 0 {
 			writeOGGPage(&buf, serial, seq, granule, 0x00, pagePackets)
 			seq++
 			pagePackets = nil
 			pageSize = 0
+			pageSegs = 0
 		}
 		pagePackets = append(pagePackets, pkt)
 		pageSize += len(pkt)
+		pageSegs += pktSegs
 		granule = int64(info.PreSkip) + int64(i+1)*int64(framesPerPacket)
 		if granule > info.GranulePos {
 			granule = info.GranulePos

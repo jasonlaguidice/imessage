@@ -498,17 +498,32 @@ func (br *backfillRelay) convertRelayAttachment(ctx context.Context, intent brid
 		mimeType = "application/octet-stream"
 	}
 
+	// Convert CAF Opus voice messages to OGG Opus for Matrix/Beeper clients
+	fileName := att.FileName
+	var durationMs int
+	if mimeType == "audio/x-caf" || strings.HasSuffix(strings.ToLower(fileName), ".caf") {
+		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+	}
+
 	content := &event.MessageEventContent{
 		MsgType: mimeToMsgType(mimeType),
-		Body:    att.FileName,
+		Body:    fileName,
 		Info: &event.FileInfo{
 			MimeType: mimeType,
 			Size:     len(data),
 		},
 	}
 
+	// Mark as voice message if this was a CAF voice recording
+	if durationMs > 0 {
+		content.MSC3245Voice = &event.MSC3245Voice{}
+		content.MSC1767Audio = &event.MSC1767Audio{
+			Duration: durationMs,
+		}
+	}
+
 	if intent != nil {
-		url, encFile, err := intent.UploadMedia(ctx, "", data, att.FileName, mimeType)
+		url, encFile, err := intent.UploadMedia(ctx, "", data, fileName, mimeType)
 		if err != nil {
 			return nil, fmt.Errorf("failed to upload attachment: %w", err)
 		}

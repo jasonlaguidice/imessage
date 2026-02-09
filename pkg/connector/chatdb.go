@@ -177,19 +177,26 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			continue
 		}
 		sender := chatDBMakeEventSender(msg, c)
-		cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg)
-		if err != nil {
-			continue
-		}
 
-		backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
-			ConvertedMessage: cm,
-			Sender:           sender,
-			ID:               makeMessageID(msg.GUID),
-			TxnID:            networkid.TransactionID(msg.GUID),
-			Timestamp:        msg.Time,
-			StreamOrder:      msg.Time.UnixMilli(),
-		})
+		// Strip U+FFFC (object replacement character) — inline attachment
+		// placeholders from NSAttributedString that render as blank
+		msg.Text = strings.ReplaceAll(msg.Text, "\uFFFC", "")
+		msg.Text = strings.TrimSpace(msg.Text)
+
+		// Only create a text part if there's actual text content
+		if msg.Text != "" || msg.Subject != "" {
+			cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg)
+			if err == nil {
+				backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
+					ConvertedMessage: cm,
+					Sender:           sender,
+					ID:               makeMessageID(msg.GUID),
+					TxnID:            networkid.TransactionID(msg.GUID),
+					Timestamp:        msg.Time,
+					StreamOrder:      msg.Time.UnixMilli(),
+				})
+			}
+		}
 
 		for i, att := range msg.Attachments {
 			if att == nil {
@@ -371,6 +378,12 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 		return nil, fmt.Errorf("failed to read attachment %s: %w", att.PathOnDisk, err)
 	}
 
+	// Convert CAF Opus voice messages to OGG Opus for Matrix/Beeper clients
+	var durationMs int
+	if mimeType == "audio/x-caf" || strings.HasSuffix(strings.ToLower(fileName), ".caf") {
+		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+	}
+
 	content := &event.MessageEventContent{
 		MsgType: mimeToMsgType(mimeType),
 		Body:    fileName,
@@ -378,6 +391,14 @@ func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, inten
 			MimeType: mimeType,
 			Size:     len(data),
 		},
+	}
+
+	// Mark as voice message if this was a CAF voice recording
+	if durationMs > 0 {
+		content.MSC3245Voice = &event.MSC3245Voice{}
+		content.MSC1767Audio = &event.MSC1767Audio{
+			Duration: durationMs,
+		}
 	}
 
 	if intent != nil {
