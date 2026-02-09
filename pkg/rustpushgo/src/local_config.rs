@@ -127,7 +127,10 @@ pub struct LocalMacOSConfig {
 impl LocalMacOSConfig {
     pub fn new() -> Result<Self, String> {
         let hw = HardwareInfo::read()?;
-        let device_id = Uuid::new_v4().to_string().to_uppercase();
+        // Use the real hardware UUID as device ID — AAAbsintheContext
+        // embeds the real hardware UUID in validation data, so a random
+        // UUID would cause Apple to reject the registration (error 6001).
+        let device_id = hw.platform_uuid.to_uppercase();
 
         // Build UA strings using the real Darwin version from this Mac
         // instead of hardcoding values from a different macOS release.
@@ -147,8 +150,17 @@ impl LocalMacOSConfig {
         })
     }
 
-    pub fn with_device_id(mut self, id: String) -> Self {
-        self.device_id = id;
+    pub fn with_device_id(self, id: String) -> Self {
+        // For LocalMacOSConfig, the device ID must always be the hardware
+        // UUID because AAAbsintheContext embeds it in the validation data.
+        // Ignore any persisted device ID — it may be a stale random UUID
+        // from before this fix.
+        if id != self.device_id {
+            log::warn!(
+                "Ignoring persisted device ID {} — LocalMacOSConfig must use hardware UUID {}",
+                id, self.device_id
+            );
+        }
         self
     }
 }
