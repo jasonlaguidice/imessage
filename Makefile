@@ -52,6 +52,7 @@ ifeq ($(UNAME_S),Darwin)
 	missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
+	command -v cmake >/dev/null 2>&1 || missing="$$missing cmake"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
 	if [ -n "$$missing" ]; then \
