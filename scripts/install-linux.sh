@@ -21,6 +21,8 @@ if [ -f "$CONFIG" ]; then
 else
     echo "Generating config..."
     "$BINARY" -g -c "$CONFIG" -r "$REGISTRATION"
+    # Make DB path absolute so it doesn't depend on working directory
+    sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
     echo "✓ Config generated at $CONFIG"
 fi
 
