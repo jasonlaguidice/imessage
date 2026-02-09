@@ -541,9 +541,23 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
 /// The hardware key is a JSON-serialized `HardwareConfig` extracted once from
 /// a real Mac (e.g., via copper's QR code tool). This config uses the
 /// open-absinthe NAC emulator to generate fresh validation data on any platform.
-#[cfg(feature = "hardware-key")]
+///
+/// On macOS this is not needed (use `create_local_macos_config` instead).
+/// Building with the `hardware-key` feature links open-absinthe + unicorn.
 #[uniffi::export]
 pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    _create_config_from_hardware_key_inner(base64_key, None)
+}
+
+/// Create a cross-platform config from a base64-encoded JSON hardware key
+/// with a persisted device ID.
+#[uniffi::export]
+pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    _create_config_from_hardware_key_inner(base64_key, Some(device_id))
+}
+
+#[cfg(feature = "hardware-key")]
+fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use rustpush::macos::{MacOSConfig, HardwareConfig};
 
@@ -552,7 +566,7 @@ pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<Wrapped
     let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
 
-    let device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    let device_id = device_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string().to_uppercase());
 
     // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig
     let (hw, nac_relay_url) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
@@ -581,40 +595,14 @@ pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<Wrapped
     }))
 }
 
-/// Create a cross-platform config from a base64-encoded JSON hardware key
-/// with a persisted device ID.
-#[cfg(feature = "hardware-key")]
-#[uniffi::export]
-pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
-    use base64::{Engine, engine::general_purpose::STANDARD};
-    use rustpush::macos::{MacOSConfig, HardwareConfig};
-
-    let clean_key: String = base64_key.chars().filter(|c| !c.is_whitespace()).collect();
-    let json_bytes = STANDARD.decode(&clean_key)
-        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
-
-    let (hw, nac_relay_url) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
-        (full.inner, full.nac_relay_url)
-    } else {
-        let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
-            .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
-        (hw, None)
-    };
-
-    let config = MacOSConfig {
-        inner: hw,
-        version: "15.3".to_string(),
-        protocol_version: 1640,
-        device_id,
-        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-        udid: None,
-        nac_relay_url,
-    };
-
-    Ok(Arc::new(WrappedOSConfig {
-        config: Arc::new(config),
-    }))
+#[cfg(not(feature = "hardware-key"))]
+fn _create_config_from_hardware_key_inner(base64_key: String, _device_id: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    let _ = base64_key;
+    Err(WrappedError::GenericError {
+        msg: "Hardware key support not available in this build. \
+              On macOS, use the Apple ID login flow instead (which uses native validation). \
+              To enable hardware key support, rebuild with: cargo build --features hardware-key".into(),
+    })
 }
 
 #[uniffi::export(async_runtime = "tokio")]
