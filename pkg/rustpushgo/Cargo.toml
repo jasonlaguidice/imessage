@@ -7,10 +7,6 @@ edition = "2021"
 crate-type = ["staticlib", "rlib"]
 name = "rustpushgo"
 
-[[bin]]
-name = "imessage-login"
-path = "src/login_cli.rs"
-
 [features]
 # hardware-key enables open-absinthe (x86 NAC emulator via unicorn-engine).
 # Required on Linux; unnecessary on macOS (native AAAbsintheContext is used).
