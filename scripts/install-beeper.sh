@@ -78,6 +78,9 @@ if [ -f "$CONFIG" ]; then
 else
     echo "Generating Beeper config..."
     "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
+    # Make DB path absolute so it doesn't depend on working directory
+    DATA_ABS_TMP="$(cd "$DATA_DIR" && pwd)"
+    sed -i '' "s|uri: file:mautrix-imessage.db|uri: file:$DATA_ABS_TMP/mautrix-imessage.db|" "$CONFIG"
     echo "✓ Config saved to $CONFIG"
 fi
 
@@ -87,6 +90,34 @@ if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     echo "  Try: rm $CONFIG && re-run make install-beeper"
     echo ""
     exit 1
+fi
+
+# ── Check for existing login / prompt if needed ──────────────
+DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+NEEDS_LOGIN=false
+
+if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
+    NEEDS_LOGIN=true
+elif command -v sqlite3 >/dev/null 2>&1; then
+    LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
+    if [ "$LOGIN_COUNT" = "0" ]; then
+        NEEDS_LOGIN=true
+    fi
+fi
+
+if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No iMessage login found — starting login...    │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    "$BINARY" login -c "$CONFIG"
+    echo ""
+elif [ "$NEEDS_LOGIN" = "true" ]; then
+    echo ""
+    echo "  ⚠ No iMessage login found. Run interactively to log in:"
+    echo "    $BINARY login -c $CONFIG"
+    echo ""
 fi
 
 # ── Full Disk Access check ────────────────────────────────────
@@ -184,15 +215,13 @@ for i in $(seq 1 15); do
         echo "✓ Bridge is running"
         echo ""
         echo "═══════════════════════════════════════════════"
-        echo "  Next: Open Beeper and DM"
-        echo "    @${BRIDGE_NAME}bot:$DOMAIN"
-        echo "  Send: login"
+        echo "  Setup Complete"
         echo "═══════════════════════════════════════════════"
         echo ""
-        echo "Logs:    tail -f $LOG_OUT"
-        echo "Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
-        echo "Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
-        echo "Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
+        echo "  Logs:    tail -f $LOG_OUT"
+        echo "  Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
+        echo "  Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
+        echo "  Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
         exit 0
     fi
     sleep 1
