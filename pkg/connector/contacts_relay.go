@@ -33,9 +33,11 @@ func newContactRelayFromKey(hardwareKey string) *contactRelayClient {
 		return nil
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(hardwareKey))
+	// Strip all non-base64 characters (Beeper UI can inject non-breaking spaces, newlines, etc.)
+	cleaned := stripNonBase64(hardwareKey)
+	decoded, err := base64.StdEncoding.DecodeString(cleaned)
 	if err != nil {
-		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(hardwareKey))
+		decoded, err = base64.RawStdEncoding.DecodeString(cleaned)
 		if err != nil {
 			return nil
 		}
@@ -61,6 +63,19 @@ func newContactRelayFromKey(hardwareKey string) *contactRelayClient {
 		byPhone: make(map[string]*imessage.Contact),
 		byEmail: make(map[string]*imessage.Contact),
 	}
+}
+
+// stripNonBase64 removes all characters that are not valid in base64 encoding.
+// This handles garbage injected by chat UIs (non-breaking spaces, newlines, etc.).
+func stripNonBase64(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '+' || r == '/' || r == '=' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // normalizePhone strips all non-digit characters (except leading +).
