@@ -35,6 +35,10 @@ type UserLoginMetadata struct {
 	// Hardware key for cross-platform (non-macOS) operation.
 	// Base64-encoded JSON HardwareConfig extracted from a real Mac.
 	HardwareKey string `json:"hardware_key,omitempty"`
+
+	// PreferredHandle is the user-chosen handle for outgoing messages
+	// (e.g. "tel:+15551234567" or "mailto:user@example.com").
+	PreferredHandle string `json:"preferred_handle,omitempty"`
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {

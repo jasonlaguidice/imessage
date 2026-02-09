@@ -91,6 +91,16 @@ impl WrappedIDSUsers {
     pub fn login_id(&self, i: u64) -> String {
         self.inner[i as usize].user_id.clone()
     }
+
+    pub fn get_handles(&self) -> Vec<String> {
+        self.inner.iter()
+            .flat_map(|user| {
+                user.registration.get("com.apple.madrid")
+                    .map(|reg| reg.handles.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
 }
 
 #[derive(uniffi::Object)]

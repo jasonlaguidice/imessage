@@ -27,11 +27,12 @@ const (
 	LoginStepAppleIDPassword = "fi.mau.imessage.login.appleid"
 	LoginStepExternalKey     = "fi.mau.imessage.login.externalkey"
 	LoginStepTwoFactor       = "fi.mau.imessage.login.2fa"
+	LoginStepSelectHandle    = "fi.mau.imessage.login.select_handle"
 	LoginStepComplete        = "fi.mau.imessage.login.complete"
 )
 
 // AppleIDLogin implements the multi-step login flow:
-// Apple ID + password → 2FA code → IDS registration → connected.
+// Apple ID + password → 2FA code → IDS registration → handle selection → connected.
 type AppleIDLogin struct {
 	User     *bridgev2.User
 	Main     *IMConnector
@@ -39,6 +40,8 @@ type AppleIDLogin struct {
 	cfg      *rustpushgo.WrappedOsConfig
 	conn     *rustpushgo.WrappedApsConnection
 	session  *rustpushgo.LoginSession
+	result   *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle   string                                  // chosen handle
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -75,6 +78,12 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 }
 
 func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	// Handle selection step (after IDS registration)
+	if l.result != nil {
+		l.handle = input["handle"]
+		return l.completeLogin(ctx)
+	}
+
 	// Step 1: Apple ID + password
 	if l.session == nil {
 		username := input["username"]
@@ -141,57 +150,30 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
 	}
+	l.result = &result
 
-	client := &IMClient{
-		Main:          l.Main,
-		config:        l.cfg,
-		users:         result.Users,
-		identity:      result.Identity,
-		connection:    l.conn,
-		recentUnsends: make(map[string]time.Time),
-		smsPortals:    make(map[string]bool),
+	handles := result.Users.GetHandles()
+	if step := handleSelectionStep(handles); step != nil {
+		return step, nil
 	}
+	// Single handle — skip selection
+	if len(handles) > 0 {
+		l.handle = handles[0]
+	}
+	return l.completeLogin(ctx)
+}
 
-	loginID := networkid.UserLoginID(result.Users.LoginId(0))
-
+func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	meta := &UserLoginMetadata{
-		Platform:    "rustpush-local",
-		APSState:    l.conn.State().ToString(),
-		IDSUsers:    result.Users.ToString(),
-		IDSIdentity: result.Identity.ToString(),
-		DeviceID:    l.cfg.GetDeviceId(),
+		Platform:        "rustpush-local",
+		APSState:        l.conn.State().ToString(),
+		IDSUsers:        l.result.Users.ToString(),
+		IDSIdentity:     l.result.Identity.ToString(),
+		DeviceID:        l.cfg.GetDeviceId(),
+		PreferredHandle: l.handle,
 	}
 
-	ul, err := l.User.NewLogin(ctx, &database.UserLogin{
-		ID:         loginID,
-		RemoteName: l.username,
-		RemoteProfile: status.RemoteProfile{
-			Name: l.username,
-		},
-		Metadata: meta,
-	}, &bridgev2.NewLoginParams{
-		DeleteOnConflict: true,
-		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
-			client.UserLogin = login
-			login.Client = client
-			return nil
-		},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create user login: %w", err)
-	}
-
-	go client.Connect(context.Background())
-
-	return &bridgev2.LoginStep{
-		Type:         bridgev2.LoginStepTypeComplete,
-		StepID:       LoginStepComplete,
-		Instructions: "Successfully logged in to iMessage. Bridge is starting.",
-		CompleteParams: &bridgev2.LoginCompleteParams{
-			UserLoginID: ul.ID,
-			UserLogin:   ul,
-		},
-	}, nil
+	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
 }
 
 // ============================================================================
@@ -199,7 +181,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 // ============================================================================
 
 // ExternalKeyLogin implements the multi-step login flow for non-macOS platforms:
-// Hardware key → Apple ID + password → 2FA code → IDS registration → connected.
+// Hardware key → Apple ID + password → 2FA code → IDS registration → handle selection → connected.
 type ExternalKeyLogin struct {
 	User        *bridgev2.User
 	Main        *IMConnector
@@ -208,6 +190,8 @@ type ExternalKeyLogin struct {
 	cfg         *rustpushgo.WrappedOsConfig
 	conn        *rustpushgo.WrappedApsConnection
 	session     *rustpushgo.LoginSession
+	result      *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle      string                                  // chosen handle
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -232,6 +216,12 @@ func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, erro
 }
 
 func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	// Handle selection step (after IDS registration)
+	if l.result != nil {
+		l.handle = input["handle"]
+		return l.completeLogin(ctx)
+	}
+
 	// Step 1: Hardware key
 	if l.cfg == nil {
 		hwKey := input["hardware_key"]
@@ -330,33 +320,88 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
 	}
+	l.result = &result
 
+	handles := result.Users.GetHandles()
+	if step := handleSelectionStep(handles); step != nil {
+		return step, nil
+	}
+	// Single handle — skip selection
+	if len(handles) > 0 {
+		l.handle = handles[0]
+	}
+	return l.completeLogin(ctx)
+}
+
+func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
+	meta := &UserLoginMetadata{
+		Platform:        "rustpush-external-key",
+		APSState:        l.conn.State().ToString(),
+		IDSUsers:        l.result.Users.ToString(),
+		IDSIdentity:     l.result.Identity.ToString(),
+		DeviceID:        l.cfg.GetDeviceId(),
+		HardwareKey:     l.hardwareKey,
+		PreferredHandle: l.handle,
+	}
+
+	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
+}
+
+// ============================================================================
+// Shared login helpers
+// ============================================================================
+
+// handleSelectionStep returns a login step prompting the user to pick a handle,
+// or nil if there are fewer than 2 handles (no choice needed).
+func handleSelectionStep(handles []string) *bridgev2.LoginStep {
+	if len(handles) < 2 {
+		return nil
+	}
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepSelectHandle,
+		Instructions: "Choose which identity to use for outgoing iMessages.\n" +
+			"This is what recipients will see your messages \"from\".",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type:    bridgev2.LoginInputFieldTypeSelect,
+				ID:      "handle",
+				Name:    "Send messages as",
+				Options: handles,
+			}},
+		},
+	}
+}
+
+// completeLoginWithMeta is the shared tail of both login flows: creates the
+// IMClient, persists metadata, and starts the bridge connection.
+func completeLoginWithMeta(
+	ctx context.Context,
+	user *bridgev2.User,
+	main *IMConnector,
+	username string,
+	cfg *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
+	result *rustpushgo.IdsUsersWithIdentityRecord,
+	meta *UserLoginMetadata,
+) (*bridgev2.LoginStep, error) {
 	client := &IMClient{
-		Main:          l.Main,
-		config:        l.cfg,
+		Main:          main,
+		config:        cfg,
 		users:         result.Users,
 		identity:      result.Identity,
-		connection:    l.conn,
+		connection:    conn,
 		recentUnsends: make(map[string]time.Time),
 		smsPortals:    make(map[string]bool),
 	}
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 
-	meta := &UserLoginMetadata{
-		Platform:    "rustpush-external-key",
-		APSState:    l.conn.State().ToString(),
-		IDSUsers:    result.Users.ToString(),
-		IDSIdentity: result.Identity.ToString(),
-		DeviceID:    l.cfg.GetDeviceId(),
-		HardwareKey: l.hardwareKey,
-	}
-
-	ul, err := l.User.NewLogin(ctx, &database.UserLogin{
+	ul, err := user.NewLogin(ctx, &database.UserLogin{
 		ID:         loginID,
-		RemoteName: l.username,
+		RemoteName: username,
 		RemoteProfile: status.RemoteProfile{
-			Name: l.username,
+			Name: username,
 		},
 		Metadata: meta,
 	}, &bridgev2.NewLoginParams{
@@ -376,7 +421,7 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeComplete,
 		StepID:       LoginStepComplete,
-		Instructions: "Successfully logged in to iMessage via external key. Bridge is starting.",
+		Instructions: "Successfully logged in to iMessage. Bridge is starting.",
 		CompleteParams: &bridgev2.LoginCompleteParams{
 			UserLoginID: ul.ID,
 			UserLogin:   ul,
