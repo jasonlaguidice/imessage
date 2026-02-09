@@ -15,42 +15,135 @@ echo "════════════════════════�
 echo ""
 
 # ── Generate config ───────────────────────────────────────────
+FIRST_RUN=false
 mkdir -p "$DATA_DIR"
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
 else
-    echo "Generating config..."
-    "$BINARY" -g -c "$CONFIG" -r "$REGISTRATION"
-    # Make DB path absolute so it doesn't depend on working directory
-    sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
-    echo "✓ Config generated at $CONFIG"
+    FIRST_RUN=true
+
+    read -p "Homeserver URL [http://localhost:8008]: " HS_ADDRESS
+    HS_ADDRESS="${HS_ADDRESS:-http://localhost:8008}"
+
+    read -p "Homeserver domain (the server_name, e.g. example.com): " HS_DOMAIN
+    if [ -z "$HS_DOMAIN" ]; then
+        echo "ERROR: Domain is required." >&2
+        exit 1
+    fi
+
+    read -p "Your Matrix ID [@you:$HS_DOMAIN]: " ADMIN_USER
+    ADMIN_USER="${ADMIN_USER:-@you:$HS_DOMAIN}"
+
+    echo ""
+    echo "Database:"
+    echo "  1) PostgreSQL (recommended)"
+    echo "  2) SQLite"
+    read -p "Choice [1]: " DB_CHOICE
+    DB_CHOICE="${DB_CHOICE:-1}"
+
+    if [ "$DB_CHOICE" = "1" ]; then
+        DB_TYPE="postgres"
+        read -p "PostgreSQL URI [postgres://localhost/mautrix_imessage?sslmode=disable]: " DB_URI
+        DB_URI="${DB_URI:-postgres://localhost/mautrix_imessage?sslmode=disable}"
+    else
+        DB_TYPE="sqlite3-fk-wal"
+        DB_URI="file:$DATA_DIR/mautrix-imessage.db?_txlock=immediate"
+    fi
+
+    echo ""
+
+    # Generate example config, then patch in user values
+    "$BINARY" -c "$CONFIG" -e 2>/dev/null
+    echo "✓ Generated config"
+
+    python3 -c "
+import re, sys
+text = open('$CONFIG').read()
+
+def patch(text, key, val):
+    return re.sub(
+        r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$',
+        r'\1 ' + val,
+        text, count=1, flags=re.MULTILINE
+    )
+
+text = patch(text, 'address', '$HS_ADDRESS')
+text = patch(text, 'domain', '$HS_DOMAIN')
+text = patch(text, 'type', '$DB_TYPE')
+text = patch(text, 'uri', '$DB_URI')
+
+lines = text.split('\n')
+in_perms = False
+for i, line in enumerate(lines):
+    if 'permissions:' in line and not line.strip().startswith('#'):
+        in_perms = True
+        continue
+    if in_perms and line.strip() and not line.strip().startswith('#'):
+        indent = len(line) - len(line.lstrip())
+        lines[i] = ' ' * indent + '\"$ADMIN_USER\": admin'
+        break
+text = '\n'.join(lines)
+
+open('$CONFIG', 'w').write(text)
+"
+    echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
 fi
 
-# ── Collect homeserver details ────────────────────────────────
-if ! grep -q "address:" "$CONFIG" 2>/dev/null || grep -q "address: https://example.com" "$CONFIG" 2>/dev/null; then
-    echo ""
-    read -p "Homeserver URL (e.g. https://matrix.example.com): " HS_URL
-    read -p "Homeserver domain (e.g. example.com): " HS_DOMAIN
-    read -p "Your Matrix ID (e.g. @you:example.com): " MATRIX_ID
+# ── Generate registration ────────────────────────────────────
+if [ -f "$REGISTRATION" ]; then
+    echo "✓ Registration already exists"
+else
+    "$BINARY" -c "$CONFIG" -g -r "$REGISTRATION" 2>/dev/null
+    echo "✓ Generated registration"
+fi
 
-    # Patch config
-    sed -i "s|address: .*|address: $HS_URL|" "$CONFIG"
-    sed -i "s|domain: .*|domain: $HS_DOMAIN|" "$CONFIG"
-
-    echo "✓ Config updated with homeserver details"
+# ── Register with homeserver (first run only) ─────────────────
+if [ "$FIRST_RUN" = true ]; then
+    REG_PATH="$(cd "$DATA_DIR" && pwd)/registration.yaml"
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
-    echo "│  Register the bridge with your homeserver       │"
+    echo "│  Register with your homeserver:                 │"
     echo "│                                                 │"
-    echo "│  Add to your homeserver's config:               │"
-    echo "│                                                 │"
-    echo "│  app_service_config_files:                      │"
-    echo "│    - $REGISTRATION"
+    echo "│  Add to homeserver.yaml:                        │"
+    echo "│    app_service_config_files:                    │"
+    echo "│      - $REG_PATH"
     echo "│                                                 │"
     echo "│  Then restart your homeserver.                  │"
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     read -p "Press Enter once your homeserver is restarted..."
+fi
+
+# ── Check for existing login / prompt if needed ──────────────
+DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+NEEDS_LOGIN=false
+
+if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
+    NEEDS_LOGIN=true
+elif command -v sqlite3 >/dev/null 2>&1; then
+    LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
+    if [ "$LOGIN_COUNT" = "0" ]; then
+        NEEDS_LOGIN=true
+    fi
+fi
+
+if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No iMessage login found — starting login...    │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    # Stop the bridge if running (otherwise it holds the DB lock)
+    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+        systemctl --user stop mautrix-imessage
+    fi
+    "$BINARY" login -c "$CONFIG"
+    echo ""
+elif [ "$NEEDS_LOGIN" = "true" ]; then
+    echo ""
+    echo "  ⚠ No iMessage login found. Run interactively to log in:"
+    echo "    $BINARY login -c $CONFIG"
+    echo ""
 fi
 
 # ── Install systemd service (optional) ────────────────────────
@@ -75,17 +168,30 @@ WantedBy=default.target
 EOF
     systemctl --user daemon-reload
     systemctl --user enable mautrix-imessage
-    systemctl --user start mautrix-imessage
-    echo "✓ Bridge started (systemd user service installed)"
 }
 
-echo ""
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-    read -p "Install as a systemd user service? [Y/n] " answer
-    case "$answer" in
-        [nN]*) ;;
-        *)     install_systemd ;;
-    esac
+    if [ -f "$SERVICE_FILE" ]; then
+        # Update: rebuild service file (binary path may change), restart
+        install_systemd
+        systemctl --user restart mautrix-imessage
+        echo "✓ Bridge restarted"
+    elif [ -t 0 ]; then
+        # Fresh install with TTY: ask
+        echo ""
+        read -p "Install as a systemd user service? [Y/n] " answer
+        case "$answer" in
+            [nN]*) ;;
+            *)     install_systemd
+                   systemctl --user start mautrix-imessage
+                   echo "✓ Bridge started (systemd user service installed)" ;;
+        esac
+    else
+        # Fresh install without TTY: install automatically
+        install_systemd
+        systemctl --user start mautrix-imessage
+        echo "✓ Bridge started (systemd user service installed)"
+    fi
 fi
 
 echo ""
@@ -106,7 +212,4 @@ else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
 fi
-echo ""
-echo "  Next: DM the bridge bot and use the 'External Key'"
-echo "  login flow with your hardware key."
 echo ""

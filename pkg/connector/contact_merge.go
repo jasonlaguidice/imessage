@@ -67,11 +67,64 @@ func (c *IMClient) resolveContactPortalID(identifier string) networkid.PortalID 
 			Receiver: c.UserLogin.ID,
 		})
 		if err == nil && portal != nil && portal.MXID != "" {
+			c.UserLogin.Log.Debug().
+				Str("original", identifier).
+				Str("resolved", altID).
+				Msg("Resolved contact portal to existing portal")
 			return networkid.PortalID(altID)
 		}
 	}
 
 	return defaultID
+}
+
+// resolveSendTarget determines the best identifier to send to for a DM portal.
+// For merged contacts with multiple numbers, the portal ID might be a number
+// that's no longer active on iMessage (no IDS keys). This validates the target
+// and falls back to alternate contact numbers that are reachable.
+func (c *IMClient) resolveSendTarget(portalID string) string {
+	if c.client == nil || strings.Contains(portalID, ",") {
+		return portalID
+	}
+
+	// Only do validation for contacts with multiple identifiers —
+	// single-number contacts skip the overhead entirely.
+	contact := c.lookupContact(portalID)
+	if contact == nil || len(contactPortalIDs(contact)) <= 1 {
+		return portalID
+	}
+
+	// Multi-number contact: validate the portal ID is reachable on iMessage
+	valid := c.client.ValidateTargets([]string{portalID}, c.handle)
+	if len(valid) > 0 {
+		return portalID
+	}
+
+	// Portal ID is not reachable — try alternate numbers for this contact
+	c.UserLogin.Log.Info().
+		Str("portal_id", portalID).
+		Msg("Portal ID not reachable on iMessage, trying alternate contact numbers")
+
+	for _, altID := range contactPortalIDs(contact) {
+		if altID == portalID {
+			continue
+		}
+		valid := c.client.ValidateTargets([]string{altID}, c.handle)
+		if len(valid) > 0 {
+			c.UserLogin.Log.Info().
+				Str("portal_id", portalID).
+				Str("send_target", altID).
+				Msg("Resolved send target to alternate contact number")
+			return altID
+		}
+	}
+
+	// No valid target found, return original (will likely fail but gives
+	// a clear error rather than silently dropping)
+	c.UserLogin.Log.Warn().
+		Str("portal_id", portalID).
+		Msg("No reachable number found for contact")
+	return portalID
 }
 
 // getContactChatGUIDs returns all possible chat.db GUIDs for a DM portal,

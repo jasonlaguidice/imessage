@@ -25,5 +25,6 @@ rustpush/certs/fairplay/
 # Development/test prompt files
 ENDTOEND_TEST_PROMPT.md
 RUSTPUSH_INTEGRATION_PROMPT.md
+prompts/
 mautrix-imessage-v2.app/
 .build-commit
