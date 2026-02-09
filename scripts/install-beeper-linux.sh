@@ -4,6 +4,8 @@ set -euo pipefail
 BINARY="$1"
 DATA_DIR="$2"
 
+BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 
@@ -63,7 +65,7 @@ if [ -f "$CONFIG" ]; then
     echo "  Delete it to regenerate from Beeper."
 else
     echo "Generating Beeper config..."
-    "$BBCTL" config --type imessage-v2 -o "$CONFIG" sh-imessage
+    "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
     echo "✓ Config saved to $CONFIG"
 fi
 
