@@ -30,6 +30,30 @@ func prompt(label string) string {
 	return strings.TrimSpace(line)
 }
 
+// promptSelect displays numbered options and returns the selected value.
+func promptSelect(label string, options []string) string {
+	fmt.Fprintf(os.Stderr, "%s:\n", label)
+	for i, opt := range options {
+		fmt.Fprintf(os.Stderr, "  %d) %s\n", i+1, opt)
+	}
+	for {
+		fmt.Fprintf(os.Stderr, "Enter number (1-%d): ", len(options))
+		line, _ := stdinReader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		var idx int
+		if _, err := fmt.Sscanf(trimmed, "%d", &idx); err == nil && idx >= 1 && idx <= len(options) {
+			return options[idx-1]
+		}
+		// Also accept the option value directly
+		for _, opt := range options {
+			if strings.EqualFold(trimmed, opt) {
+				return opt
+			}
+		}
+		fmt.Fprintf(os.Stderr, "  Invalid choice, try again.\n")
+	}
+}
+
 // promptMultiline reads lines until an empty line, concatenating and stripping
 // all whitespace. Used for fields like hardware keys that are long base64
 // strings which get split across lines when pasted.
@@ -126,6 +150,8 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 				if strings.Contains(field.ID, "key") {
 					// Long base64 values get line-wrapped when pasted.
 					input[field.ID] = promptMultiline(field.Name)
+				} else if len(field.Options) > 0 {
+					input[field.ID] = promptSelect(field.Name, field.Options)
 				} else {
 					input[field.ID] = prompt(field.Name)
 				}
