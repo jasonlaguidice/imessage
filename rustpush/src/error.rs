@@ -25,8 +25,8 @@ pub enum PushError {
     AuthError(plist::Value),
     #[error("Authentication establishment error {0:?}")]
     CertError(plist::Dictionary),
-    #[error("Error registering with IDS: {0}")]
-    RegisterFailed(u64),
+    #[error("Error registering with IDS: status={0} response={1}")]
+    RegisterFailed(u64, String),
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
     #[error("IDS Lookup failed {0}")]

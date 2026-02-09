@@ -1104,13 +1104,14 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
 
     let response = request.send(&REQWEST).await?.bytes().await?;
 
-    info!("register response {}", std::str::from_utf8(&response).expect("resp not utf8?"));
+    let response_str = std::str::from_utf8(&response).unwrap_or("<non-utf8>").to_string();
+    info!("register response {}", response_str);
 
     let resp: Value = plist::from_bytes(&response)?;
 
     let status = resp.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {
-        return Err(PushError::RegisterFailed(status))
+        return Err(PushError::RegisterFailed(status, response_str))
     }
 
     // update registrations
@@ -1119,7 +1120,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     for service in service_list {
         let dict = service.as_dictionary().unwrap();
         let service_name = dict.get("service").unwrap().as_string().unwrap();
-        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
+        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(u64::MAX, "no users in response".to_string()))?.as_array().unwrap();
 
         let service = id_services.iter().find(|service| service.name == service_name).expect("Service not found??");
 
@@ -1129,13 +1130,14 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
             if status != 0 {
-                error!("Registration failed for user with status {}, user dict: {:?}", status, user_dict);
+                let user_dict_str = format!("{:?}", user_dict);
+                error!("Registration failed for user with status {}, user dict: {}", status, user_dict_str);
                 if status == 6009 || status == 6001 {
                     if let Some(alert) = user_dict.get("alert") {
                         return Err(PushError::CustomerMessage(plist::from_value(alert)?))
                     }
                 }
-                return Err(PushError::RegisterFailed(status));
+                return Err(PushError::RegisterFailed(status, user_dict_str));
             }
 
             let mut my_handles = vec![];
@@ -1146,7 +1148,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
                 if status != 0 {
                     error!("Failed to register {uri} status {}", status);
-                    return Err(PushError::RegisterFailed(status));
+                    return Err(PushError::RegisterFailed(status, format!("handle {} rejected", uri)));
                 }
                 my_handles.push(uri.to_string());
             }
