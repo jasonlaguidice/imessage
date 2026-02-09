@@ -50,7 +50,8 @@ type IMClient struct {
 	users      *rustpushgo.WrappedIdsUsers
 	identity   *rustpushgo.WrappedIdsngmIdentity
 	connection *rustpushgo.WrappedApsConnection
-	handle     string // Primary iMessage handle (e.g., tel:+1234567890)
+	handle     string   // Primary iMessage handle used for sending (e.g., tel:+1234567890)
+	allHandles []string // All registered handles (for IsThisUser checks)
 
 	// Chat.db supplement (optional — backfill + contacts)
 	chatDB *chatDB
@@ -106,10 +107,19 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	// Get our handle
 	handles := client.GetHandles()
+	c.allHandles = handles
 	if len(handles) > 0 {
 		c.handle = handles[0]
+		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != "" {
+			for _, h := range handles {
+				if h == meta.PreferredHandle {
+					c.handle = h
+					break
+				}
+			}
+		}
 	}
-	log.Info().Strs("handles", handles).Msg("Connected to iMessage")
+	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
 
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
@@ -175,7 +185,13 @@ func (c *IMClient) LogoutRemote(ctx context.Context) {
 }
 
 func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {
-	return string(userID) == c.handle
+	uid := string(userID)
+	for _, h := range c.allHandles {
+		if uid == h {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
@@ -1115,8 +1131,17 @@ func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
 // Helpers
 // ============================================================================
 
+func (c *IMClient) isMyHandle(handle string) bool {
+	for _, h := range c.allHandles {
+		if handle == h {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
-	if sender == nil || *sender == "" || *sender == c.handle {
+	if sender == nil || *sender == "" || c.isMyHandle(*sender) {
 		return bridgev2.EventSender{
 			IsFromMe:    true,
 			SenderLogin: c.UserLogin.ID,

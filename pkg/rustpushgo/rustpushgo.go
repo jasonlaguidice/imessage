@@ -1,9 +1,7 @@
 package rustpushgo
 
 // #include <rustpushgo.h>
-// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz
-// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv
-// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv
+// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lz -lresolv
 import "C"
 
 import (
@@ -587,6 +585,15 @@ func uniffiCheckChecksums() {
 		if checksum != 19097 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedidsngmidentity_to_string: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedidsusers_get_handles(uniffiStatus)
+		})
+		if checksum != 54112 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedidsusers_get_handles: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1508,6 +1515,15 @@ type WrappedIdsUsers struct {
 func NewWrappedIdsUsers(string *string) *WrappedIdsUsers {
 	return FfiConverterWrappedIDSUsersINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) unsafe.Pointer {
 		return C.uniffi_rustpushgo_fn_constructor_wrappedidsusers_new(rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(string)), _uniffiStatus)
+	}))
+}
+
+func (_self *WrappedIdsUsers) GetHandles() []string {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedIdsUsers")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterSequenceStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
+		return rustBufferFromC(C.uniffi_rustpushgo_fn_method_wrappedidsusers_get_handles(
+			_pointer, _uniffiStatus))
 	}))
 }
 

@@ -235,6 +235,11 @@ void* uniffi_rustpushgo_fn_constructor_wrappedidsusers_new(
 	RustCallStatus* out_status
 );
 
+RustBuffer uniffi_rustpushgo_fn_method_wrappedidsusers_get_handles(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 RustBuffer uniffi_rustpushgo_fn_method_wrappedidsusers_login_id(
 	void* ptr,
 	uint64_t i,
@@ -710,6 +715,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedapsstate_to_string(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedidsngmidentity_to_string(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_get_handles(
 	RustCallStatus* out_status
 );
 
