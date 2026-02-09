@@ -77,7 +77,7 @@ if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     exit 1
 fi
 
-# ── Install systemd service (optional) ────────────────────────
+# ── Install / update systemd service ─────────────────────────
 SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
 
 install_systemd() {
@@ -99,17 +99,30 @@ WantedBy=default.target
 EOF
     systemctl --user daemon-reload
     systemctl --user enable mautrix-imessage
-    systemctl --user start mautrix-imessage
-    echo "✓ Bridge started (systemd user service installed)"
 }
 
-echo ""
 if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
-    read -p "Install as a systemd user service? [Y/n] " answer
-    case "$answer" in
-        [nN]*) ;;
-        *)     install_systemd ;;
-    esac
+    if [ -f "$SERVICE_FILE" ]; then
+        # Update: rebuild service file (binary path may change), restart
+        install_systemd
+        systemctl --user restart mautrix-imessage
+        echo "✓ Bridge restarted"
+    elif [ -t 0 ]; then
+        # Fresh install with TTY: ask
+        echo ""
+        read -p "Install as a systemd user service? [Y/n] " answer
+        case "$answer" in
+            [nN]*) ;;
+            *)     install_systemd
+                   systemctl --user start mautrix-imessage
+                   echo "✓ Bridge started (systemd user service installed)" ;;
+        esac
+    else
+        # Fresh install without TTY: install automatically
+        install_systemd
+        systemctl --user start mautrix-imessage
+        echo "✓ Bridge started (systemd user service installed)"
+    fi
 fi
 
 echo ""
