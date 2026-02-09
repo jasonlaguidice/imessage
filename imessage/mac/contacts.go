@@ -70,7 +70,17 @@ func (cs *ContactStore) RequestContactAccess() error {
 	case C.CNAuthorizationStatusAuthorized:
 		cs.HasContactAccess = true
 	}
+	// On some macOS versions (e.g. Ventura), the authorization API may report
+	// denied even when access was granted via System Preferences. Fall back to
+	// a real query to check if contacts are actually accessible.
+	if !cs.HasContactAccess {
+		cs.HasContactAccess = cs.testContactQuery()
+	}
 	return nil
+}
+
+func (cs *ContactStore) testContactQuery() bool {
+	return C.meowTestContactQuery(cs.int) == 1
 }
 
 func gostring(s *C.NSString) string { return C.GoString(C.nsstring2cstring(s)) }

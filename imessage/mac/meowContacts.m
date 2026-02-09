@@ -115,3 +115,18 @@ unsigned long meowGetArrayLength(NSArray* arr) {
     }
     return arr.count;
 }
+
+int meowTestContactQuery(CNContactStore* store) {
+	NSArray* keysToFetch = @[CNContactGivenNameKey];
+	NSString *containerId = store.defaultContainerIdentifier;
+	if (containerId == nil) {
+		return 0;
+	}
+	NSPredicate *predicate = [CNContact predicateForContactsInContainerWithIdentifier:containerId];
+	NSError* error;
+	NSArray* contacts = [store unifiedContactsMatchingPredicate:predicate keysToFetch:keysToFetch error:&error];
+	if (error != nil || contacts == nil) {
+		return 0;
+	}
+	return 1;
+}
