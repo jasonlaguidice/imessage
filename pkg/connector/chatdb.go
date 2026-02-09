@@ -11,6 +11,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -118,7 +119,9 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			chatGUIDs = []string{chatGUID}
 		}
 	} else {
-		chatGUIDs = portalIDToChatGUIDs(portalID)
+		// Use contact-aware lookup: includes chat GUIDs for all of the
+		// contact's phone numbers, so merged DM portals get complete history.
+		chatGUIDs = c.getContactChatGUIDs(portalID)
 	}
 
 	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages called")
@@ -133,40 +136,43 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		count = 50
 	}
 
+	// Fetch messages from ALL chat GUIDs and merge. For contacts with multiple
+	// phone numbers, this combines messages from all numbers into one timeline.
+	// Also tries multiple GUID formats (any/iMessage/SMS) per phone number.
 	var messages []*imessage.Message
-	var err error
-	var usedGUID string
+	var lastErr error
 
-	// Try each possible GUID format until we find messages.
-	// macOS Tahoe+ uses "any;-;" while older versions use "iMessage;-;" or "SMS;-;".
 	for _, chatGUID := range chatGUIDs {
+		var msgs []*imessage.Message
 		if params.AnchorMessage != nil {
 			if params.Forward {
-				messages, err = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
+				msgs, lastErr = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
 			} else {
-				messages, err = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
+				msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
 			}
 		} else {
 			// For fresh portals (no anchor), fetch messages within the configured
 			// initial sync window (default 365 days).
 			days := c.Main.Config.GetInitialSyncDays()
 			minDate := time.Now().AddDate(0, 0, -days)
-			messages, err = db.api.GetMessagesSinceDate(chatGUID, minDate, "")
+			msgs, lastErr = db.api.GetMessagesSinceDate(chatGUID, minDate, "")
 		}
-		if err == nil && len(messages) > 0 {
-			usedGUID = chatGUID
-			break
+		if lastErr == nil {
+			messages = append(messages, msgs...)
 		}
-	}
-	if usedGUID == "" && len(chatGUIDs) > 0 {
-		usedGUID = chatGUIDs[0]
-	}
-	if err != nil {
-		log.Error().Err(err).Str("chat_guid", usedGUID).Msg("Failed to fetch messages from chat.db")
-		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", err)
 	}
 
-	log.Info().Str("chat_guid", usedGUID).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+	if len(messages) == 0 && lastErr != nil {
+		log.Error().Err(lastErr).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from chat.db")
+		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", lastErr)
+	}
+
+	// Sort chronologically — messages may come from multiple chat GUIDs
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Time.Before(messages[j].Time)
+	})
+
+	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
 
 	// Get an intent for uploading media. The bot intent works for all uploads.
 	intent := c.Main.Bridge.Bot
