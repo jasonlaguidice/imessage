@@ -46,6 +46,13 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 
 	ctx := br.Log.WithContext(context.Background())
 
+	// Run database migrations (normally done in Start → StartConnectors,
+	// but we don't call Start because we don't need the Matrix connection).
+	if err := br.DB.Upgrade(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "[!] Database migration failed: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Find the admin user from permissions config.
 	userMXID := findAdminUser(br)
 	if userMXID == "" {
