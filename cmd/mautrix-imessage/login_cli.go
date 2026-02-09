@@ -30,10 +30,21 @@ func prompt(label string) string {
 	return strings.TrimSpace(line)
 }
 
-func promptPassword(label string) string {
-	fmt.Fprintf(os.Stderr, "%s: ", label)
-	line, _ := stdinReader.ReadString('\n')
-	return strings.TrimSpace(line)
+// promptMultiline reads lines until an empty line, concatenating and stripping
+// all whitespace. Used for fields like hardware keys that are long base64
+// strings which get split across lines when pasted.
+func promptMultiline(label string) string {
+	fmt.Fprintf(os.Stderr, "%s (paste, then press Enter on a blank line):\n", label)
+	var parts []string
+	for {
+		line, _ := stdinReader.ReadString('\n')
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			break
+		}
+		parts = append(parts, trimmed)
+	}
+	return strings.Join(parts, "")
 }
 
 // runInteractiveLogin drives the bridge's login flow from the terminal.
@@ -112,8 +123,9 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 		case bridgev2.LoginStepTypeUserInput:
 			input := make(map[string]string)
 			for _, field := range step.UserInputParams.Fields {
-				if field.Type == bridgev2.LoginInputFieldTypePassword {
-					input[field.ID] = promptPassword(field.Name)
+				if strings.Contains(field.ID, "key") {
+					// Long base64 values get line-wrapped when pasted.
+					input[field.ID] = promptMultiline(field.Name)
 				} else {
 					input[field.ID] = prompt(field.Name)
 				}
