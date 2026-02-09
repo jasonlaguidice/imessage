@@ -779,6 +779,8 @@ impl LoginSession {
         &self,
         config: &WrappedOSConfig,
         connection: &WrappedAPSConnection,
+        existing_identity: Option<Arc<WrappedIDSNGMIdentity>>,
+        existing_users: Option<Arc<WrappedIDSUsers>>,
     ) -> Result<IDSUsersWithIdentityRecord, WrappedError> {
         let os_config = config.config.clone();
         let conn = connection.inner.clone();
@@ -803,24 +805,73 @@ impl LoginSession {
         ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get IDS delegate: {}", e) })?;
 
         let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
-        let user = authenticate_apple(ids_delegate, &*os_config).await
+        let fresh_user = authenticate_apple(ids_delegate, &*os_config).await
             .map_err(|e| WrappedError::GenericError { msg: format!("IDS authentication failed: {}", e) })?;
 
-        let identity = IDSNGMIdentity::new()
-            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create identity: {}", e) })?;
+        // Resolve identity: reuse existing or generate new
+        let identity = match existing_identity {
+            Some(wrapped) => {
+                info!("Reusing existing identity (avoiding new device notification)");
+                wrapped.inner.clone()
+            }
+            None => {
+                info!("Generating new identity (first login)");
+                IDSNGMIdentity::new()
+                    .map_err(|e| WrappedError::GenericError {
+                        msg: format!("Failed to create identity: {}", e)
+                    })?
+            }
+        };
 
-        let mut users = vec![user];
+        // Decide whether to reuse existing registration or register fresh.
+        // Reusing avoids calling Apple's register endpoint, which triggers
+        // "X added a new Mac" notifications to contacts.
+        let users = match existing_users {
+            Some(ref wrapped) if !wrapped.inner.is_empty() => {
+                // Check if the existing registration is still valid
+                let has_valid_registration = wrapped.inner[0]
+                    .registration.get("com.apple.madrid")
+                    .map(|r| r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false))
+                    .unwrap_or(false);
 
-        if users[0].registration.is_empty() {
-            info!("Registering new identity...");
-            register(
-                &*os_config,
-                &*conn.state.read().await,
-                &[&MADRID_SERVICE],
-                &mut users,
-                &identity,
-            ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
-        }
+                if has_valid_registration {
+                    info!("Reusing existing registration (still valid, skipping register endpoint)");
+                    // Merge the fresh auth_keypair into the existing users.
+                    // authenticate_apple() issues a new auth cert — we need that
+                    // for future authenticated requests. But keep the existing
+                    // registration data (handles, registration certs, etc.)
+                    let mut existing = wrapped.inner.clone();
+                    existing[0].auth_keypair = fresh_user.auth_keypair.clone();
+                    existing
+                } else {
+                    info!("Existing registration expired, must re-register");
+                    let mut users = vec![fresh_user];
+                    register(
+                        &*os_config,
+                        &*conn.state.read().await,
+                        &[&MADRID_SERVICE],
+                        &mut users,
+                        &identity,
+                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
+                    users
+                }
+            }
+            _ => {
+                // No existing users — first login, must register
+                let mut users = vec![fresh_user];
+                if users[0].registration.is_empty() {
+                    info!("Registering identity (first login)...");
+                    register(
+                        &*os_config,
+                        &*conn.state.read().await,
+                        &[&MADRID_SERVICE],
+                        &mut users,
+                        &identity,
+                    ).await.map_err(|e| WrappedError::GenericError { msg: format!("Registration failed: {}", e) })?;
+                }
+                users
+            }
+        };
 
         Ok(IDSUsersWithIdentityRecord {
             users: Arc::new(WrappedIDSUsers { inner: users }),

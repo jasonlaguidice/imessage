@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -56,7 +57,11 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 		return nil, fmt.Errorf("failed to initialize local NAC config: %w", err)
 	}
 	l.cfg = cfg
-	l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
+
+	// Reuse existing APS state if available (preserves push token, avoids new device)
+	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+	apsState := getExistingAPSState(l.User, log)
+	l.conn = rustpushgo.Connect(cfg, apsState)
 
 	return &bridgev2.LoginStep{
 		Type:   bridgev2.LoginStepTypeUserInput,
@@ -145,7 +150,27 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 }
 
 func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
-	result, err := l.session.Finish(l.cfg, l.conn)
+	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+
+	// Reuse existing identity if available (avoids "new Mac" notifications)
+	var existingIdentityArg **rustpushgo.WrappedIdsngmIdentity
+	if existing := getExistingIdentity(l.User, log); existing != nil {
+		log.Info().Msg("Reusing existing IDS identity for re-authentication")
+		existingIdentityArg = &existing
+	} else {
+		log.Info().Msg("No existing identity found, will generate new one (first login)")
+	}
+
+	// Reuse existing IDS users/registration if available (avoids register() call)
+	var existingUsersArg **rustpushgo.WrappedIdsUsers
+	if existing := getExistingUsers(l.User, log); existing != nil {
+		log.Info().Msg("Reusing existing IDS users for re-authentication")
+		existingUsersArg = &existing
+	} else {
+		log.Info().Msg("No existing users found, will register fresh (first login)")
+	}
+
+	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -237,7 +262,11 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 			return nil, fmt.Errorf("invalid hardware key: %w", err)
 		}
 		l.cfg = cfg
-		l.conn = rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(nil))
+
+		// Reuse existing APS state if available (preserves push token, avoids new device)
+		extLog := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+		apsState := getExistingAPSState(l.User, extLog)
+		l.conn = rustpushgo.Connect(cfg, apsState)
 
 		return &bridgev2.LoginStep{
 			Type:   bridgev2.LoginStepTypeUserInput,
@@ -315,7 +344,27 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 }
 
 func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
-	result, err := l.session.Finish(l.cfg, l.conn)
+	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+
+	// Reuse existing identity if available (avoids "new Mac" notifications)
+	var existingIdentityArg **rustpushgo.WrappedIdsngmIdentity
+	if existing := getExistingIdentity(l.User, log); existing != nil {
+		log.Info().Msg("Reusing existing IDS identity for re-authentication")
+		existingIdentityArg = &existing
+	} else {
+		log.Info().Msg("No existing identity found, will generate new one (first login)")
+	}
+
+	// Reuse existing IDS users/registration if available (avoids register() call)
+	var existingUsersArg **rustpushgo.WrappedIdsUsers
+	if existing := getExistingUsers(l.User, log); existing != nil {
+		log.Info().Msg("Reusing existing IDS users for re-authentication")
+		existingUsersArg = &existing
+	} else {
+		log.Info().Msg("No existing users found, will register fresh (first login)")
+	}
+
+	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -348,6 +397,77 @@ func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginSt
 }
 
 // ============================================================================
+// Existing session state lookup
+// ============================================================================
+
+// getExistingIdentity looks up the stored IDSNGMIdentity for reuse during
+// re-authentication (avoiding "new Mac" notifications). Checks in order:
+//  1. Existing logins in the bridge database
+//  2. The backup session file (~/.local/share/mautrix-imessage/session.json)
+//
+// Returns nil if no existing identity is found (first-ever login).
+func getExistingIdentity(user *bridgev2.User, log zerolog.Logger) *rustpushgo.WrappedIdsngmIdentity {
+	// Check DB first
+	for _, login := range user.GetCachedUserLogins() {
+		if meta, ok := login.Metadata.(*UserLoginMetadata); ok && meta.IDSIdentity != "" {
+			log.Info().Msg("Found existing identity in database")
+			identityStr := meta.IDSIdentity
+			return rustpushgo.NewWrappedIdsngmIdentity(&identityStr)
+		}
+	}
+	// Fall back to session file (survives DB resets)
+	state := loadSessionState(log)
+	if state.IDSIdentity != "" {
+		log.Info().Msg("Found existing identity in backup file")
+		return rustpushgo.NewWrappedIdsngmIdentity(&state.IDSIdentity)
+	}
+	return nil
+}
+
+// getExistingAPSState looks up the stored APS connection state for reuse during
+// re-authentication (preserves push token, avoids new device registration).
+// Checks DB first, then the backup session file.
+// Returns a WrappedApsState — either with existing state or nil (new connection).
+func getExistingAPSState(user *bridgev2.User, log zerolog.Logger) *rustpushgo.WrappedApsState {
+	// Check DB first
+	for _, login := range user.GetCachedUserLogins() {
+		if meta, ok := login.Metadata.(*UserLoginMetadata); ok && meta.APSState != "" {
+			log.Info().Msg("Found existing APS state in database, reusing push token")
+			return rustpushgo.NewWrappedApsState(&meta.APSState)
+		}
+	}
+	// Fall back to session file
+	state := loadSessionState(log)
+	if state.APSState != "" {
+		log.Info().Msg("Found existing APS state in backup file, reusing push token")
+		return rustpushgo.NewWrappedApsState(&state.APSState)
+	}
+	log.Info().Msg("No existing APS state found, will create new connection (first login)")
+	return rustpushgo.NewWrappedApsState(nil)
+}
+
+// getExistingUsers looks up the stored IDSUsers for reuse during
+// re-authentication (avoids calling register() which triggers notifications).
+// Checks DB first, then the backup session file.
+// Returns nil if no existing users are found (first-ever login).
+func getExistingUsers(user *bridgev2.User, log zerolog.Logger) *rustpushgo.WrappedIdsUsers {
+	// Check DB first
+	for _, login := range user.GetCachedUserLogins() {
+		if meta, ok := login.Metadata.(*UserLoginMetadata); ok && meta.IDSUsers != "" {
+			log.Info().Msg("Found existing IDS users in database")
+			return rustpushgo.NewWrappedIdsUsers(&meta.IDSUsers)
+		}
+	}
+	// Fall back to session file
+	state := loadSessionState(log)
+	if state.IDSUsers != "" {
+		log.Info().Msg("Found existing IDS users in backup file")
+		return rustpushgo.NewWrappedIdsUsers(&state.IDSUsers)
+	}
+	return nil
+}
+
+// ============================================================================
 // Shared login helpers
 // ============================================================================
 
@@ -374,7 +494,8 @@ func handleSelectionStep(handles []string) *bridgev2.LoginStep {
 }
 
 // completeLoginWithMeta is the shared tail of both login flows: creates the
-// IMClient, persists metadata, and starts the bridge connection.
+// IMClient, persists metadata, saves the identity backup file, and starts the
+// bridge connection.
 func completeLoginWithMeta(
 	ctx context.Context,
 	user *bridgev2.User,
@@ -385,6 +506,15 @@ func completeLoginWithMeta(
 	result *rustpushgo.IdsUsersWithIdentityRecord,
 	meta *UserLoginMetadata,
 ) (*bridgev2.LoginStep, error) {
+	log := main.Bridge.Log.With().Str("component", "imessage").Logger()
+
+	// Persist full session state to backup file so it survives DB resets.
+	saveSessionState(log, PersistedSessionState{
+		IDSIdentity: meta.IDSIdentity,
+		APSState:    meta.APSState,
+		IDSUsers:    meta.IDSUsers,
+	})
+
 	client := &IMClient{
 		Main:          main,
 		config:        cfg,

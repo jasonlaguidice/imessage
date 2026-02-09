@@ -97,6 +97,7 @@ func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flow
 
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	meta := login.Metadata.(*UserLoginMetadata)
+	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
 
 	rustpushgo.InitLogger()
 
@@ -127,6 +128,13 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	usersStr := &meta.IDSUsers
 	identityStr := &meta.IDSIdentity
 	apsStateStr := &meta.APSState
+
+	// Eagerly persist full session state to the backup file so it survives DB resets.
+	saveSessionState(log, PersistedSessionState{
+		IDSIdentity: meta.IDSIdentity,
+		APSState:    meta.APSState,
+		IDSUsers:    meta.IDSUsers,
+	})
 
 	client := &IMClient{
 		Main:          c,

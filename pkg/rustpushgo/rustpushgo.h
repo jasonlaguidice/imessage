@@ -171,6 +171,8 @@ void* uniffi_rustpushgo_fn_method_loginsession_finish(
 	void* ptr,
 	void* config,
 	void* connection,
+	RustBuffer existing_identity,
+	RustBuffer existing_users,
 	RustCallStatus* out_status
 );
 

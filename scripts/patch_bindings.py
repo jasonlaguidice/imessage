@@ -4,10 +4,14 @@ import re
 import sys
 
 def patch(content: str) -> str:
-    # 1. Add CGO LDFLAGS
+    # 1. Add CGO LDFLAGS (platform-specific)
     content = content.replace(
         '// #include <rustpushgo.h>\nimport "C"',
-        '// #include <rustpushgo.h>\n// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lz -lresolv\nimport "C"'
+        '// #include <rustpushgo.h>\n'
+        '// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz\n'
+        '// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv\n'
+        '// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv\n'
+        'import "C"'
     )
 
     # 2. Replace type alias with named struct + conversion functions
