@@ -203,6 +203,15 @@ HardwareInfo hw_info_read(void) {
         info.os_version = strdup([verStr UTF8String]);
     }
 
+    // --- Darwin/kernel version (e.g., "24.3.0" for macOS 15.x) ---
+    {
+        char release[32] = {0};
+        size_t len = sizeof(release);
+        if (sysctlbyname("kern.osrelease", release, &len, NULL, 0) == 0) {
+            info.darwin_version = strdup(release);
+        }
+    }
+
     return info;
 }
 
@@ -218,6 +227,7 @@ void hw_info_free(HardwareInfo *info) {
     free(info->mlb);
     free(info->mac_address);
     free(info->root_disk_uuid);
+    free(info->darwin_version);
     free(info->error);
     memset(info, 0, sizeof(HardwareInfo));
 }
