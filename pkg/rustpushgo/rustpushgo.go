@@ -1,7 +1,9 @@
 package rustpushgo
 
 // #include <rustpushgo.h>
-// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lz -lresolv
+// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz
+// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv
+// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv
 import "C"
 
 import (
