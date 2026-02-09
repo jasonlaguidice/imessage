@@ -7,7 +7,7 @@ mod test_hwinfo;
 use std::{io::Cursor, path::PathBuf, str::FromStr, sync::Arc};
 
 use icloud_auth::AppleAccount;
-use keystore::{init_keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
+use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use log::{debug, error, info, warn};
 use rustpush::{
     authenticate_apple, login_apple_delegates, register, APSConnectionResource,
@@ -100,6 +100,23 @@ impl WrappedIDSUsers {
                     .unwrap_or_default()
             })
             .collect()
+    }
+
+    /// Check that all keystore keys referenced by the user state actually exist.
+    /// Returns false if any auth/id keypair alias is missing from the keystore,
+    /// which means the keystore was wiped or never migrated and re-login is needed.
+    pub fn validate_keystore(&self) -> bool {
+        if self.inner.is_empty() {
+            return true;
+        }
+        for user in &self.inner {
+            let alias = &user.auth_keypair.private.0;
+            if keystore().get_key_type(alias).ok().flatten().is_none() {
+                warn!("Keystore key '{}' not found for user '{}' — keystore/state mismatch", alias, user.user_id);
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -490,10 +507,20 @@ pub fn init_logger() {
     // This must be called before any rustpush operations (APNs connect, login, etc.).
     let state_path = "state/keystore.plist";
     let _ = std::fs::create_dir_all("state");
-    let state: SoftwareKeystoreState = std::fs::read(state_path)
-        .ok()
-        .and_then(|data| plist::from_bytes(&data).ok())
-        .unwrap_or_default();
+    let state: SoftwareKeystoreState = match std::fs::read(state_path) {
+        Ok(data) => plist::from_bytes(&data).unwrap_or_else(|e| {
+            warn!("Failed to parse keystore at {}: {} — starting with empty keystore", state_path, e);
+            SoftwareKeystoreState::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            info!("No keystore file at {} — starting fresh", state_path);
+            SoftwareKeystoreState::default()
+        }
+        Err(e) => {
+            warn!("Failed to read keystore at {}: {} — starting with empty keystore", state_path, e);
+            SoftwareKeystoreState::default()
+        }
+    };
     let path_for_closure = state_path.to_string();
     init_keystore(SoftwareKeystore {
         state: RwLock::new(state),

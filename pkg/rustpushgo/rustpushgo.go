@@ -1,9 +1,7 @@
 package rustpushgo
 
 // #include <rustpushgo.h>
-// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz
-// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv
-// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv
+// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lz -lresolv
 import "C"
 
 import (
@@ -614,6 +612,15 @@ func uniffiCheckChecksums() {
 		if checksum != 29 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedidsusers_to_string: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedidsusers_validate_keystore(uniffiStatus)
+		})
+		if checksum != 49609 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedidsusers_validate_keystore: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1544,6 +1551,15 @@ func (_self *WrappedIdsUsers) ToString() string {
 	return FfiConverterStringINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) RustBufferI {
 		return rustBufferFromC(C.uniffi_rustpushgo_fn_method_wrappedidsusers_to_string(
 			_pointer, _uniffiStatus))
+	}))
+}
+
+func (_self *WrappedIdsUsers) ValidateKeystore() bool {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedIdsUsers")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterBoolINSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.int8_t {
+		return C.uniffi_rustpushgo_fn_method_wrappedidsusers_validate_keystore(
+			_pointer, _uniffiStatus)
 	}))
 }
 
