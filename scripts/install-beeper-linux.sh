@@ -79,6 +79,38 @@ if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     exit 1
 fi
 
+# ── Check for existing login / prompt if needed ──────────────
+DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+NEEDS_LOGIN=false
+
+if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
+    NEEDS_LOGIN=true
+elif command -v sqlite3 >/dev/null 2>&1; then
+    LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
+    if [ "$LOGIN_COUNT" = "0" ]; then
+        NEEDS_LOGIN=true
+    fi
+fi
+
+if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No iMessage login found — starting login...    │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    # Stop the bridge if running (otherwise it holds the DB lock)
+    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+        systemctl --user stop mautrix-imessage
+    fi
+    "$BINARY" login -c "$CONFIG"
+    echo ""
+elif [ "$NEEDS_LOGIN" = "true" ]; then
+    echo ""
+    echo "  ⚠ No iMessage login found. Run interactively to log in:"
+    echo "    $BINARY login -c $CONFIG"
+    echo ""
+fi
+
 # ── Install / update systemd service ─────────────────────────
 SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
 
@@ -144,7 +176,4 @@ else
     echo "  Run manually:"
     echo "    cd $(dirname "$CONFIG") && $BINARY -c $CONFIG"
 fi
-echo ""
-echo "  Next: DM the bridge bot in Beeper and use the"
-echo "  'External Key' login flow with your hardware key."
 echo ""

@@ -17,6 +17,8 @@
 package main
 
 import (
+	"os"
+
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
 	"github.com/lrhodin/imessage/pkg/connector"
@@ -39,5 +41,18 @@ var m = mxmain.BridgeMain{
 
 func main() {
 	m.InitVersion(Tag, Commit, BuildTime)
+
+	// Handle "login" subcommand: interactive CLI login that writes to the
+	// bridge DB using the same code path as the Matrix bot.
+	if len(os.Args) > 1 && os.Args[0] != "-" {
+		switch os.Args[1] {
+		case "login":
+			// Remove "login" from args so flag parsing in PreInit works.
+			os.Args = append(os.Args[:1], os.Args[2:]...)
+			runInteractiveLogin(&m)
+			return
+		}
+	}
+
 	m.Run()
 }
