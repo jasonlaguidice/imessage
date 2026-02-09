@@ -1,7 +1,9 @@
 package rustpushgo
 
 // #include <rustpushgo.h>
-// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lz -lresolv
+// #cgo LDFLAGS: -L${SRCDIR}/../../ -lrustpushgo -ldl -lm -lz
+// #cgo darwin LDFLAGS: -framework Security -framework SystemConfiguration -framework CoreFoundation -framework Foundation -framework CoreServices -lresolv
+// #cgo linux LDFLAGS: -lpthread -lssl -lcrypto -lresolv
 import "C"
 
 import (
@@ -537,7 +539,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_loginsession_finish(uniffiStatus)
 		})
-		if checksum != 40086 {
+		if checksum != 25021 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_loginsession_finish: UniFFI API checksum mismatch")
 		}
@@ -1231,14 +1233,14 @@ type LoginSession struct {
 	ffiObject FfiObject
 }
 
-func (_self *LoginSession) Finish(config *WrappedOsConfig, connection *WrappedApsConnection) (IdsUsersWithIdentityRecord, error) {
+func (_self *LoginSession) Finish(config *WrappedOsConfig, connection *WrappedApsConnection, existingIdentity **WrappedIdsngmIdentity, existingUsers **WrappedIdsUsers) (IdsUsersWithIdentityRecord, error) {
 	_pointer := _self.ffiObject.incrementPointer("*LoginSession")
 	defer _self.ffiObject.decrementPointer()
 	return uniffiRustCallAsyncWithErrorAndResult(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_loginsession_finish(
-				_pointer, FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection),
+				_pointer, FfiConverterWrappedOSConfigINSTANCE.Lower(config), FfiConverterWrappedAPSConnectionINSTANCE.Lower(connection), rustBufferToC(FfiConverterOptionalWrappedIDSNGMIdentityINSTANCE.Lower(existingIdentity)), rustBufferToC(FfiConverterOptionalWrappedIDSUsersINSTANCE.Lower(existingUsers)),
 				status,
 			))
 		},
@@ -2421,6 +2423,80 @@ type FfiDestroyerOptionalBytes struct{}
 func (_ FfiDestroyerOptionalBytes) Destroy(value *[]byte) {
 	if value != nil {
 		FfiDestroyerBytes{}.Destroy(*value)
+	}
+}
+
+type FfiConverterOptionalWrappedIDSNGMIdentity struct{}
+
+var FfiConverterOptionalWrappedIDSNGMIdentityINSTANCE = FfiConverterOptionalWrappedIDSNGMIdentity{}
+
+func (c FfiConverterOptionalWrappedIDSNGMIdentity) Lift(rb RustBufferI) **WrappedIdsngmIdentity {
+	return LiftFromRustBuffer[**WrappedIdsngmIdentity](c, rb)
+}
+
+func (_ FfiConverterOptionalWrappedIDSNGMIdentity) Read(reader io.Reader) **WrappedIdsngmIdentity {
+	if readInt8(reader) == 0 {
+		return nil
+	}
+	temp := FfiConverterWrappedIDSNGMIdentityINSTANCE.Read(reader)
+	return &temp
+}
+
+func (c FfiConverterOptionalWrappedIDSNGMIdentity) Lower(value **WrappedIdsngmIdentity) RustBuffer {
+	return LowerIntoRustBuffer[**WrappedIdsngmIdentity](c, value)
+}
+
+func (_ FfiConverterOptionalWrappedIDSNGMIdentity) Write(writer io.Writer, value **WrappedIdsngmIdentity) {
+	if value == nil {
+		writeInt8(writer, 0)
+	} else {
+		writeInt8(writer, 1)
+		FfiConverterWrappedIDSNGMIdentityINSTANCE.Write(writer, *value)
+	}
+}
+
+type FfiDestroyerOptionalWrappedIdsngmIdentity struct{}
+
+func (_ FfiDestroyerOptionalWrappedIdsngmIdentity) Destroy(value **WrappedIdsngmIdentity) {
+	if value != nil {
+		FfiDestroyerWrappedIdsngmIdentity{}.Destroy(*value)
+	}
+}
+
+type FfiConverterOptionalWrappedIDSUsers struct{}
+
+var FfiConverterOptionalWrappedIDSUsersINSTANCE = FfiConverterOptionalWrappedIDSUsers{}
+
+func (c FfiConverterOptionalWrappedIDSUsers) Lift(rb RustBufferI) **WrappedIdsUsers {
+	return LiftFromRustBuffer[**WrappedIdsUsers](c, rb)
+}
+
+func (_ FfiConverterOptionalWrappedIDSUsers) Read(reader io.Reader) **WrappedIdsUsers {
+	if readInt8(reader) == 0 {
+		return nil
+	}
+	temp := FfiConverterWrappedIDSUsersINSTANCE.Read(reader)
+	return &temp
+}
+
+func (c FfiConverterOptionalWrappedIDSUsers) Lower(value **WrappedIdsUsers) RustBuffer {
+	return LowerIntoRustBuffer[**WrappedIdsUsers](c, value)
+}
+
+func (_ FfiConverterOptionalWrappedIDSUsers) Write(writer io.Writer, value **WrappedIdsUsers) {
+	if value == nil {
+		writeInt8(writer, 0)
+	} else {
+		writeInt8(writer, 1)
+		FfiConverterWrappedIDSUsersINSTANCE.Write(writer, *value)
+	}
+}
+
+type FfiDestroyerOptionalWrappedIdsUsers struct{}
+
+func (_ FfiDestroyerOptionalWrappedIdsUsers) Destroy(value **WrappedIdsUsers) {
+	if value != nil {
+		FfiDestroyerWrappedIdsUsers{}.Destroy(*value)
 	}
 }
 
