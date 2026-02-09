@@ -237,11 +237,11 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		if hwKey == "" {
 			return nil, fmt.Errorf("hardware key is required")
 		}
-		l.hardwareKey = hwKey
+		l.hardwareKey = stripNonBase64(hwKey)
 
 		rustpushgo.InitLogger()
 
-		cfg, err := rustpushgo.CreateConfigFromHardwareKey(hwKey)
+		cfg, err := rustpushgo.CreateConfigFromHardwareKey(l.hardwareKey)
 		if err != nil {
 			return nil, fmt.Errorf("invalid hardware key: %w", err)
 		}
