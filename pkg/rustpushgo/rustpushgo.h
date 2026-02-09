@@ -251,6 +251,11 @@ RustBuffer uniffi_rustpushgo_fn_method_wrappedidsusers_to_string(
 	RustCallStatus* out_status
 );
 
+int8_t uniffi_rustpushgo_fn_method_wrappedidsusers_validate_keystore(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_free_wrappedosconfig(
 	void* ptr,
 	RustCallStatus* out_status
@@ -727,6 +732,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_login_id(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_to_string(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_validate_keystore(
 	RustCallStatus* out_status
 );
 
