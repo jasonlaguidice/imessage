@@ -541,6 +541,7 @@ pub fn create_local_macos_config_with_device_id(device_id: String) -> Result<Arc
 /// The hardware key is a JSON-serialized `HardwareConfig` extracted once from
 /// a real Mac (e.g., via copper's QR code tool). This config uses the
 /// open-absinthe NAC emulator to generate fresh validation data on any platform.
+#[cfg(feature = "hardware-key")]
 #[uniffi::export]
 pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -582,6 +583,7 @@ pub fn create_config_from_hardware_key(base64_key: String) -> Result<Arc<Wrapped
 
 /// Create a cross-platform config from a base64-encoded JSON hardware key
 /// with a persisted device ID.
+#[cfg(feature = "hardware-key")]
 #[uniffi::export]
 pub fn create_config_from_hardware_key_with_device_id(base64_key: String, device_id: String) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     use base64::{Engine, engine::general_purpose::STANDARD};

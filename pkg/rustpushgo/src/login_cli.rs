@@ -6,16 +6,16 @@
 //! Usage:
 //!   cargo run --bin imessage-login
 //!
-//! Or with an external hardware key:
-//!   cargo run --bin imessage-login -- --hardware-key <base64>
+//! Or with an external hardware key (requires hardware-key feature):
+//!   cargo run --bin imessage-login --features hardware-key -- --hardware-key <base64>
 
 use std::io::{self, Write};
-use std::sync::Arc;
 
 use rustpushgo::{
-    connect, create_config_from_hardware_key, create_local_macos_config, init_logger,
-    login_start, WrappedAPSState,
+    connect, create_local_macos_config, init_logger, login_start, WrappedAPSState, WrappedOSConfig,
+    WrappedError,
 };
+use std::sync::Arc;
 
 fn prompt(msg: &str) -> String {
     eprint!("{}", msg);
@@ -23,6 +23,25 @@ fn prompt(msg: &str) -> String {
     let mut input = String::new();
     io::stdin().read_line(&mut input).unwrap();
     input.trim().to_string()
+}
+
+fn create_config(hw_key: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
+    if let Some(key) = hw_key {
+        #[cfg(feature = "hardware-key")]
+        {
+            eprintln!("[*] Using external hardware key");
+            return rustpushgo::create_config_from_hardware_key(key);
+        }
+        #[cfg(not(feature = "hardware-key"))]
+        {
+            let _ = key;
+            return Err(WrappedError::GenericError {
+                msg: "hardware-key feature not enabled. Rebuild with --features hardware-key".into(),
+            });
+        }
+    }
+    eprintln!("[*] Using local macOS config (IOKit + AAAbsintheContext)");
+    create_local_macos_config()
 }
 
 #[tokio::main]
@@ -33,19 +52,10 @@ async fn main() {
     let hw_key = args.iter().position(|a| a == "--hardware-key").map(|i| args[i + 1].clone());
 
     // --- Create config ---
-    let cfg = if let Some(key) = hw_key {
-        eprintln!("[*] Using external hardware key");
-        create_config_from_hardware_key(key).unwrap_or_else(|e| {
-            eprintln!("[!] Invalid hardware key: {e}");
-            std::process::exit(1);
-        })
-    } else {
-        eprintln!("[*] Using local macOS config (IOKit + AAAbsintheContext)");
-        create_local_macos_config().unwrap_or_else(|e| {
-            eprintln!("[!] Failed to read hardware info: {e}");
-            std::process::exit(1);
-        })
-    };
+    let cfg = create_config(hw_key).unwrap_or_else(|e| {
+        eprintln!("[!] Config failed: {e}");
+        std::process::exit(1);
+    });
 
     eprintln!("[*] Device UUID: {}", cfg.get_device_id());
 
