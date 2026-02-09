@@ -63,7 +63,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$(dirname "$CONFIG")
+WorkingDirectory=$(dirname "$BINARY")
 ExecStart=$BINARY -c $CONFIG
 Restart=always
 RestartSec=5
