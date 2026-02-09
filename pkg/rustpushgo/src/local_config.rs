@@ -144,7 +144,7 @@ impl LocalMacOSConfig {
         Ok(Self {
             hw,
             device_id,
-            protocol_version: 1640,
+            protocol_version: 1660,
             icloud_ua,
             aoskit_version,
         })

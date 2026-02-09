@@ -1087,6 +1087,46 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
         ("validation-data", Value::Data(config.generate_validation_data().await?))
     ].into_iter()));
 
+    // Log the registration payload (redact validation-data since it's large binary)
+    {
+        let mut debug_body = body.as_dictionary().unwrap().clone();
+        debug_body.remove("validation-data");
+        if let Some(services_val) = debug_body.get("services") {
+            // Also redact large binary keys in client-data for readability
+            if let Some(services_arr) = services_val.as_array() {
+                let redacted: Vec<Value> = services_arr.iter().map(|svc| {
+                    let mut svc_dict = svc.as_dictionary().unwrap().clone();
+                    if let Some(users_val) = svc_dict.get("users") {
+                        if let Some(users_arr) = users_val.as_array() {
+                            let redacted_users: Vec<Value> = users_arr.iter().map(|u| {
+                                let mut ud = u.as_dictionary().unwrap().clone();
+                                if let Some(cd) = ud.get("client-data") {
+                                    let mut cd_dict = cd.as_dictionary().unwrap().clone();
+                                    for key in &["public-message-identity-key", "public-message-ngm-device-prekey-data-key"] {
+                                        if cd_dict.contains_key(*key) {
+                                            cd_dict.insert(key.to_string(), Value::String("<redacted>".into()));
+                                        }
+                                    }
+                                    ud.insert("client-data".into(), Value::Dictionary(cd_dict));
+                                }
+                                if ud.contains_key("kt-loggable-data") {
+                                    ud.insert("kt-loggable-data".into(), Value::String("<redacted>".into()));
+                                }
+                                Value::Dictionary(ud)
+                            }).collect();
+                            svc_dict.insert("users".into(), Value::Array(redacted_users));
+                        }
+                    }
+                    Value::Dictionary(svc_dict)
+                }).collect();
+                debug_body.insert("services".into(), Value::Array(redacted));
+            }
+        }
+        info!("Registration request body: {:?}", debug_body);
+        info!("Registration headers: x-protocol-version={}, user-agent=com.apple.invitation-registration {}", 
+            config.get_protocol_version(), config.get_version_ua());
+    }
+
     let mut request = SignedRequest::new("id-register", Method::POST)
             .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
             .header("x-protocol-version", &config.get_protocol_version().to_string())
