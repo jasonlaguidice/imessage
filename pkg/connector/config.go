@@ -27,6 +27,11 @@ type IMConfig struct {
 	// InitialSyncDays is how far back to look for chats during initial sync.
 	// Default is 365 (1 year).
 	InitialSyncDays int `yaml:"initial_sync_days"`
+
+	// PreferredHandle overrides the outgoing iMessage identity.
+	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
+	// If empty, the handle chosen during login is used.
+	PreferredHandle string `yaml:"preferred_handle"`
 }
 
 type umIMConfig IMConfig
@@ -70,6 +75,7 @@ func (c *IMConfig) FormatDisplayname(params DisplaynameParams) string {
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
 	helper.Copy(up.Int, "initial_sync_days")
+	helper.Copy(up.Str, "preferred_handle")
 }
 
 // GetInitialSyncDays returns the configured initial sync window in days,

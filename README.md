@@ -4,7 +4,7 @@ A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix c
 
 This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://docs.mau.fi/bridges/general/bridgev2.html) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
 
-**Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, and contact name resolution.
+**Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, and contact name resolution.
 
 **Platforms**: macOS (full features) and Linux (via hardware key extracted from a Mac once).
 
@@ -141,7 +141,9 @@ Without the relay (Intel keys only), chat history starts from when you log in an
 
 ## Login
 
-Follow the prompts: Apple ID → password. If the Mac is signed into iCloud with the same Apple ID, login completes without 2FA.
+Follow the prompts: Apple ID → password → 2FA (if needed) → handle selection. If the Mac is signed into iCloud with the same Apple ID, login completes without 2FA.
+
+If your Apple ID has multiple identities registered (e.g. a phone number and an email address), you'll be asked which one to use for outgoing messages. This is what recipients see your messages "from". To change it later, set `preferred_handle` in the config (see [Configuration](#configuration)) or log in again.
 
 > **Tip:** In a DM with the bot, commands don't need a prefix. In a regular room, use `!im login`, `!im help`, etc.
 
@@ -262,6 +264,7 @@ Key options:
 |-------|---------|-------------|
 | `network.initial_sync_days` | `365` | How far back to backfill on first login |
 | `network.displayname_template` | First/Last name | How bridged contacts appear in Matrix |
+| `network.preferred_handle` | *(from login)* | Outgoing identity (`tel:+15551234567` or `mailto:user@example.com`) |
 | `backfill.max_initial_messages` | `10000` | Max messages to backfill per chat |
 | `encryption.allow` | `true` | Enable end-to-bridge encryption |
 | `database.type` | `sqlite3-fk-wal` | `sqlite3-fk-wal` or `postgres` |
