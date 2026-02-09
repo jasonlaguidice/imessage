@@ -9,9 +9,19 @@ UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
 RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis -name '*.rs' 2>/dev/null)
+RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis rustpush/open-absinthe/src -name '*.rs' 2>/dev/null)
+CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
+GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
 LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
+
+# Track the git commit so ldflags changes trigger a Go rebuild.
+# .build-commit is updated whenever HEAD changes.
+COMMIT_FILE := .build-commit
+PREV_COMMIT := $(shell cat $(COMMIT_FILE) 2>/dev/null)
+ifneq ($(COMMIT),$(PREV_COMMIT))
+  $(shell echo $(COMMIT) > $(COMMIT_FILE))
+endif
 
 .PHONY: build clean install install-beeper uninstall rust bindings check-deps check-deps-linux
 
@@ -74,7 +84,7 @@ else
   CARGO_FEATURES := --features hardware-key
 endif
 
-$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) pkg/rustpushgo/Cargo.toml
+$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
@@ -97,7 +107,7 @@ build: check-deps $(RUST_LIB) $(BINARY)
 	codesign --force --deep --sign - $(APP_BUNDLE)
 	@echo "Built $(APP_BUNDLE) ($(VERSION)-$(COMMIT))"
 
-$(BINARY): $(shell find . -name '*.go') $(shell find . -name '*.m') $(shell find . -name '*.h') go.mod $(RUST_LIB)
+$(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
 	@cp Info.plist $(INFO_PLIST)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
@@ -106,7 +116,7 @@ else
 build: check-deps $(RUST_LIB) $(BINARY)
 	@echo "Built $(BINARY) ($(VERSION)-$(COMMIT))"
 
-$(BINARY): $(shell find . -name '*.go') go.mod $(RUST_LIB)
+$(BINARY): $(GO_SRC) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 endif
