@@ -10,7 +10,7 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 ## Quick Start (macOS)
 
-macOS 14.2+ required. Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
+macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
 
 ### With Beeper
 
