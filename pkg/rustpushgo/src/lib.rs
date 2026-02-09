@@ -594,7 +594,7 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     let config = MacOSConfig {
         inner: hw,
         version: "15.3".to_string(),
-        protocol_version: 1640,
+        protocol_version: 1660,
         device_id,
         icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
