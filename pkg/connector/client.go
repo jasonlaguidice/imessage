@@ -1272,8 +1272,12 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		}
 	}
 
+	// For DMs, resolve the best sendable identifier. For merged contacts,
+	// the portal ID might be an inactive number that rustpush can't send to.
+	sendTo := c.resolveSendTarget(portalID)
+
 	return rustpushgo.WrappedConversation{
-		Participants: []string{c.handle, portalID},
+		Participants: []string{c.handle, sendTo},
 		IsSms:        isSms,
 	}
 }
