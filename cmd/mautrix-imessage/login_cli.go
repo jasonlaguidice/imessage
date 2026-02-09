@@ -20,17 +20,19 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+// Global reader so buffered input isn't lost between prompts (important when
+// input is piped rather than typed interactively).
+var stdinReader = bufio.NewReader(os.Stdin)
+
 func prompt(label string) string {
 	fmt.Fprintf(os.Stderr, "%s: ", label)
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
+	line, _ := stdinReader.ReadString('\n')
 	return strings.TrimSpace(line)
 }
 
 func promptPassword(label string) string {
 	fmt.Fprintf(os.Stderr, "%s: ", label)
-	reader := bufio.NewReader(os.Stdin)
-	line, _ := reader.ReadString('\n')
+	line, _ := stdinReader.ReadString('\n')
 	return strings.TrimSpace(line)
 }
 
