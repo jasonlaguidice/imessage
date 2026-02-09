@@ -138,6 +138,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	result, err := l.session.Finish(l.cfg, l.conn)
 	if err != nil {
+		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
 	}
 
@@ -326,6 +327,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	result, err := l.session.Finish(l.cfg, l.conn)
 	if err != nil {
+		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
 	}
 
