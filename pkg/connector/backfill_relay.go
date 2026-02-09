@@ -154,7 +154,9 @@ func (br *backfillRelay) FetchMessages(ctx context.Context, params bridgev2.Fetc
 			chatGUIDs = []string{chatGUID}
 		}
 	} else {
-		chatGUIDs = portalIDToChatGUIDs(portalID)
+		// Use contact-aware lookup: includes chat GUIDs for all of the
+		// contact's phone numbers, so merged DM portals get complete history.
+		chatGUIDs = c.getContactChatGUIDs(portalID)
 	}
 
 	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages via relay")
@@ -169,37 +171,41 @@ func (br *backfillRelay) FetchMessages(ctx context.Context, params bridgev2.Fetc
 		count = 50
 	}
 
+	// Fetch messages from ALL chat GUIDs and merge. For contacts with multiple
+	// phone numbers, this combines messages from all numbers into one timeline.
 	var messages []RelayMessage
-	var err error
-	var usedGUID string
+	var lastErr error
 
 	for _, chatGUID := range chatGUIDs {
+		var msgs []RelayMessage
 		if params.AnchorMessage != nil {
 			ts := params.AnchorMessage.Timestamp.UnixMilli()
 			if params.Forward {
-				messages, err = br.GetMessages(chatGUID, &ts, nil, 0)
+				msgs, lastErr = br.GetMessages(chatGUID, &ts, nil, 0)
 			} else {
-				messages, err = br.GetMessages(chatGUID, nil, &ts, count)
+				msgs, lastErr = br.GetMessages(chatGUID, nil, &ts, count)
 			}
 		} else {
 			days := c.Main.Config.GetInitialSyncDays()
 			sinceTs := time.Now().AddDate(0, 0, -days).UnixMilli()
-			messages, err = br.GetMessages(chatGUID, &sinceTs, nil, 0)
+			msgs, lastErr = br.GetMessages(chatGUID, &sinceTs, nil, 0)
 		}
-		if err == nil && len(messages) > 0 {
-			usedGUID = chatGUID
-			break
+		if lastErr == nil {
+			messages = append(messages, msgs...)
 		}
-	}
-	if usedGUID == "" && len(chatGUIDs) > 0 {
-		usedGUID = chatGUIDs[0]
-	}
-	if err != nil {
-		log.Error().Err(err).Str("chat_guid", usedGUID).Msg("Failed to fetch messages from relay")
-		return nil, fmt.Errorf("failed to fetch messages from relay: %w", err)
 	}
 
-	log.Info().Str("chat_guid", usedGUID).Int("raw_message_count", len(messages)).Msg("Got messages from relay")
+	if len(messages) == 0 && lastErr != nil {
+		log.Error().Err(lastErr).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from relay")
+		return nil, fmt.Errorf("failed to fetch messages from relay: %w", lastErr)
+	}
+
+	// Sort chronologically — messages may come from multiple chat GUIDs
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].TimestampMs < messages[j].TimestampMs
+	})
+
+	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from relay")
 
 	intent := c.Main.Bridge.Bot
 	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
@@ -348,6 +354,62 @@ func (c *IMClient) runInitialSyncViaRelay(ctx context.Context, log zerolog.Logge
 			portalKey: portalKey,
 			info:      chat,
 		})
+	}
+
+	// Deduplicate DM entries for contacts with multiple phone numbers.
+	// At this point entries are ordered newest-first (from GetChats), so the
+	// first entry for a contact is the most recently active phone number —
+	// that's the one we keep as the primary portal.
+	{
+		type contactGroup struct {
+			indices []int
+		}
+		groups := make(map[string]*contactGroup)
+		for i, entry := range entries {
+			portalID := string(entry.portalKey.ID)
+			if strings.Contains(portalID, ",") {
+				continue // skip groups
+			}
+			contact := c.lookupContact(portalID)
+			key := contactKeyFromContact(contact)
+			if key == "" {
+				continue
+			}
+			if g, ok := groups[key]; ok {
+				g.indices = append(g.indices, i)
+			} else {
+				groups[key] = &contactGroup{indices: []int{i}}
+			}
+		}
+
+		skip := make(map[int]bool)
+		for _, group := range groups {
+			if len(group.indices) <= 1 {
+				continue
+			}
+			// Keep the first entry (most recently active), skip the rest.
+			// Backfill for the primary portal will include messages from all
+			// numbers via getContactChatGUIDs.
+			primaryIdx := group.indices[0]
+			for _, idx := range group.indices[1:] {
+				skip[idx] = true
+				log.Info().
+					Str("skip_portal", string(entries[idx].portalKey.ID)).
+					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
+					Msg("Merging DM portal for contact with multiple phone numbers")
+			}
+		}
+
+		if len(skip) > 0 {
+			var merged []chatEntry
+			for i, entry := range entries {
+				if !skip[i] {
+					merged = append(merged, entry)
+				}
+			}
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated DM entries by contact")
+			entries = merged
+		}
 	}
 
 	// Process oldest-activity first so most recent gets highest stream_ordering

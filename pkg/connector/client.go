@@ -1210,8 +1210,11 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string) netwo
 
 	for _, p := range participants {
 		if p != c.handle {
+			// Resolve to an existing portal if the contact has multiple phone numbers.
+			// This ensures messages from any of a contact's numbers land in one room.
+			portalID := c.resolveContactPortalID(p)
 			return networkid.PortalKey{
-				ID:       networkid.PortalID(p),
+				ID:       portalID,
 				Receiver: c.UserLogin.ID,
 			}
 		}
@@ -1235,8 +1238,10 @@ func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string
 		return c.makePortalKey(participants, groupName)
 	}
 	if sender != nil && *sender != "" {
+		// Resolve to existing portal for contacts with multiple numbers
+		portalID := c.resolveContactPortalID(*sender)
 		return networkid.PortalKey{
-			ID:       networkid.PortalID(*sender),
+			ID:       portalID,
 			Receiver: c.UserLogin.ID,
 		}
 	}
@@ -1347,6 +1352,59 @@ func (c *IMClient) runInitialSync(ctx context.Context, log zerolog.Logger) {
 			portalKey: portalKey,
 			info:      info,
 		})
+	}
+
+	// Deduplicate DM entries for contacts with multiple phone numbers.
+	// At this point entries are ordered newest-first (from GetChatsWithMessagesAfter),
+	// so the first entry for a contact is the most recently active phone number —
+	// that's the one we keep as the primary portal.
+	{
+		type contactGroup struct {
+			indices []int
+		}
+		groups := make(map[string]*contactGroup)
+		for i, entry := range entries {
+			portalID := string(entry.portalKey.ID)
+			if strings.Contains(portalID, ",") {
+				continue // skip groups
+			}
+			contact := c.lookupContact(portalID)
+			key := contactKeyFromContact(contact)
+			if key == "" {
+				continue
+			}
+			if g, ok := groups[key]; ok {
+				g.indices = append(g.indices, i)
+			} else {
+				groups[key] = &contactGroup{indices: []int{i}}
+			}
+		}
+
+		skip := make(map[int]bool)
+		for _, group := range groups {
+			if len(group.indices) <= 1 {
+				continue
+			}
+			primaryIdx := group.indices[0]
+			for _, idx := range group.indices[1:] {
+				skip[idx] = true
+				log.Info().
+					Str("skip_portal", string(entries[idx].portalKey.ID)).
+					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
+					Msg("Merging DM portal for contact with multiple phone numbers")
+			}
+		}
+
+		if len(skip) > 0 {
+			var merged []chatEntry
+			for i, entry := range entries {
+				if !skip[i] {
+					merged = append(merged, entry)
+				}
+			}
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated DM entries by contact")
+			entries = merged
+		}
 	}
 
 	// GetChatsWithMessagesAfter returns chats ordered by MAX(message.date)
