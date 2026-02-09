@@ -5,6 +5,8 @@ BINARY="$1"
 DATA_DIR="$2"
 BUNDLE_ID="$3"
 
+BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
+
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 PLIST="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
@@ -75,7 +77,7 @@ if [ -f "$CONFIG" ]; then
     echo "  Delete it to regenerate from Beeper."
 else
     echo "Generating Beeper config..."
-    "$BBCTL" config --type imessage-v2 -o "$CONFIG" sh-imessage
+    "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
     echo "✓ Config saved to $CONFIG"
 fi
 
@@ -170,7 +172,7 @@ for i in $(seq 1 15); do
         echo ""
         echo "═══════════════════════════════════════════════"
         echo "  Next: Open Beeper and DM"
-        echo "    @sh-imessagebot:$DOMAIN"
+        echo "    @${BRIDGE_NAME}bot:$DOMAIN"
         echo "  Send: login"
         echo "═══════════════════════════════════════════════"
         echo ""
@@ -187,4 +189,4 @@ echo ""
 echo "Bridge is starting up (check logs for status):"
 echo "  tail -f $LOG_OUT"
 echo ""
-echo "Once running, DM @sh-imessagebot:$DOMAIN and send: login"
+echo "Once running, DM @${BRIDGE_NAME}bot:$DOMAIN and send: login"
