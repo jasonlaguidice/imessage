@@ -22,6 +22,14 @@ make install-beeper
 
 The installer handles everything: Homebrew, dependencies, building, Beeper login, config, and LaunchAgent setup. Once running, DM `@sh-imessagebot:beeper.local` in Beeper and send `login`.
 
+**Already have an iMessage bridge (e.g. BlueBubbles)?** Use a custom bridge name to run both side by side:
+
+```bash
+BRIDGE_NAME=sh-imessage-v2 make install-beeper
+```
+
+This registers a separate bridge so it doesn't collide with the existing one. DM `@sh-imessage-v2bot:beeper.local` instead.
+
 ### With a Self-Hosted Homeserver
 
 ```bash
