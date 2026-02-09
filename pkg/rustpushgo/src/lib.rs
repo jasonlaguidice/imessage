@@ -566,8 +566,6 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
 
-    let device_id = device_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string().to_uppercase());
-
     // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig
     let (hw, nac_relay_url) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
         (full.inner, full.nac_relay_url)
@@ -576,6 +574,10 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
             .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
         (hw, None)
     };
+
+    // Use the real hardware UUID from the extracted key so the bridge
+    // shows up as the original Mac rather than a new phantom device.
+    let device_id = device_id.unwrap_or_else(|| hw.platform_uuid.to_uppercase());
 
     // Always use known-good values for protocol fields — the extraction tool's
     // values (e.g. icloud_ua) may not match what the runtime code expects.
