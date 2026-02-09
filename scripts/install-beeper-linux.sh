@@ -66,6 +66,8 @@ if [ -f "$CONFIG" ]; then
 else
     echo "Generating Beeper config..."
     "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
+    # Make DB path absolute so it doesn't depend on working directory
+    sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
     echo "✓ Config saved to $CONFIG"
 fi
 
