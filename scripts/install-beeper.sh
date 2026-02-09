@@ -116,6 +116,8 @@ LOG_OUT="$DATA_ABS/bridge.stdout.log"
 LOG_ERR="$DATA_ABS/bridge.stderr.log"
 
 mkdir -p "$(dirname "$PLIST")"
+GUI_DOMAIN="gui/$(id -u)"
+launchctl bootout "$GUI_DOMAIN/$BUNDLE_ID" 2>/dev/null || true
 launchctl unload "$PLIST" 2>/dev/null || true
 
 cat > "$PLIST" << PLIST_EOF
@@ -157,7 +159,18 @@ cat > "$PLIST" << PLIST_EOF
 </plist>
 PLIST_EOF
 
-launchctl load "$PLIST"
+if ! launchctl bootstrap "$GUI_DOMAIN" "$PLIST" 2>/dev/null; then
+    if ! launchctl load "$PLIST" 2>/dev/null; then
+        echo ""
+        echo "⚠  LaunchAgent failed to load. You can run the bridge manually:"
+        echo "   $BINARY -c $CONFIG_ABS"
+        echo ""
+        echo "   This is a known issue on macOS 13 (Ventura). Try:"
+        echo "   1. Remove and re-add the .app in Full Disk Access"
+        echo "   2. Re-run: make install-beeper"
+        echo ""
+    fi
+fi
 echo "✓ Bridge started (LaunchAgent installed)"
 echo ""
 
@@ -177,9 +190,9 @@ for i in $(seq 1 15); do
         echo "═══════════════════════════════════════════════"
         echo ""
         echo "Logs:    tail -f $LOG_OUT"
-        echo "Stop:    launchctl unload $PLIST"
-        echo "Start:   launchctl load $PLIST"
-        echo "Restart: launchctl unload $PLIST && launchctl load $PLIST"
+        echo "Stop:    launchctl bootout $GUI_DOMAIN/$BUNDLE_ID"
+        echo "Start:   launchctl bootstrap $GUI_DOMAIN $PLIST"
+        echo "Restart: launchctl kickstart -k $GUI_DOMAIN/$BUNDLE_ID"
         exit 0
     fi
     sleep 1
