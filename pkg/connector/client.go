@@ -105,17 +105,29 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 	c.client = client
 
-	// Get our handle
+	// Get our handle (precedence: config > login metadata > first handle)
 	handles := client.GetHandles()
 	c.allHandles = handles
 	if len(handles) > 0 {
 		c.handle = handles[0]
-		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != "" {
+		preferred := c.Main.Config.PreferredHandle
+		if preferred == "" {
+			if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+				preferred = meta.PreferredHandle
+			}
+		}
+		if preferred != "" {
+			found := false
 			for _, h := range handles {
-				if h == meta.PreferredHandle {
+				if h == preferred {
 					c.handle = h
+					found = true
 					break
 				}
+			}
+			if !found {
+				log.Warn().Str("preferred", preferred).Strs("available", handles).
+					Msg("Preferred handle not found among registered handles, using first available")
 			}
 		}
 	}
