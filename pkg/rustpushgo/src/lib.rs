@@ -575,9 +575,19 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         (hw, None)
     };
 
-    // Use the real hardware UUID from the extracted key so the bridge
+    // Always use the real hardware UUID from the extracted key so the bridge
     // shows up as the original Mac rather than a new phantom device.
-    let device_id = device_id.unwrap_or_else(|| hw.platform_uuid.to_uppercase());
+    // Ignore any persisted device ID — it may be a stale random UUID.
+    let hw_uuid = hw.platform_uuid.to_uppercase();
+    if let Some(ref old) = device_id {
+        if old != &hw_uuid {
+            log::warn!(
+                "Ignoring persisted device ID {} — using hardware UUID {} from extracted key",
+                old, hw_uuid
+            );
+        }
+    }
+    let device_id = hw_uuid;
 
     // Always use known-good values for protocol fields — the extraction tool's
     // values (e.g. icloud_ua) may not match what the runtime code expects.
