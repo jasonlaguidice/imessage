@@ -1142,6 +1142,7 @@ func (c *IMClient) isMyHandle(handle string) bool {
 
 func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
 	if sender == nil || *sender == "" || c.isMyHandle(*sender) {
+		c.ensureDoublePuppet()
 		return bridgev2.EventSender{
 			IsFromMe:    true,
 			SenderLogin: c.UserLogin.ID,
@@ -1151,6 +1152,35 @@ func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
 	return bridgev2.EventSender{
 		IsFromMe: false,
 		Sender:   makeUserID(*sender),
+	}
+}
+
+// ensureDoublePuppet retries double puppet setup if it previously failed.
+//
+// The mautrix bridgev2 framework permanently caches a nil DoublePuppet() on
+// first failure (user.go sets doublePuppetInitialized=true BEFORE calling
+// NewUserIntent). On macOS Ventura, transient IDS registration issues can
+// cause the initial setup to fail, and without a retry the nil is cached
+// forever — making all IsFromMe messages fall through to the ghost intent,
+// which flips their direction (sent appears as received).
+//
+// This workaround detects the cached nil and re-attempts login using the
+// saved access token, which succeeds once IDS registration stabilizes.
+func (c *IMClient) ensureDoublePuppet() {
+	ctx := context.Background()
+	user := c.UserLogin.User
+	if user.DoublePuppet(ctx) != nil {
+		return // already working
+	}
+	token := user.AccessToken
+	if token == "" {
+		return // no token to retry with
+	}
+	user.LogoutDoublePuppet(ctx)
+	if err := user.LoginDoublePuppet(ctx, token); err != nil {
+		c.UserLogin.Log.Warn().Err(err).Msg("Failed to re-establish double puppet")
+	} else {
+		c.UserLogin.Log.Info().Msg("Re-established double puppet after previous failure")
 	}
 }
 
