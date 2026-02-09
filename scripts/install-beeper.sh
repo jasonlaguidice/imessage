@@ -65,7 +65,7 @@ if ! "$BBCTL" whoami >/dev/null 2>&1 || "$BBCTL" whoami 2>&1 | grep -qi "not log
     echo ""
     "$BBCTL" login
 fi
-WHOAMI=$("$BBCTL" whoami 2>&1 | head -1)
+WHOAMI=$("$BBCTL" whoami 2>&1 | head -1 || true)
 echo "✓ Logged in: $WHOAMI"
 
 # ── Generate config via bbctl ─────────────────────────────────
@@ -160,7 +160,7 @@ echo "✓ Bridge started (LaunchAgent installed)"
 echo ""
 
 # ── Wait for bridge to connect ────────────────────────────────
-DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}')
+DOMAIN=$(grep '^\s*domain:' "$CONFIG" | head -1 | awk '{print $2}' || true)
 DOMAIN="${DOMAIN:-beeper.local}"
 
 echo "Waiting for bridge to start..."
