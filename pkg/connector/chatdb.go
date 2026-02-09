@@ -347,6 +347,13 @@ func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent b
 		content.MsgType = event.MsgEmote
 	}
 
+	// URL preview: detect URL and fetch og: metadata + image
+	if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
+		content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+			fetchURLPreview(ctx, portal.Bridge, intent, detectedURL),
+		}
+	}
+
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:    event.EventMessage,

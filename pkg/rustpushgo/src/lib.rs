@@ -14,7 +14,8 @@ use rustpush::{
     APSState, Attachment, AttachmentType, ConversationData, EditMessage, IDSNGMIdentity,
     IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType,
-    Reaction, UnsendMessage, IndexedMessagePart,
+    Reaction, UnsendMessage, IndexedMessagePart, LinkMeta,
+    LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
 };
 use omnisette::default_provider;
 use std::sync::RwLock;
@@ -332,6 +333,60 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                         size,
                         is_inline,
                         inline_data,
+                    });
+                }
+            }
+
+            // Encode rich link as special attachments for the Go side
+            if let Some(ref lm) = normal.link_meta {
+                let original_url: String = lm.data.original_url.clone().into();
+                let url: String = lm.data.url.clone().map(|u| u.into()).unwrap_or_default();
+                let title = lm.data.title.clone().unwrap_or_default();
+                let summary = lm.data.summary.clone().unwrap_or_default();
+
+                info!("Inbound rich link: original_url={}, url={}, title={:?}, summary={:?}, has_image={}, has_icon={}",
+                    original_url, url, title, summary,
+                    lm.data.image.is_some(), lm.data.icon.is_some());
+
+                let image_mime = if let Some(ref img) = lm.data.image {
+                    img.mime_type.clone()
+                } else if let Some(ref icon) = lm.data.icon {
+                    icon.mime_type.clone()
+                } else {
+                    String::new()
+                };
+
+                // Metadata: original_url\x01url\x01title\x01summary\x01image_mime
+                let meta = format!("{}\x01{}\x01{}\x01{}\x01{}",
+                    original_url, url, title, summary, image_mime);
+                w.attachments.push(WrappedAttachment {
+                    mime_type: "x-richlink/meta".to_string(),
+                    filename: String::new(),
+                    uti_type: String::new(),
+                    size: 0,
+                    is_inline: true,
+                    inline_data: Some(meta.into_bytes()),
+                });
+
+                // Image data (from image or icon)
+                let image_data = if let Some(ref img) = lm.data.image {
+                    let idx = img.rich_link_image_attachment_substitute_index as usize;
+                    lm.attachments.get(idx).cloned()
+                } else if let Some(ref icon) = lm.data.icon {
+                    let idx = icon.rich_link_image_attachment_substitute_index as usize;
+                    lm.attachments.get(idx).cloned()
+                } else {
+                    None
+                };
+
+                if let Some(img_data) = image_data {
+                    w.attachments.push(WrappedAttachment {
+                        mime_type: "x-richlink/image".to_string(),
+                        filename: String::new(),
+                        uti_type: String::new(),
+                        size: img_data.len() as u64,
+                        is_inline: true,
+                        inline_data: Some(img_data),
                     });
                 }
             }
@@ -900,15 +955,71 @@ impl Client {
         } else {
             MessageType::IMessage
         };
+
+        // Parse rich link encoded as prefix: \x00RL\x01original_url\x01url\x01title\x01summary\x00actual_text
+        let (actual_text, link_meta) = if text.starts_with("\x00RL\x01") {
+            let rest = &text[4..]; // skip "\x00RL\x01"
+            if let Some(end) = rest.find('\x00') {
+                let metadata = &rest[..end];
+                let actual = rest[end + 1..].to_string();
+                let fields: Vec<&str> = metadata.splitn(4, '\x01').collect();
+                let original_url_str = fields.first().copied().unwrap_or("");
+                let url_str = fields.get(1).copied().unwrap_or("");
+                let title_str = fields.get(2).copied().unwrap_or("");
+                let summary_str = fields.get(3).copied().unwrap_or("");
+
+                let original_url = NSURL {
+                    base: "$null".to_string(),
+                    relative: original_url_str.to_string(),
+                };
+                let url = if url_str.is_empty() {
+                    None
+                } else {
+                    Some(NSURL {
+                        base: "$null".to_string(),
+                        relative: url_str.to_string(),
+                    })
+                };
+                let title = if title_str.is_empty() { None } else { Some(title_str.to_string()) };
+                let summary = if summary_str.is_empty() { None } else { Some(summary_str.to_string()) };
+
+                info!("Sending rich link: url={}, title={:?}", original_url_str, title);
+
+                let lm = LinkMeta {
+                    data: LPLinkMetadata {
+                        image_metadata: None,
+                        version: 1,
+                        icon_metadata: None,
+                        original_url,
+                        url,
+                        title,
+                        summary,
+                        image: None,
+                        icon: None,
+                        images: None,
+                        icons: None,
+                    },
+                    attachments: vec![],
+                };
+                (actual, Some(lm))
+            } else {
+                (text, None)
+            }
+        } else {
+            (text, None)
+        };
+
+        let mut normal = NormalMessage::new(actual_text.clone(), service);
+        normal.link_meta = link_meta;
         let mut msg = MessageInst::new(
             conv.clone(),
             &handle,
-            Message::Message(NormalMessage::new(text.clone(), service)),
+            Message::Message(normal),
         );
         match self.client.send(&mut msg).await {
             Ok(_) => Ok(msg.id.clone()),
             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
-                // iMessage failed — no IDS targets. Retry as SMS.
+                // iMessage failed — no IDS targets. Retry as SMS (without rich link).
                 info!("No IDS targets, falling back to SMS for {:?}", conv.participants);
                 let sms_service = MessageType::SMS {
                     is_phone: false,
@@ -918,7 +1029,7 @@ impl Client {
                 let mut sms_msg = MessageInst::new(
                     conv,
                     &handle,
-                    Message::Message(NormalMessage::new(text, sms_service)),
+                    Message::Message(NormalMessage::new(actual_text, sms_service)),
                 );
                 self.client.send(&mut sms_msg).await
                     .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS: {}", e) })?;
@@ -1060,6 +1171,8 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
+        // Detect voice messages by UTI (CAF files from OGG→CAF remux are voice recordings)
+        let is_voice = uti_type == "com.apple.coreaudio-format";
         let service = if conversation.is_sms {
             MessageType::SMS {
                 is_phone: false,
@@ -1104,7 +1217,7 @@ impl Client {
                 subject: None,
                 app: None,
                 link_meta: None,
-                voice: false,
+                voice: is_voice,
                 scheduled: None,
                 embedded_profile: None,
             }),
@@ -1135,7 +1248,7 @@ impl Client {
                         subject: None,
                         app: None,
                         link_meta: None,
-                        voice: false,
+                        voice: is_voice,
                         scheduled: None,
                         embedded_profile: None,
                     }),

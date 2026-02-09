@@ -14,7 +14,7 @@ import (
 )
 
 var caps = &event.RoomFeatures{
-	ID: "fi.mau.imessage.capabilities.2024_01",
+	ID: "fi.mau.imessage.capabilities.2025_02",
 
 	Formatting: map[event.FormattingFeature]event.CapabilitySupportLevel{
 		event.FmtBold:   event.CapLevelDropped,
@@ -26,12 +26,22 @@ var caps = &event.RoomFeatures{
 				"*/*": event.CapLevelFullySupported,
 			},
 		},
+		event.CapMsgGIF: {
+			MimeTypes: map[string]event.CapabilitySupportLevel{
+				"image/gif": event.CapLevelFullySupported,
+			},
+		},
 		event.MsgVideo: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
 				"*/*": event.CapLevelFullySupported,
 			},
 		},
 		event.MsgAudio: {
+			MimeTypes: map[string]event.CapabilitySupportLevel{
+				"*/*": event.CapLevelFullySupported,
+			},
+		},
+		event.CapMsgVoice: {
 			MimeTypes: map[string]event.CapabilitySupportLevel{
 				"*/*": event.CapLevelFullySupported,
 			},
@@ -57,7 +67,7 @@ var capsDM *event.RoomFeatures
 func init() {
 	c := *caps
 	capsDM = &c
-	capsDM.ID = "fi.mau.imessage.capabilities.2024_01+dm"
+	capsDM.ID = "fi.mau.imessage.capabilities.2025_02+dm"
 }
 
 var generalCaps = &bridgev2.NetworkGeneralCapabilities{

@@ -9,12 +9,14 @@
 package connector
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -282,17 +284,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		c.markPortalSMS(string(portalKey.ID))
 	}
 
-	if msg.Text != nil && *msg.Text != "" {
-		content := &event.MessageEventContent{
-			MsgType: event.MsgText,
-			Body:    *msg.Text,
-		}
-		if msg.Subject != nil && *msg.Subject != "" {
-			content.Body = fmt.Sprintf("**%s**\n%s", *msg.Subject, *msg.Text)
-			content.Format = event.FormatHTML
-			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", *msg.Subject, *msg.Text)
-		}
-
+	if msg.Text != nil && *msg.Text != "" && strings.TrimRight(*msg.Text, "\ufffc \n") != "" {
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*rustpushgo.WrappedMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventMessage,
@@ -310,16 +302,22 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		})
 	}
 
-	for i, att := range msg.Attachments {
+	attIndex := 0
+	for _, att := range msg.Attachments {
+		// Skip rich link sideband attachments (handled in convertMessage)
+		if att.MimeType == "x-richlink/meta" || att.MimeType == "x-richlink/image" {
+			continue
+		}
 		attID := msg.Uuid
-		if i > 0 || (msg.Text != nil && *msg.Text != "") {
-			attID = fmt.Sprintf("%s_att%d", msg.Uuid, i)
+		if attIndex > 0 || (msg.Text != nil && *msg.Text != "") {
+			attID = fmt.Sprintf("%s_att%d", msg.Uuid, attIndex)
 		}
 		attMsg := &attachmentMessage{
 			WrappedMessage: &msg,
 			Attachment:     &att,
-			Index:          i,
+			Index:          attIndex,
 		}
+		attIndex++
 		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*attachmentMessage]{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventMessage,
@@ -503,6 +501,48 @@ func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessag
 // Matrix → iMessage
 // ============================================================================
 
+// convertURLPreviewToIMessage encodes a Beeper link preview (or auto-detected
+// URL) into the sideband text prefix that Rust parses for rich link sending.
+// Follows the pattern from mautrix-whatsapp's urlpreview.go.
+func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *event.MessageEventContent) string {
+	log := zerolog.Ctx(ctx)
+	body := content.Body
+
+	// Priority 1: Explicit BeeperLinkPreviews from Matrix
+	if len(content.BeeperLinkPreviews) > 0 {
+		lp := content.BeeperLinkPreviews[0]
+		canonical := lp.CanonicalURL
+		if canonical == "" {
+			canonical = lp.MatchedURL
+		}
+		log.Debug().
+			Str("matched_url", lp.MatchedURL).
+			Str("canonical_url", canonical).
+			Str("title", lp.Title).
+			Msg("Encoding Beeper link preview for iMessage")
+		return "\x00RL\x01" + lp.MatchedURL + "\x01" + canonical + "\x01" + lp.Title + "\x01" + lp.Description + "\x00" + body
+	}
+
+	// Priority 2: Auto-detect URL and fetch preview from homeserver
+	if detectedURL := urlRegex.FindString(body); detectedURL != "" {
+		fetchURL := normalizeURL(detectedURL)
+		log.Debug().Str("detected_url", detectedURL).Msg("Auto-detected URL in outbound message, fetching preview")
+		title, desc := "", ""
+		if mc, ok := c.Main.Bridge.Matrix.(bridgev2.MatrixConnectorWithURLPreviews); ok {
+			if lp, err := mc.GetURLPreview(ctx, fetchURL); err == nil && lp != nil {
+				title = lp.Title
+				desc = lp.Description
+				log.Debug().Str("title", title).Str("description", desc).Msg("Got URL preview from homeserver for outbound")
+			} else if err != nil {
+				log.Debug().Err(err).Msg("Failed to fetch URL preview from homeserver for outbound")
+			}
+		}
+		return "\x00RL\x01" + detectedURL + "\x01" + fetchURL + "\x01" + title + "\x01" + desc + "\x00" + body
+	}
+
+	return body
+}
+
 func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
@@ -515,9 +555,19 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 		return c.handleMatrixFile(ctx, msg, conv)
 	}
 
-	uuid, err := c.client.SendMessage(conv, msg.Content.Body, c.handle)
+	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
+
+	uuid, err := c.client.SendMessage(conv, textToSend, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
+	}
+
+	// If the outbound message has a URL but no link previews from the client,
+	// edit the Matrix event to add com.beeper.linkpreviews so Beeper renders them.
+	if len(msg.Content.BeeperLinkPreviews) == 0 {
+		if detectedURL := urlRegex.FindString(msg.Content.Body); detectedURL != "" {
+			go c.addOutboundURLPreview(msg.Event.ID, msg.Portal.MXID, msg.Content.Body, msg.Content.MsgType, detectedURL)
+		}
 	}
 
 	return &bridgev2.MatrixMessageResponse{
@@ -528,6 +578,40 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			Metadata:  &MessageMetadata{},
 		},
 	}, nil
+}
+
+// addOutboundURLPreview edits an outbound Matrix event to add com.beeper.linkpreviews
+// so Beeper displays a URL preview for messages sent from the client.
+func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, body string, msgType event.MessageType, detectedURL string) {
+	log := c.UserLogin.Log.With().
+		Str("component", "url_preview").
+		Stringer("event_id", eventID).
+		Str("detected_url", detectedURL).
+		Logger()
+	ctx := log.WithContext(context.Background())
+
+	intent := c.UserLogin.User.DoublePuppet(ctx)
+	if intent == nil {
+		log.Debug().Msg("No double puppet available, skipping outbound URL preview edit")
+		return
+	}
+
+	preview := fetchURLPreview(ctx, c.Main.Bridge, intent, detectedURL)
+
+	editContent := &event.MessageEventContent{
+		MsgType:            msgType,
+		Body:               body,
+		BeeperLinkPreviews: []*event.BeeperLinkPreview{preview},
+	}
+	editContent.SetEdit(eventID)
+
+	wrappedContent := &event.Content{Parsed: editContent}
+	_, err := intent.SendMessage(ctx, roomID, event.EventMessage, wrappedContent, nil)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to send outbound URL preview edit")
+	} else {
+		log.Debug().Str("title", preview.Title).Msg("Sent outbound URL preview edit")
+	}
 }
 
 func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMessage, conv rustpushgo.WrappedConversation) (*bridgev2.MatrixMessageResponse, error) {
@@ -551,6 +635,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	if msg.Content.Info != nil && msg.Content.Info.MimeType != "" {
 		mimeType = msg.Content.Info.MimeType
 	}
+
+	// Convert OGG Opus voice recordings to CAF Opus for native iMessage playback
+	data, mimeType, fileName = convertAudioForIMessage(data, mimeType, fileName)
 
 	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle)
 	if err != nil {
@@ -1386,6 +1473,101 @@ type attachmentMessage struct {
 	Index      int
 }
 
+// convertURLPreviewToBeeper parses rich link sideband attachments from an
+// inbound iMessage and returns Beeper link previews. Follows the pattern
+// from mautrix-whatsapp's urlpreview.go.
+func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage, bodyText string) []*event.BeeperLinkPreview {
+	log := zerolog.Ctx(ctx)
+
+	// Find sideband attachments encoded by Rust
+	var rlMeta, rlImage *rustpushgo.WrappedAttachment
+	for i := range msg.Attachments {
+		switch msg.Attachments[i].MimeType {
+		case "x-richlink/meta":
+			rlMeta = &msg.Attachments[i]
+		case "x-richlink/image":
+			rlImage = &msg.Attachments[i]
+		}
+	}
+
+	if rlMeta != nil && rlMeta.InlineData != nil {
+		fields := bytes.SplitN(*rlMeta.InlineData, []byte{0x01}, 5)
+		originalURL := string(fields[0])
+		canonicalURL := originalURL
+		if len(fields) > 1 && len(fields[1]) > 0 {
+			canonicalURL = string(fields[1])
+		}
+		title := ""
+		if len(fields) > 2 && len(fields[2]) > 0 {
+			title = string(fields[2])
+		}
+		description := ""
+		if len(fields) > 3 && len(fields[3]) > 0 {
+			description = string(fields[3])
+		}
+		imageMime := ""
+		if len(fields) > 4 && len(fields[4]) > 0 {
+			imageMime = string(fields[4])
+		}
+
+		log.Debug().
+			Str("original_url", originalURL).
+			Str("canonical_url", canonicalURL).
+			Str("title", title).
+			Str("description", description).
+			Str("image_mime", imageMime).
+			Msg("Parsed rich link sideband data from iMessage")
+
+		// MatchedURL must exactly match a URL in the body text so Beeper
+		// can associate the preview with the inline URL. Use regex to find
+		// the URL in the body rather than trusting the NSURL-converted value.
+		matchedURL := originalURL
+		if bodyURL := urlRegex.FindString(bodyText); bodyURL != "" {
+			matchedURL = bodyURL
+		}
+
+		preview := &event.BeeperLinkPreview{
+			MatchedURL: matchedURL,
+			LinkPreview: event.LinkPreview{
+				CanonicalURL: canonicalURL,
+				Title:        title,
+				Description:  description,
+			},
+		}
+
+		// Upload preview image if available
+		if rlImage != nil && rlImage.InlineData != nil && intent != nil {
+			if imageMime == "" {
+				imageMime = "image/jpeg"
+			}
+			log.Debug().Int("image_bytes", len(*rlImage.InlineData)).Str("mime", imageMime).Msg("Uploading rich link preview image")
+			url, encFile, err := intent.UploadMedia(ctx, "", *rlImage.InlineData, "preview", imageMime)
+			if err == nil {
+				if encFile != nil {
+					preview.ImageEncryption = encFile
+					preview.ImageURL = encFile.URL
+				} else {
+					preview.ImageURL = url
+				}
+				preview.ImageType = imageMime
+			} else {
+				log.Warn().Err(err).Msg("Failed to upload rich link preview image")
+			}
+		}
+
+		log.Debug().Str("matched_url", matchedURL).Str("title", title).Msg("Inbound rich link preview ready")
+		return []*event.BeeperLinkPreview{preview}
+	}
+
+	// No rich link from iMessage — auto-detect URL and fetch og: metadata + image
+	if detectedURL := urlRegex.FindString(bodyText); detectedURL != "" {
+		log.Debug().Str("detected_url", detectedURL).Msg("No iMessage rich link, fetching URL preview")
+		return []*event.BeeperLinkPreview{fetchURLPreview(ctx, portal.Bridge, intent, detectedURL)}
+	}
+
+	return nil
+}
+
 func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
 	text := ptrStringOr(msg.Text, "")
 	content := &event.MessageEventContent{
@@ -1402,6 +1584,8 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 		}
 	}
 
+	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
+
 	return &bridgev2.ConvertedMessage{
 		Parts: []*bridgev2.ConvertedMessagePart{{
 			Type:    event.EventMessage,
@@ -1412,19 +1596,41 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
-	msgType := mimeToMsgType(att.MimeType)
+	mimeType := att.MimeType
+	fileName := att.Filename
+	var durationMs int
+
+	// Convert CAF Opus voice messages to OGG Opus for Matrix clients
+	var inlineData []byte
+	if att.IsInline && att.InlineData != nil {
+		inlineData = *att.InlineData
+		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
+			inlineData, mimeType, fileName, durationMs = convertAudioForMatrix(inlineData, mimeType, fileName)
+		}
+	}
+
+	msgType := mimeToMsgType(mimeType)
 
 	content := &event.MessageEventContent{
 		MsgType: msgType,
-		Body:    att.Filename,
+		Body:    fileName,
 		Info: &event.FileInfo{
-			MimeType: att.MimeType,
+			MimeType: mimeType,
 			Size:     int(att.Size),
 		},
 	}
 
-	if att.IsInline && att.InlineData != nil && intent != nil {
-		url, encFile, err := intent.UploadMedia(ctx, "", *att.InlineData, att.Filename, att.MimeType)
+	// Mark as voice message if this was a CAF voice recording
+	if durationMs > 0 {
+		content.MSC3245Voice = &event.MSC3245Voice{}
+		content.MSC1767Audio = &event.MSC1767Audio{
+			Duration: durationMs,
+		}
+		content.Info.Size = len(inlineData)
+	}
+
+	if inlineData != nil && intent != nil {
+		url, encFile, err := intent.UploadMedia(ctx, "", inlineData, fileName, mimeType)
 		if err != nil {
 			return nil, fmt.Errorf("failed to upload attachment: %w", err)
 		}
@@ -1512,6 +1718,8 @@ func mimeToUTI(mime string) string {
 		return "public.mp3"
 	case mime == "audio/aac", mime == "audio/mp4":
 		return "public.aac-audio"
+	case mime == "audio/x-caf":
+		return "com.apple.coreaudio-format"
 	case strings.HasPrefix(mime, "image/"):
 		return "public.image"
 	case strings.HasPrefix(mime, "video/"):
@@ -1566,6 +1774,18 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 		return time.Since(t) < 5*time.Minute
 	}
 	return false
+}
+
+// urlRegex matches URLs in message text for rich link matching.
+// Matches explicit schemes (https://...) and bare domains (example.com, example.com/path).
+var urlRegex = regexp.MustCompile(`(?:https?://\S+|(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}(?:/\S*)?)`)
+
+// normalizeURL ensures a URL has a scheme for HTTP fetching.
+func normalizeURL(u string) string {
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return "https://" + u
+	}
+	return u
 }
 
 func ptrStringOr(s *string, def string) string {
