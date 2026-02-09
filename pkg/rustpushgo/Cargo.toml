@@ -12,7 +12,10 @@ name = "imessage-login"
 path = "src/login_cli.rs"
 
 [features]
-default = ["hardware-key"]
+# hardware-key enables open-absinthe (x86 NAC emulator via unicorn-engine).
+# Required on Linux; unnecessary on macOS (native AAAbsintheContext is used).
+# The Makefile passes --features hardware-key on Linux only.
+default = []
 hardware-key = ["rustpush/macos-validation-data"]
 
 [dependencies]

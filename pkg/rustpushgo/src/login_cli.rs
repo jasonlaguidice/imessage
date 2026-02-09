@@ -27,18 +27,8 @@ fn prompt(msg: &str) -> String {
 
 fn create_config(hw_key: Option<String>) -> Result<Arc<WrappedOSConfig>, WrappedError> {
     if let Some(key) = hw_key {
-        #[cfg(feature = "hardware-key")]
-        {
-            eprintln!("[*] Using external hardware key");
-            return rustpushgo::create_config_from_hardware_key(key);
-        }
-        #[cfg(not(feature = "hardware-key"))]
-        {
-            let _ = key;
-            return Err(WrappedError::GenericError {
-                msg: "hardware-key feature not enabled. Rebuild with --features hardware-key".into(),
-            });
-        }
+        eprintln!("[*] Using external hardware key");
+        return rustpushgo::create_config_from_hardware_key(key);
     }
     eprintln!("[*] Using local macOS config (IOKit + AAAbsintheContext)");
     create_local_macos_config()

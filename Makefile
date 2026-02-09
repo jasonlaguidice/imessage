@@ -52,7 +52,6 @@ ifeq ($(UNAME_S),Darwin)
 	missing=""; \
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
-	command -v cmake >/dev/null 2>&1 || missing="$$missing cmake"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
 	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
 	if [ -n "$$missing" ]; then \
@@ -67,8 +66,16 @@ endif
 # Rust static library
 # ===========================================================================
 
+# On Linux, enable hardware-key feature (open-absinthe x86 NAC emulator).
+# On macOS, native AAAbsintheContext is used — no unicorn/cmake needed.
+ifeq ($(UNAME_S),Darwin)
+  CARGO_FEATURES :=
+else
+  CARGO_FEATURES := --features hardware-key
+endif
+
 $(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) pkg/rustpushgo/Cargo.toml
-	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release
+	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
 rust: $(RUST_LIB)
