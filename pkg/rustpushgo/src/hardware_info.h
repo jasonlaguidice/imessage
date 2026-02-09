@@ -17,6 +17,7 @@ typedef struct {
     uint8_t *mac_address;       // 6-byte MAC
     size_t mac_address_len;
     char *root_disk_uuid;       // root volume UUID
+    char *darwin_version;       // e.g., "24.3.0" (from uname)
     char *error;                // set on failure
 } HardwareInfo;
 

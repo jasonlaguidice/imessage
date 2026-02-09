@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use plist::{Dictionary, Value};
 use uuid::Uuid;
 
-use rustpush::{activation::ActivationInfo, DebugMeta, OSConfig, PushError, RegisterMeta};
+use rustpush::{activation::ActivationInfo, APSState, DebugMeta, LoginClientInfo, OSConfig, PushError, RegisterMeta};
 
 // FFI for hardware_info.m
 #[repr(C)]
@@ -34,6 +34,7 @@ struct CHardwareInfo {
     mac_address: *mut u8,
     mac_address_len: usize,
     root_disk_uuid: *mut std::os::raw::c_char,
+    darwin_version: *mut std::os::raw::c_char,
     error: *mut std::os::raw::c_char,
 }
 
@@ -73,6 +74,7 @@ pub struct HardwareInfo {
     pub mlb: String,
     pub mac_address: [u8; 6],
     pub root_disk_uuid: String,
+    pub darwin_version: String,
 }
 
 impl HardwareInfo {
@@ -103,6 +105,7 @@ impl HardwareInfo {
             mlb: c_str_to_string(raw.mlb).unwrap_or_default(),
             mac_address,
             root_disk_uuid: c_str_to_string(raw.root_disk_uuid).unwrap_or_default(),
+            darwin_version: c_str_to_string(raw.darwin_version).unwrap_or_else(|| "24.0.0".to_string()),
         };
 
         unsafe { hw_info_free(&mut raw) };
@@ -126,12 +129,21 @@ impl LocalMacOSConfig {
         let hw = HardwareInfo::read()?;
         let device_id = Uuid::new_v4().to_string().to_uppercase();
 
+        // Build UA strings using the real Darwin version from this Mac
+        // instead of hardcoding values from a different macOS release.
+        let darwin = &hw.darwin_version;
+        let icloud_ua = format!(
+            "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/{}",
+            darwin
+        );
+        let aoskit_version = "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string();
+
         Ok(Self {
             hw,
             device_id,
             protocol_version: 1640,
-            icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-            aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+            icloud_ua,
+            aoskit_version,
         })
     }
 
@@ -270,5 +282,20 @@ impl OSConfig for LocalMacOSConfig {
             ),
             ("v", Value::String("1".to_string())),
         ])
+    }
+
+    fn get_gsa_config(&self, push: &APSState, require_mac: bool) -> LoginClientInfo {
+        LoginClientInfo {
+            ak_context_type: "imessage".to_string(),
+            client_app_name: "Messages".to_string(),
+            client_bundle_id: "com.apple.MobileSMS".to_string(),
+            mme_client_info_akd: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.akd/1.0)", require_mac),
+            mme_client_info: self.get_adi_mme_info("com.apple.AuthKit/1 (com.apple.MobileSMS/1262.500.151.1.2)", require_mac),
+            akd_user_agent: format!("akd/1.0 CFNetwork/1568.100.1 Darwin/{}", self.hw.darwin_version),
+            browser_user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)".to_string(),
+            hardware_headers: self.get_gsa_hardware_headers(),
+            push_token: push.token.map(|i| encode_hex(&i).to_uppercase()),
+            update_account_bundle_id: self.get_adi_mme_info("com.apple.AppleAccount/1.0 (com.apple.systempreferences.AppleIDSettings/1)", require_mac),
+        }
     }
 }
