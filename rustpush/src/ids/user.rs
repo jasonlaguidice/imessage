@@ -1104,7 +1104,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
 
     let response = request.send(&REQWEST).await?.bytes().await?;
 
-    debug!("register response {}", std::str::from_utf8(&response).expect("resp not utf8?"));
+    info!("register response {}", std::str::from_utf8(&response).expect("resp not utf8?"));
 
     let resp: Value = plist::from_bytes(&response)?;
 
@@ -1129,6 +1129,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
             if status != 0 {
+                error!("Registration failed for user with status {}, user dict: {:?}", status, user_dict);
                 if status == 6009 || status == 6001 {
                     if let Some(alert) = user_dict.get("alert") {
                         return Err(PushError::CustomerMessage(plist::from_value(alert)?))
