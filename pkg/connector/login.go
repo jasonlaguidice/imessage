@@ -58,9 +58,13 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 	}
 	l.cfg = cfg
 
-	// Reuse existing APS state if available (preserves push token, avoids new device)
+	// Reuse existing session state if available and keystore matches
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
-	apsState := getExistingAPSState(l.User, log)
+	session := loadCachedSession(l.User, log)
+	if !session.validate(log) {
+		session = nil
+	}
+	apsState := getExistingAPSState(session, log)
 	l.conn = rustpushgo.Connect(cfg, apsState)
 
 	return &bridgev2.LoginStep{
@@ -152,10 +156,15 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
 
+	// Reuse existing session state if available and keystore matches
+	session := loadCachedSession(l.User, log)
+	if !session.validate(log) {
+		session = nil
+	}
+
 	// Reuse existing identity if available (avoids "new Mac" notifications)
 	var existingIdentityArg **rustpushgo.WrappedIdsngmIdentity
-	if existing := getExistingIdentity(l.User, log); existing != nil {
-		log.Info().Msg("Reusing existing IDS identity for re-authentication")
+	if existing := getExistingIdentity(session, log); existing != nil {
 		existingIdentityArg = &existing
 	} else {
 		log.Info().Msg("No existing identity found, will generate new one (first login)")
@@ -163,8 +172,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 
 	// Reuse existing IDS users/registration if available (avoids register() call)
 	var existingUsersArg **rustpushgo.WrappedIdsUsers
-	if existing := getExistingUsers(l.User, log); existing != nil {
-		log.Info().Msg("Reusing existing IDS users for re-authentication")
+	if existing := getExistingUsers(session, log); existing != nil {
 		existingUsersArg = &existing
 	} else {
 		log.Info().Msg("No existing users found, will register fresh (first login)")
@@ -263,9 +271,13 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		}
 		l.cfg = cfg
 
-		// Reuse existing APS state if available (preserves push token, avoids new device)
+		// Reuse existing session state if available and keystore matches
 		extLog := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
-		apsState := getExistingAPSState(l.User, extLog)
+		session := loadCachedSession(l.User, extLog)
+		if !session.validate(extLog) {
+			session = nil
+		}
+		apsState := getExistingAPSState(session, extLog)
 		l.conn = rustpushgo.Connect(cfg, apsState)
 
 		return &bridgev2.LoginStep{
@@ -346,10 +358,15 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
 
+	// Reuse existing session state if available and keystore matches
+	session := loadCachedSession(l.User, log)
+	if !session.validate(log) {
+		session = nil
+	}
+
 	// Reuse existing identity if available (avoids "new Mac" notifications)
 	var existingIdentityArg **rustpushgo.WrappedIdsngmIdentity
-	if existing := getExistingIdentity(l.User, log); existing != nil {
-		log.Info().Msg("Reusing existing IDS identity for re-authentication")
+	if existing := getExistingIdentity(session, log); existing != nil {
 		existingIdentityArg = &existing
 	} else {
 		log.Info().Msg("No existing identity found, will generate new one (first login)")
@@ -357,8 +374,7 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 
 	// Reuse existing IDS users/registration if available (avoids register() call)
 	var existingUsersArg **rustpushgo.WrappedIdsUsers
-	if existing := getExistingUsers(l.User, log); existing != nil {
-		log.Info().Msg("Reusing existing IDS users for re-authentication")
+	if existing := getExistingUsers(session, log); existing != nil {
 		existingUsersArg = &existing
 	} else {
 		log.Info().Msg("No existing users found, will register fresh (first login)")
@@ -400,69 +416,99 @@ func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginSt
 // Existing session state lookup
 // ============================================================================
 
-// getExistingIdentity looks up the stored IDSNGMIdentity for reuse during
-// re-authentication (avoiding "new Mac" notifications). Checks in order:
-//  1. Existing logins in the bridge database
-//  2. The backup session file (~/.local/share/mautrix-imessage/session.json)
-//
-// Returns nil if no existing identity is found (first-ever login).
-func getExistingIdentity(user *bridgev2.User, log zerolog.Logger) *rustpushgo.WrappedIdsngmIdentity {
+// cachedSessionState holds the raw strings for all three session components.
+// They are validated as a group against the keystore before use, since they
+// reference each other's keys and are only useful together.
+type cachedSessionState struct {
+	IDSIdentity string
+	APSState    string
+	IDSUsers    string
+	source      string // "database" or "backup file", for logging
+}
+
+// loadCachedSession looks up all three session components (identity, APS state,
+// IDS users) from the bridge database or backup session file. Returns nil if
+// nothing is found. The returned state has NOT been validated against the
+// keystore yet — call validate() before using.
+func loadCachedSession(user *bridgev2.User, log zerolog.Logger) *cachedSessionState {
 	// Check DB first
 	for _, login := range user.GetCachedUserLogins() {
-		if meta, ok := login.Metadata.(*UserLoginMetadata); ok && meta.IDSIdentity != "" {
-			log.Info().Msg("Found existing identity in database")
-			identityStr := meta.IDSIdentity
-			return rustpushgo.NewWrappedIdsngmIdentity(&identityStr)
+		if meta, ok := login.Metadata.(*UserLoginMetadata); ok {
+			if meta.IDSUsers != "" || meta.IDSIdentity != "" || meta.APSState != "" {
+				log.Info().Msg("Found existing session state in database")
+				return &cachedSessionState{
+					IDSIdentity: meta.IDSIdentity,
+					APSState:    meta.APSState,
+					IDSUsers:    meta.IDSUsers,
+					source:      "database",
+				}
+			}
 		}
 	}
 	// Fall back to session file (survives DB resets)
 	state := loadSessionState(log)
-	if state.IDSIdentity != "" {
-		log.Info().Msg("Found existing identity in backup file")
-		return rustpushgo.NewWrappedIdsngmIdentity(&state.IDSIdentity)
+	if state.IDSIdentity != "" || state.APSState != "" || state.IDSUsers != "" {
+		log.Info().Msg("Found existing session state in backup file")
+		return &cachedSessionState{
+			IDSIdentity: state.IDSIdentity,
+			APSState:    state.APSState,
+			IDSUsers:    state.IDSUsers,
+			source:      "backup file",
+		}
 	}
 	return nil
 }
 
-// getExistingAPSState looks up the stored APS connection state for reuse during
+// validate checks that the cached IDS users state references keys that exist
+// in the keystore. If the keystore was wiped, never migrated, or belongs to a
+// different installation, this returns false and all cached state should be
+// discarded (they are a coupled set).
+func (c *cachedSessionState) validate(log zerolog.Logger) bool {
+	if c == nil || c.IDSUsers == "" {
+		return true // nothing to validate
+	}
+	users := rustpushgo.NewWrappedIdsUsers(&c.IDSUsers)
+	if !users.ValidateKeystore() {
+		log.Warn().
+			Str("source", c.source).
+			Msg("Cached session state references missing keystore keys — discarding (will register fresh)")
+		return false
+	}
+	log.Info().Str("source", c.source).Msg("Cached session state validated against keystore")
+	return true
+}
+
+// getExistingIdentity returns the cached IDSNGMIdentity for reuse during
+// re-authentication (avoiding "new Mac" notifications).
+// The session must have been validated before calling this.
+func getExistingIdentity(session *cachedSessionState, log zerolog.Logger) *rustpushgo.WrappedIdsngmIdentity {
+	if session != nil && session.IDSIdentity != "" {
+		log.Info().Str("source", session.source).Msg("Reusing existing identity")
+		identityStr := session.IDSIdentity
+		return rustpushgo.NewWrappedIdsngmIdentity(&identityStr)
+	}
+	return nil
+}
+
+// getExistingAPSState returns the cached APS connection state for reuse during
 // re-authentication (preserves push token, avoids new device registration).
-// Checks DB first, then the backup session file.
-// Returns a WrappedApsState — either with existing state or nil (new connection).
-func getExistingAPSState(user *bridgev2.User, log zerolog.Logger) *rustpushgo.WrappedApsState {
-	// Check DB first
-	for _, login := range user.GetCachedUserLogins() {
-		if meta, ok := login.Metadata.(*UserLoginMetadata); ok && meta.APSState != "" {
-			log.Info().Msg("Found existing APS state in database, reusing push token")
-			return rustpushgo.NewWrappedApsState(&meta.APSState)
-		}
+// The session must have been validated before calling this.
+func getExistingAPSState(session *cachedSessionState, log zerolog.Logger) *rustpushgo.WrappedApsState {
+	if session != nil && session.APSState != "" {
+		log.Info().Str("source", session.source).Msg("Reusing existing APS state")
+		return rustpushgo.NewWrappedApsState(&session.APSState)
 	}
-	// Fall back to session file
-	state := loadSessionState(log)
-	if state.APSState != "" {
-		log.Info().Msg("Found existing APS state in backup file, reusing push token")
-		return rustpushgo.NewWrappedApsState(&state.APSState)
-	}
-	log.Info().Msg("No existing APS state found, will create new connection (first login)")
+	log.Info().Msg("No existing APS state found, will create new connection")
 	return rustpushgo.NewWrappedApsState(nil)
 }
 
-// getExistingUsers looks up the stored IDSUsers for reuse during
+// getExistingUsers returns the cached IDSUsers for reuse during
 // re-authentication (avoids calling register() which triggers notifications).
-// Checks DB first, then the backup session file.
-// Returns nil if no existing users are found (first-ever login).
-func getExistingUsers(user *bridgev2.User, log zerolog.Logger) *rustpushgo.WrappedIdsUsers {
-	// Check DB first
-	for _, login := range user.GetCachedUserLogins() {
-		if meta, ok := login.Metadata.(*UserLoginMetadata); ok && meta.IDSUsers != "" {
-			log.Info().Msg("Found existing IDS users in database")
-			return rustpushgo.NewWrappedIdsUsers(&meta.IDSUsers)
-		}
-	}
-	// Fall back to session file
-	state := loadSessionState(log)
-	if state.IDSUsers != "" {
-		log.Info().Msg("Found existing IDS users in backup file")
-		return rustpushgo.NewWrappedIdsUsers(&state.IDSUsers)
+// The session must have been validated before calling this.
+func getExistingUsers(session *cachedSessionState, log zerolog.Logger) *rustpushgo.WrappedIdsUsers {
+	if session != nil && session.IDSUsers != "" {
+		log.Info().Str("source", session.source).Msg("Reusing existing IDS users")
+		return rustpushgo.NewWrappedIdsUsers(&session.IDSUsers)
 	}
 	return nil
 }
