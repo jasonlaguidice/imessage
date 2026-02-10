@@ -163,11 +163,22 @@ elif command -v sqlite3 >/dev/null 2>&1; then
     fi
 fi
 
-# ── Restore preferred_handle from DB into fresh config ────────
-if [ "$NEEDS_LOGIN" = "false" ] && command -v sqlite3 >/dev/null 2>&1; then
+# ── Restore preferred_handle from DB or session backup ────────
+if [ "$NEEDS_LOGIN" = "false" ]; then
     CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" || true)
     if [ -z "$CURRENT_HANDLE" ]; then
-        SAVED_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
+        # Try DB first
+        SAVED_HANDLE=""
+        if command -v sqlite3 >/dev/null 2>&1 && [ -n "$DB_URI" ] && [ -f "$DB_URI" ]; then
+            SAVED_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
+        fi
+        # Fall back to session backup file
+        if [ -z "$SAVED_HANDLE" ]; then
+            SESSION_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage/session.json"
+            if [ -f "$SESSION_FILE" ] && command -v python3 >/dev/null 2>&1; then
+                SAVED_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_FILE')).get('preferred_handle',''))" 2>/dev/null || true)
+            fi
+        fi
         if [ -n "$SAVED_HANDLE" ]; then
             sed -i '' "s|preferred_handle: .*|preferred_handle: '$SAVED_HANDLE'|" "$CONFIG"
             echo "✓ Restored preferred handle: $SAVED_HANDLE"
