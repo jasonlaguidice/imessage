@@ -140,6 +140,18 @@ elif command -v sqlite3 >/dev/null 2>&1; then
     fi
 fi
 
+# ── Restore preferred_handle from DB into fresh config ────────
+if [ "$NEEDS_LOGIN" = "false" ] && command -v sqlite3 >/dev/null 2>&1; then
+    CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g")
+    if [ -z "$CURRENT_HANDLE" ]; then
+        SAVED_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
+        if [ -n "$SAVED_HANDLE" ]; then
+            sed -i "s|preferred_handle: .*|preferred_handle: '$SAVED_HANDLE'|" "$CONFIG"
+            echo "✓ Restored preferred handle: $SAVED_HANDLE"
+        fi
+    fi
+fi
+
 if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
