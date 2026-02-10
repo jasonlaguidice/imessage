@@ -27,15 +27,20 @@ import (
 type backfillRelay struct {
 	baseURL    string
 	httpClient *http.Client
+	token      string // bearer token for Authorization header
 }
 
-// newBackfillRelay creates a backfill relay from the contact relay's base URL.
-func newBackfillRelay(baseURL string) *backfillRelay {
+// newBackfillRelay creates a backfill relay from the contact relay client.
+func newBackfillRelay(baseURL string, httpClient *http.Client, token string) *backfillRelay {
+	// Use a longer timeout for backfill since it transfers more data,
+	// but share the same TLS config and transport.
 	return &backfillRelay{
 		baseURL: baseURL,
 		httpClient: &http.Client{
-			Timeout: 60 * time.Second,
+			Timeout:   60 * time.Second,
+			Transport: httpClient.Transport,
 		},
+		token: token,
 	}
 }
 
@@ -81,9 +86,21 @@ type RelayChatInfo struct {
 	ThreadID    string   `json:"thread_id,omitempty"`
 }
 
+// relayGet performs an authenticated GET request to the relay.
+func (br *backfillRelay) relayGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if br.token != "" {
+		req.Header.Set("Authorization", "Bearer "+br.token)
+	}
+	return br.httpClient.Do(req)
+}
+
 // GetChats fetches recent chats from the relay.
 func (br *backfillRelay) GetChats(sinceDays int) ([]RelayChatInfo, error) {
-	resp, err := br.httpClient.Get(fmt.Sprintf("%s/chats?since_days=%d", br.baseURL, sinceDays))
+	resp, err := br.relayGet(fmt.Sprintf("%s/chats?since_days=%d", br.baseURL, sinceDays))
 	if err != nil {
 		return nil, fmt.Errorf("relay /chats request failed: %w", err)
 	}
@@ -112,7 +129,7 @@ func (br *backfillRelay) GetMessages(chatGUID string, sinceTs *int64, beforeTs *
 		u += fmt.Sprintf("&limit=%d", limit)
 	}
 
-	resp, err := br.httpClient.Get(u)
+	resp, err := br.relayGet(u)
 	if err != nil {
 		return nil, fmt.Errorf("relay /messages request failed: %w", err)
 	}
@@ -130,7 +147,7 @@ func (br *backfillRelay) GetMessages(chatGUID string, sinceTs *int64, beforeTs *
 
 // FetchAttachment downloads attachment data from the relay.
 func (br *backfillRelay) FetchAttachment(pathOnDisk string) ([]byte, string, error) {
-	resp, err := br.httpClient.Get(fmt.Sprintf("%s/attachment?path=%s", br.baseURL, url.QueryEscape(pathOnDisk)))
+	resp, err := br.relayGet(fmt.Sprintf("%s/attachment?path=%s", br.baseURL, url.QueryEscape(pathOnDisk)))
 	if err != nil {
 		return nil, "", fmt.Errorf("relay /attachment request failed: %w", err)
 	}
@@ -630,7 +647,7 @@ func (br *backfillRelay) convertRelayAttachment(ctx context.Context, intent brid
 
 // checkRelayBackfillAvailable probes the relay to see if chat.db endpoints are available.
 func (br *backfillRelay) checkAvailable() bool {
-	resp, err := br.httpClient.Get(br.baseURL + "/chats?since_days=1")
+	resp, err := br.relayGet(br.baseURL + "/chats?since_days=1")
 	if err != nil {
 		return false
 	}

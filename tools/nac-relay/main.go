@@ -1,11 +1,16 @@
 // nac-relay: Runs on a Mac and serves NAC validation data, contact lookups,
-// and chat.db backfill over HTTP. The Linux bridge calls this instead of
-// running the x86_64 NAC emulator locally.
+// and chat.db backfill over HTTPS with bearer-token auth. The Linux bridge
+// calls this instead of running the x86_64 NAC emulator locally.
+//
+// On first run, a self-signed TLS certificate and random bearer token are
+// generated and stored in ~/Library/Application Support/nac-relay/.
+// extract-key reads relay-info.json from the same directory and embeds
+// the token + cert fingerprint into the hardware key.
 //
 // Usage:
 //   go run tools/nac-relay/main.go [-port 5001] [-addr 0.0.0.0]
 //
-// Endpoints:
+// Endpoints (all require Authorization: Bearer <token> except /health):
 //   POST /validation-data                        → base64-encoded validation data
 //   GET  /contact?id=+15551234567                → JSON contact info
 //   GET  /contacts                               → all contacts (bulk)
@@ -14,7 +19,7 @@
 //   GET  /messages?chat_guid=X&since_ts=T        → messages since timestamp (ms)
 //   GET  /messages?chat_guid=X&before_ts=T&limit=N → messages before timestamp
 //   GET  /attachment?path=~/Library/Messages/...  → raw attachment file
-//   GET  /health                                 → "ok"
+//   GET  /health                                 → "ok" (no auth required)
 package main
 
 /*
@@ -562,18 +567,29 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
+	// Set up TLS + bearer token auth
+	tlsConfig, token, err := ensureRelayAuth()
+	if err != nil {
+		log.Fatalf("Failed to initialize TLS/auth: %v", err)
+	}
+
 	listenAddr := fmt.Sprintf("%s:%d", *addr, *port)
-	log.Printf("NAC relay listening on %s", listenAddr)
+	log.Printf("NAC relay listening on %s (HTTPS)", listenAddr)
 
 	// Print helpful info
 	if addrs, err := net.InterfaceAddrs(); err == nil {
 		for _, a := range addrs {
 			if ipnet, ok := a.(*net.IPNet); ok && !ipnet.IP.IsLoopback() && ipnet.IP.To4() != nil {
-				log.Printf("  → Bridge relay URL: http://%s:%d/validation-data", ipnet.IP, *port)
+				log.Printf("  → Bridge relay URL: https://%s:%d/validation-data", ipnet.IP, *port)
 			}
 		}
 	}
 	log.Println("Use -relay <url> when running extract-key to embed this URL in the hardware key.")
 
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
+	server := &http.Server{
+		Addr:      listenAddr,
+		Handler:   authMiddleware(token, http.DefaultServeMux),
+		TLSConfig: tlsConfig,
+	}
+	log.Fatal(server.ListenAndServeTLS("", ""))
 }

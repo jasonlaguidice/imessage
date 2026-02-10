@@ -1,8 +1,13 @@
 package connector
 
 import (
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,8 +22,9 @@ import (
 // contactRelayClient fetches contacts from a NAC relay server running on a Mac
 // and caches them locally for fast phone/email lookups with normalization.
 type contactRelayClient struct {
-	baseURL    string // e.g. "http://199.201.161.163:5001"
+	baseURL    string // e.g. "https://199.201.161.163:5001"
 	httpClient *http.Client
+	token      string // bearer token for Authorization header
 
 	mu       sync.RWMutex
 	byPhone  map[string]*imessage.Contact // normalized phone → contact
@@ -26,14 +32,18 @@ type contactRelayClient struct {
 	lastSync time.Time
 }
 
-// newContactRelayFromKey extracts the relay base URL from a hardware key (base64 JSON).
-// Returns nil if no relay URL is configured.
-func newContactRelayFromKey(hardwareKey string) *contactRelayClient {
+// relayKeyConfig holds the relay-related fields from the hardware key JSON.
+type relayKeyConfig struct {
+	NACRelayURL string `json:"nac_relay_url"`
+	RelayToken  string `json:"relay_token"`
+	RelayCertFP string `json:"relay_cert_fp"`
+}
+
+// parseRelayConfig extracts relay config from a hardware key (base64 JSON).
+func parseRelayConfig(hardwareKey string) *relayKeyConfig {
 	if hardwareKey == "" {
 		return nil
 	}
-
-	// Strip all non-base64 characters (Beeper UI can inject non-breaking spaces, newlines, etc.)
 	cleaned := stripNonBase64(hardwareKey)
 	decoded, err := base64.StdEncoding.DecodeString(cleaned)
 	if err != nil {
@@ -42,11 +52,52 @@ func newContactRelayFromKey(hardwareKey string) *contactRelayClient {
 			return nil
 		}
 	}
-
-	var config struct {
-		NACRelayURL string `json:"nac_relay_url"`
-	}
+	var config relayKeyConfig
 	if err := json.Unmarshal(decoded, &config); err != nil || config.NACRelayURL == "" {
+		return nil
+	}
+	return &config
+}
+
+// newRelayHTTPClient creates an http.Client that pins to the relay's TLS cert
+// fingerprint (if provided) and includes the bearer token in requests.
+func newRelayHTTPClient(certFP string, timeout time.Duration) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+
+	if certFP != "" {
+		transport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true, // we verify via fingerprint below
+			VerifyPeerCertificate: func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+				if len(rawCerts) == 0 {
+					return fmt.Errorf("relay: no TLS certificate presented")
+				}
+				h := sha256.Sum256(rawCerts[0])
+				got := hex.EncodeToString(h[:])
+				if got != certFP {
+					return fmt.Errorf("relay: TLS cert fingerprint mismatch (got %s, want %s)", got, certFP)
+				}
+				return nil
+			},
+		}
+	} else {
+		// No fingerprint — legacy key without auth, allow any cert
+		// (or it could be plain HTTP from an old relay)
+		transport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: transport,
+	}
+}
+
+// newContactRelayFromKey extracts the relay base URL from a hardware key (base64 JSON).
+// Returns nil if no relay URL is configured.
+func newContactRelayFromKey(hardwareKey string) *contactRelayClient {
+	config := parseRelayConfig(hardwareKey)
+	if config == nil {
 		return nil
 	}
 
@@ -56,12 +107,11 @@ func newContactRelayFromKey(hardwareKey string) *contactRelayClient {
 	}
 
 	return &contactRelayClient{
-		baseURL: baseURL,
-		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
-		},
-		byPhone: make(map[string]*imessage.Contact),
-		byEmail: make(map[string]*imessage.Contact),
+		baseURL:    baseURL,
+		httpClient: newRelayHTTPClient(config.RelayCertFP, 10*time.Second),
+		token:      config.RelayToken,
+		byPhone:    make(map[string]*imessage.Contact),
+		byEmail:    make(map[string]*imessage.Contact),
 	}
 }
 
@@ -122,9 +172,21 @@ type relayContactInfo struct {
 	Emails    []string `json:"emails,omitempty"`
 }
 
+// relayGet performs an authenticated GET request to the relay.
+func (c *contactRelayClient) relayGet(url string) (*http.Response, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if c.token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.token)
+	}
+	return c.httpClient.Do(req)
+}
+
 // SyncContacts fetches all contacts from the relay and builds the local cache.
 func (c *contactRelayClient) SyncContacts(log zerolog.Logger) {
-	resp, err := c.httpClient.Get(c.baseURL + "/contacts")
+	resp, err := c.relayGet(c.baseURL + "/contacts")
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to fetch contacts from relay")
 		return

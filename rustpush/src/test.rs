@@ -305,6 +305,9 @@ async fn main() {
             icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
             aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
             udid: Some("55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string()),
+            nac_relay_url: None,
+            relay_token: None,
+            relay_cert_fp: None,
         }
     });
     // let host = "https://registration-relay.beeper.com".to_string();
