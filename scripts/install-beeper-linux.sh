@@ -79,8 +79,9 @@ if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     exit 1
 fi
 
-# ── Backfill window ──────────────────────────────────────────
-if [ -t 0 ]; then
+# ── Backfill window (first install only) ──────────────────────
+DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+if [ -t 0 ] && { [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; }; then
     CURRENT_DAYS=$(grep 'initial_sync_days:' "$CONFIG" | head -1 | sed 's/.*initial_sync_days: *//')
     [ -z "$CURRENT_DAYS" ] && CURRENT_DAYS=365
     printf "How many days of message history to backfill? [%s]: " "$CURRENT_DAYS"
