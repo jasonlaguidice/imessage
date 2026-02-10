@@ -505,9 +505,33 @@ pub fn init_logger() {
 
     // Initialize the keystore with a file-backed software keystore.
     // This must be called before any rustpush operations (APNs connect, login, etc.).
-    let state_path = "state/keystore.plist";
-    let _ = std::fs::create_dir_all("state");
-    let state: SoftwareKeystoreState = match std::fs::read(state_path) {
+    //
+    // The keystore lives alongside session.json in the XDG data directory
+    // (~/.local/share/mautrix-imessage/) so that all session state is in one
+    // place and easy to migrate between machines.
+    let xdg_dir = resolve_xdg_data_dir();
+    let state_path = format!("{}/keystore.plist", xdg_dir);
+    let _ = std::fs::create_dir_all(&xdg_dir);
+
+    // Migrate from the old location (state/keystore.plist relative to working
+    // directory) if the new file doesn't exist yet.
+    let legacy_path = "state/keystore.plist";
+    if !std::path::Path::new(&state_path).exists() {
+        if std::path::Path::new(legacy_path).exists() {
+            match std::fs::copy(legacy_path, &state_path) {
+                Ok(_) => info!(
+                    "Migrated keystore from {} to {}",
+                    legacy_path, state_path
+                ),
+                Err(e) => warn!(
+                    "Failed to migrate keystore from {} to {}: {}",
+                    legacy_path, state_path, e
+                ),
+            }
+        }
+    }
+
+    let state: SoftwareKeystoreState = match std::fs::read(&state_path) {
         Ok(data) => plist::from_bytes(&data).unwrap_or_else(|e| {
             warn!("Failed to parse keystore at {}: {} — starting with empty keystore", state_path, e);
             SoftwareKeystoreState::default()
@@ -521,7 +545,7 @@ pub fn init_logger() {
             SoftwareKeystoreState::default()
         }
     };
-    let path_for_closure = state_path.to_string();
+    let path_for_closure = state_path.clone();
     init_keystore(SoftwareKeystore {
         state: RwLock::new(state),
         update_state: Box::new(move |s| {
@@ -529,6 +553,23 @@ pub fn init_logger() {
         }),
         encryptor: NoEncryptor,
     });
+}
+
+/// Resolve the XDG data directory for mautrix-imessage session state.
+/// Uses $XDG_DATA_HOME if set, otherwise ~/.local/share.
+/// Returns the full path: <base>/mautrix-imessage
+fn resolve_xdg_data_dir() -> String {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return format!("{}/mautrix-imessage", xdg);
+        }
+    }
+    if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+        return format!("{}/.local/share/mautrix-imessage", home);
+    }
+    // Last resort — fall back to old relative path
+    warn!("Could not determine HOME or XDG_DATA_HOME, using local state directory");
+    "state".to_string()
 }
 
 /// Create a local macOS config that reads hardware info from IOKit
