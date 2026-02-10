@@ -645,12 +645,12 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
 
     // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig
-    let (hw, nac_relay_url) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
-        (full.inner, full.nac_relay_url)
+    let (hw, nac_relay_url, relay_token, relay_cert_fp) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
+        (full.inner, full.nac_relay_url, full.relay_token, full.relay_cert_fp)
     } else {
         let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
             .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
-        (hw, None)
+        (hw, None, None, None)
     };
 
     // Always use the real hardware UUID from the extracted key so the bridge
@@ -678,6 +678,8 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
         aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
         udid: None,
         nac_relay_url,
+        relay_token,
+        relay_cert_fp,
     };
 
     Ok(Arc::new(WrappedOSConfig {
