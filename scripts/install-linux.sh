@@ -114,6 +114,19 @@ if [ "$FIRST_RUN" = true ]; then
     read -p "Press Enter once your homeserver is restarted..."
 fi
 
+# ── Backfill window (first install only) ──────────────────────
+DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+if [ -t 0 ] && { [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; }; then
+    CURRENT_DAYS=$(grep 'initial_sync_days:' "$CONFIG" | head -1 | sed 's/.*initial_sync_days: *//')
+    [ -z "$CURRENT_DAYS" ] && CURRENT_DAYS=365
+    printf "How many days of message history to backfill? [%s]: " "$CURRENT_DAYS"
+    read BACKFILL_DAYS
+    BACKFILL_DAYS=$(echo "$BACKFILL_DAYS" | tr -dc '0-9')
+    [ -z "$BACKFILL_DAYS" ] && BACKFILL_DAYS="$CURRENT_DAYS"
+    sed -i "s/initial_sync_days: .*/initial_sync_days: $BACKFILL_DAYS/" "$CONFIG"
+    echo "✓ Backfill window set to $BACKFILL_DAYS days"
+fi
+
 # ── Check for existing login / prompt if needed ──────────────
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
