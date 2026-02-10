@@ -453,10 +453,11 @@ func main() {
 	if len(macAddr) != 6 {
 		missing = append(missing, "mac_address")
 	}
-	if len(serialEnc) == 0 {
-		missing = append(missing, "serial_enc (Gq3489ugfi)")
-	}
-	isAppleSilicon := len(serialEnc) == 0
+	// Detect actual chip architecture (don't use _enc presence — High Sierra
+	// Intel Macs also lack _enc fields).
+	isAppleSilicon := runtime.GOARCH == "arm64"
+	hasEncFields := len(serialEnc) > 0
+
 	if isAppleSilicon && relayURL == "" {
 		fmt.Fprintf(os.Stderr, "  ⚠️  Apple Silicon detected — encrypted IOKit properties are absent.\n")
 		fmt.Fprintf(os.Stderr, "  The x86_64 NAC emulator on Linux will fail without them.\n")
@@ -467,9 +468,17 @@ func main() {
 		fmt.Fprintf(os.Stderr, "\n")
 	} else if isAppleSilicon && relayURL != "" {
 		// Apple Silicon with relay — all good, suppress _enc warnings
-	} else if len(missing) > 0 {
-		fmt.Fprintf(os.Stderr, "WARNING: Could not read: %s\n", strings.Join(missing, ", "))
-		fmt.Fprintf(os.Stderr, "The key may not work for iMessage registration.\n\n")
+	} else if !isAppleSilicon && !hasEncFields {
+		// Intel Mac without _enc fields (e.g. macOS High Sierra 10.13)
+		// The bridge will compute them at runtime from the plaintext fields.
+		fmt.Fprintf(os.Stderr, "  ℹ️  Encrypted IOKit properties not found (normal for macOS ≤10.13).\n")
+		fmt.Fprintf(os.Stderr, "  They will be computed automatically on the Linux side.\n")
+		fmt.Fprintf(os.Stderr, "\n")
+	}
+
+	if len(missing) > 0 {
+		fmt.Fprintf(os.Stderr, "  ⚠️  Could not read: %s\n", strings.Join(missing, ", "))
+		fmt.Fprintf(os.Stderr, "  The key may not work for iMessage registration.\n\n")
 	}
 
 	hw := HardwareConfig{
@@ -523,9 +532,11 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  MAC:     %02x:%02x:%02x:%02x:%02x:%02x\n",
 		macAddr[0], macAddr[1], macAddr[2], macAddr[3], macAddr[4], macAddr[5])
 	if isAppleSilicon {
-		fmt.Fprintf(os.Stderr, "  Chip:    Apple Silicon (no _enc fields)\n")
-	} else {
+		fmt.Fprintf(os.Stderr, "  Chip:    Apple Silicon\n")
+	} else if hasEncFields {
 		fmt.Fprintf(os.Stderr, "  Chip:    Intel (has _enc fields)\n")
+	} else {
+		fmt.Fprintf(os.Stderr, "  Chip:    Intel (no _enc fields — will be computed on Linux)\n")
 	}
 	if relayURL != "" {
 		fmt.Fprintf(os.Stderr, "  Relay:   %s\n", relayURL)
