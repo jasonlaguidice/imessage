@@ -84,6 +84,8 @@ go build -o ~/bin/nac-relay ./tools/nac-relay/
 
 This installs a LaunchAgent that starts on login and auto-restarts if it crashes. On first run, grant **Full Disk Access** and **Contacts** access when prompted — this enables chat history backfill (including images and attachments), contact name resolution, and SMS forwarding from the Mac.
 
+The relay auto-generates a self-signed TLS certificate and a random bearer token on first start, stored in `~/Library/Application Support/nac-relay/`. All endpoints (except `/health`) require the token. The bridge verifies the relay's certificate fingerprint (Go side) and authenticates with the token (both Go and Rust sides).
+
 ```bash
 # Check it's running
 tail -f /tmp/nac-relay.log
@@ -92,10 +94,12 @@ tail -f /tmp/nac-relay.log
 **Extract the key with the relay URL:**
 
 ```bash
-go run tools/extract-key/main.go -relay http://<your-mac-ip>:5001/validation-data
+go run tools/extract-key/main.go -relay https://<your-mac-ip>:5001/validation-data
 ```
 
-The relay URL is embedded in the key. If the bridge runs outside your LAN (e.g., cloud VM), forward port 5001 TCP to your Mac's local IP. Lock the allowed source IPs to your bridge server for security.
+The `extract-key` tool reads the token and certificate fingerprint from `relay-info.json` (written by the relay) and embeds them in the hardware key automatically. The relay must be running before you run `extract-key`.
+
+If the bridge runs outside your LAN (e.g., cloud VM), forward port 5001 TCP to your Mac's local IP. Lock the allowed source IPs to your bridge server's IP for defense in depth — the relay is also protected by TLS + bearer token auth.
 
 **Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key. Chat history starts from when you log in and contacts appear by phone number / email.
 
@@ -175,7 +179,7 @@ flowchart TB
         HS2[Homeserver] -- appservice --> Bridge2[mautrix-imessage]
         Bridge2 -- FFI --> RP2[rustpush]
         RP2 -- unicorn-engine --> NAC2[open-absinthe]
-        RP2 -. "Apple Silicon key" .-> Relay[NAC Relay on Mac]
+        RP2 -. "Apple Silicon key (HTTPS + token)" .-> Relay[NAC Relay on Mac]
     end
     Client1[Matrix client] <--> HS1
     Client2[Matrix client] <--> HS2
