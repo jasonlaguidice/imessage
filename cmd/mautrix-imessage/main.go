@@ -42,8 +42,7 @@ var m = mxmain.BridgeMain{
 func main() {
 	m.InitVersion(Tag, Commit, BuildTime)
 
-	// Handle "login" subcommand: interactive CLI login that writes to the
-	// bridge DB using the same code path as the Matrix bot.
+	// Handle subcommands / flags before normal bridge startup.
 	if len(os.Args) > 1 && os.Args[0] != "-" {
 		switch os.Args[1] {
 		case "login":
@@ -52,6 +51,20 @@ func main() {
 			runInteractiveLogin(&m)
 			return
 		}
+	}
+
+	// --setup flag: check permissions (FDA + Contacts) via native dialogs.
+	if isSetupMode() {
+		// Remove --setup from args so it doesn't confuse the bridge.
+		var filtered []string
+		for _, a := range os.Args {
+			if a != "--setup" && a != "-setup" {
+				filtered = append(filtered, a)
+			}
+		}
+		os.Args = filtered
+		runSetupPermissions()
+		return
 	}
 
 	m.Run()

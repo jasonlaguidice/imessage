@@ -24,13 +24,6 @@ import (
 	"github.com/lrhodin/imessage/imessage/mac"
 )
 
-const launchAgentLabel = "com.lrhodin.mautrix-imessage"
-
-func launchAgentPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Library", "LaunchAgents", launchAgentLabel+".plist")
-}
-
 // dialog shows a macOS dialog and returns true if the user clicked the
 // default button. The optional second button is always "Quit".
 func dialog(title, msg string) bool {
@@ -74,48 +67,11 @@ func requestContacts() (bool, error) {
 	return cs.HasContactAccess, nil
 }
 
-func installLaunchAgent(binaryPath, configPath string) error {
-	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>%s</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>%s</string>
-        <string>-c</string>
-        <string>%s</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>%s</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>%s</string>
-    <key>StandardErrorPath</key>
-    <string>%s</string>
-</dict>
-</plist>`,
-		launchAgentLabel,
-		binaryPath,
-		configPath,
-		filepath.Dir(configPath),
-		filepath.Join(filepath.Dir(configPath), "bridge.stdout.log"),
-		filepath.Join(filepath.Dir(configPath), "bridge.stderr.log"),
-	)
-	return os.WriteFile(launchAgentPath(), []byte(plist), 0644)
-}
-
-func runSetup(configPath string) {
+// runSetupPermissions checks and prompts for FDA and Contacts permissions
+// using native macOS dialogs.  It does NOT install the LaunchAgent — the
+// install script handles that.
+func runSetupPermissions() {
 	title := "iMessage Bridge Setup"
-
-	// Resolve paths
-	configPath, _ = filepath.Abs(configPath)
-	exe, _ := os.Executable()
-	exe, _ = filepath.EvalSymlinks(exe)
 
 	// ── Step 1: Full Disk Access ─────────────────────────────────
 	if !canReadChatDB() {
@@ -137,30 +93,12 @@ func runSetup(configPath string) {
 		dialog(title, "Contacts access was denied.\n\nPlease enable it in System Settings → Privacy & Security → Contacts, then restart.")
 	}
 
-	// ── Step 3: Install LaunchAgent ──────────────────────────────
-	// Unload any existing agent
-	exec.Command("launchctl", "unload", launchAgentPath()).Run()
-
-	if err := installLaunchAgent(exe, configPath); err != nil {
-		dialog(title, fmt.Sprintf("Failed to install LaunchAgent: %v", err))
-		os.Exit(1)
-	}
-
-	// ── Step 4: Start ────────────────────────────────────────────
-	if out, err := exec.Command("launchctl", "load", launchAgentPath()).CombinedOutput(); err != nil {
-		dialog(title, fmt.Sprintf("Failed to start LaunchAgent: %v\n%s", err, string(out)))
-		os.Exit(1)
-	}
-
 	status := "✓ Full Disk Access granted\n"
 	if granted {
 		status += "✓ Contacts access granted\n"
 	} else {
 		status += "⚠ Contacts access not granted (names won't resolve)\n"
 	}
-	status += "✓ LaunchAgent installed — bridge will start at login\n"
-	status += "\nThe bridge is running."
-
 	dialogInfo(title, status)
 }
 

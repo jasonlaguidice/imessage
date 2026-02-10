@@ -115,25 +115,11 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
 fi
 
-# ── Full Disk Access check ────────────────────────────────────
-APP_BUNDLE="$(dirname "$(dirname "$(dirname "$BINARY")")")"
-if ! sqlite3 "$HOME/Library/Messages/chat.db" "SELECT COUNT(*) FROM message LIMIT 1;" >/dev/null 2>&1; then
-    echo ""
-    echo "┌─────────────────────────────────────────────┐"
-    echo "│  Full Disk Access Required                  │"
-    echo "│                                             │"
-    echo "│  1. System Settings → Privacy & Security    │"
-    echo "│     → Full Disk Access                      │"
-    echo "│  2. Click + and add:                        │"
-    echo "│     $APP_BUNDLE"
-    echo "│  3. Also add Terminal.app if not present    │"
-    echo "│                                             │"
-    echo "│  Opening System Settings now...             │"
-    echo "└─────────────────────────────────────────────┘"
-    echo ""
-    open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"
-    read -p "Press Enter once Full Disk Access is granted..."
-fi
+# ── Permissions (FDA + Contacts) ──────────────────────────────
+# The binary's --setup flag prompts for Full Disk Access and Contacts
+# via native macOS dialogs.  Only needed on macOS.
+echo "Checking permissions..."
+"$BINARY" --setup -c "$CONFIG"
 
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
