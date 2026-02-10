@@ -30,9 +30,10 @@ import (
 // Together these prevent Apple from treating re-login as a "new device",
 // which would trigger "X added a new Mac" notifications to contacts.
 type PersistedSessionState struct {
-	IDSIdentity string `json:"ids_identity,omitempty"`
-	APSState    string `json:"aps_state,omitempty"`
-	IDSUsers    string `json:"ids_users,omitempty"`
+	IDSIdentity     string `json:"ids_identity,omitempty"`
+	APSState        string `json:"aps_state,omitempty"`
+	IDSUsers        string `json:"ids_users,omitempty"`
+	PreferredHandle string `json:"preferred_handle,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:

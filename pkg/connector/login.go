@@ -556,9 +556,10 @@ func completeLoginWithMeta(
 
 	// Persist full session state to backup file so it survives DB resets.
 	saveSessionState(log, PersistedSessionState{
-		IDSIdentity: meta.IDSIdentity,
-		APSState:    meta.APSState,
-		IDSUsers:    meta.IDSUsers,
+		IDSIdentity:     meta.IDSIdentity,
+		APSState:        meta.APSState,
+		IDSUsers:        meta.IDSUsers,
+		PreferredHandle: meta.PreferredHandle,
 	})
 
 	client := &IMClient{
