@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -101,6 +102,9 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 	}
 	fmt.Fprintf(os.Stderr, "[*] Logging in as %s\n", userMXID)
 
+	// Prompt for backfill window and update config before login.
+	promptBackfillDays(br.ConfigPath)
+
 	user, err := br.Bridge.GetUserByMXID(ctx, userMXID)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[!] Failed to get user: %v\n", err)
@@ -177,6 +181,72 @@ func runInteractiveLogin(br *mxmain.BridgeMain) {
 
 	// Clean shutdown.
 	os.Exit(0)
+}
+
+// promptBackfillDays asks the user how many days of history to backfill and
+// updates the config YAML file so the bridge picks up the value on startup.
+func promptBackfillDays(configPath string) {
+	fmt.Fprintf(os.Stderr, "\nHow many days of message history to backfill? [365]: ")
+	line, _ := stdinReader.ReadString('\n')
+	trimmed := strings.TrimSpace(line)
+
+	days := 365
+	if trimmed != "" {
+		if n, err := strconv.Atoi(trimmed); err == nil && n > 0 {
+			days = n
+		} else if trimmed != "" {
+			fmt.Fprintf(os.Stderr, "  Invalid number, using default (365 days)\n")
+		}
+	}
+
+	// Read the config file and update initial_sync_days in place.
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  [!] Could not read config: %v\n", err)
+		return
+	}
+
+	content := string(data)
+	dayStr := strconv.Itoa(days)
+
+	// Try to replace existing initial_sync_days line.
+	replaced := false
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimLine := strings.TrimSpace(line)
+		if strings.HasPrefix(trimLine, "initial_sync_days:") {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))]
+			lines[i] = indent + "initial_sync_days: " + dayStr
+			replaced = true
+			break
+		}
+	}
+
+	if !replaced {
+		// Append under the network: section or at the end.
+		for i, line := range lines {
+			trimLine := strings.TrimSpace(line)
+			if trimLine == "network:" {
+				// Insert after "network:" line with proper indent.
+				indent := line[:len(line)-len(strings.TrimLeft(line, " \t"))] + "    "
+				newLine := indent + "initial_sync_days: " + dayStr
+				lines = append(lines[:i+2], lines[i+1:]...)
+				lines[i+1] = newLine
+				replaced = true
+				break
+			}
+		}
+	}
+
+	if replaced {
+		err = os.WriteFile(configPath, []byte(strings.Join(lines, "\n")), 0600)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  [!] Could not write config: %v\n", err)
+			return
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "[*] Backfill window set to %d days\n\n", days)
 }
 
 // findAdminUser returns the first user MXID with admin permissions.
