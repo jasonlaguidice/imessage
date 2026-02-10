@@ -1152,18 +1152,8 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     let resp_dict = resp.as_dictionary().unwrap();
     let status = resp_dict.get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {
-        // Check for Contact Key Verification at the top-level response too
-        // (Apple may return 6001/6009 with ":EM" here, before per-user results)
-        if status == 6001 || status == 6009 {
-            if let Some(msg) = resp_dict.get("message").and_then(|v| v.as_string()) {
-                if msg.ends_with(":EM") {
-                    return Err(PushError::CustomerMessage(SupportAlert {
-                        title: "Contact Key Verification must be disabled".to_string(),
-                        body: "Your Apple Account has Contact Key Verification enabled, which requires key transparency enrollment that this bridge does not support. Please disable it in Settings → Apple Account → Contact Key Verification, then try again.".to_string(),
-                        action: None,
-                    }))
-                }
-            }
+        // Check for server-provided alert or actionable error info
+        if status == 6001 || status == 6004 || status == 6009 {
             if let Some(alert) = resp_dict.get("alert") {
                 return Err(PushError::CustomerMessage(plist::from_value(alert)?))
             }
@@ -1189,17 +1179,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             if status != 0 {
                 let user_dict_str = format!("{:?}", user_dict);
                 error!("Registration failed for user with status {}, user dict: {}", status, user_dict_str);
-                if status == 6009 || status == 6001 {
-                    // Check for Contact Key Verification (":EM" = Enrollment Missing)
-                    if let Some(msg) = user_dict.get("message").and_then(|v| v.as_string()) {
-                        if msg.ends_with(":EM") {
-                            return Err(PushError::CustomerMessage(SupportAlert {
-                                title: "Contact Key Verification must be disabled".to_string(),
-                                body: "Your Apple Account has Contact Key Verification enabled, which requires key transparency enrollment that this bridge does not support. Please disable it in Settings → Apple Account → Contact Key Verification, then try again.".to_string(),
-                                action: None,
-                            }))
-                        }
-                    }
+                if status == 6001 || status == 6004 || status == 6009 {
                     if let Some(alert) = user_dict.get("alert") {
                         return Err(PushError::CustomerMessage(plist::from_value(alert)?))
                     }
