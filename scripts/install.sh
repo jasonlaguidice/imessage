@@ -127,6 +127,41 @@ if [ "$FIRST_RUN" = true ]; then
     read -p "Press Enter once your homeserver is restarted..."
 fi
 
+# ── Check for existing login / prompt if needed ──────────────
+DB_URI=$(python3 -c "
+import re
+text = open('$CONFIG').read()
+m = re.search(r'^\s+uri:\s*file:([^?]+)', text, re.MULTILINE)
+print(m.group(1) if m else '')
+")
+NEEDS_LOGIN=false
+
+if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
+    NEEDS_LOGIN=true
+elif command -v sqlite3 >/dev/null 2>&1; then
+    LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
+    if [ "$LOGIN_COUNT" = "0" ]; then
+        NEEDS_LOGIN=true
+    fi
+fi
+
+if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+    echo ""
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No iMessage login found — starting login...    │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    # Stop the bridge if running (otherwise it holds the DB lock)
+    launchctl unload "$PLIST" 2>/dev/null || true
+    (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
+    echo ""
+elif [ "$NEEDS_LOGIN" = "true" ]; then
+    echo ""
+    echo "  ⚠ No iMessage login found. Run interactively to log in:"
+    echo "    $BINARY login -c $CONFIG"
+    echo ""
+fi
+
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
 DATA_ABS="$(cd "$DATA_DIR" && pwd)"
@@ -172,20 +207,17 @@ echo "Waiting for bridge to start..."
 for i in $(seq 1 15); do
     if grep -q "Bridge started" "$LOG_OUT" 2>/dev/null; then
         echo "✓ Bridge is running"
-        echo ""
-        echo "═══════════════════════════════════════════════"
-        echo "  Next: DM @imessagebot:$HS_DOMAIN"
-        echo "  Send: login"
-        echo "═══════════════════════════════════════════════"
-        echo ""
-        echo "Logs: tail -f $LOG_OUT"
-        exit 0
+        break
     fi
     sleep 1
 done
 
 echo ""
-echo "Bridge is starting up (check logs for status):"
-echo "  tail -f $LOG_OUT"
+echo "═══════════════════════════════════════════════"
+echo "  Setup Complete"
+echo "═══════════════════════════════════════════════"
 echo ""
-echo "Once running, DM @imessagebot:$HS_DOMAIN and send: login"
+echo "  Logs:    tail -f $LOG_OUT"
+echo "  Restart: launchctl kickstart -k gui/$(id -u)/$BUNDLE_ID"
+echo "  Stop:    launchctl bootout gui/$(id -u)/$BUNDLE_ID"
+echo ""
