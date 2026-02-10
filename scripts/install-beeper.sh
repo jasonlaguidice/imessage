@@ -142,13 +142,10 @@ elif command -v sqlite3 >/dev/null 2>&1; then
     fi
 fi
 
-# Check if backup session state exists — if so, the bridge can auto-restore
-# without a full Apple ID re-login.
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
-if [ "$NEEDS_LOGIN" = "true" ] \
-    && [ -f "$SESSION_DIR/session.json" ] \
-    && [ -f "$SESSION_DIR/keystore.plist" ]; then
-    echo "✓ Found backup session state — bridge will auto-restore login"
+# Check if backup session state can be restored — validates that session.json
+# and keystore.plist exist AND that the keystore has the referenced keys.
+if [ "$NEEDS_LOGIN" = "true" ] && "$BINARY" check-restore 2>/dev/null; then
+    echo "✓ Backup session state validated — bridge will auto-restore login"
     NEEDS_LOGIN=false
 fi
 
