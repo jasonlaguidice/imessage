@@ -89,10 +89,13 @@ fi
 mkdir -p "$DATA_DIR"
 if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
     # Config exists locally but bridge isn't registered on server (e.g. bbctl
-    # delete was run manually).  The stale config has an invalid as_token.
+    # delete was run manually).  The stale config has an invalid as_token and
+    # the DB references rooms that no longer exist.
     echo "⚠  Local config exists but bridge is not registered on server."
-    echo "   Removing stale config to re-register..."
+    echo "   Removing stale config and database to re-register..."
     rm -f "$CONFIG"
+    DB_DIR="$(cd "$DATA_DIR" && pwd)"
+    rm -f "$DB_DIR"/mautrix-imessage.db*
 fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
@@ -137,6 +140,16 @@ elif command -v sqlite3 >/dev/null 2>&1; then
     if [ "$LOGIN_COUNT" = "0" ]; then
         NEEDS_LOGIN=true
     fi
+fi
+
+# Check if backup session state exists — if so, the bridge can auto-restore
+# without a full Apple ID re-login.
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+if [ "$NEEDS_LOGIN" = "true" ] \
+    && [ -f "$SESSION_DIR/session.json" ] \
+    && [ -f "$SESSION_DIR/keystore.plist" ]; then
+    echo "✓ Found backup session state — bridge will auto-restore login"
+    NEEDS_LOGIN=false
 fi
 
 if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then

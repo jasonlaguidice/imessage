@@ -15,6 +15,10 @@ import (
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/id"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
@@ -61,7 +65,113 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	} else {
 		log.Info().Msg("Running on non-macOS platform — chat.db and contacts unavailable")
 	}
+
+	// Auto-restore: if the DB has no logins but we have valid backup session
+	// state (session.json + keystore), create a user_login from the backup
+	// instead of requiring a full re-login.
+	c.tryAutoRestore(ctx)
+
 	return nil
+}
+
+// tryAutoRestore checks if the database is empty but valid session state
+// exists in the backup files.  If so, it creates a user_login entry from
+// the backup, avoiding the need for a full Apple ID re-authentication.
+func (c *IMConnector) tryAutoRestore(ctx context.Context) {
+	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
+
+	// Only restore if there are no existing logins.
+	usersWithLogins, err := c.Bridge.DB.UserLogin.GetAllUserIDsWithLogins(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to check existing logins for auto-restore")
+		return
+	}
+	if len(usersWithLogins) > 0 {
+		return // DB already has logins, nothing to restore
+	}
+
+	// Check for backup session state
+	state := loadSessionState(log)
+	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
+		log.Debug().Msg("No complete backup session state found, skipping auto-restore")
+		return
+	}
+
+	// Validate against keystore
+	rustpushgo.InitLogger()
+	session := &cachedSessionState{
+		IDSIdentity: state.IDSIdentity,
+		APSState:    state.APSState,
+		IDSUsers:    state.IDSUsers,
+		source:      "backup file (auto-restore)",
+	}
+	if !session.validate(log) {
+		log.Info().Msg("Backup session state failed keystore validation, skipping auto-restore")
+		return
+	}
+
+	// Extract login ID and username from the cached IDS users
+	users := rustpushgo.NewWrappedIdsUsers(&state.IDSUsers)
+	loginID := networkid.UserLoginID(users.LoginId(0))
+	if loginID == "" {
+		log.Warn().Msg("Backup session has no login ID, skipping auto-restore")
+		return
+	}
+
+	handles := users.GetHandles()
+	username := string(loginID)
+	if len(handles) > 0 {
+		username = handles[0]
+	}
+
+	// Find the admin user to attach this login to
+	adminMXID := ""
+	for userID, perm := range c.Bridge.Config.Permissions {
+		if perm.Admin {
+			adminMXID = userID
+			break
+		}
+	}
+	if adminMXID == "" {
+		log.Warn().Msg("No admin user in config, skipping auto-restore")
+		return
+	}
+
+	user, err := c.Bridge.GetUserByMXID(ctx, id.UserID(adminMXID))
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get admin user for auto-restore")
+		return
+	}
+
+	log.Info().
+		Str("login_id", string(loginID)).
+		Str("username", username).
+		Msg("Auto-restoring login from backup session state")
+
+	meta := &UserLoginMetadata{
+		Platform:    runtime.GOOS,
+		ChatsSynced: false,
+		APSState:    state.APSState,
+		IDSUsers:    state.IDSUsers,
+		IDSIdentity: state.IDSIdentity,
+	}
+
+	_, err = user.NewLogin(ctx, &database.UserLogin{
+		ID:         loginID,
+		RemoteName: username,
+		RemoteProfile: status.RemoteProfile{
+			Name: username,
+		},
+		Metadata: meta,
+	}, &bridgev2.NewLoginParams{
+		DeleteOnConflict: true,
+	})
+	if err != nil {
+		log.Err(err).Msg("Failed to auto-restore login from backup")
+		return
+	}
+
+	log.Info().Str("login_id", string(loginID)).Msg("Successfully auto-restored login from backup session state")
 }
 
 func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
