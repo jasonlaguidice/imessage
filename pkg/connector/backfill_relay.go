@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
@@ -479,27 +481,49 @@ func relayChatInfoToBridgev2(info RelayChatInfo, c *IMClient) *bridgev2.ChatInfo
 			displayName = c.buildGroupName(info.Members)
 		}
 		chatInfo.Name = &displayName
+		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
 		members := &bridgev2.ChatMemberList{
-			IsFull:           true,
-			TotalMemberCount: len(info.Members) + 1,
-			Members:          make([]bridgev2.ChatMember, 0, len(info.Members)+1),
+			IsFull:    true,
+			MemberMap: make(map[networkid.UserID]bridgev2.ChatMember),
 		}
 		// Add self
-		members.Members = append(members.Members, bridgev2.ChatMember{
+		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
 			EventSender: bridgev2.EventSender{
 				IsFromMe:    true,
 				SenderLogin: c.UserLogin.ID,
 				Sender:      makeUserID(c.handle),
 			},
-		})
+			Membership: event.MembershipJoin,
+		}
 		// Add other members
 		for _, m := range info.Members {
-			memberID := addIdentifierPrefix(m)
-			members.Members = append(members.Members, bridgev2.ChatMember{
-				EventSender: bridgev2.EventSender{
-					Sender: makeUserID(memberID),
+			userID := makeUserID(addIdentifierPrefix(m))
+			members.MemberMap[userID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{Sender: userID},
+				Membership:  event.MembershipJoin,
+			}
+		}
+		chatInfo.Members = members
+	} else {
+		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
+		otherUser := makeUserID(addIdentifierPrefix(parsed.LocalID))
+		members := &bridgev2.ChatMemberList{
+			IsFull:      true,
+			OtherUserID: otherUser,
+			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
+				makeUserID(c.handle): {
+					EventSender: bridgev2.EventSender{
+						IsFromMe:    true,
+						SenderLogin: c.UserLogin.ID,
+						Sender:      makeUserID(c.handle),
+					},
+					Membership: event.MembershipJoin,
 				},
-			})
+				otherUser: {
+					EventSender: bridgev2.EventSender{Sender: otherUser},
+					Membership:  event.MembershipJoin,
+				},
+			},
 		}
 		chatInfo.Members = members
 	}
