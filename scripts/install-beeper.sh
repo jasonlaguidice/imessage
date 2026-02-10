@@ -141,6 +141,9 @@ elif command -v sqlite3 >/dev/null 2>&1; then
     if [ "$LOGIN_COUNT" = "0" ]; then
         NEEDS_LOGIN=true
     fi
+else
+    # sqlite3 not available — can't verify DB has logins, assume login needed
+    NEEDS_LOGIN=true
 fi
 
 # Check if backup session state can be restored — validates that session.json

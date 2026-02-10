@@ -24,6 +24,7 @@ dpkg -s pkg-config   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES pkg-config"
 dpkg -s libolm-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libolm-dev"
 dpkg -s libclang-dev >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libclang-dev"
 dpkg -s libssl-dev   >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES libssl-dev"
+command -v sqlite3 >/dev/null 2>&1 || APT_PACKAGES="$APT_PACKAGES sqlite3"
 
 # Deduplicate
 APT_PACKAGES=$(echo "$APT_PACKAGES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
