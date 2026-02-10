@@ -92,13 +92,22 @@ elif command -v sqlite3 >/dev/null 2>&1; then
     fi
 fi
 
-if [ "$NEEDS_LOGIN" = "true" ]; then
+if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     echo ""
-    echo "  ℹ No iMessage login found."
-    echo "  Start the bridge and log in through Beeper:"
-    echo "    1. Start the bridge (systemd will do this automatically)"
-    echo "    2. Open Beeper and find the iMessage bridge bot"
-    echo "    3. Send 'login' to start the login flow"
+    echo "┌─────────────────────────────────────────────────┐"
+    echo "│  No iMessage login found — starting login...    │"
+    echo "└─────────────────────────────────────────────────┘"
+    echo ""
+    # Stop the bridge if running (otherwise it holds the DB lock)
+    if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
+        systemctl --user stop mautrix-imessage
+    fi
+    "$BINARY" login -c "$CONFIG"
+    echo ""
+elif [ "$NEEDS_LOGIN" = "true" ]; then
+    echo ""
+    echo "  ℹ No iMessage login found. Run interactively to log in:"
+    echo "    $BINARY login -c $CONFIG"
     echo ""
 fi
 
