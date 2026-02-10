@@ -54,17 +54,31 @@ go run tools/extract-key/main.go
 
 This reads hardware identifiers (serial, MLB, ROM, etc.) and outputs a base64 key. The Mac is not modified.
 
-**Apple Silicon Macs** lack the encrypted IOKit properties needed by the x86_64 NAC emulator. You must also run the NAC relay:
+**Apple Silicon Macs** lack the encrypted IOKit properties needed by the x86_64 NAC emulator. You must also run the NAC relay — a small HTTP server that generates Apple validation data using the Mac's native `AAAbsintheContext` framework.
+
+**Set up the relay:**
 
 ```bash
-# Terminal 1: start the relay (keeps running)
-go run tools/nac-relay/main.go
+go build -o ~/bin/nac-relay ./tools/nac-relay/
+~/bin/nac-relay --setup
+```
 
-# Terminal 2: extract key with relay URL
+This installs a LaunchAgent that starts on login and auto-restarts if it crashes. On first run, grant **Full Disk Access** and **Contacts** access when prompted — this enables chat history backfill (including images and attachments), contact name resolution, and SMS forwarding from the Mac.
+
+```bash
+# Check it's running
+tail -f /tmp/nac-relay.log
+```
+
+**Extract the key with the relay URL:**
+
+```bash
 go run tools/extract-key/main.go -relay http://<your-mac-ip>:5001/validation-data
 ```
 
-The relay URL is embedded in the key. Set up port forwarding if the bridge runs outside your LAN (see [NAC Relay](#nac-relay) below).
+The relay URL is embedded in the key. If the bridge runs outside your LAN (e.g., cloud VM), forward port 5001 TCP to your Mac's local IP. Lock the allowed source IPs to your bridge server for security.
+
+**Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key. Chat history starts from when you log in and contacts appear by phone number / email.
 
 ### Step 2: Build and install the bridge (on Linux)
 
@@ -95,39 +109,6 @@ DM the bridge bot and choose the **"Apple ID (External Key)"** login flow:
 3. Enter the 2FA code sent to your trusted devices
 
 The bridge registers with Apple's servers and starts receiving iMessages.
-
-### NAC Relay
-
-The NAC relay is required for **Apple Silicon** Macs. It's a tiny HTTP server that generates Apple validation data on demand using the Mac's native `AAAbsintheContext` framework.
-
-**Install as a persistent service (recommended):**
-
-```bash
-# Build and install as a LaunchAgent with .app bundle for TCC permissions
-go build -o ~/bin/nac-relay ./tools/nac-relay/
-~/bin/nac-relay --setup
-```
-
-The `--setup` command creates an `.app` bundle at `~/Applications/nac-relay.app`, installs a LaunchAgent, and starts the service. On first run it will prompt for **Full Disk Access** (needed for chat.db backfill) and **Contacts** access — grant both when the system dialogs appear.
-
-```bash
-# Check status
-tail -f /tmp/nac-relay.log
-```
-
-**Port forwarding**: If your bridge runs outside the LAN (e.g., cloud VM), forward port 5001 TCP to your Mac's local IP. Lock the allowed source IPs to your bridge server for security.
-
-**Intel Macs**: The NAC relay is not needed. The bridge runs the x86_64 NAC emulator locally on Linux using hardware data from the extracted key.
-
-### Linux Features with NAC Relay
-
-When the NAC relay is running on a Mac with Full Disk Access and Contacts access granted:
-
-- **Chat history backfill** — messages from the Mac's `chat.db` are synced via the relay, including images and attachments
-- **Contact name resolution** — contacts are resolved from the Mac's Contacts.app, so bridged users appear by name instead of phone number / email
-- **SMS forwarding** — works the same as macOS (enable Text Message Forwarding on your iPhone)
-
-Without the relay (Intel keys only), chat history starts from when you log in and contacts appear by phone number / email.
 
 ## Login
 
