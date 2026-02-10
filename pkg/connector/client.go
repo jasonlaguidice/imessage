@@ -303,14 +303,21 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 }
 
 // UpdateUsers is called when IDS keys are refreshed.
+// NOTE: This callback runs on the Tokio async runtime thread.  We must NOT
+// make blocking FFI calls back into Rust (e.g. connection.State()) on this
+// thread or the runtime will panic with "Cannot block the current thread
+// from within a runtime".  Spawn a goroutine so the callback returns
+// immediately and the blocking work happens on a regular OS thread.
 func (c *IMClient) UpdateUsers(users *rustpushgo.WrappedIdsUsers) {
-	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
 	c.users = users
 
-	// Persist all state (APS tokens, IDS keys, identity, device ID) — not just
-	// IDSUsers — so a crash between periodic saves doesn't lose APS state.
-	c.persistState(log)
-	log.Debug().Msg("IDS users updated, full state persisted")
+	go func() {
+		log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
+		// Persist all state (APS tokens, IDS keys, identity, device ID) — not just
+		// IDSUsers — so a crash between periodic saves doesn't lose APS state.
+		c.persistState(log)
+		log.Debug().Msg("IDS users updated, full state persisted")
+	}()
 }
 
 // ============================================================================
