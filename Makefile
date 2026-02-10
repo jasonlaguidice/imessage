@@ -151,27 +151,31 @@ endif
 # ===========================================================================
 # Extract-key (hardware key extraction tool)
 # ===========================================================================
+# extract-key uses CGO with Objective-C and macOS frameworks (Foundation,
+# IOKit, DiskArbitration), so it can only be compiled on macOS.
+# It has its own go.mod (Go 1.20) so it can build on macOS 10.13 High Sierra.
+#
+# On older Macs without Go installed, use the self-contained build script:
+#   cd tools/extract-key && ./build.sh
 
-.PHONY: extract-key extract-key-intel
+.PHONY: extract-key
 
-# Build extract-key for the current Mac
+ifeq ($(UNAME_S),Darwin)
 extract-key:
-	go build -o extract-key ./tools/extract-key/
-
-# Cross-compile extract-key for Intel Macs (runs on macOS 10.13 High Sierra and later)
-extract-key-intel:
-	CGO_CFLAGS="-mmacosx-version-min=10.13" \
-	CGO_LDFLAGS="-mmacosx-version-min=10.13" \
-	MACOSX_DEPLOYMENT_TARGET=10.13 \
-	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 \
-		go build -o extract-key-intel ./tools/extract-key/
-	@echo ""
-	@echo "Built extract-key-intel (x86_64, macOS 10.13+)"
-	@echo "Copy to the Intel Mac and run:  ./extract-key-intel"
+	cd tools/extract-key && go build -trimpath -o ../../extract-key .
+else
+extract-key:
+	@echo "Error: extract-key must be built on macOS." >&2
+	@echo "It uses Objective-C and macOS frameworks (IOKit, Foundation, DiskArbitration)." >&2
+	@echo "" >&2
+	@echo "On the target Mac (including High Sierra 10.13+):" >&2
+	@echo "  cd tools/extract-key && ./build.sh" >&2
+	@exit 1
+endif
 
 clean:
 ifeq ($(UNAME_S),Darwin)
 	rm -rf $(APP_NAME).app
 endif
-	rm -f $(APP_NAME) $(RUST_LIB) extract-key extract-key-intel
+	rm -f $(APP_NAME) $(RUST_LIB) extract-key tools/extract-key/extract-key
 	cd pkg/rustpushgo && cargo clean 2>/dev/null || true
