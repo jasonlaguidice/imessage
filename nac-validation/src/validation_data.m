@@ -26,8 +26,7 @@
 
 // ---- Configuration ----
 
-static NSString *const kCertURL = @"http://static.ess.apple.com/identity/validation/cert-1.0.plist";
-static NSString *const kInitValidationURL = @"https://identity.ess.apple.com/WebObjects/TDIdentityService.woa/wa/initializeValidation";
+static NSString *const kIDSBagURL = @"https://init.ess.apple.com/WebObjects/VCInit.woa/wa/getBag?ix=3";
 
 // ---- Synchronous HTTP helper ----
 
@@ -75,6 +74,57 @@ static NSData *httpPost(NSString *urlStr, NSData *body, NSString *contentType, N
     if (outStatus) *outStatus = status;
     if (blockError && outError) *outError = blockError;
     return result;
+}
+
+// ---- IDS bag URL resolution ----
+
+/**
+ * Fetch a URL from the IDS bag.
+ *
+ * The bag endpoint returns a plist with a "bag" key containing an inner plist
+ * dictionary. This function fetches the bag, parses it, and returns the string
+ * value for the requested key.
+ */
+static NSString *fetchBagURL(NSString *bagURL, NSString *key, NSError **outError) {
+    NSError *fetchErr = nil;
+    NSData *bagData = httpGet(bagURL, &fetchErr);
+    if (!bagData) {
+        if (outError) *outError = [NSError errorWithDomain:@"NAC" code:30
+            userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"Failed to fetch IDS bag: %@", fetchErr]}];
+        return nil;
+    }
+
+    id outerPlist = [NSPropertyListSerialization propertyListWithData:bagData options:0 format:NULL error:&fetchErr];
+    if (![outerPlist isKindOfClass:[NSDictionary class]] || !outerPlist[@"bag"]) {
+        if (outError) *outError = [NSError errorWithDomain:@"NAC" code:31
+            userInfo:@{NSLocalizedDescriptionKey: @"IDS bag response missing 'bag' key"}];
+        return nil;
+    }
+
+    NSData *innerData = outerPlist[@"bag"];
+    if (![innerData isKindOfClass:[NSData class]]) {
+        if (outError) *outError = [NSError errorWithDomain:@"NAC" code:32
+            userInfo:@{NSLocalizedDescriptionKey: @"IDS bag 'bag' value is not data"}];
+        return nil;
+    }
+
+    id innerPlist = [NSPropertyListSerialization propertyListWithData:innerData options:0 format:NULL error:&fetchErr];
+    if (![innerPlist isKindOfClass:[NSDictionary class]]) {
+        if (outError) *outError = [NSError errorWithDomain:@"NAC" code:33
+            userInfo:@{NSLocalizedDescriptionKey: @"IDS bag inner plist is not a dictionary"}];
+        return nil;
+    }
+
+    NSString *value = innerPlist[key];
+    if (!value || ![value isKindOfClass:[NSString class]]) {
+        if (outError) *outError = [NSError errorWithDomain:@"NAC" code:34
+            userInfo:@{NSLocalizedDescriptionKey:
+                [NSString stringWithFormat:@"IDS bag missing key '%@'", key]}];
+        return nil;
+    }
+
+    return value;
 }
 
 // ---- NAC selector discovery ----
@@ -201,9 +251,21 @@ int generate_validation_data(NSData **outData, NSError **outError) {
         return 1;
     }
 
-    // --- Step 1: Fetch validation certificate ---
+    // --- Step 0: Resolve URLs from IDS bag ---
     NSError *fetchErr = nil;
-    NSData *certPlistData = httpGet(kCertURL, &fetchErr);
+    NSString *certURL = fetchBagURL(kIDSBagURL, @"id-validation-cert", &fetchErr);
+    if (!certURL) {
+        if (outError && !*outError) *outError = fetchErr;
+        return 30;
+    }
+    NSString *initValidationURL = fetchBagURL(kIDSBagURL, @"id-initialize-validation", &fetchErr);
+    if (!initValidationURL) {
+        if (outError && !*outError) *outError = fetchErr;
+        return 31;
+    }
+
+    // --- Step 1: Fetch validation certificate ---
+    NSData *certPlistData = httpGet(certURL, &fetchErr);
     if (!certPlistData) {
         if (outError) *outError = [NSError errorWithDomain:@"NAC" code:2
             userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to fetch cert: %@", fetchErr]}];
@@ -250,7 +312,7 @@ int generate_validation_data(NSData **outData, NSError **outError) {
         format:NSPropertyListXMLFormat_v1_0 options:0 error:&nacError];
 
     NSInteger httpStatus = 0;
-    NSData *responseData = httpPost(kInitValidationURL, requestPlist,
+    NSData *responseData = httpPost(initValidationURL, requestPlist,
         @"application/x-apple-plist", &httpStatus, &nacError);
 
     if (httpStatus != 200 || !responseData) {

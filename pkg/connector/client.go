@@ -94,23 +94,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	rustpushgo.InitLogger()
 
-	// Validate that the software keystore still has the signing keys referenced
-	// by the saved user state.  If the keystore file was deleted/reset while the
-	// bridge DB kept the old state, every IDS operation would fail with
-	// "Keystore error Key not found".  Detect this early and ask the user to
-	// re-login instead of producing a cryptic send-time error.
+	// If the keystore lost the signing keys referenced by saved user state,
+	// clear stale users and identity so NewClient will regenerate everything.
 	if c.users != nil && !c.users.ValidateKeystore() {
-		log.Error().Msg("Keystore keys missing for saved user state — clearing stale login, please re-login")
+		log.Warn().Msg("Keystore keys missing for saved user state — clearing stale state, will re-register")
 		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 		meta.IDSUsers = ""
 		meta.IDSIdentity = ""
-		meta.APSState = ""
 		_ = c.UserLogin.Save(ctx)
-		c.UserLogin.BridgeState.Send(status.BridgeState{
-			StateEvent: status.StateBadCredentials,
-			Message:    "Signing keys lost — please re-login to iMessage",
-		})
-		return
+		emptyUsers := ""
+		c.users = rustpushgo.NewWrappedIdsUsers(&emptyUsers)
+		emptyIdentity := ""
+		c.identity = rustpushgo.NewWrappedIdsngmIdentity(&emptyIdentity)
 	}
 
 	client, err := rustpushgo.NewClient(c.connection, c.users, c.identity, c.config, c, c)

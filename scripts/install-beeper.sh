@@ -126,7 +126,9 @@ if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     # Stop the bridge if running (otherwise it holds the DB lock)
     GUI_DOMAIN_TMP="gui/$(id -u)"
     launchctl bootout "$GUI_DOMAIN_TMP/$BUNDLE_ID" 2>/dev/null || true
-    "$BINARY" login -c "$CONFIG"
+    # Run login from the data directory so the keystore (state/keystore.plist)
+    # is written to the same location the launchd service will read from.
+    (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
     echo ""
 elif [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
