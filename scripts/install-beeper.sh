@@ -193,12 +193,6 @@ elif [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
 fi
 
-# ── Permissions (FDA + Contacts) ──────────────────────────────
-# The binary's --setup flag prompts for Full Disk Access and Contacts
-# via native macOS dialogs.  Only needed on macOS.
-echo "Checking permissions..."
-"$BINARY" --setup -c "$CONFIG"
-
 # ── Install LaunchAgent ───────────────────────────────────────
 CONFIG_ABS="$(cd "$DATA_DIR" && pwd)/config.yaml"
 DATA_ABS="$(cd "$DATA_DIR" && pwd)"
