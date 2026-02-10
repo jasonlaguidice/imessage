@@ -236,6 +236,32 @@ static struct hw_result read_hardware() {
 
     IOObjectRelease(platform);
 
+    // Fallback: read ROM and MLB from IODeviceTree:/options (NVRAM node).
+    // On macOS 10.13 High Sierra, the NVRAM GUID-prefixed properties may not
+    // be exposed on IOPlatformExpertDevice but are available on the options node.
+    if (!r.mlb || (r.rom == NULL || r.rom_len == 0)) {
+        io_registry_entry_t options = IORegistryEntryFromPath(IO_PORT_DEFAULT, "IODeviceTree:/options");
+        if (options) {
+            if (!r.mlb) {
+                r.mlb = io_string(options, CFSTR("4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:MLB"));
+                if (!r.mlb) {
+                    unsigned char *mdata; int mlen;
+                    io_data(options, CFSTR("4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:MLB"), &mdata, &mlen);
+                    if (mdata && mlen > 0) {
+                        // Strip trailing null padding
+                        while (mlen > 0 && mdata[mlen-1] == 0) mlen--;
+                        if (mlen > 0) r.mlb = strndup((char*)mdata, mlen);
+                        free(mdata);
+                    }
+                }
+            }
+            if (r.rom == NULL || r.rom_len == 0) {
+                io_data(options, CFSTR("4D1EDE05-38C7-4A6A-9CC6-4BCCA8B38C14:ROM"), &r.rom, &r.rom_len);
+            }
+            IOObjectRelease(options);
+        }
+    }
+
     // OS build number
     {
         char buf[64];
