@@ -21,6 +21,10 @@ package main
 #import <Foundation/Foundation.h>
 #import <IOKit/IOKitLib.h>
 #import <DiskArbitration/DiskArbitration.h>
+
+// Both kIOMainPortDefault (macOS 12+) and kIOMasterPortDefault (deprecated in 12)
+// are MACH_PORT_NULL. Use 0 directly for compatibility back to 10.13 High Sierra.
+#define IO_PORT_DEFAULT MACH_PORT_NULL
 #include <sys/sysctl.h>
 #include <sys/mount.h>
 #include <net/if.h>
@@ -150,7 +154,7 @@ static struct hw_result read_hardware() {
     struct hw_result r;
     memset(&r, 0, sizeof(r));
 
-    io_service_t platform = IOServiceGetMatchingService(kIOMainPortDefault,
+    io_service_t platform = IOServiceGetMatchingService(IO_PORT_DEFAULT,
         IOServiceMatching("IOPlatformExpertDevice"));
     if (!platform) {
         r.error = strdup("failed to find IOPlatformExpertDevice");

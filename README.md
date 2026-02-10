@@ -46,13 +46,32 @@ sudo apt install -y git make
 
 ### Step 1: Extract hardware key (one-time, on your Mac)
 
+**If the Mac has Go installed (macOS 13+):**
+
 ```bash
 git clone https://github.com/lrhodin/imessage.git
 cd imessage
 go run tools/extract-key/main.go
 ```
 
-This reads hardware identifiers (serial, MLB, ROM, etc.) and outputs a base64 key. The Mac is not modified.
+**If the Mac is older (macOS 10.13 High Sierra through 12) or doesn't have Go:**
+
+Cross-compile on any Mac that has Go, then copy the binary over:
+
+```bash
+# On your newer Mac (with Go installed):
+git clone https://github.com/lrhodin/imessage.git
+cd imessage
+make extract-key-intel
+
+# Copy to the older Mac:
+scp extract-key-intel user@old-mac:~/
+
+# On the older Mac:
+cd ~ && ./extract-key-intel
+```
+
+This reads hardware identifiers (serial, MLB, ROM, etc.) and outputs a base64 key. The Mac is not modified and can continue to be used normally.
 
 **Apple Silicon Macs** lack the encrypted IOKit properties needed by the x86_64 NAC emulator. You must also run the NAC relay — a small HTTP server that generates Apple validation data using the Mac's native `AAAbsintheContext` framework.
 

@@ -148,9 +148,30 @@ else
 	@echo "On Linux, stop the service and remove the binary manually."
 endif
 
+# ===========================================================================
+# Extract-key (hardware key extraction tool)
+# ===========================================================================
+
+.PHONY: extract-key extract-key-intel
+
+# Build extract-key for the current Mac
+extract-key:
+	go build -o extract-key ./tools/extract-key/
+
+# Cross-compile extract-key for Intel Macs (runs on macOS 10.13 High Sierra and later)
+extract-key-intel:
+	CGO_CFLAGS="-mmacosx-version-min=10.13" \
+	CGO_LDFLAGS="-mmacosx-version-min=10.13" \
+	MACOSX_DEPLOYMENT_TARGET=10.13 \
+	GOOS=darwin GOARCH=amd64 CGO_ENABLED=1 \
+		go build -o extract-key-intel ./tools/extract-key/
+	@echo ""
+	@echo "Built extract-key-intel (x86_64, macOS 10.13+)"
+	@echo "Copy to the Intel Mac and run:  ./extract-key-intel"
+
 clean:
 ifeq ($(UNAME_S),Darwin)
 	rm -rf $(APP_NAME).app
 endif
-	rm -f $(APP_NAME) $(RUST_LIB)
+	rm -f $(APP_NAME) $(RUST_LIB) extract-key extract-key-intel
 	cd pkg/rustpushgo && cargo clean 2>/dev/null || true
