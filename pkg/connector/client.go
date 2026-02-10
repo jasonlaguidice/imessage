@@ -961,6 +961,12 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 // ============================================================================
 
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	// Only support forward backfill (initial sync). The backward backfill
+	// queue is disabled — it used to delete and recreate rooms on
+	// discrepancies which was unreliable.
+	if !params.Forward {
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+	}
 	if c.chatDB != nil {
 		return c.chatDB.FetchMessages(ctx, params, c)
 	}
