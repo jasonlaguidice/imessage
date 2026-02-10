@@ -263,6 +263,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"unsafe"
@@ -311,6 +312,35 @@ type MacOSConfig struct {
 	ICloudUA        string         `json:"icloud_ua"`
 	AOSKitVersion   string         `json:"aoskit_version"`
 	NACRelayURL     string         `json:"nac_relay_url,omitempty"`
+	RelayToken      string         `json:"relay_token,omitempty"`
+	RelayCertFP     string         `json:"relay_cert_fp,omitempty"`
+}
+
+// relayInfo matches the relay-info.json written by nac-relay.
+type relayInfo struct {
+	Token           string `json:"token"`
+	CertFingerprint string `json:"cert_fingerprint"`
+}
+
+// readRelayInfo reads ~/Library/Application Support/nac-relay/relay-info.json.
+func readRelayInfo() (*relayInfo, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	path := filepath.Join(home, "Library", "Application Support", "nac-relay", "relay-info.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var info relayInfo
+	if err := json.Unmarshal(data, &info); err != nil {
+		return nil, err
+	}
+	if info.Token == "" || info.CertFingerprint == "" {
+		return nil, fmt.Errorf("relay-info.json is incomplete (missing token or cert fingerprint)")
+	}
+	return &info, nil
 }
 
 func goBytes(p *C.uchar, n C.int) []byte {
@@ -345,6 +375,31 @@ func main() {
 	for i, arg := range os.Args[1:] {
 		if arg == "-relay" && i+1 < len(os.Args)-1 {
 			relayURL = os.Args[i+2]
+		}
+	}
+
+	// If -relay is specified, read the auth credentials from relay-info.json.
+	// The nac-relay must have been started at least once to generate these.
+	var relayAuth *relayInfo
+	if relayURL != "" {
+		var err error
+		relayAuth, err = readRelayInfo()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "\n")
+			fmt.Fprintf(os.Stderr, "  ❌ Cannot read NAC relay credentials.\n")
+			fmt.Fprintf(os.Stderr, "\n")
+			fmt.Fprintf(os.Stderr, "  The NAC relay must be started before running extract-key so that\n")
+			fmt.Fprintf(os.Stderr, "  TLS certificates and auth tokens are generated.\n")
+			fmt.Fprintf(os.Stderr, "\n")
+			fmt.Fprintf(os.Stderr, "  Start the relay first:\n")
+			fmt.Fprintf(os.Stderr, "    go run tools/nac-relay/main.go\n")
+			fmt.Fprintf(os.Stderr, "  Or install it as a service:\n")
+			fmt.Fprintf(os.Stderr, "    go run tools/nac-relay/main.go --setup\n")
+			fmt.Fprintf(os.Stderr, "\n")
+			fmt.Fprintf(os.Stderr, "  Then re-run extract-key.\n")
+			fmt.Fprintf(os.Stderr, "  (Error: %v)\n", err)
+			fmt.Fprintf(os.Stderr, "\n")
+			os.Exit(1)
 		}
 	}
 
@@ -408,7 +463,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  You MUST run the NAC relay on this Mac and re-extract with:\n")
 		fmt.Fprintf(os.Stderr, "\n")
 		fmt.Fprintf(os.Stderr, "    1. Start the relay:  go run tools/nac-relay/main.go\n")
-		fmt.Fprintf(os.Stderr, "    2. Re-extract:       go run tools/extract-key/main.go -relay http://<this-ip>:5001/validation-data\n")
+		fmt.Fprintf(os.Stderr, "    2. Re-extract:       go run tools/extract-key/main.go -relay https://<this-ip>:5001/validation-data\n")
 		fmt.Fprintf(os.Stderr, "\n")
 	} else if isAppleSilicon && relayURL != "" {
 		// Apple Silicon with relay — all good, suppress _enc warnings
@@ -443,6 +498,10 @@ func main() {
 		AOSKitVersion:   "com.apple.AOSKit/282",
 		NACRelayURL:     relayURL,
 	}
+	if relayAuth != nil {
+		config.RelayToken = relayAuth.Token
+		config.RelayCertFP = relayAuth.CertFingerprint
+	}
 
 	jsonBytes, err := json.Marshal(config)
 	if err != nil {
@@ -470,6 +529,10 @@ func main() {
 	}
 	if relayURL != "" {
 		fmt.Fprintf(os.Stderr, "  Relay:   %s\n", relayURL)
+	}
+	if relayAuth != nil {
+		fmt.Fprintf(os.Stderr, "  Auth:    token + TLS cert pinning\n")
+		fmt.Fprintf(os.Stderr, "  CertFP:  %s...%s\n", relayAuth.CertFingerprint[:8], relayAuth.CertFingerprint[len(relayAuth.CertFingerprint)-8:])
 	}
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "  This Mac can continue to be used normally.\n")

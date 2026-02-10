@@ -179,7 +179,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			go c.periodicContactRelaySync(log)
 
 			// Check if the relay also supports chat.db backfill
-			br := newBackfillRelay(c.contactRelay.baseURL)
+			br := newBackfillRelay(c.contactRelay.baseURL, c.contactRelay.httpClient, c.contactRelay.token)
 			if br.checkAvailable() {
 				c.backfillRelay = br
 				log.Info().Msg("Backfill relay available — chat.db backfill enabled via relay")
