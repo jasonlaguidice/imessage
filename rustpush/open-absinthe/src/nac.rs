@@ -16,6 +16,95 @@ use unicorn_engine::{RegisterX86, Unicorn};
 use crate::AbsintheError;
 
 // ============================================================================
+// XNU IOKit property encryption (x86_64 Linux only)
+// ============================================================================
+
+/// FFI binding to the XNU kernel encryption function extracted from the macOS
+/// kernel.  Only available when compiled on x86_64-linux (cfg `has_xnu_encrypt`
+/// is set by build.rs).
+#[cfg(has_xnu_encrypt)]
+extern "C" {
+    fn sub_ffffff8000ec7320(data: *const u8, size: u64, output: *mut u8);
+}
+
+/// Encrypt a plaintext IOKit property value using the XNU kernel function.
+/// Returns 17 bytes of encrypted output, or an error if the function is not
+/// available on this platform.
+#[cfg(has_xnu_encrypt)]
+fn encrypt_io_property(data: &[u8]) -> Result<Vec<u8>, AbsintheError> {
+    let mut output = vec![0u8; 17];
+    unsafe {
+        sub_ffffff8000ec7320(data.as_ptr(), data.len() as u64, output.as_mut_ptr());
+    }
+    Ok(output)
+}
+
+/// Parse a UUID string like "XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" into 16
+/// raw bytes.
+#[cfg(has_xnu_encrypt)]
+fn uuid_str_to_bytes(uuid: &str) -> Result<[u8; 16], AbsintheError> {
+    let hex_str: String = uuid.chars().filter(|c| *c != '-').collect();
+    if hex_str.len() != 32 {
+        return Err(AbsintheError::Other(format!(
+            "Invalid UUID length: expected 32 hex chars, got {} from '{}'",
+            hex_str.len(),
+            uuid
+        )));
+    }
+    let mut bytes = [0u8; 16];
+    for i in 0..16 {
+        bytes[i] = u8::from_str_radix(&hex_str[i * 2..i * 2 + 2], 16).map_err(|e| {
+            AbsintheError::Other(format!("Invalid hex in UUID '{}': {}", uuid, e))
+        })?;
+    }
+    Ok(bytes)
+}
+
+/// Given a HardwareConfig, compute any missing `_enc` fields from their
+/// plaintext counterparts using the XNU kernel encryption function.
+/// This is needed for keys extracted from macOS High Sierra (10.13) which
+/// lacks the encrypted IOKit properties in its kernel.
+#[cfg(has_xnu_encrypt)]
+fn compute_missing_enc_fields(hw: &mut HardwareConfig) -> Result<(), AbsintheError> {
+    // platform_serial_number → Gq3489ugfi (serial as string bytes)
+    if hw.platform_serial_number_enc.is_empty() && !hw.platform_serial_number.is_empty() {
+        info!("Computing missing platform_serial_number_enc (Gq3489ugfi) from plaintext");
+        hw.platform_serial_number_enc =
+            encrypt_io_property(hw.platform_serial_number.as_bytes())?;
+    }
+
+    // platform_uuid → Fyp98tpgj (UUID as 16 raw bytes)
+    if hw.platform_uuid_enc.is_empty() && !hw.platform_uuid.is_empty() {
+        info!("Computing missing platform_uuid_enc (Fyp98tpgj) from plaintext");
+        let uuid_bytes = uuid_str_to_bytes(&hw.platform_uuid)?;
+        hw.platform_uuid_enc = encrypt_io_property(&uuid_bytes)?;
+    }
+
+    // root_disk_uuid → kbjfrfpoJU (UUID as 16 raw bytes)
+    if hw.root_disk_uuid_enc.is_empty() && !hw.root_disk_uuid.is_empty() {
+        info!("Computing missing root_disk_uuid_enc (kbjfrfpoJU) from plaintext");
+        let uuid_bytes = uuid_str_to_bytes(&hw.root_disk_uuid)?;
+        hw.root_disk_uuid_enc = encrypt_io_property(&uuid_bytes)?;
+    }
+
+    // mlb → abKPld1EcMni (MLB as null-terminated string)
+    if hw.mlb_enc.is_empty() && !hw.mlb.is_empty() {
+        info!("Computing missing mlb_enc (abKPld1EcMni) from plaintext");
+        let mut mlb_bytes = hw.mlb.as_bytes().to_vec();
+        mlb_bytes.push(0); // null-terminated
+        hw.mlb_enc = encrypt_io_property(&mlb_bytes)?;
+    }
+
+    // rom → oycqAZloTNDm (ROM as 6 raw bytes)
+    if hw.rom_enc.is_empty() && !hw.rom.is_empty() {
+        info!("Computing missing rom_enc (oycqAZloTNDm) from plaintext");
+        hw.rom_enc = encrypt_io_property(&hw.rom)?;
+    }
+
+    Ok(())
+}
+
+// ============================================================================
 // Serde helpers
 // ============================================================================
 
@@ -720,12 +809,22 @@ impl ValidationCtx {
         out_request_bytes: &mut Vec<u8>,
         hw_config: &HardwareConfig,
     ) -> Result<ValidationCtx, AbsintheError> {
+        // 0. Compute missing _enc fields if we have the XNU encrypt function
+        //    (needed for keys extracted from macOS High Sierra 10.13)
+        #[allow(unused_mut)]
+        let hw_config = {
+            let mut hw = hw_config.clone();
+            #[cfg(has_xnu_encrypt)]
+            compute_missing_enc_fields(&mut hw)?;
+            hw
+        };
+
         // 1. Load the NAC binary
         let raw = get_binary()?;
         let binary = extract_x86_64_slice(&raw)?;
 
         // 2. Create emulator state
-        let state = Rc::new(RefCell::new(EmuState::new(hw_config)));
+        let state = Rc::new(RefCell::new(EmuState::new(&hw_config)));
 
         // 3. Create Unicorn x86-64 engine
         let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64)
