@@ -2,7 +2,7 @@
 
 A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix client.
 
-This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://docs.mau.fi/bridges/general/bridgev2.html) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
+This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
 
 **Features**: text, images, video, audio, files, reactions/tapbacks, edits, unsends, typing indicators, read receipts, group chats, SMS forwarding, and contact name resolution.
 
