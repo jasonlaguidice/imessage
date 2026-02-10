@@ -142,7 +142,7 @@ fi
 
 # ── Restore preferred_handle from DB into fresh config ────────
 if [ "$NEEDS_LOGIN" = "false" ] && command -v sqlite3 >/dev/null 2>&1; then
-    CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g")
+    CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" || true)
     if [ -z "$CURRENT_HANDLE" ]; then
         SAVED_HANDLE=$(sqlite3 "$DB_URI" "SELECT json_extract(metadata, '$.preferred_handle') FROM user_login LIMIT 1;" 2>/dev/null || true)
         if [ -n "$SAVED_HANDLE" ]; then
