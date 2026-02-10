@@ -70,8 +70,30 @@ fi
 WHOAMI=$("$BBCTL" whoami 2>&1 | head -1 || true)
 echo "✓ Logged in: $WHOAMI"
 
+# ── Check for existing bridge registration ────────────────────
+# If the bridge is already registered on the server but we're about to
+# generate a fresh config (no local config file), the old registration's
+# rooms would be orphaned.  Delete it first so the server cleans up rooms.
+EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
+    echo ""
+    echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
+    echo "   Deleting old registration to avoid orphaned rooms..."
+    "$BBCTL" delete --force "$BRIDGE_NAME" <<< "y" 2>/dev/null \
+        || "$BBCTL" delete "$BRIDGE_NAME" <<< "y" 2>/dev/null \
+        || echo "   (Could not auto-delete — you may need to run: bbctl delete $BRIDGE_NAME)"
+    echo "✓ Old registration cleaned up"
+fi
+
 # ── Generate config via bbctl ─────────────────────────────────
 mkdir -p "$DATA_DIR"
+if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
+    # Config exists locally but bridge isn't registered on server (e.g. bbctl
+    # delete was run manually).  The stale config has an invalid as_token.
+    echo "⚠  Local config exists but bridge is not registered on server."
+    echo "   Removing stale config to re-register..."
+    rm -f "$CONFIG"
+fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
     echo "  Delete it to regenerate from Beeper."
