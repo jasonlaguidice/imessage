@@ -189,6 +189,10 @@ fi
 SERVICE_FILE="$HOME/.config/systemd/user/mautrix-imessage.service"
 
 install_systemd() {
+    # Enable lingering so user services survive SSH session closures
+    if command -v loginctl >/dev/null 2>&1 && [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+        sudo loginctl enable-linger "$USER" 2>/dev/null || true
+    fi
     mkdir -p "$(dirname "$SERVICE_FILE")"
     cat > "$SERVICE_FILE" << EOF
 [Unit]
