@@ -241,9 +241,10 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 
 	// Eagerly persist full session state to the backup file so it survives DB resets.
 	saveSessionState(log, PersistedSessionState{
-		IDSIdentity: meta.IDSIdentity,
-		APSState:    meta.APSState,
-		IDSUsers:    meta.IDSUsers,
+		IDSIdentity:     meta.IDSIdentity,
+		APSState:        meta.APSState,
+		IDSUsers:        meta.IDSUsers,
+		PreferredHandle: meta.PreferredHandle,
 	})
 
 	client := &IMClient{
