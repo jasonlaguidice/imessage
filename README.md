@@ -30,9 +30,7 @@ cd imessage
 make install
 ```
 
-The installer auto-installs Homebrew and dependencies if needed, asks three questions (homeserver URL, domain, your Matrix ID), generates config files, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge.
-
-Once running, DM `@imessagebot:yourdomain` in your Matrix client and send `login`.
+The installer auto-installs Homebrew and dependencies if needed, asks three questions (homeserver URL, domain, your Matrix ID), generates config files, handles iMessage login, and starts the bridge as a LaunchAgent. It will pause and tell you exactly what to add to your `homeserver.yaml` to register the bridge.
 
 ## Quick Start (Linux)
 
