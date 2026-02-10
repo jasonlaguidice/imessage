@@ -17,6 +17,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
@@ -50,6 +51,16 @@ func main() {
 			os.Args = append(os.Args[:1], os.Args[2:]...)
 			runInteractiveLogin(&m)
 			return
+		case "check-restore":
+			// Validate that backup session state can be restored without
+			// re-authentication. Exits 0 if valid, 1 if not.
+			if connector.CheckSessionRestore() {
+				fmt.Fprintln(os.Stderr, "[+] Backup session state is valid — login can be auto-restored")
+				os.Exit(0)
+			} else {
+				fmt.Fprintln(os.Stderr, "[-] No valid backup session state — login required")
+				os.Exit(1)
+			}
 		}
 	}
 

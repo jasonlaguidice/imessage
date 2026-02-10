@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 
 	"github.com/rs/zerolog"
+
+	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
 // PersistedSessionState holds all the session data that needs to survive
@@ -131,4 +133,29 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 	saveSessionState(log, state)
 	_ = os.Remove(legacyPath)
 	return state
+}
+
+// CheckSessionRestore validates that backup session state (session.json +
+// keystore) exists and the IDS user keys are present in the keystore.
+// Returns true if login can be auto-restored without re-authentication.
+// This is intended to be called from the CLI (check-restore subcommand)
+// before starting the bridge.
+func CheckSessionRestore() bool {
+	log := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
+
+	// Initialize keystore (loads from XDG path, migrates if needed)
+	rustpushgo.InitLogger()
+
+	state := loadSessionState(log)
+	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
+		return false
+	}
+
+	session := &cachedSessionState{
+		IDSIdentity: state.IDSIdentity,
+		APSState:    state.APSState,
+		IDSUsers:    state.IDSUsers,
+		source:      "backup file (check-restore)",
+	}
+	return session.validate(log)
 }
