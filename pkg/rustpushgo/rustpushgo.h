@@ -171,6 +171,14 @@ void* uniffi_rustpushgo_fn_method_client_stop(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_join_keychain_clique(
+	void* ptr,
+	RustBuffer passcode,
+	RustCallStatus* out_status
+);
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique(
+	RustCallStatus* out_status
+);
 void* uniffi_rustpushgo_fn_method_client_test_cloud_messages(
 	void* ptr,
 	RustCallStatus* out_status

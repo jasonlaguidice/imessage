@@ -213,6 +213,84 @@ impl WrappedTokenProvider {
     pub async fn get_dsid(&self) -> Result<String, WrappedError> {
         Ok(self.inner.get_dsid().await?)
     }
+
+    /// Join the iCloud Keychain trust circle using a device passcode.
+    /// Required before CloudKit Messages can decrypt PCS-encrypted records.
+    /// The passcode is the 6-digit PIN or password used to unlock an iPhone/Mac.
+    /// Returns a description of the escrow bottle used.
+    pub async fn join_keychain_clique(&self, passcode: String) -> Result<String, WrappedError> {
+        info!("=== Joining iCloud Keychain Trust Circle ===");
+
+        let dsid = self.inner.get_dsid().await?;
+        let adsid = self.inner.get_adsid().await?;
+        let mme_delegate = self.inner.get_mme_delegate().await?;
+        let account = self.inner.get_account();
+        let os_config = self.inner.get_os_config();
+        let anisette = account.lock().await.anisette.clone();
+
+        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
+            .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+        let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+            state: tokio::sync::RwLock::new(cloudkit_state),
+            anisette: anisette.clone(),
+            config: os_config.clone(),
+            token_provider: self.inner.clone(),
+        });
+        let keychain_state = rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+            .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?;
+        let keychain = Arc::new(rustpush::keychain::KeychainClient {
+            anisette: anisette.clone(),
+            token_provider: self.inner.clone(),
+            state: tokio::sync::RwLock::new(keychain_state),
+            config: os_config.clone(),
+            update_state: Box::new(|_state| {
+                info!("Keychain state updated");
+            }),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: cloudkit.clone(),
+        });
+
+        info!("Fetching escrow bottles...");
+        let bottles = keychain.get_viable_bottles().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+
+        if bottles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac.".into()
+            });
+        }
+
+        info!("Found {} escrow bottle(s)", bottles.len());
+        for (i, (_data, meta)) in bottles.iter().enumerate() {
+            info!("  [{}] serial={} build={} timestamp={}", i, meta.serial, meta.build, meta.timestamp);
+        }
+
+        let passcode_bytes = passcode.as_bytes();
+        let mut last_err = String::new();
+        for (i, (data, meta)) in bottles.iter().enumerate() {
+            info!("Trying bottle {} (serial={})...", i, meta.serial);
+            match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
+                Ok(()) => {
+                    info!("Successfully joined keychain trust circle via bottle {}", i);
+                    info!("Syncing keychain zones...");
+                    keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await
+                        .map_err(|e| WrappedError::GenericError {
+                            msg: format!("Joined clique but keychain sync failed: {}", e)
+                        })?;
+                    return Ok(format!("Joined iCloud Keychain (device: serial={}, build={})", meta.serial, meta.build));
+                }
+                Err(e) => {
+                    warn!("Bottle {} failed: {}", i, e);
+                    last_err = format!("{}", e);
+                }
+            }
+        }
+
+        Err(WrappedError::GenericError {
+            msg: format!("All {} bottles failed. Last error: {}. Check your device passcode.", bottles.len(), last_err)
+        })
+    }
 }
 
 /// Restore a TokenProvider from persisted account credentials.

@@ -28,6 +28,7 @@ const (
 	LoginStepAppleIDPassword = "fi.mau.imessage.login.appleid"
 	LoginStepExternalKey     = "fi.mau.imessage.login.externalkey"
 	LoginStepTwoFactor       = "fi.mau.imessage.login.2fa"
+	LoginStepDevicePasscode  = "fi.mau.imessage.login.device_passcode"
 	LoginStepSelectHandle    = "fi.mau.imessage.login.select_handle"
 	LoginStepComplete        = "fi.mau.imessage.login.complete"
 )
@@ -87,7 +88,12 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 }
 
 func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
-	// Handle selection step (after IDS registration)
+	// Device passcode step (after IDS registration, before handle selection)
+	if passcode, ok := input["passcode"]; ok && l.result != nil {
+		return l.handlePasscodeAndContinue(ctx, passcode)
+	}
+
+	// Handle selection step (after device passcode)
 	if l.result != nil {
 		l.handle = input["handle"]
 		return l.completeLogin(ctx)
@@ -185,11 +191,19 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 	}
 	l.result = &result
 
-	handles := result.Users.GetHandles()
+	return devicePasscodeStep(), nil
+}
+
+func (l *AppleIDLogin) handlePasscodeAndContinue(ctx context.Context, passcode string) (*bridgev2.LoginStep, error) {
+	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+	if err := joinKeychainWithPasscode(log, l.result.TokenProvider, passcode); err != nil {
+		return nil, err
+	}
+
+	handles := l.result.Users.GetHandles()
 	if step := handleSelectionStep(handles); step != nil {
 		return step, nil
 	}
-	// Single handle — skip selection
 	if len(handles) > 0 {
 		l.handle = handles[0]
 	}
@@ -249,7 +263,12 @@ func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, erro
 }
 
 func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
-	// Handle selection step (after IDS registration)
+	// Device passcode step (after IDS registration, before handle selection)
+	if passcode, ok := input["passcode"]; ok && l.result != nil {
+		return l.handlePasscodeAndContinue(ctx, passcode)
+	}
+
+	// Handle selection step (after device passcode)
 	if l.result != nil {
 		l.handle = input["handle"]
 		return l.completeLogin(ctx)
@@ -387,11 +406,19 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 	}
 	l.result = &result
 
-	handles := result.Users.GetHandles()
+	return devicePasscodeStep(), nil
+}
+
+func (l *ExternalKeyLogin) handlePasscodeAndContinue(ctx context.Context, passcode string) (*bridgev2.LoginStep, error) {
+	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+	if err := joinKeychainWithPasscode(log, l.result.TokenProvider, passcode); err != nil {
+		return nil, err
+	}
+
+	handles := l.result.Users.GetHandles()
 	if step := handleSelectionStep(handles); step != nil {
 		return step, nil
 	}
-	// Single handle — skip selection
 	if len(handles) > 0 {
 		l.handle = handles[0]
 	}
@@ -516,6 +543,44 @@ func getExistingUsers(session *cachedSessionState, log zerolog.Logger) *rustpush
 // ============================================================================
 // Shared login helpers
 // ============================================================================
+
+// devicePasscodeStep returns a login step prompting the user for their iPhone/Mac
+// device passcode, needed to join the iCloud Keychain trust circle for message backfill.
+func devicePasscodeStep() *bridgev2.LoginStep {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepDevicePasscode,
+		Instructions: "Enter the passcode you use to unlock your iPhone or Mac.\n\n" +
+			"This is needed to join the iCloud Keychain trust circle, which gives the bridge " +
+			"access to your Messages in iCloud for backfilling chat history.\n\n" +
+			"Your passcode is only used once during setup and is not stored.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type: bridgev2.LoginInputFieldTypePassword,
+				ID:   "passcode",
+				Name: "Device Passcode",
+			}},
+		},
+	}
+}
+
+// joinKeychainWithPasscode calls the Rust FFI to join the iCloud Keychain trust
+// circle using the provided device passcode. This is required for PCS-encrypted
+// CloudKit records (Messages in iCloud).
+func joinKeychainWithPasscode(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvider, passcode string) error {
+	if tp == nil || *tp == nil {
+		log.Warn().Msg("No TokenProvider available, skipping keychain join")
+		return nil
+	}
+	log.Info().Msg("Joining iCloud Keychain trust circle...")
+	result, err := (*tp).JoinKeychainClique(passcode)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to join keychain trust circle")
+		return fmt.Errorf("failed to join iCloud Keychain: %w", err)
+	}
+	log.Info().Str("result", result).Msg("Successfully joined iCloud Keychain trust circle")
+	return nil
+}
 
 // handleSelectionStep returns a login step prompting the user to pick a handle,
 // or nil if there are fewer than 2 handles (no choice needed).
