@@ -59,12 +59,6 @@ type IMClient struct {
 	// Cloud contacts (iCloud CardDAV — no relay needed)
 	cloudContacts *cloudContactsClient
 
-	// Contact relay (optional — for Linux with NAC relay)
-	contactRelay *contactRelayClient
-
-	// Backfill relay (optional — for Linux with NAC relay + chat.db access)
-	backfillRelay *backfillRelay
-
 	// Background goroutine lifecycle
 	stopChan chan struct{}
 
@@ -167,7 +161,6 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Set up contact source (in order of preference):
 	// 1. iCloud CardDAV (cloud contacts — works everywhere, no relay needed)
 	// 2. chat.db (macOS with Full Disk Access)
-	// 3. NAC relay (legacy fallback)
 	{
 		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 		c.cloudContacts = newCloudContactsClient(meta)
@@ -186,26 +179,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		go c.watchContactChanges(log)
 	}
 
-	// Set up contact relay if no better contact source and we have a relay URL
-	if c.cloudContacts == nil && c.chatDB == nil {
-		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-		c.contactRelay = newContactRelayFromKey(meta.HardwareKey)
-		if c.contactRelay != nil {
-			log.Info().Str("relay", c.contactRelay.baseURL).Msg("Contact relay available for name resolution")
-			c.contactRelay.SyncContacts(log)
-			go c.periodicContactRelaySync(log)
 
-			// Check if the relay also supports chat.db backfill
-			br := newBackfillRelay(c.contactRelay.baseURL, c.contactRelay.httpClient, c.contactRelay.token)
-			if br.checkAvailable() {
-				c.backfillRelay = br
-				log.Info().Msg("Backfill relay available — chat.db backfill enabled via relay")
-				go c.periodicRelaySync(log)
-			} else {
-				log.Info().Msg("Backfill relay not available (relay may lack Full Disk Access)")
-			}
-		}
-	}
 }
 
 func (c *IMClient) Disconnect() {
@@ -822,7 +796,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	isGroup := strings.Contains(portalID, ",")
 
 	chatInfo := &bridgev2.ChatInfo{
-		CanBackfill: c.chatDB != nil || c.backfillRelay != nil,
+		CanBackfill: c.chatDB != nil,
 	}
 
 	if isGroup {
@@ -905,9 +879,6 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	}
 	if contact == nil && c.chatDB != nil {
 		contact, _ = c.chatDB.api.GetContactInfo(localID)
-	}
-	if contact == nil && c.contactRelay != nil {
-		contact, _ = c.contactRelay.GetContactInfo(localID)
 	}
 	if contact != nil && contact.HasName() {
 		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
@@ -996,9 +967,6 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	if c.chatDB != nil {
 		return c.chatDB.FetchMessages(ctx, params, c)
 	}
-	if c.backfillRelay != nil {
-		return c.backfillRelay.FetchMessages(ctx, params, c)
-	}
 	return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 }
 
@@ -1041,13 +1009,6 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 	}
 }
 
-// periodicRelaySync runs initial sync via the backfill relay (once), then idles.
-func (c *IMClient) periodicRelaySync(log zerolog.Logger) {
-	ctx := log.WithContext(context.Background())
-	c.runInitialSyncViaRelay(ctx, log)
-	<-c.stopChan
-}
-
 // periodicCloudContactSync re-fetches contacts from iCloud CardDAV every 15 minutes.
 func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	ticker := time.NewTicker(15 * time.Minute)
@@ -1056,20 +1017,6 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 		select {
 		case <-ticker.C:
 			c.cloudContacts.SyncContacts(log)
-		case <-c.stopChan:
-			return
-		}
-	}
-}
-
-// periodicContactRelaySync re-fetches contacts from the relay every 15 minutes.
-func (c *IMClient) periodicContactRelaySync(log zerolog.Logger) {
-	ticker := time.NewTicker(15 * time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			c.contactRelay.SyncContacts(log)
 		case <-c.stopChan:
 			return
 		}
@@ -1642,9 +1589,6 @@ func (c *IMClient) buildGroupName(members []string) string {
 		}
 		if contact == nil && c.chatDB != nil {
 			contact, _ = c.chatDB.api.GetContactInfo(lookupID)
-		}
-		if contact == nil && c.contactRelay != nil {
-			contact, _ = c.contactRelay.GetContactInfo(lookupID)
 		}
 		if contact != nil && contact.HasName() {
 			name = c.Main.Config.FormatDisplayname(DisplaynameParams{

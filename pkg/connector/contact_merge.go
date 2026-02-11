@@ -149,7 +149,7 @@ func (c *IMClient) getContactChatGUIDs(portalID string) []string {
 }
 
 // lookupContact resolves a portal/identifier string to a Contact using
-// whatever contact source is available (chat.db Contacts.framework or relay).
+// whatever contact source is available (cloud contacts or chat.db).
 func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	localID := stripIdentifierPrefix(identifier)
 	if localID == "" {
@@ -162,9 +162,6 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	}
 	if contact == nil && c.chatDB != nil {
 		contact, _ = c.chatDB.api.GetContactInfo(localID)
-	}
-	if contact == nil && c.contactRelay != nil {
-		contact, _ = c.contactRelay.GetContactInfo(localID)
 	}
 	return contact
 }
