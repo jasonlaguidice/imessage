@@ -39,6 +39,12 @@ type UserLoginMetadata struct {
 	// PreferredHandle is the user-chosen handle for outgoing messages
 	// (e.g. "tel:+15551234567" or "mailto:user@example.com").
 	PreferredHandle string `json:"preferred_handle,omitempty"`
+
+	// iCloud CardDAV credentials for cloud-based contact sync.
+	// Obtained from MobileMe delegate during login.
+	DSID            string `json:"dsid,omitempty"`
+	MMEAuthToken    string `json:"mme_auth_token,omitempty"`
+	ContactsURL     string `json:"contacts_url,omitempty"`
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {

@@ -554,6 +554,22 @@ func completeLoginWithMeta(
 ) (*bridgev2.LoginStep, error) {
 	log := main.Bridge.Log.With().Str("component", "imessage").Logger()
 
+	// Store iCloud credentials from login result (for CardDAV contacts sync)
+	if result.Dsid != nil {
+		meta.DSID = *result.Dsid
+	}
+	if result.MmeAuthToken != nil {
+		meta.MMEAuthToken = *result.MmeAuthToken
+	}
+	if result.ContactsUrl != nil {
+		meta.ContactsURL = *result.ContactsUrl
+	}
+	if meta.ContactsURL != "" {
+		log.Info().Str("contacts_url", meta.ContactsURL).Msg("Contacts CardDAV URL available")
+	} else {
+		log.Warn().Msg("No contacts CardDAV URL from login — cloud contact sync will not be available")
+	}
+
 	// Persist full session state to backup file so it survives DB resets.
 	saveSessionState(log, PersistedSessionState{
 		IDSIdentity:     meta.IDSIdentity,

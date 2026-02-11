@@ -65,6 +65,12 @@ impl WrappedAPSConnection {
 pub struct IDSUsersWithIdentityRecord {
     pub users: Arc<WrappedIDSUsers>,
     pub identity: Arc<WrappedIDSNGMIdentity>,
+    /// DSID for iCloud services (used for CardDAV auth)
+    pub dsid: Option<String>,
+    /// mmeAuthToken for iCloud services (used for CardDAV auth)
+    pub mme_auth_token: Option<String>,
+    /// CardDAV URL for contacts (from MobileMe delegate config)
+    pub contacts_url: Option<String>,
 }
 
 #[derive(uniffi::Object)]
@@ -836,7 +842,18 @@ impl LoginSession {
 
         let spd = account.spd.as_ref().expect("No SPD after login");
         let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap();
+        let dsid = spd.get("DsPrsId").or_else(|| spd.get("dsid"))
+            .and_then(|v| {
+                if let Some(s) = v.as_string() {
+                    Some(s.to_string())
+                } else if let Some(i) = v.as_signed_integer() {
+                    Some(i.to_string())
+                } else {
+                    None
+                }
+            });
 
+        // Request both IDS (for messaging) and MobileMe (for contacts CardDAV URL)
         let delegates = login_apple_delegates(
             &self.username,
             &pet,
@@ -844,8 +861,27 @@ impl LoginSession {
             None,
             &mut *account.anisette.lock().await,
             &*os_config,
-            &[LoginDelegate::IDS],
-        ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get IDS delegate: {}", e) })?;
+            &[LoginDelegate::IDS, LoginDelegate::MobileMe],
+        ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) })?;
+
+        // Extract contacts CardDAV URL and mmeAuthToken from MobileMe delegate
+        let (mme_auth_token, contacts_url) = if let Some(ref mme) = delegates.mobileme {
+            let token = mme.tokens.get("mmeAuthToken").cloned();
+            let url = mme.config.get("com.apple.Dataclass.Contacts")
+                .and_then(|v| v.as_dictionary())
+                .and_then(|d| d.get("url"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_string());
+            if url.is_some() {
+                info!("Got contacts CardDAV URL from MobileMe delegate");
+            } else {
+                warn!("MobileMe delegate present but no contacts CardDAV URL found");
+            }
+            (token, url)
+        } else {
+            warn!("No MobileMe delegate in response — contacts sync won't be available");
+            (None, None)
+        };
 
         let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
         let fresh_user = authenticate_apple(ids_delegate, &*os_config).await
@@ -919,6 +955,9 @@ impl LoginSession {
         Ok(IDSUsersWithIdentityRecord {
             users: Arc::new(WrappedIDSUsers { inner: users }),
             identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
+            dsid,
+            mme_auth_token: mme_auth_token,
+            contacts_url,
         })
     }
 }

@@ -157,9 +157,13 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	}
 
 	var contact *imessage.Contact
-	if c.chatDB != nil {
+	if c.cloudContacts != nil {
+		contact, _ = c.cloudContacts.GetContactInfo(localID)
+	}
+	if contact == nil && c.chatDB != nil {
 		contact, _ = c.chatDB.api.GetContactInfo(localID)
-	} else if c.contactRelay != nil {
+	}
+	if contact == nil && c.contactRelay != nil {
 		contact, _ = c.contactRelay.GetContactInfo(localID)
 	}
 	return contact
