@@ -89,8 +89,8 @@ pub struct AuthTokenRequest {
 }
 
 pub struct FetchedToken {
-    token: String,
-    expiration: SystemTime,
+    pub token: String,
+    pub expiration: SystemTime,
 }
 
 pub struct AppleAccount<T: AnisetteProvider> {

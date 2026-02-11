@@ -73,7 +73,22 @@ void uniffi_rustpushgo_fn_free_client(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_get_contacts_url(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_get_dsid(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_get_handles(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_get_icloud_auth_headers(
 	void* ptr,
 	RustCallStatus* out_status
 );
@@ -269,6 +284,26 @@ RustBuffer uniffi_rustpushgo_fn_method_wrappedosconfig_get_device_id(
 	RustCallStatus* out_status
 );
 
+void uniffi_rustpushgo_fn_free_wrappedtokenprovider(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_contacts_url(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_dsid(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_icloud_auth_headers(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void uniffi_rustpushgo_fn_init_callback_messagecallback(
 	ForeignCallback callback_stub,
 	RustCallStatus* out_status
@@ -322,8 +357,19 @@ void* uniffi_rustpushgo_fn_func_new_client(
 	void* users,
 	void* identity,
 	void* config,
+	RustBuffer token_provider,
 	uint64_t message_callback,
 	uint64_t update_users_callback,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_func_restore_token_provider(
+	void* config,
+	void* connection,
+	RustBuffer username,
+	RustBuffer hashed_password_hex,
+	RustBuffer pet,
+	RustBuffer spd_base64,
 	RustCallStatus* out_status
 );
 
@@ -658,7 +704,23 @@ uint16_t uniffi_rustpushgo_checksum_func_new_client(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_func_restore_token_provider(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_contacts_url(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_dsid(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_get_handles(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_get_icloud_auth_headers(
 	RustCallStatus* out_status
 );
 
@@ -743,6 +805,18 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedidsusers_validate_keystore(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedosconfig_get_device_id(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_contacts_url(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_dsid(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_icloud_auth_headers(
 	RustCallStatus* out_status
 );
 

@@ -554,31 +554,31 @@ func completeLoginWithMeta(
 ) (*bridgev2.LoginStep, error) {
 	log := main.Bridge.Log.With().Str("component", "imessage").Logger()
 
-	// Store iCloud credentials from login result (for CardDAV contacts sync)
-	if result.Dsid != nil {
-		meta.DSID = *result.Dsid
-	}
-	if result.MmeAuthToken != nil {
-		meta.MMEAuthToken = *result.MmeAuthToken
-	}
-	if result.ContactsUrl != nil {
-		meta.ContactsURL = *result.ContactsUrl
-	}
-	if meta.ContactsURL != "" {
-		log.Info().Str("contacts_url", meta.ContactsURL).Msg("Contacts CardDAV URL available")
+	// Store iCloud account persist data for TokenProvider restoration
+	if result.AccountPersist != nil {
+		meta.AccountUsername = result.AccountPersist.Username
+		meta.AccountHashedPasswordHex = result.AccountPersist.HashedPasswordHex
+		meta.AccountPET = result.AccountPersist.Pet
+		meta.AccountADSID = result.AccountPersist.Adsid
+		meta.AccountDSID = result.AccountPersist.Dsid
+		meta.AccountSPDBase64 = result.AccountPersist.SpdBase64
+		log.Info().Str("dsid", meta.AccountDSID).Msg("iCloud account credentials available for TokenProvider")
 	} else {
-		log.Warn().Msg("No contacts CardDAV URL from login — cloud contact sync will not be available")
+		log.Warn().Msg("No account persist data from login — cloud services will not be available")
 	}
 
 	// Persist full session state to backup file so it survives DB resets.
 	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:     meta.IDSIdentity,
-		APSState:        meta.APSState,
-		IDSUsers:        meta.IDSUsers,
-		PreferredHandle: meta.PreferredHandle,
-		DSID:            meta.DSID,
-		MMEAuthToken:    meta.MMEAuthToken,
-		ContactsURL:     meta.ContactsURL,
+		IDSIdentity:              meta.IDSIdentity,
+		APSState:                 meta.APSState,
+		IDSUsers:                 meta.IDSUsers,
+		PreferredHandle:          meta.PreferredHandle,
+		AccountUsername:          meta.AccountUsername,
+		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
+		AccountPET:               meta.AccountPET,
+		AccountADSID:             meta.AccountADSID,
+		AccountDSID:              meta.AccountDSID,
+		AccountSPDBase64:         meta.AccountSPDBase64,
 	})
 
 	client := &IMClient{
@@ -587,6 +587,7 @@ func completeLoginWithMeta(
 		users:         result.Users,
 		identity:      result.Identity,
 		connection:    conn,
+		tokenProvider: result.TokenProvider,
 		recentUnsends: make(map[string]time.Time),
 		smsPortals:    make(map[string]bool),
 	}

@@ -149,14 +149,17 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		Msg("Auto-restoring login from backup session state")
 
 	meta := &UserLoginMetadata{
-		Platform:    runtime.GOOS,
-		ChatsSynced: false,
-		APSState:    state.APSState,
-		IDSUsers:    state.IDSUsers,
-		IDSIdentity: state.IDSIdentity,
-		DSID:        state.DSID,
-		MMEAuthToken: state.MMEAuthToken,
-		ContactsURL: state.ContactsURL,
+		Platform:                 runtime.GOOS,
+		ChatsSynced:              false,
+		APSState:                 state.APSState,
+		IDSUsers:                 state.IDSUsers,
+		IDSIdentity:              state.IDSIdentity,
+		AccountUsername:          state.AccountUsername,
+		AccountHashedPasswordHex: state.AccountHashedPasswordHex,
+		AccountPET:               state.AccountPET,
+		AccountADSID:             state.AccountADSID,
+		AccountDSID:              state.AccountDSID,
+		AccountSPDBase64:         state.AccountSPDBase64,
 	}
 
 	_, err = user.NewLogin(ctx, &database.UserLogin{
@@ -244,13 +247,16 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 
 	// Eagerly persist full session state to the backup file so it survives DB resets.
 	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:     meta.IDSIdentity,
-		APSState:        meta.APSState,
-		IDSUsers:        meta.IDSUsers,
-		PreferredHandle: meta.PreferredHandle,
-		DSID:            meta.DSID,
-		MMEAuthToken:    meta.MMEAuthToken,
-		ContactsURL:     meta.ContactsURL,
+		IDSIdentity:              meta.IDSIdentity,
+		APSState:                 meta.APSState,
+		IDSUsers:                 meta.IDSUsers,
+		PreferredHandle:          meta.PreferredHandle,
+		AccountUsername:          meta.AccountUsername,
+		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
+		AccountPET:               meta.AccountPET,
+		AccountADSID:             meta.AccountADSID,
+		AccountDSID:              meta.AccountDSID,
+		AccountSPDBase64:         meta.AccountSPDBase64,
 	})
 
 	client := &IMClient{
