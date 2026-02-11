@@ -717,9 +717,7 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 }
 
 func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
-	log := zerolog.Ctx(ctx).With().Str("action", "handle_matrix_read_receipt").Logger()
 	if c.client == nil {
-		log.Warn().Msg("Client is nil, skipping read receipt")
 		return nil
 	}
 	conv := c.portalToConversation(receipt.Portal)
@@ -728,21 +726,7 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		uuid := string(receipt.ExactMessage.ID)
 		forUuid = &uuid
 	}
-	log.Info().
-		Str("portal_id", string(receipt.Portal.ID)).
-		Str("handle", c.handle).
-		Strs("participants", conv.Participants).
-		Str("group_name", ptrStringOr(conv.GroupName, "")).
-		Bool("is_sms", conv.IsSms).
-		Str("for_uuid", ptrStringOr(forUuid, "")).
-		Msg("Sending read receipt to iMessage")
-	err := c.client.SendReadReceipt(conv, c.handle, forUuid)
-	if err != nil {
-		log.Err(err).Msg("Failed to send read receipt")
-	} else {
-		log.Info().Msg("Read receipt sent successfully")
-	}
-	return err
+	return c.client.SendReadReceipt(conv, c.handle, forUuid)
 }
 
 func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
