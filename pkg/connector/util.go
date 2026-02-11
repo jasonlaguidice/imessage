@@ -53,3 +53,51 @@ func stripNonBase64(s string) string {
 	}
 	return b.String()
 }
+
+// stripIdentifierPrefix removes tel: or mailto: prefix from an identifier.
+func stripIdentifierPrefix(id string) string {
+	id = strings.TrimPrefix(id, "tel:")
+	id = strings.TrimPrefix(id, "mailto:")
+	return id
+}
+
+// addIdentifierPrefix adds the appropriate tel:/mailto: prefix to a raw identifier
+// so it matches the portal/ghost ID format used by rustpush.
+func addIdentifierPrefix(localID string) string {
+	if strings.HasPrefix(localID, "tel:") || strings.HasPrefix(localID, "mailto:") {
+		return localID
+	}
+	if strings.Contains(localID, "@") {
+		return "mailto:" + localID
+	}
+	if strings.HasPrefix(localID, "+") || isNumeric(localID) {
+		return "tel:" + localID
+	}
+	return localID
+}
+
+// isNumeric returns true if the string contains only digits.
+func isNumeric(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// identifierToDisplaynameParams converts a portal/ghost identifier to
+// DisplaynameParams for contact name formatting.
+func identifierToDisplaynameParams(identifier string) DisplaynameParams {
+	localID := stripIdentifierPrefix(identifier)
+	if strings.HasPrefix(localID, "+") {
+		return DisplaynameParams{Phone: localID, ID: localID}
+	}
+	if strings.Contains(localID, "@") {
+		return DisplaynameParams{Email: localID, ID: localID}
+	}
+	return DisplaynameParams{ID: localID}
+}
