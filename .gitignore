@@ -30,3 +30,6 @@ RUSTPUSH_INTEGRATION_PROMPT.md
 prompts/
 mautrix-imessage-v2.app/
 .build-commit
+.DS_Store
+.apl.history
+tools/apl/
