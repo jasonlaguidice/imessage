@@ -61,8 +61,9 @@ func (c *cloudContactsClient) doRequest(method, url, body string, depth string) 
 	if err != nil {
 		return nil, err
 	}
-	// Apple CardDAV uses Basic auth: DSID:mmeAuthToken
-	req.SetBasicAuth(c.dsid, c.authToken)
+	// Apple uses X-MobileMe-AuthToken: base64(DSID:mmeAuthToken)
+	authStr := base64.StdEncoding.EncodeToString([]byte(c.dsid + ":" + c.authToken))
+	req.Header.Set("Authorization", "X-MobileMe-AuthToken "+authStr)
 	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
 	if depth != "" {
 		req.Header.Set("Depth", depth)
