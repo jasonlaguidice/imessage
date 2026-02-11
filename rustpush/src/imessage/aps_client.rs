@@ -316,10 +316,6 @@ impl IMClient {
         let topic = if message.message.is_sms() { "com.apple.private.alloy.sms" } else { "com.apple.madrid" };
 
         let targets = message.prepare_send(&handles);
-        if matches!(message.message, Message::Read) {
-            info!("send(Read): topic={}, sender={:?}, targets={:?}, my_handles={:?}",
-                topic, message.sender, targets, handles);
-        }
         self.identity.cache_keys(
             topic,
             &targets,
@@ -336,12 +332,6 @@ impl IMClient {
             ident_cache.get_participants_targets(topic, &handle, &targets)
         };
         drop(ident_cache);
-
-        if matches!(message.message, Message::Read) {
-            info!("send(Read): resolved {} device targets: {:?}",
-                message_targets.len(),
-                message_targets.iter().map(|t| format!("{}(token:{})", t.participant, crate::util::encode_hex(&t.delivery_data.push_token[..4]))).collect::<Vec<_>>());
-        }
 
         // if we have multiple people, but not a single target going to not us, we cannot "send" this message.
         // Read receipts are allowed to go only to self-devices (cross-device read sync).
