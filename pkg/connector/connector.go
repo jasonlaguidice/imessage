@@ -50,21 +50,6 @@ func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
-	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
-	if isRunningOnMacOS() {
-		// Attempt to read chat.db early so macOS registers the app in the
-		// Full Disk Access list.  Without this, the TCC entry only appears
-		// after the first login (when Connect() calls openChatDB()), which
-		// means new users can't grant FDA before logging in.
-		if !canReadChatDB(log) {
-			showDialogAndOpenFDA(log)
-			waitForFDA(log)
-		}
-		// Request contact access so macOS prompts early (same as normal install flow).
-		requestContactAccess(log)
-	} else {
-		log.Info().Msg("Running on non-macOS platform — chat.db and contacts unavailable")
-	}
 
 	// Auto-restore: if the DB has no logins but we have valid backup session
 	// state (session.json + keystore), create a user_login from the backup
