@@ -1979,6 +1979,16 @@ impl MessageInst {
         if self.message.is_sms() {
             target_participants = vec![self.sender.as_ref().unwrap().clone()];
         }
+        if let Message::Read = self.message {
+            // For read receipts, include ALL of the user's own handles so that
+            // devices registered under any handle (e.g. tel: vs mailto:) receive
+            // the read receipt for cross-device read sync.
+            for handle in my_handles {
+                if !target_participants.contains(handle) {
+                    target_participants.push(handle.clone());
+                }
+            }
+        }
         
         if let Message::ChangeParticipants(change) = &self.message {
             // notify the all participants that they were added
