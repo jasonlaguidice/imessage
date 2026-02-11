@@ -485,7 +485,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_send_read_receipt(uniffiStatus)
 		})
-		if checksum != 41488 {
+		if checksum != 61662 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_send_read_receipt: UniFFI API checksum mismatch")
 		}
@@ -1037,14 +1037,14 @@ func (_self *Client) SendMessage(conversation WrappedConversation, text string, 
 		})
 }
 
-func (_self *Client) SendReadReceipt(conversation WrappedConversation, handle string) error {
+func (_self *Client) SendReadReceipt(conversation WrappedConversation, handle string, forUuid *string) error {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
 	return uniffiRustCallAsyncWithError(
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_read_receipt(
-				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)),
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(forUuid)),
 				status,
 			))
 		},

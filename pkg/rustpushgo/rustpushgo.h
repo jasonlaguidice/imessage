@@ -118,6 +118,7 @@ void* uniffi_rustpushgo_fn_method_client_send_read_receipt(
 	void* ptr,
 	RustBuffer conversation,
 	RustBuffer handle,
+	RustBuffer for_uuid,
 	RustCallStatus* out_status
 );
 
