@@ -34,6 +34,11 @@ type PersistedSessionState struct {
 	APSState        string `json:"aps_state,omitempty"`
 	IDSUsers        string `json:"ids_users,omitempty"`
 	PreferredHandle string `json:"preferred_handle,omitempty"`
+
+	// iCloud CardDAV credentials (for cloud contact sync across restarts)
+	DSID         string `json:"dsid,omitempty"`
+	MMEAuthToken string `json:"mme_auth_token,omitempty"`
+	ContactsURL  string `json:"contacts_url,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:

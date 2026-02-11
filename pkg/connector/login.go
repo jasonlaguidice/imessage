@@ -576,6 +576,9 @@ func completeLoginWithMeta(
 		APSState:        meta.APSState,
 		IDSUsers:        meta.IDSUsers,
 		PreferredHandle: meta.PreferredHandle,
+		DSID:            meta.DSID,
+		MMEAuthToken:    meta.MMEAuthToken,
+		ContactsURL:     meta.ContactsURL,
 	})
 
 	client := &IMClient{
