@@ -1565,6 +1565,144 @@ impl Client {
         }
     }
 
+    /// Test CloudKit Messages access: creates CloudKitClient + KeychainClient + CloudMessagesClient,
+    /// then tries to sync chats and messages. Logs results. Returns a summary string.
+    pub async fn test_cloud_messages(&self) -> Result<String, WrappedError> {
+        let tp = self.token_provider.as_ref()
+            .ok_or(WrappedError::GenericError { msg: "No TokenProvider available".into() })?;
+
+        info!("=== CloudKit Messages Test ===");
+
+        // Get needed credentials
+        let dsid = tp.inner.get_dsid().await?;
+        let adsid = tp.inner.get_adsid().await?;
+        let mme_delegate = tp.inner.get_mme_delegate().await?;
+        let account = tp.inner.get_account();
+        let os_config = tp.inner.get_os_config();
+
+        info!("DSID: {}, ADSID: {}", dsid, adsid);
+
+        // Get anisette client from the account
+        let anisette = account.lock().await.anisette.clone();
+
+        // Create CloudKitState
+        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
+            .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+
+        // Create CloudKitClient
+        let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+            state: tokio::sync::RwLock::new(cloudkit_state),
+            anisette: anisette.clone(),
+            config: os_config.clone(),
+            token_provider: tp.inner.clone(),
+        });
+
+        // Create KeychainClientState
+        let keychain_state = rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+            .ok_or(WrappedError::GenericError { msg: "Failed to create KeychainClientState — missing KeychainSync config in MobileMe delegate".into() })?;
+
+        info!("KeychainClientState created successfully");
+
+        // Create KeychainClient
+        let keychain = Arc::new(rustpush::keychain::KeychainClient {
+            anisette: anisette.clone(),
+            token_provider: tp.inner.clone(),
+            state: tokio::sync::RwLock::new(keychain_state),
+            config: os_config.clone(),
+            update_state: Box::new(|_state| {
+                // For now, don't persist keychain state
+                info!("Keychain state updated (not persisted yet)");
+            }),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: cloudkit.clone(),
+        });
+
+        // Try to sync the keychain (needed for PCS decryption keys)
+        info!("Syncing iCloud Keychain...");
+        match keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await {
+            Ok(()) => info!("Keychain sync successful"),
+            Err(e) => {
+                let msg = format!("Keychain sync failed: {}. This likely means we need to join the trust circle first.", e);
+                warn!("{}", msg);
+                return Ok(msg);
+            }
+        }
+
+        // Create CloudMessagesClient
+        let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit.clone(), keychain.clone());
+
+        // Try counting records first
+        info!("Counting CloudKit message records...");
+        match cloud_messages.count_records().await {
+            Ok(summary) => {
+                info!("CloudKit record counts — messages: {}, chats: {}, attachments: {}",
+                    summary.messages_summary.len(), summary.chat_summary.len(), summary.attachment_summary.len());
+            }
+            Err(e) => {
+                warn!("Failed to count records: {}", e);
+            }
+        }
+
+        // Try syncing chats
+        info!("Syncing CloudKit chats...");
+        let mut total_chats = 0;
+        let mut chat_names: Vec<String> = Vec::new();
+        match cloud_messages.sync_chats(None).await {
+            Ok((_token, chats, status)) => {
+                info!("Chat sync returned {} chats (status={})", chats.len(), status);
+                for (id, chat_opt) in &chats {
+                    if let Some(chat) = chat_opt {
+                        let name = chat.display_name.as_deref().unwrap_or("(unnamed)");
+                        let participants: Vec<&str> = chat.participants.iter().map(|p| p.uri.as_str()).collect();
+                        info!("  Chat: {} | id={} | svc={} | participants={:?}", name, chat.chat_identifier, chat.service_name, participants);
+                        chat_names.push(format!("{}: {} [{}]", id, name, chat.chat_identifier));
+                    } else {
+                        info!("  Chat {} deleted", id);
+                    }
+                    total_chats += 1;
+                }
+            }
+            Err(e) => {
+                let msg = format!("Chat sync failed: {}", e);
+                warn!("{}", msg);
+                return Ok(msg);
+            }
+        }
+
+        // Try syncing messages (first page)
+        info!("Syncing CloudKit messages (first page)...");
+        let mut total_messages = 0;
+        match cloud_messages.sync_messages(None).await {
+            Ok((_token, messages, status)) => {
+                info!("Message sync returned {} messages (status={})", messages.len(), status);
+                for (id, msg_opt) in messages.iter().take(20) {
+                    if let Some(msg) = msg_opt {
+                        let from_me = msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME);
+                        info!("  Msg: {} | chat={} | sender={} | from_me={} | svc={} | guid={}",
+                            id, msg.chat_id, msg.sender, from_me, msg.service, msg.guid);
+                    } else {
+                        info!("  Msg {} deleted", id);
+                    }
+                    total_messages += 1;
+                }
+                if messages.len() > 20 {
+                    info!("  ... and {} more messages", messages.len() - 20);
+                    total_messages = messages.len();
+                }
+            }
+            Err(e) => {
+                let msg = format!("Message sync failed: {}", e);
+                warn!("{}", msg);
+                return Ok(format!("Chats OK ({} chats), but message sync failed: {}", total_chats, e));
+            }
+        }
+
+        let summary = format!("CloudKit sync OK: {} chats, {} messages (first page)", total_chats, total_messages);
+        info!("{}", summary);
+        Ok(summary)
+    }
+
     pub async fn stop(&self) {
         let mut handle = self.receive_handle.lock().await;
         if let Some(h) = handle.take() {

@@ -154,19 +154,68 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
         let mut mme = self.mme_delegate.lock().await;
-        let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
+        let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or_else(|| {
+            warn!("refresh_mme: PET token not found in account tokens");
+            PushError::TokenMissing
+        })?;
         let account = self.account.lock().await;
 
         let Some(spd) = &account.spd else { panic!("No spd!") };
         let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
+        let username = account.username.as_ref().unwrap().clone();
 
-        let delegates = login_apple_delegates(account.username.as_ref().unwrap(), &pet, adsid, None, 
-            &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
+        info!("refresh_mme: refreshing MobileMe delegate for user={} adsid={} pet_len={}", username, adsid, pet.len());
 
-        *mme = delegates.mobileme;
-        *self.mme_refreshed.lock().await = SystemTime::now();
+        let result = login_apple_delegates(&username, &pet, adsid, None, 
+            &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await;
+        drop(account);
 
-        Ok(())
+        match result {
+            Ok(delegates) => {
+                *mme = delegates.mobileme;
+                *self.mme_refreshed.lock().await = SystemTime::now();
+                info!("refresh_mme: MobileMe delegate refreshed successfully");
+                Ok(())
+            }
+            Err(e) => {
+                warn!("refresh_mme: PET-based auth failed ({}), trying password re-auth...", e);
+                // PET expired — try re-authenticating with stored password to get a fresh PET
+                let mut account = self.account.lock().await;
+                let has_password = account.hashed_password.is_some();
+                let has_username = account.username.is_some();
+                if has_password && has_username {
+                    let username = account.username.clone().unwrap();
+                    let password = account.hashed_password.clone().unwrap();
+                    info!("refresh_mme: re-authenticating with stored password for user={}", username);
+                    match account.login_email_pass(&username, &password).await {
+                        Ok(login_state) => {
+                            info!("refresh_mme: password re-auth returned {:?}", login_state);
+                            // Get fresh PET
+                            if let Some(new_pet) = account.get_pet() {
+                                let spd = account.spd.as_ref().expect("No SPD after re-auth!");
+                                let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
+                                info!("refresh_mme: got fresh PET (len={}), fetching MobileMe delegate", new_pet.len());
+                                let delegates = login_apple_delegates(&username, &new_pet, adsid, None,
+                                    &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
+                                *mme = delegates.mobileme;
+                                *self.mme_refreshed.lock().await = SystemTime::now();
+                                info!("refresh_mme: MobileMe delegate refreshed via password re-auth");
+                                Ok(())
+                            } else {
+                                Err(PushError::TokenMissing)
+                            }
+                        }
+                        Err(auth_err) => {
+                            warn!("refresh_mme: password re-auth also failed: {}", auth_err);
+                            Err(e) // return original error
+                        }
+                    }
+                } else {
+                    warn!("refresh_mme: no stored password for re-auth (has_password={}, has_username={})", has_password, has_username);
+                    Err(e)
+                }
+            }
+        }
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
@@ -241,6 +290,32 @@ impl<T: AnisetteProvider> TokenProvider<T> {
                 .or_else(|| v.as_string().map(|s| s.to_string())))
             .ok_or(PushError::TokenMissing)?)
     }
+
+    /// Get the ADSID from the account's SPD.
+    pub async fn get_adsid(&self) -> Result<String, PushError> {
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(PushError::TokenMissing)?;
+        Ok(spd.get("adsid")
+            .and_then(|v| v.as_string().map(|s| s.to_string()))
+            .ok_or(PushError::TokenMissing)?)
+    }
+
+    /// Get the MobileMe delegate response, refreshing if needed.
+    pub async fn get_mme_delegate(&self) -> Result<MobileMeDelegateResponse, PushError> {
+        let _ = self.get_mme_token("mmeAuthToken").await?;
+        let mme = self.mme_delegate.lock().await;
+        mme.clone().ok_or(PushError::TokenMissing)
+    }
+
+    /// Get the account (for creating CloudKit/Keychain clients).
+    pub fn get_account(&self) -> Arc<Mutex<AppleAccount<T>>> {
+        self.account.clone()
+    }
+
+    /// Get the OS config.
+    pub fn get_os_config(&self) -> Arc<dyn OSConfig> {
+        self.os_config.clone()
+    }
 }
 
 #[derive(Deserialize)]
@@ -250,7 +325,7 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(rename = "com.apple.mobileme")]

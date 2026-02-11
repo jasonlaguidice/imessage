@@ -171,6 +171,11 @@ void* uniffi_rustpushgo_fn_method_client_stop(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_test_cloud_messages(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_validate_targets(
 	void* ptr,
 	RustBuffer targets,
@@ -757,6 +762,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_unsend(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_stop(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_test_cloud_messages(
 	RustCallStatus* out_status
 );
 

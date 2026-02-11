@@ -178,6 +178,16 @@ func (c *IMClient) Connect(ctx context.Context) {
 		go c.periodicCloudContactSync(log)
 	}
 
+	// Test CloudKit Messages access
+	go func() {
+		log.Info().Msg("Testing CloudKit Messages access...")
+		result, err := c.client.TestCloudMessages()
+		if err != nil {
+			log.Error().Err(err).Msg("CloudKit Messages test failed")
+		} else {
+			log.Info().Str("result", result).Msg("CloudKit Messages test result")
+		}
+	}()
 
 }
 
