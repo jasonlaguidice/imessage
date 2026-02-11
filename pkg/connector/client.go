@@ -53,6 +53,9 @@ type IMClient struct {
 	handle     string   // Primary iMessage handle used for sending (e.g., tel:+1234567890)
 	allHandles []string // All registered handles (for IsThisUser checks)
 
+	// iCloud token provider (auth for CardDAV, CloudKit, etc.)
+	tokenProvider **rustpushgo.WrappedTokenProvider
+
 	// Chat.db supplement (optional — backfill + contacts)
 	chatDB *chatDB
 
@@ -110,7 +113,23 @@ func (c *IMClient) Connect(ctx context.Context) {
 		return
 	}
 
-	client, err := rustpushgo.NewClient(c.connection, c.users, c.identity, c.config, c, c)
+	// Restore token provider from persisted credentials if not already set
+	if c.tokenProvider == nil || *c.tokenProvider == nil {
+		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+		if meta.AccountUsername != "" && meta.AccountPET != "" && meta.AccountSPDBase64 != "" {
+			log.Info().Msg("Restoring iCloud TokenProvider from persisted credentials")
+			tp, err := rustpushgo.RestoreTokenProvider(c.config, c.connection,
+				meta.AccountUsername, meta.AccountHashedPasswordHex,
+				meta.AccountPET, meta.AccountSPDBase64)
+			if err != nil {
+				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
+			} else {
+				c.tokenProvider = &tp
+			}
+		}
+	}
+
+	client, err := rustpushgo.NewClient(c.connection, c.users, c.identity, c.config, c.tokenProvider, c, c)
 	if err != nil {
 		log.Err(err).Msg("Failed to create rustpush client")
 		c.UserLogin.BridgeState.Send(status.BridgeState{
@@ -161,14 +180,11 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Set up contact source (in order of preference):
 	// 1. iCloud CardDAV (cloud contacts — works everywhere, no relay needed)
 	// 2. chat.db (macOS with Full Disk Access)
-	{
-		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-		c.cloudContacts = newCloudContactsClient(meta)
-		if c.cloudContacts != nil {
-			log.Info().Str("url", c.cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
-			c.cloudContacts.SyncContacts(log)
-			go c.periodicCloudContactSync(log)
-		}
+	c.cloudContacts = newCloudContactsClient(c.client, log)
+	if c.cloudContacts != nil {
+		log.Info().Str("url", c.cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
+		c.cloudContacts.SyncContacts(log)
+		go c.periodicCloudContactSync(log)
 	}
 
 	// Open chat.db for backfill and contact info (macOS with FDA only)

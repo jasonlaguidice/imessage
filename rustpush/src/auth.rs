@@ -177,6 +177,70 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         }
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
+
+    /// Seed the MobileMe delegate directly (avoids a network refresh on first use).
+    pub async fn seed_mme_delegate(&self, delegate: MobileMeDelegateResponse) {
+        *self.mme_delegate.lock().await = Some(delegate);
+        *self.mme_refreshed.lock().await = SystemTime::now();
+    }
+
+    /// Get the full set of HTTP headers needed for iCloud MobileMe API calls.
+    /// Includes Authorization (X-MobileMe-AuthToken), anisette headers, and
+    /// X-Mme-Client-Info. Auto-refreshes mmeAuthToken if stale.
+    pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, PushError> {
+        let mme_token = self.get_mme_token("mmeAuthToken").await?;
+
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(PushError::TokenMissing)?;
+        let dsid = spd.get("DsPrsId")
+            .or_else(|| spd.get("dsid"))
+            .and_then(|v| v.as_unsigned_integer().map(|i| i.to_string())
+                .or_else(|| v.as_signed_integer().map(|i| i.to_string()))
+                .or_else(|| v.as_string().map(|s| s.to_string())))
+            .ok_or(PushError::TokenMissing)?;
+
+        let anisette_headers = account.anisette.lock().await.get_headers().await?.clone();
+        drop(account);
+
+        let auth_payload = format!("{}:{}", dsid, mme_token);
+        let auth_b64 = base64_encode(auth_payload.as_bytes());
+
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), format!("X-MobileMe-AuthToken {}", auth_b64));
+
+        for (k, v) in &anisette_headers {
+            headers.insert(k.clone(), v.clone());
+        }
+
+        Ok(headers)
+    }
+
+    /// Get the contacts CardDAV URL from the MobileMe delegate config.
+    /// Triggers a delegate refresh if not yet loaded.
+    pub async fn get_contacts_url(&self) -> Result<Option<String>, PushError> {
+        // Ensure MobileMe delegate is loaded
+        let _ = self.get_mme_token("mmeAuthToken").await?;
+        let mme = self.mme_delegate.lock().await;
+        Ok(mme.as_ref().and_then(|d| {
+            d.config.get("com.apple.Dataclass.Contacts")
+                .and_then(|v| v.as_dictionary())
+                .and_then(|d| d.get("url"))
+                .and_then(|v| v.as_string())
+                .map(|s| s.to_string())
+        }))
+    }
+
+    /// Get the DSID from the account's SPD.
+    pub async fn get_dsid(&self) -> Result<String, PushError> {
+        let account = self.account.lock().await;
+        let spd = account.spd.as_ref().ok_or(PushError::TokenMissing)?;
+        Ok(spd.get("DsPrsId")
+            .or_else(|| spd.get("dsid"))
+            .and_then(|v| v.as_unsigned_integer().map(|i| i.to_string())
+                .or_else(|| v.as_signed_integer().map(|i| i.to_string()))
+                .or_else(|| v.as_string().map(|s| s.to_string())))
+            .ok_or(PushError::TokenMissing)?)
+    }
 }
 
 #[derive(Deserialize)]

@@ -1,7 +1,7 @@
 
 pub mod activation;
 mod aps;
-mod util;
+pub mod util;
 mod imessage;
 mod error;
 mod auth;

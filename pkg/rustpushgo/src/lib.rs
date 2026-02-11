@@ -4,9 +4,9 @@ pub mod local_config;
 #[cfg(test)]
 mod test_hwinfo;
 
-use std::{io::Cursor, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc};
 
-use icloud_auth::AppleAccount;
+use icloud_auth::{AppleAccount, FetchedToken};
 use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use log::{debug, error, info, warn};
 use rustpush::{
@@ -15,7 +15,8 @@ use rustpush::{
     IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessagePart,
     MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType,
     Reaction, UnsendMessage, IndexedMessagePart, LinkMeta,
-    LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
+    LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL, TokenProvider,
+    util::{base64_decode, encode_hex},
 };
 use omnisette::default_provider;
 use std::sync::RwLock;
@@ -65,12 +66,22 @@ impl WrappedAPSConnection {
 pub struct IDSUsersWithIdentityRecord {
     pub users: Arc<WrappedIDSUsers>,
     pub identity: Arc<WrappedIDSNGMIdentity>,
-    /// DSID for iCloud services (used for CardDAV auth)
-    pub dsid: Option<String>,
-    /// mmeAuthToken for iCloud services (used for CardDAV auth)
-    pub mme_auth_token: Option<String>,
-    /// CardDAV URL for contacts (from MobileMe delegate config)
-    pub contacts_url: Option<String>,
+    /// TokenProvider for iCloud services (CardDAV, CloudKit, etc.)
+    pub token_provider: Option<Arc<WrappedTokenProvider>>,
+    /// Persist data for restoring the TokenProvider after restart.
+    pub account_persist: Option<AccountPersistData>,
+}
+
+/// Data needed to restore a TokenProvider from persisted state.
+/// Stored in session.json so it survives database resets.
+#[derive(uniffi::Record)]
+pub struct AccountPersistData {
+    pub username: String,
+    pub hashed_password_hex: String,
+    pub pet: String,
+    pub adsid: String,
+    pub dsid: String,
+    pub spd_base64: String,
 }
 
 #[derive(uniffi::Object)]
@@ -171,6 +182,87 @@ impl From<rustpush::PushError> for WrappedError {
     fn from(e: rustpush::PushError) -> Self {
         WrappedError::GenericError { msg: format!("{}", e) }
     }
+}
+
+// ============================================================================
+// Token Provider (iCloud auth for CardDAV, CloudKit, etc.)
+// ============================================================================
+
+/// Wraps a TokenProvider that manages MobileMe auth tokens with auto-refresh.
+/// Used for iCloud services like CardDAV contacts and CloudKit messages.
+#[derive(uniffi::Object)]
+pub struct WrappedTokenProvider {
+    inner: Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl WrappedTokenProvider {
+    /// Get HTTP headers needed for iCloud MobileMe API calls.
+    /// Includes Authorization (X-MobileMe-AuthToken) and anisette headers.
+    /// Auto-refreshes the mmeAuthToken weekly.
+    pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, WrappedError> {
+        Ok(self.inner.get_icloud_auth_headers().await?)
+    }
+
+    /// Get the contacts CardDAV URL from the MobileMe delegate config.
+    pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
+        Ok(self.inner.get_contacts_url().await?)
+    }
+
+    /// Get the DSID for this account.
+    pub async fn get_dsid(&self) -> Result<String, WrappedError> {
+        Ok(self.inner.get_dsid().await?)
+    }
+}
+
+/// Restore a TokenProvider from persisted account credentials.
+/// Used on session restore (when we don't go through the login flow).
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn restore_token_provider(
+    config: &WrappedOSConfig,
+    connection: &WrappedAPSConnection,
+    username: String,
+    hashed_password_hex: String,
+    pet: String,
+    spd_base64: String,
+) -> Result<Arc<WrappedTokenProvider>, WrappedError> {
+    let os_config = config.config.clone();
+    let conn = connection.inner.clone();
+
+    // Create a fresh anisette provider
+    let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
+    let anisette = default_provider(client_info.clone(), PathBuf::from_str("state/anisette").unwrap());
+
+    // Create a new AppleAccount and populate it with persisted state
+    let mut account = AppleAccount::new_with_anisette(client_info, anisette)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Failed to create account: {}", e) })?;
+
+    account.username = Some(username);
+
+    // Restore hashed password
+    let hashed_password = rustpush::util::decode_hex(&hashed_password_hex)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
+    account.hashed_password = Some(hashed_password);
+
+    // Restore SPD from base64-encoded plist
+    let spd_bytes = base64_decode(&spd_base64);
+    let spd: plist::Dictionary = plist::from_bytes(&spd_bytes)
+        .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
+    account.spd = Some(spd);
+
+    // Inject the PET token with a far-future expiration so TokenProvider
+    // can use it for refresh_mme() without needing to re-login.
+    account.tokens.insert("com.apple.gs.idms.pet".to_string(), icloud_auth::FetchedToken {
+        token: pet,
+        expiration: std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60 * 24 * 30), // 30 days
+    });
+
+    let account = Arc::new(tokio::sync::Mutex::new(account));
+    let token_provider = TokenProvider::new(account, os_config);
+
+    info!("Restored TokenProvider from persisted credentials");
+
+    Ok(Arc::new(WrappedTokenProvider { inner: token_provider }))
 }
 
 // ============================================================================
@@ -841,47 +933,49 @@ impl LoginSession {
             .ok_or(WrappedError::GenericError { msg: "No PET token available after login".to_string() })?;
 
         let spd = account.spd.as_ref().expect("No SPD after login");
-        let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap();
+        let adsid = spd.get("adsid").expect("No adsid").as_string().unwrap().to_string();
         let dsid = spd.get("DsPrsId").or_else(|| spd.get("dsid"))
             .and_then(|v| {
                 if let Some(s) = v.as_string() {
                     Some(s.to_string())
                 } else if let Some(i) = v.as_signed_integer() {
                     Some(i.to_string())
+                } else if let Some(i) = v.as_unsigned_integer() {
+                    Some(i.to_string())
                 } else {
                     None
                 }
-            });
+            })
+            .unwrap_or_default();
+
+        // Build persist data before delegates call (while we have SPD access)
+        let hashed_password_hex = account.hashed_password.as_ref()
+            .map(|p| encode_hex(p))
+            .unwrap_or_default();
+        let mut spd_bytes = Vec::new();
+        plist::to_writer_binary(&mut spd_bytes, spd)
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
+        let spd_base64 = rustpush::util::base64_encode(&spd_bytes);
+
+        let account_persist = AccountPersistData {
+            username: self.username.clone(),
+            hashed_password_hex,
+            pet: pet.clone(),
+            adsid: adsid.clone(),
+            dsid: dsid.clone(),
+            spd_base64,
+        };
 
         // Request both IDS (for messaging) and MobileMe (for contacts CardDAV URL)
         let delegates = login_apple_delegates(
             &self.username,
             &pet,
-            adsid,
+            &adsid,
             None,
             &mut *account.anisette.lock().await,
             &*os_config,
             &[LoginDelegate::IDS, LoginDelegate::MobileMe],
         ).await.map_err(|e| WrappedError::GenericError { msg: format!("Failed to get delegates: {}", e) })?;
-
-        // Extract contacts CardDAV URL and mmeAuthToken from MobileMe delegate
-        let (mme_auth_token, contacts_url) = if let Some(ref mme) = delegates.mobileme {
-            let token = mme.tokens.get("mmeAuthToken").cloned();
-            let url = mme.config.get("com.apple.Dataclass.Contacts")
-                .and_then(|v| v.as_dictionary())
-                .and_then(|d| d.get("url"))
-                .and_then(|v| v.as_string())
-                .map(|s| s.to_string());
-            if url.is_some() {
-                info!("Got contacts CardDAV URL from MobileMe delegate");
-            } else {
-                warn!("MobileMe delegate present but no contacts CardDAV URL found");
-            }
-            (token, url)
-        } else {
-            warn!("No MobileMe delegate in response — contacts sync won't be available");
-            (None, None)
-        };
 
         let ids_delegate = delegates.ids.ok_or(WrappedError::GenericError { msg: "No IDS delegate in response".to_string() })?;
         let fresh_user = authenticate_apple(ids_delegate, &*os_config).await
@@ -903,11 +997,8 @@ impl LoginSession {
         };
 
         // Decide whether to reuse existing registration or register fresh.
-        // Reusing avoids calling Apple's register endpoint, which triggers
-        // "X added a new Mac" notifications to contacts.
         let users = match existing_users {
             Some(ref wrapped) if !wrapped.inner.is_empty() => {
-                // Check if the existing registration is still valid
                 let has_valid_registration = wrapped.inner[0]
                     .registration.get("com.apple.madrid")
                     .map(|r| r.calculate_rereg_time_s().map(|t| t > 0).unwrap_or(false))
@@ -915,10 +1006,6 @@ impl LoginSession {
 
                 if has_valid_registration {
                     info!("Reusing existing registration (still valid, skipping register endpoint)");
-                    // Merge the fresh auth_keypair into the existing users.
-                    // authenticate_apple() issues a new auth cert — we need that
-                    // for future authenticated requests. But keep the existing
-                    // registration data (handles, registration certs, etc.)
                     let mut existing = wrapped.inner.clone();
                     existing[0].auth_keypair = fresh_user.auth_keypair.clone();
                     existing
@@ -936,7 +1023,6 @@ impl LoginSession {
                 }
             }
             _ => {
-                // No existing users — first login, must register
                 let mut users = vec![fresh_user];
                 if users[0].registration.is_empty() {
                     info!("Registering identity (first login)...");
@@ -952,12 +1038,25 @@ impl LoginSession {
             }
         };
 
+        // Take ownership of the account to create a TokenProvider.
+        // The MobileMe delegate from `delegates` is seeded into the provider
+        // so the first get_mme_token() doesn't need to re-fetch.
+        let owned_account = guard.take()
+            .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
+        let account_arc = Arc::new(tokio::sync::Mutex::new(owned_account));
+        let token_provider = TokenProvider::new(account_arc, os_config.clone());
+
+        // Seed the MobileMe delegate so get_contacts_url() and get_mme_token()
+        // work immediately without a network round-trip.
+        if let Some(mobileme) = delegates.mobileme {
+            token_provider.seed_mme_delegate(mobileme).await;
+        }
+
         Ok(IDSUsersWithIdentityRecord {
             users: Arc::new(WrappedIDSUsers { inner: users }),
             identity: Arc::new(WrappedIDSNGMIdentity { inner: identity }),
-            dsid,
-            mme_auth_token: mme_auth_token,
-            contacts_url,
+            token_provider: Some(Arc::new(WrappedTokenProvider { inner: token_provider })),
+            account_persist: Some(account_persist),
         })
     }
 }
@@ -1011,6 +1110,7 @@ pub struct Client {
     client: Arc<IMClient>,
     conn: rustpush::APSConnection,
     receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    token_provider: Option<Arc<WrappedTokenProvider>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1019,6 +1119,7 @@ pub async fn new_client(
     users: &WrappedIDSUsers,
     identity: &WrappedIDSNGMIdentity,
     config: &WrappedOSConfig,
+    token_provider: Option<Arc<WrappedTokenProvider>>,
     message_callback: Box<dyn MessageCallback>,
     update_users_callback: Box<dyn UpdateUsersCallback>,
 ) -> Result<Arc<Client>, WrappedError> {
@@ -1090,6 +1191,7 @@ pub async fn new_client(
         client,
         conn: connection.inner.clone(),
         receive_handle: tokio::sync::Mutex::new(Some(receive_handle)),
+        token_provider,
     }))
 }
 
@@ -1097,6 +1199,32 @@ pub async fn new_client(
 impl Client {
     pub async fn get_handles(&self) -> Vec<String> {
         self.client.identity.get_handles().await
+    }
+
+    /// Get iCloud auth headers (Authorization + anisette) for MobileMe API calls.
+    /// Returns None if no token provider is available.
+    pub async fn get_icloud_auth_headers(&self) -> Result<Option<HashMap<String, String>>, WrappedError> {
+        match &self.token_provider {
+            Some(tp) => Ok(Some(tp.inner.get_icloud_auth_headers().await?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the contacts CardDAV URL from the MobileMe delegate.
+    /// Returns None if no token provider is available.
+    pub async fn get_contacts_url(&self) -> Result<Option<String>, WrappedError> {
+        match &self.token_provider {
+            Some(tp) => Ok(tp.inner.get_contacts_url().await?),
+            None => Ok(None),
+        }
+    }
+
+    /// Get the DSID for this account.
+    pub async fn get_dsid(&self) -> Result<Option<String>, WrappedError> {
+        match &self.token_provider {
+            Some(tp) => Ok(Some(tp.inner.get_dsid().await?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn validate_targets(

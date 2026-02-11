@@ -20,15 +20,16 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/lrhodin/imessage/imessage"
+	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
 // cloudContactsClient fetches contacts from iCloud via CardDAV and caches
 // them locally for fast phone/email lookups.
 type cloudContactsClient struct {
-	baseURL    string // CardDAV URL from MobileMe delegate (e.g. "https://contacts.icloud.com")
-	dsid       string // iCloud DSID (used in URL paths and Basic auth username)
-	authToken  string // mmeAuthToken (Basic auth password)
-	httpClient *http.Client
+	baseURL      string // CardDAV URL from MobileMe delegate
+	dsid         string // cached DSID for URL construction
+	rustClient   *rustpushgo.Client // for getting auth headers via TokenProvider
+	httpClient   *http.Client
 
 	mu       sync.RWMutex
 	byPhone  map[string]*imessage.Contact // normalized phone → contact
@@ -37,16 +38,34 @@ type cloudContactsClient struct {
 	lastSync time.Time
 }
 
-// newCloudContactsClient creates a CardDAV contacts client from login metadata.
-// Returns nil if the required credentials are not available.
-func newCloudContactsClient(meta *UserLoginMetadata) *cloudContactsClient {
-	if meta.ContactsURL == "" || meta.DSID == "" || meta.MMEAuthToken == "" {
+// newCloudContactsClient creates a CardDAV contacts client using the rust Client's
+// TokenProvider for authentication. Returns nil if the token provider is unavailable
+// or the contacts URL can't be retrieved.
+func newCloudContactsClient(rustClient *rustpushgo.Client, log zerolog.Logger) *cloudContactsClient {
+	if rustClient == nil {
 		return nil
 	}
+
+	contactsURL, err := rustClient.GetContactsUrl()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get contacts URL from TokenProvider")
+		return nil
+	}
+	if contactsURL == nil || *contactsURL == "" {
+		log.Warn().Msg("No contacts CardDAV URL available from TokenProvider")
+		return nil
+	}
+
+	dsidPtr, err := rustClient.GetDsid()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get DSID from TokenProvider")
+		return nil
+	}
+
 	return &cloudContactsClient{
-		baseURL:   strings.TrimRight(meta.ContactsURL, "/"),
-		dsid:      meta.DSID,
-		authToken: meta.MMEAuthToken,
+		baseURL:    strings.TrimRight(*contactsURL, "/"),
+		dsid:       *dsidPtr,
+		rustClient: rustClient,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -56,14 +75,25 @@ func newCloudContactsClient(meta *UserLoginMetadata) *cloudContactsClient {
 }
 
 // doRequest performs an authenticated request to the CardDAV server.
+// Gets fresh auth + anisette headers from the TokenProvider on each call.
 func (c *cloudContactsClient) doRequest(method, url, body string, depth string) (*http.Response, error) {
+	// Get auth headers from Rust (includes Authorization + anisette, auto-refreshes)
+	headersPtr, err := c.rustClient.GetIcloudAuthHeaders()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get iCloud auth headers: %w", err)
+	}
+	if headersPtr == nil {
+		return nil, fmt.Errorf("no iCloud auth headers available (no token provider)")
+	}
+	headers := *headersPtr
+
 	req, err := http.NewRequest(method, url, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
-	// Apple uses X-MobileMe-AuthToken: base64(DSID:mmeAuthToken)
-	authStr := base64.StdEncoding.EncodeToString([]byte(c.dsid + ":" + c.authToken))
-	req.Header.Set("Authorization", "X-MobileMe-AuthToken "+authStr)
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	req.Header.Set("Content-Type", "application/xml; charset=utf-8")
 	if depth != "" {
 		req.Header.Set("Depth", depth)
