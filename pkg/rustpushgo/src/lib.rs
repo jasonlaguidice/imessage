@@ -1226,13 +1226,18 @@ impl Client {
         &self,
         conversation: WrappedConversation,
         handle: String,
+        for_uuid: Option<String>,
     ) -> Result<(), WrappedError> {
-        info!("send_read_receipt: handle={}, participants={:?}, group_name={:?}, is_sms={}",
-            handle, conversation.participants, conversation.group_name, conversation.is_sms);
+        info!("send_read_receipt: handle={}, participants={:?}, group_name={:?}, is_sms={}, for_uuid={:?}",
+            handle, conversation.participants, conversation.group_name, conversation.is_sms, for_uuid);
         let conv: ConversationData = (&conversation).into();
         let mut msg = MessageInst::new(conv, &handle, Message::Read);
-        info!("send_read_receipt: created MessageInst, command={}, sender={:?}, conversation_participants={:?}",
-            msg.message.get_c(), msg.sender, msg.conversation.as_ref().map(|c| &c.participants));
+        if let Some(uuid) = for_uuid {
+            info!("send_read_receipt: overriding UUID from {} to {}", msg.id, uuid);
+            msg.id = uuid;
+        }
+        info!("send_read_receipt: created MessageInst, command={}, uuid={}, sender={:?}, conversation_participants={:?}",
+            msg.message.get_c(), msg.id, msg.sender, msg.conversation.as_ref().map(|c| &c.participants));
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send read receipt: {}", e) })?;
         info!("send_read_receipt: send completed successfully");

@@ -207,6 +207,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     };
 
     let validation_data = os_config.generate_validation_data().await?;
+    info!("login_apple_delegates: validation data generated ({} bytes)", validation_data.len());
     let base_headers = anisette.get_headers().await?;
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
@@ -229,6 +230,19 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     let text = resp.text().await?;
 
     debug!("login_apple_delegates response: HTTP {} body_len={}", status, text.len());
+
+    if !status.is_success() {
+        warn!("login_apple_delegates: server returned HTTP {} (body: {} bytes)", status.as_u16(), text.len());
+        if !text.is_empty() {
+            debug!("login_apple_delegates: response body: {}", &text[..text.len().min(2000)]);
+        }
+    }
+
+    if text.is_empty() {
+        return Err(PushError::AuthError(plist::Value::String(
+            format!("Empty response from {} (HTTP {})", os_config.get_login_url(), status.as_u16())
+        )));
+    }
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
     let parsed_dict = parsed.as_dictionary().unwrap();

@@ -26,6 +26,14 @@ endif
 .PHONY: build clean install install-beeper uninstall rust bindings check-deps check-deps-linux
 
 # ===========================================================================
+# Path validation – spaces in the working directory break CGO linker flags
+# and #cgo LDFLAGS ${SRCDIR} expansion. Detect early with a clear message.
+# ===========================================================================
+ifneq ($(word 2,$(CURDIR)),)
+  $(error The project path "$(CURDIR)" contains spaces. CGO and the linker cannot handle spaces in library paths. Please clone or move the project to a path without spaces, e.g.: /home/$$USER/imessage)
+endif
+
+# ===========================================================================
 # Platform detection
 # ===========================================================================
 
@@ -36,14 +44,14 @@ ifeq ($(UNAME_S),Darwin)
   BINARY      := $(APP_BUNDLE)/Contents/MacOS/$(APP_NAME)
   INFO_PLIST  := $(APP_BUNDLE)/Contents/Info.plist
   CGO_CFLAGS  := -I/opt/homebrew/include
-  CGO_LDFLAGS := -L/opt/homebrew/lib -L$(shell pwd)
+  CGO_LDFLAGS := -L/opt/homebrew/lib -L$(CURDIR)
   CARGO_ENV   := MACOSX_DEPLOYMENT_TARGET=13.0
 else
   # Linux: include Go and Rust installed by bootstrap
   export PATH := /usr/local/go/bin:$(HOME)/.cargo/bin:$(PATH)
   BINARY      := $(APP_NAME)
   CGO_CFLAGS  :=
-  CGO_LDFLAGS := -L$(shell pwd)
+  CGO_LDFLAGS := -L$(CURDIR)
   CARGO_ENV   :=
 endif
 

@@ -723,14 +723,20 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		return nil
 	}
 	conv := c.portalToConversation(receipt.Portal)
+	var forUuid *string
+	if receipt.ExactMessage != nil {
+		uuid := string(receipt.ExactMessage.ID)
+		forUuid = &uuid
+	}
 	log.Info().
 		Str("portal_id", string(receipt.Portal.ID)).
 		Str("handle", c.handle).
 		Strs("participants", conv.Participants).
 		Str("group_name", ptrStringOr(conv.GroupName, "")).
 		Bool("is_sms", conv.IsSms).
+		Str("for_uuid", ptrStringOr(forUuid, "")).
 		Msg("Sending read receipt to iMessage")
-	err := c.client.SendReadReceipt(conv, c.handle)
+	err := c.client.SendReadReceipt(conv, c.handle, forUuid)
 	if err != nil {
 		log.Err(err).Msg("Failed to send read receipt")
 	} else {

@@ -809,6 +809,20 @@ impl ValidationCtx {
         out_request_bytes: &mut Vec<u8>,
         hw_config: &HardwareConfig,
     ) -> Result<ValidationCtx, AbsintheError> {
+        // Log hardware key diagnostics
+        info!("NAC init: product={} serial={} board={} build={}",
+            hw_config.product_name, hw_config.platform_serial_number,
+            hw_config.board_id, hw_config.os_build_num);
+        info!("NAC init: uuid={} rom={} bytes mlb={} mac={} bytes",
+            hw_config.platform_uuid, hw_config.rom.len(),
+            hw_config.mlb, hw_config.io_mac_address.len());
+        info!("NAC init: _enc fields: serial_enc={} uuid_enc={} disk_enc={} rom_enc={} mlb_enc={}",
+            hw_config.platform_serial_number_enc.len(),
+            hw_config.platform_uuid_enc.len(),
+            hw_config.root_disk_uuid_enc.len(),
+            hw_config.rom_enc.len(),
+            hw_config.mlb_enc.len());
+
         // 0. Compute missing _enc fields if we have the XNU encrypt function
         //    (needed for keys extracted from macOS High Sierra 10.13)
         #[allow(unused_mut)]
