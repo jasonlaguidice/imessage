@@ -56,6 +56,9 @@ type IMClient struct {
 	// Chat.db supplement (optional — backfill + contacts)
 	chatDB *chatDB
 
+	// Cloud contacts (iCloud CardDAV — no relay needed)
+	cloudContacts *cloudContactsClient
+
 	// Contact relay (optional — for Linux with NAC relay)
 	contactRelay *contactRelayClient
 
@@ -161,6 +164,20 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
+	// Set up contact source (in order of preference):
+	// 1. iCloud CardDAV (cloud contacts — works everywhere, no relay needed)
+	// 2. chat.db (macOS with Full Disk Access)
+	// 3. NAC relay (legacy fallback)
+	{
+		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+		c.cloudContacts = newCloudContactsClient(meta)
+		if c.cloudContacts != nil {
+			log.Info().Str("url", c.cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
+			c.cloudContacts.SyncContacts(log)
+			go c.periodicCloudContactSync(log)
+		}
+	}
+
 	// Open chat.db for backfill and contact info (macOS with FDA only)
 	c.chatDB = openChatDB(log)
 	if c.chatDB != nil {
@@ -169,8 +186,8 @@ func (c *IMClient) Connect(ctx context.Context) {
 		go c.watchContactChanges(log)
 	}
 
-	// Set up contact relay if chat.db isn't available (Linux) and we have a relay URL
-	if c.chatDB == nil {
+	// Set up contact relay if no better contact source and we have a relay URL
+	if c.cloudContacts == nil && c.chatDB == nil {
 		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 		c.contactRelay = newContactRelayFromKey(meta.HardwareKey)
 		if c.contactRelay != nil {
@@ -880,12 +897,16 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		Identifiers: []string{identifier},
 	}
 
-	// Try contact info from chat.db (Contacts.framework) or relay
+	// Try contact info from cloud contacts, chat.db, or relay
 	localID := stripIdentifierPrefix(identifier)
 	var contact *imessage.Contact
-	if c.chatDB != nil {
+	if c.cloudContacts != nil {
+		contact, _ = c.cloudContacts.GetContactInfo(localID)
+	}
+	if contact == nil && c.chatDB != nil {
 		contact, _ = c.chatDB.api.GetContactInfo(localID)
-	} else if c.contactRelay != nil {
+	}
+	if contact == nil && c.contactRelay != nil {
 		contact, _ = c.contactRelay.GetContactInfo(localID)
 	}
 	if contact != nil && contact.HasName() {
@@ -1025,6 +1046,20 @@ func (c *IMClient) periodicRelaySync(log zerolog.Logger) {
 	ctx := log.WithContext(context.Background())
 	c.runInitialSyncViaRelay(ctx, log)
 	<-c.stopChan
+}
+
+// periodicCloudContactSync re-fetches contacts from iCloud CardDAV every 15 minutes.
+func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.cloudContacts.SyncContacts(log)
+		case <-c.stopChan:
+			return
+		}
+	}
 }
 
 // periodicContactRelaySync re-fetches contacts from the relay every 15 minutes.
@@ -1602,9 +1637,13 @@ func (c *IMClient) buildGroupName(members []string) string {
 		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
 		var contact *imessage.Contact
-		if c.chatDB != nil {
+		if c.cloudContacts != nil {
+			contact, _ = c.cloudContacts.GetContactInfo(lookupID)
+		}
+		if contact == nil && c.chatDB != nil {
 			contact, _ = c.chatDB.api.GetContactInfo(lookupID)
-		} else if c.contactRelay != nil {
+		}
+		if contact == nil && c.contactRelay != nil {
 			contact, _ = c.contactRelay.GetContactInfo(lookupID)
 		}
 		if contact != nil && contact.HasName() {

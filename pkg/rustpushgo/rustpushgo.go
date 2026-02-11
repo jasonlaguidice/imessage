@@ -1667,13 +1667,19 @@ func (_ FfiDestroyerWrappedOsConfig) Destroy(value *WrappedOsConfig) {
 }
 
 type IdsUsersWithIdentityRecord struct {
-	Users    *WrappedIdsUsers
-	Identity *WrappedIdsngmIdentity
+	Users        *WrappedIdsUsers
+	Identity     *WrappedIdsngmIdentity
+	Dsid         *string
+	MmeAuthToken *string
+	ContactsUrl  *string
 }
 
 func (r *IdsUsersWithIdentityRecord) Destroy() {
 	FfiDestroyerWrappedIdsUsers{}.Destroy(r.Users)
 	FfiDestroyerWrappedIdsngmIdentity{}.Destroy(r.Identity)
+	FfiDestroyerOptionalString{}.Destroy(r.Dsid)
+	FfiDestroyerOptionalString{}.Destroy(r.MmeAuthToken)
+	FfiDestroyerOptionalString{}.Destroy(r.ContactsUrl)
 }
 
 type FfiConverterTypeIDSUsersWithIdentityRecord struct{}
@@ -1688,6 +1694,9 @@ func (c FfiConverterTypeIDSUsersWithIdentityRecord) Read(reader io.Reader) IdsUs
 	return IdsUsersWithIdentityRecord{
 		FfiConverterWrappedIDSUsersINSTANCE.Read(reader),
 		FfiConverterWrappedIDSNGMIdentityINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -1698,6 +1707,9 @@ func (c FfiConverterTypeIDSUsersWithIdentityRecord) Lower(value IdsUsersWithIden
 func (c FfiConverterTypeIDSUsersWithIdentityRecord) Write(writer io.Writer, value IdsUsersWithIdentityRecord) {
 	FfiConverterWrappedIDSUsersINSTANCE.Write(writer, value.Users)
 	FfiConverterWrappedIDSNGMIdentityINSTANCE.Write(writer, value.Identity)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Dsid)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.MmeAuthToken)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ContactsUrl)
 }
 
 type FfiDestroyerTypeIdsUsersWithIdentityRecord struct{}
