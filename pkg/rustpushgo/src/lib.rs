@@ -820,14 +820,60 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     let json_bytes = STANDARD.decode(&clean_key)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid base64: {}", e) })?;
 
-    // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig
-    let (hw, nac_relay_url, relay_token, relay_cert_fp) = if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
-        (full.inner, full.nac_relay_url, full.relay_token, full.relay_cert_fp)
-    } else {
-        let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
-            .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
-        (hw, None, None, None)
-    };
+    // Try full MacOSConfig first (from extract-key tool), fall back to bare HardwareConfig.
+    // We prefer the OS version/build metadata from the extracted key so our
+    // registration body matches a real Mac as closely as possible.
+    let (hw, version, protocol_version, icloud_ua, aoskit_version, nac_relay_url, relay_token, relay_cert_fp) =
+        if let Ok(full) = serde_json::from_slice::<MacOSConfig>(&json_bytes) {
+            let version = if !full.version.trim().is_empty() {
+                full.version
+            } else {
+                "13.6.4".to_string()
+            };
+            let protocol_version = if full.protocol_version != 0 {
+                full.protocol_version
+            } else {
+                1660
+            };
+
+            // get_normal_ua() expects icloud_ua to contain whitespace so it can
+            // split out the "com.apple.iCloudHelper/..." prefix.
+            let icloud_ua = if full.icloud_ua.split_once(char::is_whitespace).is_some() {
+                full.icloud_ua
+            } else {
+                "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string()
+            };
+
+            let aoskit_version = if !full.aoskit_version.trim().is_empty() {
+                full.aoskit_version
+            } else {
+                "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string()
+            };
+
+            (
+                full.inner,
+                version,
+                protocol_version,
+                icloud_ua,
+                aoskit_version,
+                full.nac_relay_url,
+                full.relay_token,
+                full.relay_cert_fp,
+            )
+        } else {
+            let hw: HardwareConfig = serde_json::from_slice(&json_bytes)
+                .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hardware key JSON: {}", e) })?;
+            (
+                hw,
+                "13.6.4".to_string(),
+                1660,
+                "com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/22.5.0".to_string(),
+                "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
+                None,
+                None,
+                None,
+            )
+        };
 
     // Always use the real hardware UUID from the extracted key so the bridge
     // shows up as the original Mac rather than a new phantom device.
@@ -843,16 +889,16 @@ fn _create_config_from_hardware_key_inner(base64_key: String, device_id: Option<
     }
     let device_id = hw_uuid;
 
-    // Always use known-good values for protocol fields — the extraction tool's
-    // values (e.g. icloud_ua) may not match what the runtime code expects.
     let config = MacOSConfig {
         inner: hw,
-        version: "15.3".to_string(),
-        protocol_version: 1660,
-        device_id,
-        icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
-        aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
-        udid: None,
+        version,
+        protocol_version,
+        device_id: device_id.clone(),
+        icloud_ua,
+        aoskit_version,
+        // Avoid panics in codepaths that expect a UDID (Find My, CloudKit, etc).
+        // On macOS, using the device UUID is sufficient.
+        udid: Some(device_id),
         nac_relay_url,
         relay_token,
         relay_cert_fp,
