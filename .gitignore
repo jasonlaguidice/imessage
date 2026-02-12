@@ -11,6 +11,7 @@
 *.log
 
 /mautrix-imessage
+/mautrix-imessage-v2
 /mautrix-imessage.app
 /extract-key
 /extract-key-intel
