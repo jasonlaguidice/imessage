@@ -4,7 +4,7 @@ pub mod local_config;
 #[cfg(test)]
 mod test_hwinfo;
 
-use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc};
+use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use icloud_auth::{AppleAccount, FetchedToken};
@@ -185,6 +185,179 @@ impl From<rustpush::PushError> for WrappedError {
     }
 }
 
+fn is_pcs_recoverable_error(err: &rustpush::PushError) -> bool {
+    matches!(
+        err,
+        rustpush::PushError::ShareKeyNotFound(_)
+            | rustpush::PushError::DecryptionKeyNotFound(_)
+            | rustpush::PushError::PCSRecordKeyMissing
+            | rustpush::PushError::MasterKeyNotFound
+    )
+}
+
+fn keychain_retry_delay(attempt: usize) -> Duration {
+    match attempt {
+        0..=4 => Duration::from_secs(2),
+        5..=11 => Duration::from_secs(4),
+        _ => Duration::from_secs(6),
+    }
+}
+
+async fn sync_keychain_with_retries(
+    keychain: &rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>,
+    max_attempts: usize,
+    context: &str,
+) -> Result<(), WrappedError> {
+    let attempts = max_attempts.max(1);
+    let mut last_err: Option<rustpush::PushError> = None;
+    for attempt in 0..attempts {
+        match keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await {
+            Ok(()) => {
+                if attempt > 0 {
+                    info!("{} keychain sync recovered after {} attempt(s)", context, attempt + 1);
+                }
+                return Ok(());
+            }
+            Err(err) => {
+                if matches!(err, rustpush::PushError::NotInClique) {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("{} keychain sync failed: {}", context, err),
+                    });
+                }
+
+                let retrying = attempt + 1 < attempts;
+                warn!(
+                    "{} keychain sync attempt {}/{} failed: {}{}",
+                    context,
+                    attempt + 1,
+                    attempts,
+                    err,
+                    if retrying { " (retrying)" } else { "" }
+                );
+                last_err = Some(err);
+                if retrying {
+                    tokio::time::sleep(keychain_retry_delay(attempt)).await;
+                }
+            }
+        }
+    }
+
+    let msg = match last_err {
+        Some(err) => format!("{} keychain sync failed after retries: {}", context, err),
+        None => format!("{} keychain sync failed", context),
+    };
+    Err(WrappedError::GenericError { msg })
+}
+
+async fn finalize_keychain_setup_with_probe(
+    keychain: Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
+    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+) -> Result<(), WrappedError> {
+    let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit, keychain.clone());
+
+    // Keep retrying for ~1-3 minutes so login completes only when CloudKit
+    // decryption is actually ready (single atomic login flow).
+    const MAX_ATTEMPTS: usize = 24;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let attempt_no = attempt + 1;
+        sync_keychain_with_retries(&keychain, 1, "Login finalize").await?;
+
+        match cloud_messages.sync_chats(None).await {
+            Ok((_token, chats, status)) => {
+                info!(
+                    "CloudKit decrypt probe (chats) succeeded on attempt {} (status={}, records={})",
+                    attempt_no,
+                    status,
+                    chats.len()
+                );
+            }
+            Err(err) => {
+                if matches!(err, rustpush::PushError::NotInClique) {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("CloudKit probe failed: {}", err),
+                    });
+                }
+
+                let retrying = attempt_no < MAX_ATTEMPTS;
+                if is_pcs_recoverable_error(&err) {
+                    warn!(
+                        "CloudKit decrypt probe (chats) missing PCS keys on attempt {}/{}: {}{}",
+                        attempt_no,
+                        MAX_ATTEMPTS,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                } else {
+                    warn!(
+                        "CloudKit decrypt probe (chats) failed on attempt {}/{}: {}{}",
+                        attempt_no,
+                        MAX_ATTEMPTS,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                }
+                if retrying {
+                    tokio::time::sleep(keychain_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(WrappedError::GenericError {
+                    msg: format!("CloudKit decrypt probe failed after retries (chats): {}", err),
+                });
+            }
+        }
+
+        match cloud_messages.sync_messages(None).await {
+            Ok((_token, messages, status)) => {
+                info!(
+                    "CloudKit decrypt probe (messages) succeeded on attempt {} (status={}, records={})",
+                    attempt_no,
+                    status,
+                    messages.len()
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                if matches!(err, rustpush::PushError::NotInClique) {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("CloudKit probe failed: {}", err),
+                    });
+                }
+
+                let retrying = attempt_no < MAX_ATTEMPTS;
+                if is_pcs_recoverable_error(&err) {
+                    warn!(
+                        "CloudKit decrypt probe (messages) missing PCS keys on attempt {}/{}: {}{}",
+                        attempt_no,
+                        MAX_ATTEMPTS,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                } else {
+                    warn!(
+                        "CloudKit decrypt probe (messages) failed on attempt {}/{}: {}{}",
+                        attempt_no,
+                        MAX_ATTEMPTS,
+                        err,
+                        if retrying { " (retrying)" } else { "" }
+                    );
+                }
+                if retrying {
+                    tokio::time::sleep(keychain_retry_delay(attempt)).await;
+                    continue;
+                }
+                return Err(WrappedError::GenericError {
+                    msg: format!("CloudKit decrypt probe failed after retries (messages): {}", err),
+                });
+            }
+        }
+    }
+
+    Err(WrappedError::GenericError {
+        msg: "CloudKit decrypt probe failed after retries".into(),
+    })
+}
+
 // ============================================================================
 // Token Provider (iCloud auth for CardDAV, CloudKit, etc.)
 // ============================================================================
@@ -298,12 +471,13 @@ impl WrappedTokenProvider {
             match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
                 Ok(()) => {
                     info!("Successfully joined keychain trust circle via bottle {}", i);
-                    info!("Syncing keychain zones...");
-                    keychain.sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES).await
-                        .map_err(|e| WrappedError::GenericError {
-                            msg: format!("Joined clique but keychain sync failed: {}", e)
-                        })?;
-                    return Ok(format!("Joined iCloud Keychain (device: serial={}, build={})", meta.serial, meta.build));
+                    info!("Finalizing keychain setup (sync + CloudKit decrypt probe)...");
+                    finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone()).await?;
+                    return Ok(format!(
+                        "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
+                        meta.serial,
+                        meta.build,
+                    ));
                 }
                 Err(e) => {
                     warn!("Bottle {} failed: {}", i, e);
@@ -1326,6 +1500,7 @@ pub struct Client {
     receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     token_provider: Option<Arc<WrappedTokenProvider>>,
     cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>>>,
+    cloud_keychain_client: tokio::sync::Mutex<Option<Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1408,6 +1583,7 @@ pub async fn new_client(
         receive_handle: tokio::sync::Mutex::new(Some(receive_handle)),
         token_provider,
         cloud_messages_client: tokio::sync::Mutex::new(None),
+        cloud_keychain_client: tokio::sync::Mutex::new(None),
     }))
 }
 
@@ -1481,18 +1657,31 @@ impl Client {
             client: cloudkit.clone(),
         });
 
-        keychain
-            .sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync keychain: {}", e),
-            })?;
+        sync_keychain_with_retries(&keychain, 3, "Cloud client init").await?;
 
         let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
-            cloudkit, keychain,
+            cloudkit, keychain.clone(),
         ));
         *locked = Some(cloud_messages.clone());
+        *self.cloud_keychain_client.lock().await = Some(keychain);
         Ok(cloud_messages)
+    }
+
+    async fn get_or_init_cloud_keychain_client(&self) -> Result<Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>, WrappedError> {
+        let _ = self.get_or_init_cloud_messages_client().await?;
+        self.cloud_keychain_client
+            .lock()
+            .await
+            .clone()
+            .ok_or(WrappedError::GenericError {
+                msg: "No keychain client available".into(),
+            })
+    }
+
+    async fn recover_cloud_pcs_state(&self, context: &str) -> Result<(), WrappedError> {
+        info!("{}: starting keychain resync recovery", context);
+        let keychain = self.get_or_init_cloud_keychain_client().await?;
+        sync_keychain_with_retries(&keychain, 6, context).await
     }
 }
 
@@ -1872,12 +2061,48 @@ impl Client {
     ) -> Result<WrappedCloudSyncChatsPage, WrappedError> {
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let (next_token, chats, status) = cloud_messages
-            .sync_chats(token)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit chats: {}", e),
-            })?;
+
+        const MAX_SYNC_ATTEMPTS: usize = 4;
+        let mut sync_result = None;
+        let mut last_pcs_err: Option<rustpush::PushError> = None;
+
+        for attempt in 0..MAX_SYNC_ATTEMPTS {
+            match cloud_messages.sync_chats(token.clone()).await {
+                Ok(result) => {
+                    sync_result = Some(result);
+                    break;
+                }
+                Err(err) if is_pcs_recoverable_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit chats sync hit PCS key error on attempt {}/{}: {}",
+                        attempt_no,
+                        MAX_SYNC_ATTEMPTS,
+                        err
+                    );
+                    last_pcs_err = Some(err);
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.recover_cloud_pcs_state("CloudKit chats sync").await?;
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit chats: {}", err),
+                    });
+                }
+            }
+        }
+
+        let (next_token, chats, status) = match sync_result {
+            Some(result) => result,
+            None => {
+                let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to sync CloudKit chats after PCS recovery retries: {}", err),
+                });
+            }
+        };
 
         let updated_timestamp_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1928,12 +2153,48 @@ impl Client {
     ) -> Result<WrappedCloudSyncMessagesPage, WrappedError> {
         let token = decode_continuation_token(continuation_token)?;
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
-        let (next_token, messages, status) = cloud_messages
-            .sync_messages(token)
-            .await
-            .map_err(|e| WrappedError::GenericError {
-                msg: format!("Failed to sync CloudKit messages: {}", e),
-            })?;
+
+        const MAX_SYNC_ATTEMPTS: usize = 4;
+        let mut sync_result = None;
+        let mut last_pcs_err: Option<rustpush::PushError> = None;
+
+        for attempt in 0..MAX_SYNC_ATTEMPTS {
+            match cloud_messages.sync_messages(token.clone()).await {
+                Ok(result) => {
+                    sync_result = Some(result);
+                    break;
+                }
+                Err(err) if is_pcs_recoverable_error(&err) => {
+                    let attempt_no = attempt + 1;
+                    warn!(
+                        "CloudKit messages sync hit PCS key error on attempt {}/{}: {}",
+                        attempt_no,
+                        MAX_SYNC_ATTEMPTS,
+                        err
+                    );
+                    last_pcs_err = Some(err);
+                    if attempt_no < MAX_SYNC_ATTEMPTS {
+                        self.recover_cloud_pcs_state("CloudKit messages sync").await?;
+                        continue;
+                    }
+                }
+                Err(err) => {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit messages: {}", err),
+                    });
+                }
+            }
+        }
+
+        let (next_token, messages, status) = match sync_result {
+            Some(result) => result,
+            None => {
+                let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                return Err(WrappedError::GenericError {
+                    msg: format!("Failed to sync CloudKit messages after PCS recovery retries: {}", err),
+                });
+            }
+        };
 
         let mut normalized = Vec::with_capacity(messages.len());
         for (record_name, msg_opt) in messages {
@@ -1996,12 +2257,47 @@ impl Client {
         let mut deduped: HashMap<String, WrappedCloudSyncMessage> = HashMap::new();
 
         'pages: for _ in 0..max_pages {
-            let (next_token, messages, status) = cloud_messages
-                .sync_messages(token)
-                .await
-                .map_err(|e| WrappedError::GenericError {
-                    msg: format!("Failed to sync CloudKit messages: {}", e),
-                })?;
+            const MAX_SYNC_ATTEMPTS: usize = 4;
+            let mut sync_result = None;
+            let mut last_pcs_err: Option<rustpush::PushError> = None;
+
+            for attempt in 0..MAX_SYNC_ATTEMPTS {
+                match cloud_messages.sync_messages(token.clone()).await {
+                    Ok(result) => {
+                        sync_result = Some(result);
+                        break;
+                    }
+                    Err(err) if is_pcs_recoverable_error(&err) => {
+                        let attempt_no = attempt + 1;
+                        warn!(
+                            "CloudKit recent fetch hit PCS key error on attempt {}/{}: {}",
+                            attempt_no,
+                            MAX_SYNC_ATTEMPTS,
+                            err
+                        );
+                        last_pcs_err = Some(err);
+                        if attempt_no < MAX_SYNC_ATTEMPTS {
+                            self.recover_cloud_pcs_state("CloudKit recent fetch").await?;
+                            continue;
+                        }
+                    }
+                    Err(err) => {
+                        return Err(WrappedError::GenericError {
+                            msg: format!("Failed to sync CloudKit messages: {}", err),
+                        });
+                    }
+                }
+            }
+
+            let (next_token, messages, status) = match sync_result {
+                Some(result) => result,
+                None => {
+                    let err = last_pcs_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown error".into());
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Failed to sync CloudKit messages after PCS recovery retries: {}", err),
+                    });
+                }
+            };
 
             for (record_name, msg_opt) in messages {
                 let Some(msg) = msg_opt else {
