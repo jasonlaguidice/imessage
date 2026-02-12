@@ -641,19 +641,65 @@ impl PCSShareProtection {
     }
 
     pub fn decode_key_public(&self) -> Result<Vec<u8>, PushError> {
-        Ok(self.keyset.keyset.first().expect("No public keyset! (bad decoding?)").decryption_key.pub_key.to_vec())
+        Ok(self
+            .keyset
+            .keyset
+            .first()
+            .expect("No public keyset! (bad decoding?)")
+            .decryption_key
+            .pub_key
+            .to_vec())
     }
 
-    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
-        info!("Decoding with {}", base64_encode(&self.decode_key_public()?));
-        let account = Value::String(base64_encode(&self.decode_key_public()?));
-        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct") == Some(&account))
-            .ok_or(PushError::ShareKeyNotFound(encode_hex(&self.decode_key_public()?)))?;
-        let decoded = PCSPrivateKey::from_dict(item, keychain);
+    /// Return all public keys that may be able to decrypt this share protection.
+    /// Apple may include multiple candidate recipients; on some accounts/devices
+    /// not all of them will exist locally.
+    pub fn decode_key_public_candidates(&self) -> Result<Vec<Vec<u8>>, PushError> {
+        Ok(self
+            .keyset
+            .keyset
+            .iter()
+            .map(|k| k.decryption_key.pub_key.to_vec())
+            .collect())
+    }
 
-        let key = decoded.key();
+    pub fn decrypt_with_keychain(
+        &self,
+        keychain: &KeychainClientState,
+        service: &PCSService<'_>,
+    ) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+        let candidates = self.decode_key_public_candidates()?;
+        if candidates.is_empty() {
+            return Err(PushError::ShareKeyNotFound(
+                "PCS share protection had no candidate public keys".into(),
+            ));
+        }
 
-        self.decode(&key)
+        let candidate_hexes: Vec<String> = candidates.iter().map(|c| encode_hex(c)).collect();
+
+        let Some(zone) = keychain.items.get(service.zone) else {
+            return Err(PushError::ShareKeyNotFound(format!(
+                "PCS keychain zone '{}' missing (candidates: {})",
+                service.zone,
+                candidate_hexes.join(",")
+            )));
+        };
+
+        for pub_key in &candidates {
+            let account = Value::String(base64_encode(pub_key));
+            if let Some(item) = zone.keys.values().find(|x| x.get("acct") == Some(&account)) {
+                info!(
+                    "Decoding with {} (zone={})",
+                    base64_encode(pub_key),
+                    service.zone
+                );
+                let decoded = PCSPrivateKey::from_dict(item, keychain);
+                let key = decoded.key();
+                return self.decode(&key);
+            }
+        }
+
+        Err(PushError::ShareKeyNotFound(candidate_hexes.join(",")))
     }
 
     pub fn create(encrypt: &CompactECKey<Private>, keys: &[CompactECKey<Private>]) -> Result<Self, PushError> {

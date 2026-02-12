@@ -249,6 +249,36 @@ async fn sync_keychain_with_retries(
     Err(WrappedError::GenericError { msg })
 }
 
+async fn refresh_recoverable_tlk_shares(
+    keychain: &Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
+    context: &str,
+) -> Result<(), WrappedError> {
+    let identity_opt = {
+        let state = keychain.state.read().await;
+        state.user_identity.clone()
+    };
+
+    let Some(identity) = identity_opt else {
+        warn!("{}: no keychain user identity available for TLK share refresh", context);
+        return Ok(());
+    };
+
+    match keychain.fetch_shares_for(&identity).await {
+        Ok(shares) => {
+            info!("{}: fetched {} recoverable TLK share(s)", context, shares.len());
+            if !shares.is_empty() {
+                keychain.store_keys(&shares).await?;
+            }
+        }
+        Err(err) => {
+            // Best-effort: we still attempt regular keychain sync / CloudKit probes.
+            warn!("{}: failed to fetch recoverable TLK shares: {}", context, err);
+        }
+    }
+
+    Ok(())
+}
+
 async fn finalize_keychain_setup_with_probe(
     keychain: Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
     cloudkit: Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
@@ -259,6 +289,11 @@ async fn finalize_keychain_setup_with_probe(
 
     for attempt in 0..attempts {
         let attempt_no = attempt + 1;
+        if attempt == 0 {
+            // After join, explicitly refresh recoverable TLK shares for this new peer.
+            // Some accounts/devices need an extra fetch before all view keys materialize.
+            refresh_recoverable_tlk_shares(&keychain, "Login finalize").await?;
+        }
         sync_keychain_with_retries(&keychain, 1, "Login finalize").await?;
 
         match cloud_messages.sync_chats(None).await {
@@ -296,6 +331,9 @@ async fn finalize_keychain_setup_with_probe(
                     );
                 }
                 if retrying {
+                    if is_pcs_recoverable_error(&err) && attempt % 4 == 0 {
+                        refresh_recoverable_tlk_shares(&keychain, "Login finalize").await?;
+                    }
                     tokio::time::sleep(keychain_retry_delay(attempt)).await;
                     continue;
                 }
@@ -341,6 +379,9 @@ async fn finalize_keychain_setup_with_probe(
                     );
                 }
                 if retrying {
+                    if is_pcs_recoverable_error(&err) && attempt % 4 == 0 {
+                        refresh_recoverable_tlk_shares(&keychain, "Login finalize").await?;
+                    }
                     tokio::time::sleep(keychain_retry_delay(attempt)).await;
                     continue;
                 }
@@ -1721,6 +1762,7 @@ impl Client {
     async fn recover_cloud_pcs_state(&self, context: &str) -> Result<(), WrappedError> {
         info!("{}: starting keychain resync recovery", context);
         let keychain = self.get_or_init_cloud_keychain_client().await?;
+        refresh_recoverable_tlk_shares(&keychain, context).await?;
         sync_keychain_with_retries(&keychain, 6, context).await
     }
 }

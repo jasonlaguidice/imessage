@@ -24,7 +24,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
 use tokio::sync::Mutex;
 use cloudkit_proto::RecordIdentifier;
-use log::info;
+use log::{info, warn};
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
 use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
@@ -499,39 +499,112 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         return Ok(locked.clone().unwrap())
     }
 
-    async fn sync_records<T: CloudKitRecord>(&self, zone: &str, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+    async fn sync_records<T: CloudKitRecord>(
+        &self,
+        zone: &str,
+        continuation_token: Option<Vec<u8>>,
+    ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
         let container = self.get_container().await?;
 
-        let zone = container.private_zone(zone.to_string());
-        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
-        let (_assets, response) = container.perform(&CloudKitSession::new(),
-            FetchRecordChangesOperation::new(zone.clone(), continuation_token, &NO_ASSETS)).await?;
+        let zone_id = container.private_zone(zone.to_string());
+        let mut key = container
+            .get_zone_encryption_config(&zone_id, &self.keychain, &MESSAGES_SERVICE)
+            .await?;
+        let (_assets, response) = container
+            .perform(
+                &CloudKitSession::new(),
+                FetchRecordChangesOperation::new(zone_id.clone(), continuation_token, &NO_ASSETS),
+            )
+            .await?;
 
         let mut results = HashMap::new();
+        let mut refreshed_zone_key_config = false;
+        let mut skipped = 0usize;
 
         for change in &response.change {
-            let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
+            let identifier = change
+                .identifier
+                .as_ref()
+                .unwrap()
+                .value
+                .as_ref()
+                .unwrap()
+                .name()
+                .to_string();
 
             let Some(record) = &change.record else {
                 results.insert(identifier, None);
                 continue;
             };
-            if record.r#type.as_ref().unwrap().name() != T::record_type() { continue }
+            if record.r#type.as_ref().unwrap().name() != T::record_type() {
+                continue;
+            }
 
-            let pcskey = match pcs_keys_for_record(&record, &key) {
-                Ok(key) => key,
-                Err(PushError::PCSRecordKeyMissing) => {
-                    container.clear_cache_zone_encryption_config(&zone).await;
-                    return Err(PushError::PCSRecordKeyMissing)
-                },
-                Err(e) => return Err(e)
+            // Some accounts have historical records that reference missing/old PCS keys.
+            // Don't fail the whole sync; skip the record and continue.
+            let pcskey = match pcs_keys_for_record(record, &key) {
+                Ok(key) => Some(key),
+                Err(PushError::PCSRecordKeyMissing) if !refreshed_zone_key_config => {
+                    // Try one cache refresh (keychain/zone config can be stale during setup).
+                    container.clear_cache_zone_encryption_config(&zone_id).await;
+                    key = container
+                        .get_zone_encryption_config(&zone_id, &self.keychain, &MESSAGES_SERVICE)
+                        .await?;
+                    refreshed_zone_key_config = true;
+                    match pcs_keys_for_record(record, &key) {
+                        Ok(key) => Some(key),
+                        Err(PushError::PCSRecordKeyMissing) => {
+                            skipped += 1;
+                            warn!(
+                                "Skipping CloudKit record {} in zone {}: PCS record key missing",
+                                identifier, zone
+                            );
+                            None
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(err) if matches!(
+                    err,
+                    PushError::PCSRecordKeyMissing
+                        | PushError::ShareKeyNotFound(_)
+                        | PushError::DecryptionKeyNotFound(_)
+                        | PushError::MasterKeyNotFound
+                ) => {
+                    skipped += 1;
+                    warn!(
+                        "Skipping CloudKit record {} in zone {} due to PCS key error: {}",
+                        identifier, zone, err
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
             };
-            let item = T::from_record_encrypted(&record.record_field, Some((&pcskey, record.record_identifier.as_ref().unwrap())));
+
+            let Some(pcskey) = pcskey else {
+                continue;
+            };
+
+            let item = T::from_record_encrypted(
+                &record.record_field,
+                Some((&pcskey, record.record_identifier.as_ref().unwrap())),
+            );
 
             results.insert(identifier, Some(item));
         }
 
-        Ok((response.sync_continuation_token().to_vec(), results, response.status()))
+        if skipped > 0 {
+            warn!(
+                "CloudKit sync skipped {} undecryptable record(s) in zone {}",
+                skipped, zone
+            );
+        }
+
+        Ok((
+            response.sync_continuation_token().to_vec(),
+            results,
+            response.status(),
+        ))
     }
 
     async fn save_records<T: CloudKitRecord>(&self, zone: &str, records: HashMap<String, T>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
