@@ -806,15 +806,31 @@ pub struct PCSZoneConfig {
 impl PCSZoneConfig {
 
     fn decode_record_protection(&self, protection: &ProtectionInfo) -> Result<Vec<PCSKey>, PushError> {
-        let record_protection: PCSShareProtection = rasn::der::decode(protection.protection_info()).expect("Bad record protection?");
+        let record_protection: PCSShareProtection =
+            rasn::der::decode(protection.protection_info()).expect("Bad record protection?");
         let mut big_num = BigNumContext::new()?;
-        let record_key = CompactECKey::decompress(record_protection.decode_key_public()?.try_into().expect("Decode key not compact!"));
 
-        let item = self.zone_keys.iter().find(|k| matches!(record_key.public_key().eq(&record_key.group(), &k.public_key(), &mut big_num), Ok(true))).expect("Record key not found!");
+        for pub_key in record_protection.decode_key_public_candidates()? {
+            // PCS public keys should be compact EC keys (32 bytes). If not, ignore.
+            let compact: [u8; 32] = match pub_key.as_slice().try_into() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let record_key = CompactECKey::decompress(compact);
+            if let Some(item) = self.zone_keys.iter().find(|k| {
+                matches!(
+                    record_key
+                        .public_key()
+                        .eq(&record_key.group(), &k.public_key(), &mut big_num),
+                    Ok(true)
+                )
+            }) {
+                let (keys, _record_keys) = record_protection.decode(item)?;
+                return Ok(keys);
+            }
+        }
 
-        let (key, _record_keys) = record_protection.decode(item).unwrap();
-
-        Ok(key)
+        Err(PushError::PCSRecordKeyMissing)
     }
 }
 
