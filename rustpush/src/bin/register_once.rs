@@ -1,3 +1,16 @@
+//! register_once
+//!
+//! Purpose:
+//! - Developer/debugging helper to run a single IDS `register()` call from Linux
+//!   using already-persisted bridge session state + a hardware key.
+//! - Lets us validate registration behavior (headers/body/status) without going
+//!   through the full Matrix/Beeper login orchestration.
+//!
+//! Notes:
+//! - This is NOT used by the normal bridge runtime path.
+//! - It intentionally forces local x86 NAC emulation (`nac_relay_url = None`) so
+//!   Intel/mac-less experiments are deterministic.
+
 use std::{env, fs, path::PathBuf, sync::RwLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};

@@ -1,3 +1,19 @@
+//! test_nac_validation_flow_from_hw_key_env
+//!
+//! Purpose:
+//! - End-to-end NAC validation smoke test using a real extracted hardware key.
+//! - Verifies that `ValidationCtx::{new,key_establishment,sign}` works against
+//!   Apple's live validation endpoints from Linux.
+//!
+//! How to run:
+//! - Set `HW_KEY_B64` to the base64 key, OR set `HW_KEY_FILE` to a file path.
+//! - Run this single test with `-- --nocapture` to inspect lengths and progress.
+//!
+//! Notes:
+//! - If neither env var is set, the test exits early (skip-like behavior).
+//! - This is tooling for validation and debugging; production code does not
+//!   depend on this test.
+
 use std::io::{Cursor, Read};
 
 use open_absinthe::nac::{HardwareConfig, ValidationCtx};
