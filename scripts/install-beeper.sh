@@ -146,6 +146,42 @@ else
     NEEDS_LOGIN=true
 fi
 
+# Also require login if keychain trust-circle state is missing.
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
+FORCE_CLEAR_STATE=false
+if [ "$NEEDS_LOGIN" = "false" ]; then
+    HAS_CLIQUE=false
+    if [ -f "$TRUSTEDPEERS_FILE" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+            if python3 - <<PY >/dev/null 2>&1
+import plistlib, sys
+p = "$TRUSTEDPEERS_FILE"
+try:
+    d = plistlib.load(open(p, "rb"))
+except Exception:
+    sys.exit(1)
+ui = d.get("userIdentity", d.get("user_identity"))
+sys.exit(0 if ui else 1)
+PY
+            then
+                HAS_CLIQUE=true
+            fi
+        else
+            if grep -q "<key>userIdentity</key>" "$TRUSTEDPEERS_FILE" || grep -q "<key>user_identity</key>" "$TRUSTEDPEERS_FILE"; then
+                HAS_CLIQUE=true
+            fi
+        fi
+    fi
+
+    if [ "$HAS_CLIQUE" != "true" ]; then
+        echo "⚠ Existing login found, but keychain trust-circle is not initialized."
+        echo "  Forcing fresh login so device-passcode step can run."
+        NEEDS_LOGIN=true
+        FORCE_CLEAR_STATE=true
+    fi
+fi
+
 # Check if backup session state can be restored — validates that session.json
 # and keystore.plist exist AND that the keystore has the referenced keys.
 if [ "$NEEDS_LOGIN" = "true" ] && "$BINARY" check-restore 2>/dev/null; then
@@ -179,12 +215,19 @@ fi
 if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
-    echo "│  No iMessage login found — starting login...    │"
+    echo "│  No valid iMessage login found — starting login │"
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     # Stop the bridge if running (otherwise it holds the DB lock)
     GUI_DOMAIN_TMP="gui/$(id -u)"
     launchctl bootout "$GUI_DOMAIN_TMP/$BUNDLE_ID" 2>/dev/null || true
+
+    if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
+        echo "Clearing stale local state before login..."
+        rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
+        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
+    fi
+
     # Run login from the data directory so the keystore (state/keystore.plist)
     # is written to the same location the launchd service will read from.
     (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
