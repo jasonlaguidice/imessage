@@ -252,14 +252,12 @@ async fn sync_keychain_with_retries(
 async fn finalize_keychain_setup_with_probe(
     keychain: Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
     cloudkit: Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+    max_attempts: usize,
 ) -> Result<(), WrappedError> {
     let cloud_messages = rustpush::cloud_messages::CloudMessagesClient::new(cloudkit, keychain.clone());
+    let attempts = max_attempts.max(1);
 
-    // Keep retrying for ~1-3 minutes so login completes only when CloudKit
-    // decryption is actually ready (single atomic login flow).
-    const MAX_ATTEMPTS: usize = 24;
-
-    for attempt in 0..MAX_ATTEMPTS {
+    for attempt in 0..attempts {
         let attempt_no = attempt + 1;
         sync_keychain_with_retries(&keychain, 1, "Login finalize").await?;
 
@@ -279,12 +277,12 @@ async fn finalize_keychain_setup_with_probe(
                     });
                 }
 
-                let retrying = attempt_no < MAX_ATTEMPTS;
+                let retrying = attempt_no < attempts;
                 if is_pcs_recoverable_error(&err) {
                     warn!(
                         "CloudKit decrypt probe (chats) missing PCS keys on attempt {}/{}: {}{}",
                         attempt_no,
-                        MAX_ATTEMPTS,
+                        attempts,
                         err,
                         if retrying { " (retrying)" } else { "" }
                     );
@@ -292,7 +290,7 @@ async fn finalize_keychain_setup_with_probe(
                     warn!(
                         "CloudKit decrypt probe (chats) failed on attempt {}/{}: {}{}",
                         attempt_no,
-                        MAX_ATTEMPTS,
+                        attempts,
                         err,
                         if retrying { " (retrying)" } else { "" }
                     );
@@ -324,12 +322,12 @@ async fn finalize_keychain_setup_with_probe(
                     });
                 }
 
-                let retrying = attempt_no < MAX_ATTEMPTS;
+                let retrying = attempt_no < attempts;
                 if is_pcs_recoverable_error(&err) {
                     warn!(
                         "CloudKit decrypt probe (messages) missing PCS keys on attempt {}/{}: {}{}",
                         attempt_no,
-                        MAX_ATTEMPTS,
+                        attempts,
                         err,
                         if retrying { " (retrying)" } else { "" }
                     );
@@ -337,7 +335,7 @@ async fn finalize_keychain_setup_with_probe(
                     warn!(
                         "CloudKit decrypt probe (messages) failed on attempt {}/{}: {}{}",
                         attempt_no,
-                        MAX_ATTEMPTS,
+                        attempts,
                         err,
                         if retrying { " (retrying)" } else { "" }
                     );
@@ -466,18 +464,41 @@ impl WrappedTokenProvider {
 
         let passcode_bytes = passcode.as_bytes();
         let mut last_err = String::new();
+        let mut joined_any = false;
+        let mut last_joined_meta: Option<(String, String)> = None;
+
+        // If there are many escrow bottles, do a quick probe per bottle first,
+        // then one extended probe at the end on the latest successful join.
+        let per_bottle_probe_attempts = if bottles.len() > 1 { 3 } else { 24 };
+
         for (i, (data, meta)) in bottles.iter().enumerate() {
             info!("Trying bottle {} (serial={})...", i, meta.serial);
             match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
                 Ok(()) => {
+                    joined_any = true;
+                    last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
                     info!("Successfully joined keychain trust circle via bottle {}", i);
-                    info!("Finalizing keychain setup (sync + CloudKit decrypt probe)...");
-                    finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone()).await?;
-                    return Ok(format!(
-                        "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
-                        meta.serial,
-                        meta.build,
-                    ));
+                    info!(
+                        "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
+                        per_bottle_probe_attempts
+                    );
+                    match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
+                        Ok(()) => {
+                            return Ok(format!(
+                                "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
+                                meta.serial,
+                                meta.build,
+                            ));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Bottle {} joined, but CloudKit decrypt probe failed: {}. Trying next bottle...",
+                                i,
+                                e
+                            );
+                            last_err = format!("{}", e);
+                        }
+                    }
                 }
                 Err(e) => {
                     warn!("Bottle {} failed: {}", i, e);
@@ -486,8 +507,27 @@ impl WrappedTokenProvider {
             }
         }
 
+        if joined_any {
+            info!("All bottle-specific probes failed; running extended CloudKit decrypt probe retries...");
+            match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), 24).await {
+                Ok(()) => {
+                    if let Some((serial, build)) = last_joined_meta {
+                        return Ok(format!(
+                            "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
+                            serial,
+                            build,
+                        ));
+                    }
+                    return Ok("Joined iCloud Keychain and verified CloudKit access".to_string());
+                }
+                Err(e) => {
+                    last_err = format!("{}", e);
+                }
+            }
+        }
+
         Err(WrappedError::GenericError {
-            msg: format!("All {} bottles failed. Last error: {}. Check your device passcode.", bottles.len(), last_err)
+            msg: format!("All {} bottles failed to produce CloudKit-ready keychain state. Last error: {}", bottles.len(), last_err)
         })
     }
 }
