@@ -26,10 +26,10 @@ import (
 // cloudContactsClient fetches contacts from iCloud via CardDAV and caches
 // them locally for fast phone/email lookups.
 type cloudContactsClient struct {
-	baseURL      string // CardDAV URL from MobileMe delegate
-	dsid         string // cached DSID for URL construction
-	rustClient   *rustpushgo.Client // for getting auth headers via TokenProvider
-	httpClient   *http.Client
+	baseURL    string             // CardDAV URL from MobileMe delegate
+	dsid       string             // cached DSID for URL construction
+	rustClient *rustpushgo.Client // for getting auth headers via TokenProvider
+	httpClient *http.Client
 
 	mu       sync.RWMutex
 	byPhone  map[string]*imessage.Contact // normalized phone → contact
@@ -102,12 +102,12 @@ func (c *cloudContactsClient) doRequest(method, url, body string, depth string) 
 }
 
 // SyncContacts fetches all contacts from iCloud via CardDAV and rebuilds the cache.
-func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) {
+func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	// Step 1: Get the principal URL
 	principalURL, err := c.discoverPrincipal(log)
 	if err != nil {
 		log.Warn().Err(err).Msg("CardDAV: failed to discover principal URL")
-		return
+		return err
 	}
 	log.Debug().Str("principal", principalURL).Msg("CardDAV: discovered principal URL")
 
@@ -115,7 +115,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) {
 	homeSetURL, err := c.discoverAddressBookHome(log, principalURL)
 	if err != nil {
 		log.Warn().Err(err).Msg("CardDAV: failed to discover address book home")
-		return
+		return err
 	}
 	log.Debug().Str("home_set", homeSetURL).Msg("CardDAV: discovered address book home")
 
@@ -123,16 +123,16 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) {
 	addressBooks, err := c.listAddressBooks(log, homeSetURL)
 	if err != nil {
 		log.Warn().Err(err).Msg("CardDAV: failed to list address books")
-		return
+		return err
 	}
 	log.Debug().Int("count", len(addressBooks)).Msg("CardDAV: found address books")
 
 	// Step 4: Fetch all vCards from each address book
 	var allContacts []*imessage.Contact
 	for _, abURL := range addressBooks {
-		contacts, err := c.fetchAllVCards(log, abURL)
-		if err != nil {
-			log.Warn().Err(err).Str("address_book", abURL).Msg("CardDAV: failed to fetch vCards")
+		contacts, fetchErr := c.fetchAllVCards(log, abURL)
+		if fetchErr != nil {
+			log.Warn().Err(fetchErr).Str("address_book", abURL).Msg("CardDAV: failed to fetch vCards")
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
@@ -163,6 +163,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) {
 		Int("phone_keys", len(c.byPhone)).
 		Int("email_keys", len(c.byEmail)).
 		Msg("Contact cache synced from iCloud CardDAV")
+	return nil
 }
 
 // GetContactInfo looks up a contact by phone number or email.
@@ -345,12 +346,12 @@ func (c *cloudContactsClient) resolveURL(href string) string {
 
 // multistatus represents a WebDAV multistatus response.
 type multistatus struct {
-	XMLName   xml.Name   `xml:"multistatus"`
+	XMLName   xml.Name      `xml:"multistatus"`
 	Responses []davResponse `xml:"response"`
 }
 
 type davResponse struct {
-	Href     string       `xml:"href"`
+	Href     string        `xml:"href"`
 	Propstat []davPropstat `xml:"propstat"`
 }
 

@@ -646,18 +646,21 @@ func completeLoginWithMeta(
 		AccountSPDBase64:         meta.AccountSPDBase64,
 	})
 
-	client := &IMClient{
-		Main:          main,
-		config:        cfg,
-		users:         result.Users,
-		identity:      result.Identity,
-		connection:    conn,
-		tokenProvider: result.TokenProvider,
-		recentUnsends: make(map[string]time.Time),
-		smsPortals:    make(map[string]bool),
-	}
-
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
+
+	client := &IMClient{
+		Main:            main,
+		config:          cfg,
+		users:           result.Users,
+		identity:        result.Identity,
+		connection:      conn,
+		tokenProvider:   result.TokenProvider,
+		contactsReady:   false,
+		contactsReadyCh: make(chan struct{}),
+		cloudStore:      newCloudBackfillStore(main.Bridge.DB.Database, loginID),
+		recentUnsends:   make(map[string]time.Time),
+		smsPortals:      make(map[string]bool),
+	}
 
 	ul, err := user.NewLogin(ctx, &database.UserLogin{
 		ID:         loginID,
