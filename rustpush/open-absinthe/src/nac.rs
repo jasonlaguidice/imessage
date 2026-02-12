@@ -1098,6 +1098,14 @@ fn round_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
 }
 
+// Deterministic `_enc` derivation tests for the x86 Linux assembly path.
+//
+// Why these exist:
+// - Some Intel keys are extracted without encrypted IOKit properties.
+// - In that case we derive `_enc` fields locally via the XNU routine from
+//   `src/asm/encrypt.s`.
+// - These tests protect that behavior with known-good vectors and ensure
+//   repeated computation is idempotent.
 #[cfg(all(test, has_xnu_encrypt))]
 mod tests {
     use super::*;
