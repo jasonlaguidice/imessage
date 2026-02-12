@@ -202,6 +202,19 @@ PY
     fi
 fi
 
+# Also require login if CloudKit last error indicates missing PCS keys.
+if [ "$NEEDS_LOGIN" = "false" ] && command -v sqlite3 >/dev/null 2>&1 && [ -n "$DB_URI" ] && [ -f "$DB_URI" ]; then
+    PCS_MISSING=$(sqlite3 "$DB_URI" "SELECT count(*) FROM cloud_sync_state WHERE coalesce(last_error, '') LIKE '%PCS Share key%not found%';" 2>/dev/null || echo "0")
+    PCS_MISSING=$(echo "$PCS_MISSING" | tr -dc '0-9')
+    [ -z "$PCS_MISSING" ] && PCS_MISSING=0
+    if [ "$PCS_MISSING" -gt 0 ]; then
+        echo "⚠ Existing login found, but CloudKit PCS keys are missing."
+        echo "  Forcing fresh login to regenerate keychain/PCS state."
+        NEEDS_LOGIN=true
+        FORCE_CLEAR_STATE=true
+    fi
+fi
+
 # ── Restore preferred_handle from DB or session backup ────────
 if [ "$NEEDS_LOGIN" = "false" ]; then
     CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" || true)
