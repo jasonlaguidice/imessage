@@ -12,7 +12,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
@@ -54,6 +56,14 @@ type IMClient struct {
 
 	// Cloud contacts (iCloud CardDAV)
 	cloudContacts *cloudContactsClient
+
+	// Contacts readiness gate for CloudKit message sync.
+	contactsReady     bool
+	contactsReadyLock sync.RWMutex
+	contactsReadyCh   chan struct{}
+
+	// Cloud backfill local cache store.
+	cloudStore *cloudBackfillStore
 
 	// Background goroutine lifecycle
 	stopChan chan struct{}
@@ -168,27 +178,33 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.stopChan = make(chan struct{})
 	go c.periodicStateSave(log)
 
+	// Ensure CloudKit backfill schema/storage is available.
+	cloudStoreReady := true
+	if err = c.ensureCloudSyncStore(context.Background()); err != nil {
+		cloudStoreReady = false
+		log.Error().Err(err).Msg("Failed to initialize cloud backfill store")
+	}
+
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
 	// Set up contact source: iCloud CardDAV via TokenProvider
 	c.cloudContacts = newCloudContactsClient(c.client, log)
 	if c.cloudContacts != nil {
 		log.Info().Str("url", c.cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
-		c.cloudContacts.SyncContacts(log)
+		if syncErr := c.cloudContacts.SyncContacts(log); syncErr != nil {
+			log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
+		} else {
+			c.setContactsReady(log)
+		}
 		go c.periodicCloudContactSync(log)
+	} else {
+		// No cloud contacts available means we can't satisfy the readiness gate.
+		log.Warn().Msg("Cloud contacts unavailable, CloudKit message sync will stay gated")
 	}
 
-	// Test CloudKit Messages access
-	go func() {
-		log.Info().Msg("Testing CloudKit Messages access...")
-		result, err := c.client.TestCloudMessages()
-		if err != nil {
-			log.Error().Err(err).Msg("CloudKit Messages test failed")
-		} else {
-			log.Info().Str("result", result).Msg("CloudKit Messages test result")
-		}
-	}()
-
+	if cloudStoreReady {
+		c.startCloudSyncController(log)
+	}
 }
 
 func (c *IMClient) Disconnect() {
@@ -796,8 +812,15 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	// Groups use comma-separated participants (e.g., "tel:+15551234567,tel:+15559876543")
 	isGroup := strings.Contains(portalID, ",")
 
+	canBackfill := false
+	if c.cloudStore != nil {
+		if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err == nil {
+			canBackfill = hasMessages
+		}
+	}
+
 	chatInfo := &bridgev2.ChatInfo{
-		CanBackfill: false,
+		CanBackfill: canBackfill,
 	}
 
 	if isGroup {
@@ -953,12 +976,179 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 }
 
 // ============================================================================
-// Backfill (not yet implemented — CloudKit Phase 2)
+// Backfill (CloudKit cache-backed)
 // ============================================================================
 
+type cloudBackfillCursor struct {
+	TimestampMS int64  `json:"ts"`
+	GUID        string `json:"g"`
+}
+
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
-	// Backfill is not supported without chat.db (removed) or CloudKit (Phase 2).
-	return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	if c.cloudStore == nil {
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+
+	count := params.Count
+	if count <= 0 {
+		count = 50
+	}
+
+	if params.Portal == nil || params.ThreadRoot != "" {
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+	portalID := string(params.Portal.ID)
+	if portalID == "" {
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+
+	if params.Forward {
+		var rows []cloudMessageRow
+		var err error
+		if params.AnchorMessage != nil {
+			rows, err = c.cloudStore.listForwardMessages(
+				ctx,
+				portalID,
+				params.AnchorMessage.Timestamp.UnixMilli(),
+				string(params.AnchorMessage.ID),
+				count,
+			)
+		} else {
+			rows, err = c.cloudStore.listLatestMessages(ctx, portalID, count)
+			reverseCloudMessageRows(rows)
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
+		for _, row := range rows {
+			messages = append(messages, c.cloudRowToBackfillMessage(row))
+		}
+		return &bridgev2.FetchMessagesResponse{
+			Messages: messages,
+			HasMore:  false,
+			Forward:  true,
+		}, nil
+	}
+
+	fetchCount := count + 1
+	beforeTS := int64(0)
+	beforeGUID := ""
+	if params.Cursor != "" {
+		cursor, err := decodeCloudBackfillCursor(params.Cursor)
+		if err != nil {
+			return nil, fmt.Errorf("invalid backfill cursor: %w", err)
+		}
+		beforeTS = cursor.TimestampMS
+		beforeGUID = cursor.GUID
+	} else if params.AnchorMessage != nil {
+		beforeTS = params.AnchorMessage.Timestamp.UnixMilli()
+		beforeGUID = string(params.AnchorMessage.ID)
+	}
+
+	rows, err := c.cloudStore.listBackwardMessages(ctx, portalID, beforeTS, beforeGUID, fetchCount)
+	if err != nil {
+		return nil, err
+	}
+
+	hasMore := false
+	if len(rows) > count {
+		hasMore = true
+		rows = rows[:count]
+	}
+	reverseCloudMessageRows(rows)
+
+	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
+	for _, row := range rows {
+		messages = append(messages, c.cloudRowToBackfillMessage(row))
+	}
+
+	var nextCursor networkid.PaginationCursor
+	if hasMore && len(rows) > 0 {
+		cursor, cursorErr := encodeCloudBackfillCursor(cloudBackfillCursor{
+			TimestampMS: rows[0].TimestampMS,
+			GUID:        rows[0].GUID,
+		})
+		if cursorErr != nil {
+			return nil, cursorErr
+		}
+		nextCursor = cursor
+	}
+
+	return &bridgev2.FetchMessagesResponse{
+		Messages: messages,
+		Cursor:   nextCursor,
+		HasMore:  hasMore,
+		Forward:  false,
+	}, nil
+}
+
+func (c *IMClient) cloudRowToBackfillMessage(row cloudMessageRow) *bridgev2.BackfillMessage {
+	var sender bridgev2.EventSender
+	if row.IsFromMe {
+		sender = bridgev2.EventSender{
+			IsFromMe:    true,
+			SenderLogin: c.UserLogin.ID,
+			Sender:      makeUserID(c.handle),
+		}
+	} else {
+		normalizedSender := normalizeIdentifierForPortalID(row.Sender)
+		if normalizedSender == "" {
+			normalizedSender = row.Sender
+		}
+		sender = bridgev2.EventSender{Sender: makeUserID(normalizedSender)}
+	}
+
+	body := row.Text
+	if strings.TrimSpace(body) == "" {
+		body = "[Unsupported message type]"
+	}
+
+	return &bridgev2.BackfillMessage{
+		Sender:    sender,
+		ID:        makeMessageID(row.GUID),
+		Timestamp: time.UnixMilli(row.TimestampMS),
+		ConvertedMessage: &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType: event.MsgText,
+					Body:    body,
+				},
+			}},
+		},
+	}
+}
+
+func reverseCloudMessageRows(rows []cloudMessageRow) {
+	for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+		rows[i], rows[j] = rows[j], rows[i]
+	}
+}
+
+func encodeCloudBackfillCursor(cursor cloudBackfillCursor) (networkid.PaginationCursor, error) {
+	data, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(data)
+	return networkid.PaginationCursor(encoded), nil
+}
+
+func decodeCloudBackfillCursor(cursor networkid.PaginationCursor) (*cloudBackfillCursor, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(string(cursor))
+	if err != nil {
+		return nil, err
+	}
+	var parsed cloudBackfillCursor
+	if err = json.Unmarshal(decoded, &parsed); err != nil {
+		return nil, err
+	}
+	if parsed.GUID == "" {
+		return nil, fmt.Errorf("empty guid in cursor")
+	}
+	return &parsed, nil
 }
 
 // ============================================================================
@@ -1007,7 +1197,11 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	for {
 		select {
 		case <-ticker.C:
-			c.cloudContacts.SyncContacts(log)
+			if err := c.cloudContacts.SyncContacts(log); err != nil {
+				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
+			} else {
+				c.setContactsReady(log)
+			}
 		case <-c.stopChan:
 			return
 		}
@@ -1340,7 +1534,6 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		IsSms:        isSms,
 	}
 }
-
 
 // buildGroupName creates a human-readable group name from member identifiers
 // by resolving contact names where possible, falling back to phone/email.

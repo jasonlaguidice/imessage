@@ -6,6 +6,7 @@ mod test_hwinfo;
 
 use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use icloud_auth::{AppleAccount, FetchedToken};
 use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
 use log::{debug, error, info, warn};
@@ -236,15 +237,39 @@ impl WrappedTokenProvider {
             config: os_config.clone(),
             token_provider: self.inner.clone(),
         });
-        let keychain_state = rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
-            .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?;
+        let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+            Ok(data) => match plist::from_bytes(&data) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+                None
+            }
+        };
+        if keychain_state.is_none() {
+            keychain_state = Some(
+                rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+                    .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?
+            );
+        }
+        let path_for_closure = keychain_state_path.clone();
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette: anisette.clone(),
             token_provider: self.inner.clone(),
-            state: tokio::sync::RwLock::new(keychain_state),
+            state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
             config: os_config.clone(),
-            update_state: Box::new(|_state| {
-                info!("Keychain state updated");
+            update_state: Box::new(move |state| {
+                if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+                    warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+                } else {
+                    info!("Persisted keychain state to {}", path_for_closure);
+                }
             }),
             container: tokio::sync::Mutex::new(None),
             security_container: tokio::sync::Mutex::new(None),
@@ -451,6 +476,71 @@ impl From<&WrappedConversation> for ConversationData {
             sender_guid: c.sender_guid.clone(),
             after_guid: None,
         }
+    }
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncChat {
+    pub record_name: String,
+    pub cloud_chat_id: String,
+    pub service: String,
+    pub display_name: Option<String>,
+    pub participants: Vec<String>,
+    pub deleted: bool,
+    pub updated_timestamp_ms: u64,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncMessage {
+    pub record_name: String,
+    pub guid: String,
+    pub cloud_chat_id: String,
+    pub sender: String,
+    pub is_from_me: bool,
+    pub text: Option<String>,
+    pub service: String,
+    pub timestamp_ms: i64,
+    pub deleted: bool,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncChatsPage {
+    pub continuation_token: Option<String>,
+    pub status: i32,
+    pub done: bool,
+    pub chats: Vec<WrappedCloudSyncChat>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncMessagesPage {
+    pub continuation_token: Option<String>,
+    pub status: i32,
+    pub done: bool,
+    pub messages: Vec<WrappedCloudSyncMessage>,
+}
+
+fn apple_timestamp_ns_to_unix_ms(timestamp_ns: i64) -> i64 {
+    const APPLE_EPOCH_UNIX_MS: i64 = 978_307_200_000;
+    APPLE_EPOCH_UNIX_MS.saturating_add(timestamp_ns / 1_000_000)
+}
+
+fn decode_continuation_token(token_b64: Option<String>) -> Result<Option<Vec<u8>>, WrappedError> {
+    match token_b64 {
+        Some(token) if !token.is_empty() => BASE64_STANDARD
+            .decode(token)
+            .map(Some)
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Invalid continuation token: {}", e),
+            }),
+        _ => Ok(None),
+    }
+}
+
+fn encode_continuation_token(token: Vec<u8>) -> Option<String> {
+    if token.is_empty() {
+        None
+    } else {
+        Some(BASE64_STANDARD.encode(token))
     }
 }
 
@@ -1235,6 +1325,7 @@ pub struct Client {
     conn: rustpush::APSConnection,
     receive_handle: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     token_provider: Option<Arc<WrappedTokenProvider>>,
+    cloud_messages_client: tokio::sync::Mutex<Option<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>>>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1316,7 +1407,93 @@ pub async fn new_client(
         conn: connection.inner.clone(),
         receive_handle: tokio::sync::Mutex::new(Some(receive_handle)),
         token_provider,
+        cloud_messages_client: tokio::sync::Mutex::new(None),
     }))
+}
+
+impl Client {
+    async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>, WrappedError> {
+        let mut locked = self.cloud_messages_client.lock().await;
+        if let Some(client) = &*locked {
+            return Ok(client.clone());
+        }
+
+        let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
+            msg: "No TokenProvider available".into(),
+        })?;
+
+        let dsid = tp.inner.get_dsid().await?;
+        let adsid = tp.inner.get_adsid().await?;
+        let mme_delegate = tp.inner.get_mme_delegate().await?;
+        let account = tp.inner.get_account();
+        let os_config = tp.inner.get_os_config();
+        let anisette = account.lock().await.anisette.clone();
+
+        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone()).ok_or(
+            WrappedError::GenericError {
+                msg: "Failed to create CloudKitState".into(),
+            },
+        )?;
+        let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+            state: tokio::sync::RwLock::new(cloudkit_state),
+            anisette: anisette.clone(),
+            config: os_config.clone(),
+            token_provider: tp.inner.clone(),
+        });
+
+        let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+            Ok(data) => match plist::from_bytes(&data) {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                    None
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+                None
+            }
+        };
+        if keychain_state.is_none() {
+            keychain_state = Some(
+                rustpush::keychain::KeychainClientState::new(dsid, adsid, &mme_delegate)
+                    .ok_or(WrappedError::GenericError {
+                        msg: "Missing KeychainSync config in MobileMe delegate".into(),
+                    })?
+            );
+        }
+        let path_for_closure = keychain_state_path.clone();
+
+        let keychain = Arc::new(rustpush::keychain::KeychainClient {
+            anisette,
+            token_provider: tp.inner.clone(),
+            state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
+            config: os_config,
+            update_state: Box::new(move |state| {
+                if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+                    warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+                }
+            }),
+            container: tokio::sync::Mutex::new(None),
+            security_container: tokio::sync::Mutex::new(None),
+            client: cloudkit.clone(),
+        });
+
+        keychain
+            .sync_keychain(&rustpush::keychain::KEYCHAIN_ZONES)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to sync keychain: {}", e),
+            })?;
+
+        let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
+            cloudkit, keychain,
+        ));
+        *locked = Some(cloud_messages.clone());
+        Ok(cloud_messages)
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -1687,6 +1864,206 @@ impl Client {
             }
             Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) }),
         }
+    }
+
+    pub async fn cloud_sync_chats(
+        &self,
+        continuation_token: Option<String>,
+    ) -> Result<WrappedCloudSyncChatsPage, WrappedError> {
+        let token = decode_continuation_token(continuation_token)?;
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let (next_token, chats, status) = cloud_messages
+            .sync_chats(token)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to sync CloudKit chats: {}", e),
+            })?;
+
+        let updated_timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|dur| dur.as_millis() as u64)
+            .unwrap_or_default();
+
+        let mut normalized = Vec::with_capacity(chats.len());
+        for (record_name, chat_opt) in chats {
+            if let Some(chat) = chat_opt {
+                let cloud_chat_id = if chat.chat_identifier.is_empty() {
+                    record_name.clone()
+                } else {
+                    chat.chat_identifier.clone()
+                };
+                normalized.push(WrappedCloudSyncChat {
+                    record_name,
+                    cloud_chat_id,
+                    service: chat.service_name,
+                    display_name: chat.display_name,
+                    participants: chat.participants.into_iter().map(|p| p.uri).collect(),
+                    deleted: false,
+                    updated_timestamp_ms,
+                });
+            } else {
+                normalized.push(WrappedCloudSyncChat {
+                    cloud_chat_id: record_name.clone(),
+                    record_name,
+                    service: String::new(),
+                    display_name: None,
+                    participants: vec![],
+                    deleted: true,
+                    updated_timestamp_ms,
+                });
+            }
+        }
+
+        Ok(WrappedCloudSyncChatsPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            chats: normalized,
+        })
+    }
+
+    pub async fn cloud_sync_messages(
+        &self,
+        continuation_token: Option<String>,
+    ) -> Result<WrappedCloudSyncMessagesPage, WrappedError> {
+        let token = decode_continuation_token(continuation_token)?;
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let (next_token, messages, status) = cloud_messages
+            .sync_messages(token)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to sync CloudKit messages: {}", e),
+            })?;
+
+        let mut normalized = Vec::with_capacity(messages.len());
+        for (record_name, msg_opt) in messages {
+            if let Some(msg) = msg_opt {
+                let guid = if msg.guid.is_empty() {
+                    record_name.clone()
+                } else {
+                    msg.guid.clone()
+                };
+                let text = msg.msg_proto.text.clone().or_else(|| msg.msg_proto.subject.clone());
+                normalized.push(WrappedCloudSyncMessage {
+                    record_name,
+                    guid,
+                    cloud_chat_id: msg.chat_id,
+                    sender: msg.sender,
+                    is_from_me: msg
+                        .flags
+                        .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+                    text,
+                    service: msg.service,
+                    timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
+                    deleted: false,
+                });
+            } else {
+                normalized.push(WrappedCloudSyncMessage {
+                    guid: record_name.clone(),
+                    record_name,
+                    cloud_chat_id: String::new(),
+                    sender: String::new(),
+                    is_from_me: false,
+                    text: None,
+                    service: String::new(),
+                    timestamp_ms: 0,
+                    deleted: true,
+                });
+            }
+        }
+
+        Ok(WrappedCloudSyncMessagesPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            messages: normalized,
+        })
+    }
+
+    pub async fn cloud_fetch_recent_messages(
+        &self,
+        since_timestamp_ms: u64,
+        chat_id: Option<String>,
+        max_pages: u32,
+        max_results: u32,
+    ) -> Result<Vec<WrappedCloudSyncMessage>, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let since = since_timestamp_ms as i64;
+        let max_pages = if max_pages == 0 { 1 } else { max_pages };
+        let max_results = if max_results == 0 { 1 } else { max_results as usize };
+
+        let mut token: Option<Vec<u8>> = None;
+        let mut deduped: HashMap<String, WrappedCloudSyncMessage> = HashMap::new();
+
+        'pages: for _ in 0..max_pages {
+            let (next_token, messages, status) = cloud_messages
+                .sync_messages(token)
+                .await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("Failed to sync CloudKit messages: {}", e),
+                })?;
+
+            for (record_name, msg_opt) in messages {
+                let Some(msg) = msg_opt else {
+                    continue;
+                };
+
+                if let Some(ref wanted_chat) = chat_id {
+                    if &msg.chat_id != wanted_chat {
+                        continue;
+                    }
+                }
+
+                let timestamp_ms = apple_timestamp_ns_to_unix_ms(msg.time);
+                if timestamp_ms < since {
+                    continue;
+                }
+
+                let guid = if msg.guid.is_empty() {
+                    record_name.clone()
+                } else {
+                    msg.guid.clone()
+                };
+
+                deduped.insert(
+                    guid.clone(),
+                    WrappedCloudSyncMessage {
+                        record_name,
+                        guid,
+                        cloud_chat_id: msg.chat_id,
+                        sender: msg.sender,
+                        is_from_me: msg
+                            .flags
+                            .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+                        text: msg.msg_proto.text.clone().or_else(|| msg.msg_proto.subject.clone()),
+                        service: msg.service,
+                        timestamp_ms,
+                        deleted: false,
+                    },
+                );
+
+                if deduped.len() >= max_results {
+                    break 'pages;
+                }
+            }
+
+            if status == 3 {
+                break;
+            }
+            token = Some(next_token);
+        }
+
+        let mut output = deduped.into_values().collect::<Vec<_>>();
+        output.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.guid.cmp(&b.guid))
+        });
+        if output.len() > max_results {
+            output = output[output.len() - max_results..].to_vec();
+        }
+
+        Ok(output)
     }
 
     /// Test CloudKit Messages access: creates CloudKitClient + KeychainClient + CloudMessagesClient,

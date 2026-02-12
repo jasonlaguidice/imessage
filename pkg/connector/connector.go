@@ -245,14 +245,17 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	})
 
 	client := &IMClient{
-		Main:          c,
-		UserLogin:     login,
-		config:        cfg,
-		users:         rustpushgo.NewWrappedIdsUsers(usersStr),
-		identity:      rustpushgo.NewWrappedIdsngmIdentity(identityStr),
-		connection:    rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr)),
-		recentUnsends: make(map[string]time.Time),
-		smsPortals:    make(map[string]bool),
+		Main:            c,
+		UserLogin:       login,
+		config:          cfg,
+		users:           rustpushgo.NewWrappedIdsUsers(usersStr),
+		identity:        rustpushgo.NewWrappedIdsngmIdentity(identityStr),
+		connection:      rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr)),
+		contactsReady:   false,
+		contactsReadyCh: make(chan struct{}),
+		cloudStore:      newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
+		recentUnsends:   make(map[string]time.Time),
+		smsPortals:      make(map[string]bool),
 	}
 
 	login.Client = client

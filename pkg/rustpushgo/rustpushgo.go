@@ -447,6 +447,33 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_fetch_recent_messages(uniffiStatus)
+		})
+		if checksum != 26669 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_fetch_recent_messages: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_sync_chats(uniffiStatus)
+		})
+		if checksum != 48464 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_sync_chats: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_sync_messages(uniffiStatus)
+		})
+		if checksum != 61309 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_sync_messages: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_get_contacts_url(uniffiStatus)
 		})
 		if checksum != 50659 {
@@ -555,20 +582,20 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_client_test_cloud_messages(uniffiStatus)
-		})
-		if checksum != 57936 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_test_cloud_messages: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_stop(uniffiStatus)
 		})
 		if checksum != 26750 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_stop: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_test_cloud_messages(uniffiStatus)
+		})
+		if checksum != 57936 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_test_cloud_messages: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -681,15 +708,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique(uniffiStatus)
-		})
-		if checksum != 14380 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_contacts_url(uniffiStatus)
 		})
 		if checksum != 29421 {
@@ -713,6 +731,15 @@ func uniffiCheckChecksums() {
 		if checksum != 3524 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_icloud_auth_headers: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique(uniffiStatus)
+		})
+		if checksum != 14380 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -786,6 +813,30 @@ type FfiDestroyerUint32 struct{}
 
 func (FfiDestroyerUint32) Destroy(_ uint32) {}
 
+type FfiConverterInt32 struct{}
+
+var FfiConverterInt32INSTANCE = FfiConverterInt32{}
+
+func (FfiConverterInt32) Lower(value int32) C.int32_t {
+	return C.int32_t(value)
+}
+
+func (FfiConverterInt32) Write(writer io.Writer, value int32) {
+	writeInt32(writer, value)
+}
+
+func (FfiConverterInt32) Lift(value C.int32_t) int32 {
+	return int32(value)
+}
+
+func (FfiConverterInt32) Read(reader io.Reader) int32 {
+	return readInt32(reader)
+}
+
+type FfiDestroyerInt32 struct{}
+
+func (FfiDestroyerInt32) Destroy(_ int32) {}
+
 type FfiConverterUint64 struct{}
 
 var FfiConverterUint64INSTANCE = FfiConverterUint64{}
@@ -809,6 +860,30 @@ func (FfiConverterUint64) Read(reader io.Reader) uint64 {
 type FfiDestroyerUint64 struct{}
 
 func (FfiDestroyerUint64) Destroy(_ uint64) {}
+
+type FfiConverterInt64 struct{}
+
+var FfiConverterInt64INSTANCE = FfiConverterInt64{}
+
+func (FfiConverterInt64) Lower(value int64) C.int64_t {
+	return C.int64_t(value)
+}
+
+func (FfiConverterInt64) Write(writer io.Writer, value int64) {
+	writeInt64(writer, value)
+}
+
+func (FfiConverterInt64) Lift(value C.int64_t) int64 {
+	return int64(value)
+}
+
+func (FfiConverterInt64) Read(reader io.Reader) int64 {
+	return readInt64(reader)
+}
+
+type FfiDestroyerInt64 struct{}
+
+func (FfiDestroyerInt64) Destroy(_ int64) {}
 
 type FfiConverterBool struct{}
 
@@ -992,6 +1067,81 @@ func (ffiObject *FfiObject) freeRustArcPtr() {
 
 type Client struct {
 	ffiObject FfiObject
+}
+
+func (_self *Client) CloudFetchRecentMessages(sinceTimestampMs uint64, chatId *string, maxPages uint32, maxResults uint32) ([]WrappedCloudSyncMessage, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_fetch_recent_messages(
+				_pointer, FfiConverterUint64INSTANCE.Lower(sinceTimestampMs), rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(chatId)), FfiConverterUint32INSTANCE.Lower(maxPages), FfiConverterUint32INSTANCE.Lower(maxResults),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceTypeWrappedCloudSyncMessageINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudSyncChats(continuationToken *string) (WrappedCloudSyncChatsPage, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_sync_chats(
+				_pointer, rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(continuationToken)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterTypeWrappedCloudSyncChatsPageINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudSyncMessages(continuationToken *string) (WrappedCloudSyncMessagesPage, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_sync_messages(
+				_pointer, rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(continuationToken)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterTypeWrappedCloudSyncMessagesPageINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
 }
 
 func (_self *Client) GetContactsUrl() (*string, error) {
@@ -1293,6 +1443,30 @@ func (_self *Client) SendUnsend(conversation WrappedConversation, targetUuid str
 		})
 }
 
+func (_self *Client) Stop() {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
+		// rustFutureFunc
+		return (*C.void)(C.uniffi_rustpushgo_fn_method_client_stop(
+			_pointer,
+			status,
+		))
+	},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) TestCloudMessages() (string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -1315,30 +1489,6 @@ func (_self *Client) TestCloudMessages() (string, error) {
 		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
-		})
-}
-
-func (_self *Client) Stop() {
-	_pointer := _self.ffiObject.incrementPointer("*Client")
-	defer _self.ffiObject.decrementPointer()
-	uniffiRustCallAsync(func(status *C.RustCallStatus) *C.void {
-		// rustFutureFunc
-		return (*C.void)(C.uniffi_rustpushgo_fn_method_client_stop(
-			_pointer,
-			status,
-		))
-	},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) {
-			// completeFunc
-			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
-		},
-		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
 }
 
@@ -2152,6 +2302,230 @@ func (c FfiConverterTypeWrappedAttachment) Write(writer io.Writer, value Wrapped
 type FfiDestroyerTypeWrappedAttachment struct{}
 
 func (_ FfiDestroyerTypeWrappedAttachment) Destroy(value WrappedAttachment) {
+	value.Destroy()
+}
+
+type WrappedCloudSyncChat struct {
+	RecordName         string
+	CloudChatId        string
+	Service            string
+	DisplayName        *string
+	Participants       []string
+	Deleted            bool
+	UpdatedTimestampMs uint64
+}
+
+func (r *WrappedCloudSyncChat) Destroy() {
+	FfiDestroyerString{}.Destroy(r.RecordName)
+	FfiDestroyerString{}.Destroy(r.CloudChatId)
+	FfiDestroyerString{}.Destroy(r.Service)
+	FfiDestroyerOptionalString{}.Destroy(r.DisplayName)
+	FfiDestroyerSequenceString{}.Destroy(r.Participants)
+	FfiDestroyerBool{}.Destroy(r.Deleted)
+	FfiDestroyerUint64{}.Destroy(r.UpdatedTimestampMs)
+}
+
+type FfiConverterTypeWrappedCloudSyncChat struct{}
+
+var FfiConverterTypeWrappedCloudSyncChatINSTANCE = FfiConverterTypeWrappedCloudSyncChat{}
+
+func (c FfiConverterTypeWrappedCloudSyncChat) Lift(rb RustBufferI) WrappedCloudSyncChat {
+	return LiftFromRustBuffer[WrappedCloudSyncChat](c, rb)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncChat) Read(reader io.Reader) WrappedCloudSyncChat {
+	return WrappedCloudSyncChat{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterUint64INSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedCloudSyncChat) Lower(value WrappedCloudSyncChat) RustBuffer {
+	return LowerIntoRustBuffer[WrappedCloudSyncChat](c, value)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncChat) Write(writer io.Writer, value WrappedCloudSyncChat) {
+	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
+	FfiConverterStringINSTANCE.Write(writer, value.CloudChatId)
+	FfiConverterStringINSTANCE.Write(writer, value.Service)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.DisplayName)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.Participants)
+	FfiConverterBoolINSTANCE.Write(writer, value.Deleted)
+	FfiConverterUint64INSTANCE.Write(writer, value.UpdatedTimestampMs)
+}
+
+type FfiDestroyerTypeWrappedCloudSyncChat struct{}
+
+func (_ FfiDestroyerTypeWrappedCloudSyncChat) Destroy(value WrappedCloudSyncChat) {
+	value.Destroy()
+}
+
+type WrappedCloudSyncChatsPage struct {
+	ContinuationToken *string
+	Status            int32
+	Done              bool
+	Chats             []WrappedCloudSyncChat
+}
+
+func (r *WrappedCloudSyncChatsPage) Destroy() {
+	FfiDestroyerOptionalString{}.Destroy(r.ContinuationToken)
+	FfiDestroyerInt32{}.Destroy(r.Status)
+	FfiDestroyerBool{}.Destroy(r.Done)
+	FfiDestroyerSequenceTypeWrappedCloudSyncChat{}.Destroy(r.Chats)
+}
+
+type FfiConverterTypeWrappedCloudSyncChatsPage struct{}
+
+var FfiConverterTypeWrappedCloudSyncChatsPageINSTANCE = FfiConverterTypeWrappedCloudSyncChatsPage{}
+
+func (c FfiConverterTypeWrappedCloudSyncChatsPage) Lift(rb RustBufferI) WrappedCloudSyncChatsPage {
+	return LiftFromRustBuffer[WrappedCloudSyncChatsPage](c, rb)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncChatsPage) Read(reader io.Reader) WrappedCloudSyncChatsPage {
+	return WrappedCloudSyncChatsPage{
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterInt32INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterSequenceTypeWrappedCloudSyncChatINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedCloudSyncChatsPage) Lower(value WrappedCloudSyncChatsPage) RustBuffer {
+	return LowerIntoRustBuffer[WrappedCloudSyncChatsPage](c, value)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncChatsPage) Write(writer io.Writer, value WrappedCloudSyncChatsPage) {
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ContinuationToken)
+	FfiConverterInt32INSTANCE.Write(writer, value.Status)
+	FfiConverterBoolINSTANCE.Write(writer, value.Done)
+	FfiConverterSequenceTypeWrappedCloudSyncChatINSTANCE.Write(writer, value.Chats)
+}
+
+type FfiDestroyerTypeWrappedCloudSyncChatsPage struct{}
+
+func (_ FfiDestroyerTypeWrappedCloudSyncChatsPage) Destroy(value WrappedCloudSyncChatsPage) {
+	value.Destroy()
+}
+
+type WrappedCloudSyncMessage struct {
+	RecordName  string
+	Guid        string
+	CloudChatId string
+	Sender      string
+	IsFromMe    bool
+	Text        *string
+	Service     string
+	TimestampMs int64
+	Deleted     bool
+}
+
+func (r *WrappedCloudSyncMessage) Destroy() {
+	FfiDestroyerString{}.Destroy(r.RecordName)
+	FfiDestroyerString{}.Destroy(r.Guid)
+	FfiDestroyerString{}.Destroy(r.CloudChatId)
+	FfiDestroyerString{}.Destroy(r.Sender)
+	FfiDestroyerBool{}.Destroy(r.IsFromMe)
+	FfiDestroyerOptionalString{}.Destroy(r.Text)
+	FfiDestroyerString{}.Destroy(r.Service)
+	FfiDestroyerInt64{}.Destroy(r.TimestampMs)
+	FfiDestroyerBool{}.Destroy(r.Deleted)
+}
+
+type FfiConverterTypeWrappedCloudSyncMessage struct{}
+
+var FfiConverterTypeWrappedCloudSyncMessageINSTANCE = FfiConverterTypeWrappedCloudSyncMessage{}
+
+func (c FfiConverterTypeWrappedCloudSyncMessage) Lift(rb RustBufferI) WrappedCloudSyncMessage {
+	return LiftFromRustBuffer[WrappedCloudSyncMessage](c, rb)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncMessage) Read(reader io.Reader) WrappedCloudSyncMessage {
+	return WrappedCloudSyncMessage{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedCloudSyncMessage) Lower(value WrappedCloudSyncMessage) RustBuffer {
+	return LowerIntoRustBuffer[WrappedCloudSyncMessage](c, value)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncMessage) Write(writer io.Writer, value WrappedCloudSyncMessage) {
+	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
+	FfiConverterStringINSTANCE.Write(writer, value.Guid)
+	FfiConverterStringINSTANCE.Write(writer, value.CloudChatId)
+	FfiConverterStringINSTANCE.Write(writer, value.Sender)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsFromMe)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Text)
+	FfiConverterStringINSTANCE.Write(writer, value.Service)
+	FfiConverterInt64INSTANCE.Write(writer, value.TimestampMs)
+	FfiConverterBoolINSTANCE.Write(writer, value.Deleted)
+}
+
+type FfiDestroyerTypeWrappedCloudSyncMessage struct{}
+
+func (_ FfiDestroyerTypeWrappedCloudSyncMessage) Destroy(value WrappedCloudSyncMessage) {
+	value.Destroy()
+}
+
+type WrappedCloudSyncMessagesPage struct {
+	ContinuationToken *string
+	Status            int32
+	Done              bool
+	Messages          []WrappedCloudSyncMessage
+}
+
+func (r *WrappedCloudSyncMessagesPage) Destroy() {
+	FfiDestroyerOptionalString{}.Destroy(r.ContinuationToken)
+	FfiDestroyerInt32{}.Destroy(r.Status)
+	FfiDestroyerBool{}.Destroy(r.Done)
+	FfiDestroyerSequenceTypeWrappedCloudSyncMessage{}.Destroy(r.Messages)
+}
+
+type FfiConverterTypeWrappedCloudSyncMessagesPage struct{}
+
+var FfiConverterTypeWrappedCloudSyncMessagesPageINSTANCE = FfiConverterTypeWrappedCloudSyncMessagesPage{}
+
+func (c FfiConverterTypeWrappedCloudSyncMessagesPage) Lift(rb RustBufferI) WrappedCloudSyncMessagesPage {
+	return LiftFromRustBuffer[WrappedCloudSyncMessagesPage](c, rb)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncMessagesPage) Read(reader io.Reader) WrappedCloudSyncMessagesPage {
+	return WrappedCloudSyncMessagesPage{
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterInt32INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterSequenceTypeWrappedCloudSyncMessageINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedCloudSyncMessagesPage) Lower(value WrappedCloudSyncMessagesPage) RustBuffer {
+	return LowerIntoRustBuffer[WrappedCloudSyncMessagesPage](c, value)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncMessagesPage) Write(writer io.Writer, value WrappedCloudSyncMessagesPage) {
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ContinuationToken)
+	FfiConverterInt32INSTANCE.Write(writer, value.Status)
+	FfiConverterBoolINSTANCE.Write(writer, value.Done)
+	FfiConverterSequenceTypeWrappedCloudSyncMessageINSTANCE.Write(writer, value.Messages)
+}
+
+type FfiDestroyerTypeWrappedCloudSyncMessagesPage struct{}
+
+func (_ FfiDestroyerTypeWrappedCloudSyncMessagesPage) Destroy(value WrappedCloudSyncMessagesPage) {
 	value.Destroy()
 }
 
@@ -3087,6 +3461,92 @@ type FfiDestroyerSequenceTypeWrappedAttachment struct{}
 func (FfiDestroyerSequenceTypeWrappedAttachment) Destroy(sequence []WrappedAttachment) {
 	for _, value := range sequence {
 		FfiDestroyerTypeWrappedAttachment{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeWrappedCloudSyncChat struct{}
+
+var FfiConverterSequenceTypeWrappedCloudSyncChatINSTANCE = FfiConverterSequenceTypeWrappedCloudSyncChat{}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncChat) Lift(rb RustBufferI) []WrappedCloudSyncChat {
+	return LiftFromRustBuffer[[]WrappedCloudSyncChat](c, rb)
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncChat) Read(reader io.Reader) []WrappedCloudSyncChat {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]WrappedCloudSyncChat, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeWrappedCloudSyncChatINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncChat) Lower(value []WrappedCloudSyncChat) RustBuffer {
+	return LowerIntoRustBuffer[[]WrappedCloudSyncChat](c, value)
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncChat) Write(writer io.Writer, value []WrappedCloudSyncChat) {
+	if len(value) > math.MaxInt32 {
+		panic("[]WrappedCloudSyncChat is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeWrappedCloudSyncChatINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeWrappedCloudSyncChat struct{}
+
+func (FfiDestroyerSequenceTypeWrappedCloudSyncChat) Destroy(sequence []WrappedCloudSyncChat) {
+	for _, value := range sequence {
+		FfiDestroyerTypeWrappedCloudSyncChat{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeWrappedCloudSyncMessage struct{}
+
+var FfiConverterSequenceTypeWrappedCloudSyncMessageINSTANCE = FfiConverterSequenceTypeWrappedCloudSyncMessage{}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncMessage) Lift(rb RustBufferI) []WrappedCloudSyncMessage {
+	return LiftFromRustBuffer[[]WrappedCloudSyncMessage](c, rb)
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncMessage) Read(reader io.Reader) []WrappedCloudSyncMessage {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]WrappedCloudSyncMessage, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeWrappedCloudSyncMessageINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncMessage) Lower(value []WrappedCloudSyncMessage) RustBuffer {
+	return LowerIntoRustBuffer[[]WrappedCloudSyncMessage](c, value)
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudSyncMessage) Write(writer io.Writer, value []WrappedCloudSyncMessage) {
+	if len(value) > math.MaxInt32 {
+		panic("[]WrappedCloudSyncMessage is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeWrappedCloudSyncMessageINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeWrappedCloudSyncMessage struct{}
+
+func (FfiDestroyerSequenceTypeWrappedCloudSyncMessage) Destroy(sequence []WrappedCloudSyncMessage) {
+	for _, value := range sequence {
+		FfiDestroyerTypeWrappedCloudSyncMessage{}.Destroy(value)
 	}
 }
 
