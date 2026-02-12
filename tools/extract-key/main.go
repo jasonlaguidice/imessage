@@ -2,9 +2,10 @@
 // a base64-encoded JSON hardware key for the iMessage bridge.
 //
 // Usage:
-//   cd tools/extract-key && go run main.go
-//   # or
-//   go run tools/extract-key/main.go
+//
+//	cd tools/extract-key && go run main.go
+//	# or
+//	go run tools/extract-key/main.go
 //
 // This only READS data from IOKit — nothing is modified on the Mac.
 // The Mac can continue to be used normally, including for iMessage.
@@ -391,6 +392,14 @@ func getMacOSVersion() string {
 	return strings.TrimSpace(string(out))
 }
 
+func getDarwinVersion() string {
+	out, err := exec.Command("uname", "-r").Output()
+	if err != nil {
+		return "22.5.0"
+	}
+	return strings.TrimSpace(string(out))
+}
+
 func main() {
 	if runtime.GOOS != "darwin" {
 		fmt.Fprintln(os.Stderr, "This tool must be run on macOS.")
@@ -495,10 +504,11 @@ func main() {
 	} else if isAppleSilicon && relayURL != "" {
 		// Apple Silicon with relay — all good, suppress _enc warnings
 	} else if !isAppleSilicon && !hasEncFields {
-		// Intel Mac without _enc fields (e.g. macOS High Sierra 10.13)
-		// The bridge will compute them at runtime from the plaintext fields.
-		fmt.Fprintf(os.Stderr, "  ℹ️  Encrypted IOKit properties not found (normal for macOS ≤10.13).\n")
-		fmt.Fprintf(os.Stderr, "  They will be computed automatically on the Linux side.\n")
+		// Intel Mac without _enc fields. This can happen on older macOS versions,
+		// but seeing this on modern Intel builds is unusual and should be verified.
+		fmt.Fprintf(os.Stderr, "  ⚠️  Encrypted IOKit properties not found on this Intel Mac.\n")
+		fmt.Fprintf(os.Stderr, "  If registration fails (e.g. status 6004), capture native traffic on this Mac\n")
+		fmt.Fprintf(os.Stderr, "  to confirm required fields/headers before relying on derived values.\n")
 		fmt.Fprintf(os.Stderr, "\n")
 	}
 
@@ -524,13 +534,16 @@ func main() {
 		MLBEnc:                  mlbEnc,
 	}
 
+	darwin := getDarwinVersion()
+	icloudUA := fmt.Sprintf("com.apple.iCloudHelper/282 CFNetwork/1568.100.1 Darwin/%s", darwin)
+
 	config := MacOSConfig{
 		Inner:           hw,
 		Version:         version,
 		ProtocolVersion: 1660,
-		DeviceID:        platformUUID,
-		ICloudUA:        fmt.Sprintf("[macOS,%s,%s,%s]", version, osBuild, productName),
-		AOSKitVersion:   "com.apple.AOSKit/282",
+		DeviceID:        strings.ToUpper(platformUUID),
+		ICloudUA:        icloudUA,
+		AOSKitVersion:   "com.apple.AOSKit/282 (com.apple.accountsd/113)",
 		NACRelayURL:     relayURL,
 	}
 	if relayAuth != nil {

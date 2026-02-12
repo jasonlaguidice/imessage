@@ -87,12 +87,10 @@ fn compute_missing_enc_fields(hw: &mut HardwareConfig) -> Result<(), AbsintheErr
         hw.root_disk_uuid_enc = encrypt_io_property(&uuid_bytes)?;
     }
 
-    // mlb → abKPld1EcMni (MLB as null-terminated string)
+    // mlb → abKPld1EcMni (MLB as raw string bytes)
     if hw.mlb_enc.is_empty() && !hw.mlb.is_empty() {
         info!("Computing missing mlb_enc (abKPld1EcMni) from plaintext");
-        let mut mlb_bytes = hw.mlb.as_bytes().to_vec();
-        mlb_bytes.push(0); // null-terminated
-        hw.mlb_enc = encrypt_io_property(&mlb_bytes)?;
+        hw.mlb_enc = encrypt_io_property(hw.mlb.as_bytes())?;
     }
 
     // rom → oycqAZloTNDm (ROM as 6 raw bytes)
@@ -1098,4 +1096,87 @@ fn resolve_imports(
 
 fn round_up(val: usize, align: usize) -> usize {
     (val + align - 1) & !(align - 1)
+}
+
+#[cfg(all(test, has_xnu_encrypt))]
+mod tests {
+    use super::*;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    fn b64_dec(s: &str) -> Vec<u8> {
+        STANDARD.decode(s).expect("invalid base64 test vector")
+    }
+
+    fn b64_enc(bytes: &[u8]) -> String {
+        STANDARD.encode(bytes)
+    }
+
+    fn sample_hw_missing_enc() -> HardwareConfig {
+        HardwareConfig {
+            product_name: "MacBookAir8,1".into(),
+            io_mac_address: [0xa4, 0x83, 0xe7, 0x11, 0x47, 0x1c],
+            platform_serial_number: "C02YT1YMJK7M".into(),
+            platform_uuid: "11D299A5-CF0B-544D-BAD3-7AC7A6E452D7".into(),
+            root_disk_uuid: "FCDB63B5-D208-4AEE-B368-3DE952B911FF".into(),
+            board_id: "Mac-827FAC58A8FDFA22".into(),
+            os_build_num: "22G513".into(),
+            platform_serial_number_enc: vec![],
+            platform_uuid_enc: vec![],
+            root_disk_uuid_enc: vec![],
+            rom: b64_dec("V9BNndaG"),
+            rom_enc: vec![],
+            mlb: "C02923200KVKN3YAG".into(),
+            mlb_enc: vec![],
+        }
+    }
+
+    #[test]
+    fn test_compute_missing_enc_fields_matches_known_vectors() {
+        let mut hw = sample_hw_missing_enc();
+        compute_missing_enc_fields(&mut hw).expect("compute_missing_enc_fields failed");
+
+        println!("computed platform_serial_number_enc={}", b64_enc(&hw.platform_serial_number_enc));
+        println!("computed platform_uuid_enc={}", b64_enc(&hw.platform_uuid_enc));
+        println!("computed root_disk_uuid_enc={}", b64_enc(&hw.root_disk_uuid_enc));
+        println!("computed rom_enc={}", b64_enc(&hw.rom_enc));
+        println!("computed mlb_enc={}", b64_enc(&hw.mlb_enc));
+
+        assert_eq!(
+            hw.platform_serial_number_enc,
+            b64_dec("c3kZ7+WofxcjaBTInJCwSV0="),
+            "platform_serial_number_enc mismatch"
+        );
+        assert_eq!(
+            hw.platform_uuid_enc,
+            b64_dec("jGguP3mQH+Vw6dMAWrqZOnk="),
+            "platform_uuid_enc mismatch"
+        );
+        assert_eq!(
+            hw.root_disk_uuid_enc,
+            b64_dec("VvJODAsuSRdGQlhB5kPgf2M="),
+            "root_disk_uuid_enc mismatch"
+        );
+        assert_eq!(hw.rom_enc, b64_dec("wWF12gciXzN/96bIt/ufTB0="), "rom_enc mismatch");
+        assert_eq!(hw.mlb_enc, b64_dec("CKp4ROiInBYAdvnbrbNjjkM="), "mlb_enc mismatch");
+    }
+
+    #[test]
+    fn test_compute_missing_enc_fields_is_idempotent() {
+        let mut hw = sample_hw_missing_enc();
+        compute_missing_enc_fields(&mut hw).expect("first compute_missing_enc_fields failed");
+
+        let expected_serial = hw.platform_serial_number_enc.clone();
+        let expected_uuid = hw.platform_uuid_enc.clone();
+        let expected_disk = hw.root_disk_uuid_enc.clone();
+        let expected_rom = hw.rom_enc.clone();
+        let expected_mlb = hw.mlb_enc.clone();
+
+        compute_missing_enc_fields(&mut hw).expect("second compute_missing_enc_fields failed");
+
+        assert_eq!(hw.platform_serial_number_enc, expected_serial);
+        assert_eq!(hw.platform_uuid_enc, expected_uuid);
+        assert_eq!(hw.root_disk_uuid_enc, expected_disk);
+        assert_eq!(hw.rom_enc, expected_rom);
+        assert_eq!(hw.mlb_enc, expected_mlb);
+    }
 }
