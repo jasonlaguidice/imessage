@@ -213,13 +213,7 @@ func (c *IMClient) LogoutRemote(ctx context.Context) {
 }
 
 func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {
-	uid := string(userID)
-	for _, h := range c.allHandles {
-		if uid == h {
-			return true
-		}
-	}
-	return false
+	return c.isMyHandle(string(userID))
 }
 
 func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
@@ -328,7 +322,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	sender := c.makeEventSender(msg.Sender)
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 
 	// Track SMS portals so outbound replies use the correct service type
 	if msg.IsSms {
@@ -388,7 +382,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	targetGUID := ptrStringOr(msg.TapbackTargetUuid, "")
 	emoji := tapbackTypeToEmoji(msg.TapbackType, msg.TapbackEmoji)
 
@@ -410,7 +404,7 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	targetGUID := ptrStringOr(msg.EditTargetUuid, "")
 	newText := ptrStringOr(msg.EditNewText, "")
 
@@ -444,7 +438,7 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 }
 
 func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	targetGUID := ptrStringOr(msg.UnsendTargetUuid, "")
 
 	c.trackUnsend(targetGUID)
@@ -461,7 +455,7 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 }
 
 func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	newName := ptrStringOr(msg.NewChatName, "")
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
@@ -479,7 +473,7 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 }
 
 func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatResync,
@@ -517,7 +511,8 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 		return
 	}
 
-	senderUserID := makeUserID(ptrStringOr(msg.Sender, ""))
+	normalizedSender := normalizeIdentifierForPortalID(ptrStringOr(msg.Sender, ""))
+	senderUserID := makeUserID(normalizedSender)
 	ghost, err := c.Main.Bridge.GetGhostByID(ctx, senderUserID)
 	if err != nil || ghost == nil {
 		return
@@ -536,7 +531,7 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 }
 
 func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Typing{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventTyping,
@@ -811,7 +806,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		memberMap := make(map[networkid.UserID]bridgev2.ChatMember)
 		for _, member := range memberList {
 			userID := makeUserID(member)
-			if member == c.handle {
+			if c.isMyHandle(member) {
 				memberMap[userID] = bridgev2.ChatMember{
 					EventSender: bridgev2.EventSender{
 						IsFromMe:    true,
@@ -1075,12 +1070,63 @@ func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
 // ============================================================================
 
 func (c *IMClient) isMyHandle(handle string) bool {
+	normalizedHandle := normalizeIdentifierForPortalID(handle)
 	for _, h := range c.allHandles {
-		if handle == h {
+		if normalizedHandle == normalizeIdentifierForPortalID(h) {
 			return true
 		}
 	}
 	return false
+}
+
+// normalizeIdentifierForPortalID canonicalizes user/chat identifiers so portal
+// routing is stable across formatting variants (notably SMS numbers with and
+// without leading "+1").
+func normalizeIdentifierForPortalID(identifier string) string {
+	id := strings.TrimSpace(identifier)
+	if id == "" {
+		return ""
+	}
+
+	if strings.HasPrefix(id, "mailto:") {
+		return "mailto:" + strings.ToLower(strings.TrimPrefix(id, "mailto:"))
+	}
+	if strings.Contains(id, "@") && !strings.HasPrefix(id, "tel:") {
+		return "mailto:" + strings.ToLower(strings.TrimPrefix(id, "mailto:"))
+	}
+
+	if strings.HasPrefix(id, "tel:") || strings.HasPrefix(id, "+") || isNumeric(id) {
+		local := stripIdentifierPrefix(id)
+		normalized := normalizePhoneIdentifierForPortalID(local)
+		if normalized != "" {
+			return "tel:" + normalized
+		}
+		return addIdentifierPrefix(local)
+	}
+
+	return id
+}
+
+// normalizePhoneIdentifierForPortalID canonicalizes phone-like identifiers while
+// preserving short-code semantics (e.g. "242733" stays "242733", not "+242733").
+func normalizePhoneIdentifierForPortalID(local string) string {
+	cleaned := normalizePhone(local)
+	if cleaned == "" {
+		return ""
+	}
+	if strings.HasPrefix(cleaned, "+") {
+		return cleaned
+	}
+	if len(cleaned) == 10 {
+		return "+1" + cleaned
+	}
+	if len(cleaned) == 11 && cleaned[0] == '1' {
+		return "+" + cleaned
+	}
+	if len(cleaned) >= 11 {
+		return "+" + cleaned
+	}
+	return cleaned
 }
 
 func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
@@ -1092,9 +1138,10 @@ func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
 			Sender:      makeUserID(c.handle),
 		}
 	}
+	normalizedSender := normalizeIdentifierForPortalID(*sender)
 	return bridgev2.EventSender{
 		IsFromMe: false,
-		Sender:   makeUserID(*sender),
+		Sender:   makeUserID(normalizedSender),
 	}
 }
 
@@ -1127,23 +1174,94 @@ func (c *IMClient) ensureDoublePuppet() {
 	}
 }
 
-func (c *IMClient) makePortalKey(participants []string, groupName *string) networkid.PortalKey {
+// resolveExistingDMPortalID prefers an already-created DM portal key variant
+// (e.g. legacy tel:1415... vs canonical tel:+1415...) to avoid splitting rooms
+// when normalization rules change.
+func (c *IMClient) resolveExistingDMPortalID(identifier string) networkid.PortalID {
+	defaultID := networkid.PortalID(identifier)
+	if identifier == "" || strings.Contains(identifier, ",") || !strings.HasPrefix(identifier, "tel:") {
+		return defaultID
+	}
+
+	local := strings.TrimPrefix(identifier, "tel:")
+	candidates := make([]string, 0, 3)
+	seen := map[string]bool{identifier: true}
+	add := func(id string) {
+		if id == "" || seen[id] {
+			return
+		}
+		seen[id] = true
+		candidates = append(candidates, id)
+	}
+
+	if strings.HasPrefix(local, "+") {
+		withoutPlus := strings.TrimPrefix(local, "+")
+		add("tel:" + withoutPlus)
+		if strings.HasPrefix(local, "+1") && len(local) == 12 {
+			add("tel:" + strings.TrimPrefix(local, "+1"))
+		}
+	} else if isNumeric(local) {
+		if len(local) == 10 {
+			add("tel:1" + local)
+		}
+		if len(local) == 11 && strings.HasPrefix(local, "1") {
+			add("tel:" + local[1:])
+		}
+	}
+
+	ctx := context.Background()
+	for _, candidate := range candidates {
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       networkid.PortalID(candidate),
+			Receiver: c.UserLogin.ID,
+		})
+		if err == nil && portal != nil && portal.MXID != "" {
+			c.UserLogin.Log.Debug().
+				Str("normalized", identifier).
+				Str("resolved", candidate).
+				Msg("Resolved DM portal to existing legacy identifier")
+			return networkid.PortalID(candidate)
+		}
+	}
+
+	return defaultID
+}
+
+func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string) networkid.PortalKey {
 	isGroup := len(participants) > 2 || groupName != nil
 
 	if isGroup {
 		// Sort for consistent portal ID regardless of participant order
-		sorted := make([]string, len(participants))
-		copy(sorted, participants)
+		sorted := make([]string, 0, len(participants))
+		for _, p := range participants {
+			sorted = append(sorted, normalizeIdentifierForPortalID(p))
+		}
 		sort.Strings(sorted)
 		portalID := strings.Join(sorted, ",")
 		return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
 	}
 
 	for _, p := range participants {
-		if p != c.handle {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized != "" && !c.isMyHandle(normalized) {
 			// Resolve to an existing portal if the contact has multiple phone numbers.
 			// This ensures messages from any of a contact's numbers land in one room.
-			portalID := c.resolveContactPortalID(p)
+			portalID := c.resolveContactPortalID(normalized)
+			portalID = c.resolveExistingDMPortalID(string(portalID))
+			return networkid.PortalKey{
+				ID:       portalID,
+				Receiver: c.UserLogin.ID,
+			}
+		}
+	}
+
+	// SMS edge case: some payloads include only the local forwarding number in
+	// participants. When that happens, use sender as the DM portal identifier.
+	if sender != nil && *sender != "" {
+		normalizedSender := normalizeIdentifierForPortalID(*sender)
+		if normalizedSender != "" && !c.isMyHandle(normalizedSender) {
+			portalID := c.resolveContactPortalID(normalizedSender)
+			portalID = c.resolveExistingDMPortalID(string(portalID))
 			return networkid.PortalKey{
 				ID:       portalID,
 				Receiver: c.UserLogin.ID,
@@ -1152,8 +1270,13 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string) netwo
 	}
 
 	if len(participants) > 0 {
+		normalized := normalizeIdentifierForPortalID(participants[0])
+		if normalized == "" {
+			normalized = participants[0]
+		}
+		portalID := c.resolveExistingDMPortalID(normalized)
 		return networkid.PortalKey{
-			ID:       networkid.PortalID(participants[0]),
+			ID:       portalID,
 			Receiver: c.UserLogin.ID,
 		}
 	}
@@ -1166,11 +1289,16 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string) netwo
 // use the sender field to identify the DM portal.
 func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string) networkid.PortalKey {
 	if len(participants) > 0 {
-		return c.makePortalKey(participants, groupName)
+		return c.makePortalKey(participants, groupName, sender)
 	}
 	if sender != nil && *sender != "" {
 		// Resolve to existing portal for contacts with multiple numbers
-		portalID := c.resolveContactPortalID(*sender)
+		normalizedSender := normalizeIdentifierForPortalID(*sender)
+		if normalizedSender == "" {
+			return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
+		}
+		portalID := c.resolveContactPortalID(normalizedSender)
+		portalID = c.resolveExistingDMPortalID(string(portalID))
 		return networkid.PortalKey{
 			ID:       portalID,
 			Receiver: c.UserLogin.ID,
@@ -1219,7 +1347,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 func (c *IMClient) buildGroupName(members []string) string {
 	var names []string
 	for _, memberID := range members {
-		if memberID == c.handle {
+		if c.isMyHandle(memberID) {
 			continue // skip self
 		}
 		// Strip tel:/mailto: prefix for contact lookup
