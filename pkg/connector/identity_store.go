@@ -9,6 +9,7 @@
 package connector
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -70,6 +71,41 @@ func legacyIdentityFilePath() (string, error) {
 		dataDir = filepath.Join(home, ".local", "share")
 	}
 	return filepath.Join(dataDir, "mautrix-imessage", "identity.plist"), nil
+}
+
+// trustedPeersFilePath returns the keychain trust state path:
+// ~/.local/share/mautrix-imessage/trustedpeers.plist
+func trustedPeersFilePath() (string, error) {
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		dataDir = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(dataDir, "mautrix-imessage", "trustedpeers.plist"), nil
+}
+
+// hasKeychainCliqueState returns true if trustedpeers.plist appears to contain
+// a keychain user identity (i.e. trust circle has been joined).
+func hasKeychainCliqueState(log zerolog.Logger) bool {
+	path, err := trustedPeersFilePath()
+	if err != nil {
+		log.Debug().Err(err).Msg("Failed to determine trusted peers file path")
+		return false
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	// trustedpeers.plist is written by Rust as XML plist, where a joined clique
+	// includes either userIdentity or user_identity key.
+	if bytes.Contains(data, []byte("<key>userIdentity</key>")) || bytes.Contains(data, []byte("<key>user_identity</key>")) {
+		return true
+	}
+	log.Info().Str("path", path).Msg("Trusted peers state exists but has no user identity (not in clique)")
+	return false
 }
 
 // saveSessionState writes the full session state to the JSON file.
@@ -166,5 +202,12 @@ func CheckSessionRestore() bool {
 		IDSUsers:    state.IDSUsers,
 		source:      "backup file (check-restore)",
 	}
-	return session.validate(log)
+	if !session.validate(log) {
+		return false
+	}
+	if !hasKeychainCliqueState(log) {
+		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
+		return false
+	}
+	return true
 }

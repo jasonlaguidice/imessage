@@ -94,6 +94,10 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		log.Info().Msg("Backup session state failed keystore validation, skipping auto-restore")
 		return
 	}
+	if !hasKeychainCliqueState(log) {
+		log.Info().Msg("Skipping auto-restore: keychain trust circle not initialized (will require interactive login)")
+		return
+	}
 
 	// Extract login ID and username from the cached IDS users
 	users := rustpushgo.NewWrappedIdsUsers(&state.IDSUsers)
