@@ -126,8 +126,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		repairTaskTable,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
 			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
-		`CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
-			ON cloud_chat (login_id, record_name) WHERE record_name <> ''`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
 			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
@@ -136,6 +134,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			ON cloud_repair_task (login_id, done_ts, not_before_ts, id)`,
 	}
 
+	// Run table creation queries first (without indexes that depend on migrations)
 	for _, query := range queries {
 		if _, err := s.db.Exec(ctx, query); err != nil {
 			return fmt.Errorf("failed to ensure cloud backfill schema: %w", err)
@@ -149,6 +148,12 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN record_name TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("failed to add record_name column: %w", err)
 		}
+	}
+
+	// Create index that depends on record_name column (must be after migration)
+	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
+		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
+		return fmt.Errorf("failed to create record_name index: %w", err)
 	}
 
 	return nil
