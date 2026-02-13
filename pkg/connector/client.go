@@ -1499,48 +1499,10 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
-	// Skip backward backfill entirely — forward backfill during ChatResync
-	// already sends all messages oldest→newest. The backward backfill tasks
-	// queued by the framework are redundant and just waste ~2 hours doing nothing.
-	if !params.Forward {
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
-	}
-
+	// Forward backfill is a no-op — we let the framework's backfill queue
+	// drive everything via backward backfill (newest-first pagination).
 	if params.Forward {
-		fetchCount := count + 1
-		var rows []cloudMessageRow
-		var err error
-		if params.AnchorMessage != nil {
-			rows, err = c.cloudStore.listForwardMessages(
-				ctx,
-				portalID,
-				params.AnchorMessage.Timestamp.UnixMilli(),
-				string(params.AnchorMessage.ID),
-				fetchCount,
-			)
-		} else {
-			// No anchor: start from the oldest message (beginning of time)
-			rows, err = c.cloudStore.listForwardMessages(ctx, portalID, 0, "", fetchCount)
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		hasMore := false
-		if len(rows) > count {
-			hasMore = true
-			rows = rows[:count]
-		}
-
-		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
-		for _, row := range rows {
-			messages = append(messages, c.cloudRowToBackfillMessage(row))
-		}
-		return &bridgev2.FetchMessagesResponse{
-			Messages: messages,
-			HasMore:  hasMore,
-			Forward:  true,
-		}, nil
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 	}
 
 	fetchCount := count + 1
