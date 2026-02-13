@@ -268,6 +268,33 @@ func (s *cloudBackfillStore) hasChat(ctx context.Context, cloudChatID string) (b
 	return count > 0, nil
 }
 
+func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	var participantsJSON string
+	err := s.db.QueryRow(ctx,
+		`SELECT participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 LIMIT 1`,
+		s.loginID, portalID,
+	).Scan(&participantsJSON)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var participants []string
+	if err = json.Unmarshal([]byte(participantsJSON), &participants); err != nil {
+		return nil, err
+	}
+	// Normalize participants to portal ID format (e.g., tel:+14158138533)
+	normalized := make([]string, 0, len(participants))
+	for _, p := range participants {
+		n := normalizeIdentifierForPortalID(p)
+		if n != "" {
+			normalized = append(normalized, n)
+		}
+	}
+	return normalized, nil
+}
+
 func (s *cloudBackfillStore) hasMessage(ctx context.Context, guid string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(ctx,

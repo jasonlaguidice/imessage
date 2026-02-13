@@ -2308,6 +2308,7 @@ func (_ FfiDestroyerTypeWrappedAttachment) Destroy(value WrappedAttachment) {
 type WrappedCloudSyncChat struct {
 	RecordName         string
 	CloudChatId        string
+	GroupId            string
 	Service            string
 	DisplayName        *string
 	Participants       []string
@@ -2318,6 +2319,7 @@ type WrappedCloudSyncChat struct {
 func (r *WrappedCloudSyncChat) Destroy() {
 	FfiDestroyerString{}.Destroy(r.RecordName)
 	FfiDestroyerString{}.Destroy(r.CloudChatId)
+	FfiDestroyerString{}.Destroy(r.GroupId)
 	FfiDestroyerString{}.Destroy(r.Service)
 	FfiDestroyerOptionalString{}.Destroy(r.DisplayName)
 	FfiDestroyerSequenceString{}.Destroy(r.Participants)
@@ -2338,6 +2340,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Read(reader io.Reader) WrappedClou
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterSequenceStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
@@ -2352,6 +2355,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Lower(value WrappedCloudSyncChat) 
 func (c FfiConverterTypeWrappedCloudSyncChat) Write(writer io.Writer, value WrappedCloudSyncChat) {
 	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
 	FfiConverterStringINSTANCE.Write(writer, value.CloudChatId)
+	FfiConverterStringINSTANCE.Write(writer, value.GroupId)
 	FfiConverterStringINSTANCE.Write(writer, value.Service)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.DisplayName)
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.Participants)
@@ -2615,6 +2619,7 @@ type WrappedMessage struct {
 	ErrorStatusStr        *string
 	IsPeerCacheInvalidate bool
 	SendDelivered         bool
+	SenderGuid            *string
 }
 
 func (r *WrappedMessage) Destroy() {
@@ -2655,6 +2660,7 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.ErrorStatusStr)
 	FfiDestroyerBool{}.Destroy(r.IsPeerCacheInvalidate)
 	FfiDestroyerBool{}.Destroy(r.SendDelivered)
+	FfiDestroyerOptionalString{}.Destroy(r.SenderGuid)
 }
 
 type FfiConverterTypeWrappedMessage struct{}
@@ -2704,6 +2710,7 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -2749,6 +2756,7 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.ErrorStatusStr)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsPeerCacheInvalidate)
 	FfiConverterBoolINSTANCE.Write(writer, value.SendDelivered)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.SenderGuid)
 }
 
 type FfiDestroyerTypeWrappedMessage struct{}

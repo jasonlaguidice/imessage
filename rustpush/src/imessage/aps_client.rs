@@ -250,8 +250,8 @@ impl IMClient {
             target: Some(target),
             ..
         } = &payload {
-            if error_string == "ec-com.apple.messageprotection-802" {
-                // refreshing identity cache can fix this
+            if error_string.starts_with("ec-com.apple.messageprotection-") {
+                // refreshing identity cache can fix key-related errors
                 let mut cache_lock = self.identity.cache.lock().await;
                 cache_lock.invalidate(&target, &sender);
             }

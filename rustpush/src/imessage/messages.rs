@@ -2532,7 +2532,7 @@ impl MessageInst {
                     cv_name: loaded.cv_name.clone(),
                     sender_guid: loaded.sender_guid.clone(),
                     after_guid: None,
-                }), Message::Typing(loaded.u == Some(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp { 
+                }), Message::Typing(loaded.u.unwrap_or(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp {
                     bundle_id: bid.clone(), 
                     icon: ungzip(icon.as_ref())?, 
                 }) } else { None }));

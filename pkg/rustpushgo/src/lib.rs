@@ -692,6 +692,9 @@ pub struct WrappedMessage {
 
     // Send delivered flag
     pub send_delivered: bool,
+
+    // Group chat UUID (persistent identifier for the group conversation)
+    pub sender_guid: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -738,6 +741,7 @@ impl From<&WrappedConversation> for ConversationData {
 pub struct WrappedCloudSyncChat {
     pub record_name: String,
     pub cloud_chat_id: String,
+    pub group_id: String,
     pub service: String,
     pub display_name: Option<String>,
     pub participants: Vec<String>,
@@ -858,6 +862,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         error_status_str: None,
         is_peer_cache_invalidate: false,
         send_delivered: msg.send_delivered,
+        sender_guid: conv.and_then(|c| c.sender_guid.clone()),
     };
 
     match &msg.message {
@@ -2202,6 +2207,7 @@ impl Client {
                 normalized.push(WrappedCloudSyncChat {
                     record_name,
                     cloud_chat_id,
+                    group_id: chat.group_id,
                     service: chat.service_name,
                     display_name: chat.display_name,
                     participants: chat.participants.into_iter().map(|p| p.uri).collect(),
@@ -2211,6 +2217,7 @@ impl Client {
             } else {
                 normalized.push(WrappedCloudSyncChat {
                     cloud_chat_id: record_name.clone(),
+                    group_id: String::new(),
                     record_name,
                     service: String::new(),
                     display_name: None,
