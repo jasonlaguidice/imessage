@@ -270,8 +270,9 @@ func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID st
 	// Try matching by cloud_chat_id, record_name, or group_id.
 	// CloudKit messages reference chats by group_id UUID (the chatID field),
 	// while cloud_chat stores chat_identifier as cloud_chat_id and record hash as record_name.
+	// Use LOWER() on group_id because CloudKit stores it uppercase but messages reference it lowercase.
 	err := s.db.QueryRow(ctx,
-		`SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (cloud_chat_id=$2 OR record_name=$2 OR group_id=$2)`,
+		`SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (cloud_chat_id=$2 OR record_name=$2 OR LOWER(group_id)=LOWER($2))`,
 		s.loginID, cloudChatID,
 	).Scan(&portalID)
 	if err != nil {
