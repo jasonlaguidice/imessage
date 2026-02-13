@@ -284,6 +284,12 @@ func (c *IMClient) ingestCloudMessages(
 			}
 		}
 		if portalID == "" {
+			zerolog.Ctx(ctx).Debug().
+				Str("guid", msg.Guid).
+				Str("cloud_chat_id", msg.CloudChatId).
+				Str("sender", msg.Sender).
+				Bool("is_from_me", msg.IsFromMe).
+				Msg("Skipping cloud message: no portal ID resolved")
 			counts.Skipped++
 			continue
 		}
