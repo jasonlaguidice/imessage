@@ -79,6 +79,8 @@ else
     "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
     # Make DB path absolute so it doesn't depend on working directory
     sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
+    # Enable unlimited backward backfill (default is 0 which disables it)
+    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
     echo "✓ Config saved to $CONFIG"
 fi
 
