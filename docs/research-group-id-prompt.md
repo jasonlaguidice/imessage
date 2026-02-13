@@ -85,6 +85,19 @@ Also look at the Rust source to understand what CloudKit fields are available bu
 - `pkg/connector/sync_controller.go` — `resolvePortalIDForCloudChat()` — current portal ID resolution logic
 - `pkg/connector/client.go` — `makePortalKey()` (~line 2174) — real-time portal ID resolution
 
+## Critical Instruction: Challenge All Assumptions
+
+The prompt above contains assumptions made by a previous agent working on this problem. **Do not take any of them as fact.** Specifically, verify or disprove each of these through code inspection and database queries:
+
+- **"Apple creates a new group UUID when members are added/removed"** — Is this actually true? Or do UUIDs change for other reasons (device changes, re-syncs, etc.)? What actually triggers a new `gid`?
+- **"`original_group_id` links to the previous UUID forming a chain"** — Does it? Or does `ogid` mean something else entirely? Check the actual data: query all `cloud_chat` rows with non-empty `original_group_id` (once the column is exposed) and see if the values actually match other rows' `group_id` values.
+- **"30+ different group UUIDs all represent the same conversation"** — Are they really the same conversation, or are some of them genuinely different group threads with overlapping participants? The same friend group might have multiple independent chats.
+- **"`chat_identifier` (cid) is stable across member changes"** — Verify this. Some `cloud_chat_id` values look like `chat368136512547052395` while others look like hex hashes (`367950f3326343d1a93a4798aa98fa8e`). What determines the format? Are the `chat*` ones truly stable?
+- **"`sender_guid` in real-time messages is the same as CloudKit's `gid`"** — Confirm by cross-referencing actual values.
+- **"Style 43 = group, 45 = DM with no other values"** — Query for all distinct `style` values in the data.
+
+For each assumption, state whether it is **confirmed**, **disproved**, or **uncertain**, with evidence.
+
 ## Expected Output
 
 Produce `docs/group-id-research.md` containing:
