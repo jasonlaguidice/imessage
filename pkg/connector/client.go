@@ -10,18 +10,14 @@ package connector
 
 import (
 	"bytes"
-	"compress/lzw"
-	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
 	"image/jpeg"
-	"io"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -31,6 +27,8 @@ import (
 
 	_ "image/gif"
 	_ "image/png"
+
+	_ "golang.org/x/image/tiff"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
@@ -2754,250 +2752,11 @@ func looksLikeImage(data []byte) bool {
 // image, detected format name, and whether the data is already JPEG (so
 // callers can skip re-encoding).
 func decodeImageData(data []byte) (image.Image, string, bool) {
-	// Try stdlib decoders first (handles PNG, JPEG, GIF)
+	// Handles PNG, JPEG, GIF (stdlib) and TIFF (golang.org/x/image/tiff)
 	if img, fmtName, err := image.Decode(bytes.NewReader(data)); err == nil {
 		return img, fmtName, fmtName == "jpeg"
 	}
-	// Fallback: try TIFF parser (handles uncompressed, LZW, Deflate, PackBits)
-	if img, err := decodeTIFF(data); err == nil {
-		return img, "tiff", false
-	}
 	return nil, "", false
-}
-
-// decodeTIFF parses RGB/RGBA TIFF images with support for common compression
-// formats (uncompressed, LZW, Deflate, PackBits) without needing golang.org/x/image.
-func decodeTIFF(data []byte) (image.Image, error) {
-	if len(data) < 8 {
-		return nil, fmt.Errorf("too short for TIFF")
-	}
-
-	var bo binary.ByteOrder
-	switch string(data[0:2]) {
-	case "II":
-		bo = binary.LittleEndian
-	case "MM":
-		bo = binary.BigEndian
-	default:
-		return nil, fmt.Errorf("not TIFF")
-	}
-	if bo.Uint16(data[2:4]) != 42 {
-		return nil, fmt.Errorf("bad TIFF magic")
-	}
-
-	ifdOffset := int(bo.Uint32(data[4:8]))
-	if ifdOffset+2 > len(data) {
-		return nil, fmt.Errorf("IFD offset out of range")
-	}
-	numEntries := int(bo.Uint16(data[ifdOffset : ifdOffset+2]))
-
-	var width, height, compression, samplesPerPixel, predictor int
-	var bitsPerSample []int
-	var stripOffsets []int
-	var stripByteCounts []int
-	var rowsPerStrip int
-
-	for i := range numEntries {
-		off := ifdOffset + 2 + i*12
-		if off+12 > len(data) {
-			break
-		}
-		tag := bo.Uint16(data[off : off+2])
-		typ := bo.Uint16(data[off+2 : off+4])
-		count := int(bo.Uint32(data[off+4 : off+8]))
-		valOff := off + 8
-
-		readVal := func() int {
-			switch typ {
-			case 3: // SHORT
-				return int(bo.Uint16(data[valOff : valOff+2]))
-			case 4: // LONG
-				return int(bo.Uint32(data[valOff : valOff+4]))
-			default:
-				return int(bo.Uint32(data[valOff : valOff+4]))
-			}
-		}
-		readVals := func() []int {
-			size := 2
-			if typ == 4 {
-				size = 4
-			}
-			src := valOff
-			if count*size > 4 {
-				src = int(bo.Uint32(data[valOff : valOff+4]))
-			}
-			vals := make([]int, count)
-			for j := range count {
-				p := src + j*size
-				if p+size > len(data) {
-					break
-				}
-				if typ == 3 {
-					vals[j] = int(bo.Uint16(data[p : p+2]))
-				} else {
-					vals[j] = int(bo.Uint32(data[p : p+4]))
-				}
-			}
-			return vals
-		}
-
-		switch tag {
-		case 256: // ImageWidth
-			width = readVal()
-		case 257: // ImageLength
-			height = readVal()
-		case 258: // BitsPerSample
-			bitsPerSample = readVals()
-		case 259: // Compression
-			compression = readVal()
-		case 277: // SamplesPerPixel
-			samplesPerPixel = readVal()
-		case 273: // StripOffsets
-			stripOffsets = readVals()
-		case 278: // RowsPerStrip
-			rowsPerStrip = readVal()
-		case 279: // StripByteCounts
-			stripByteCounts = readVals()
-		case 317: // Predictor
-			predictor = readVal()
-		}
-	}
-
-	if compression != 1 && compression != 5 && compression != 8 && compression != 32773 {
-		return nil, fmt.Errorf("unsupported TIFF compression: %d", compression)
-	}
-	if width == 0 || height == 0 {
-		return nil, fmt.Errorf("invalid dimensions")
-	}
-	if samplesPerPixel == 0 {
-		samplesPerPixel = len(bitsPerSample)
-	}
-	if samplesPerPixel != 3 && samplesPerPixel != 4 {
-		return nil, fmt.Errorf("unsupported samples per pixel: %d", samplesPerPixel)
-	}
-	for _, b := range bitsPerSample {
-		if b != 8 {
-			return nil, fmt.Errorf("unsupported bits per sample: %d", b)
-		}
-	}
-	if rowsPerStrip == 0 {
-		rowsPerStrip = height
-	}
-	if len(stripOffsets) == 0 {
-		return nil, fmt.Errorf("TIFF has no strip offsets")
-	}
-
-	img := image.NewNRGBA(image.Rect(0, 0, width, height))
-	y := 0
-	bytesPerRow := width * samplesPerPixel
-	for i, sOff := range stripOffsets {
-		sLen := 0
-		if i < len(stripByteCounts) {
-			sLen = stripByteCounts[i]
-		} else {
-			sLen = len(data) - sOff
-		}
-		if sOff+sLen > len(data) {
-			sLen = len(data) - sOff
-		}
-		if sLen <= 0 {
-			break
-		}
-		rawStrip := data[sOff : sOff+sLen]
-
-		// Decompress the strip
-		stripData, err := decompressTIFFStrip(rawStrip, compression)
-		if err != nil {
-			return nil, fmt.Errorf("strip %d decompress: %w", i, err)
-		}
-
-		// Apply horizontal differencing predictor if needed
-		if predictor == 2 {
-			for r := 0; r < len(stripData)/bytesPerRow; r++ {
-				rowStart := r * bytesPerRow
-				for x := samplesPerPixel; x < bytesPerRow; x++ {
-					stripData[rowStart+x] += stripData[rowStart+x-samplesPerPixel]
-				}
-			}
-		}
-
-		for row := 0; row < rowsPerStrip && y < height; row++ {
-			rowStart := row * bytesPerRow
-			if rowStart+bytesPerRow > len(stripData) {
-				break
-			}
-			rowData := stripData[rowStart : rowStart+bytesPerRow]
-			for x := range width {
-				px := x * samplesPerPixel
-				dstIdx := (y*width + x) * 4
-				img.Pix[dstIdx+0] = rowData[px+0]
-				img.Pix[dstIdx+1] = rowData[px+1]
-				img.Pix[dstIdx+2] = rowData[px+2]
-				if samplesPerPixel == 4 {
-					img.Pix[dstIdx+3] = rowData[px+3]
-				} else {
-					img.Pix[dstIdx+3] = 0xFF
-				}
-			}
-			y++
-		}
-	}
-	return img, nil
-}
-
-// decompressTIFFStrip decompresses a single TIFF strip.
-func decompressTIFFStrip(data []byte, compression int) ([]byte, error) {
-	switch compression {
-	case 1: // No compression
-		out := make([]byte, len(data))
-		copy(out, data)
-		return out, nil
-	case 5: // LZW (TIFF uses MSB bit order, 8-bit codes)
-		r := lzw.NewReader(bytes.NewReader(data), lzw.MSB, 8)
-		defer r.Close()
-		return io.ReadAll(r)
-	case 8: // Deflate/zlib
-		r, err := zlib.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		defer r.Close()
-		return io.ReadAll(r)
-	case 32773: // PackBits
-		return decompressPackBits(data)
-	default:
-		return nil, fmt.Errorf("unsupported compression: %d", compression)
-	}
-}
-
-// decompressPackBits implements the PackBits decompression algorithm.
-func decompressPackBits(data []byte) ([]byte, error) {
-	var out []byte
-	i := 0
-	for i < len(data) {
-		n := int(int8(data[i]))
-		i++
-		if n >= 0 {
-			cnt := n + 1
-			if i+cnt > len(data) {
-				break
-			}
-			out = append(out, data[i:i+cnt]...)
-			i += cnt
-		} else if n > -128 {
-			if i >= len(data) {
-				break
-			}
-			cnt := 1 - n
-			b := data[i]
-			i++
-			for j := 0; j < cnt; j++ {
-				out = append(out, b)
-			}
-		}
-		// n == -128: no-op
-	}
-	return out, nil
 }
 
 func tapbackTypeToEmoji(tapbackType *uint32, tapbackEmoji *string) string {
