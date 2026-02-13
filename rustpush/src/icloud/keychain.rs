@@ -1749,15 +1749,26 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         let mut keys = vec![];
         let state = self.state.read().await;
+        let known_peer_count = state.state.len();
+        let total_shares = response.shares.len();
+        info!("fetch_shares_for {}: {} share(s) from server, {} known peer(s) in state", user.identifier, total_shares, known_peer_count);
+        if total_shares > 0 && known_peer_count == 0 {
+            warn!("fetch_shares_for: state.state is empty — all shares will be skipped (sender verification impossible)!");
+        }
+        let mut skipped_no_peer = 0usize;
         for share in response.shares {
-            println!("Entering on key {}", share.service());
+            info!("Processing TLK share for zone {}", share.service());
             let Some(share_record) = &share.share else {
                 warn!("Missing key!");
                 continue;
             };
             let item = CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
 
-            let Some(sending_peer) = state.state.get(&item.sender) else { continue };
+            let Some(sending_peer) = state.state.get(&item.sender) else {
+                skipped_no_peer += 1;
+                warn!("Skipping TLK share for zone {} — sender {} not found in known peers", share.service(), item.sender);
+                continue;
+            };
             sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
 
 
@@ -1789,6 +1800,11 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             
             keys.push(result);
         }
+
+        if skipped_no_peer > 0 {
+            warn!("fetch_shares_for: skipped {}/{} share(s) due to unknown sender peers", skipped_no_peer, total_shares);
+        }
+        info!("fetch_shares_for: recovered {} TLK key(s) from {} share(s)", keys.len(), total_shares);
 
         Ok(keys)
     }
@@ -1856,6 +1872,14 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn join_clique_from_escrow(&self, bottle: &EscrowData, password: &[u8], device_password: &[u8]) -> Result<(), PushError> {
         let other_identity = self.recover_bottle(bottle, password).await?;
 
+        // IMPORTANT: Fetch TLK shares BEFORE creating the new identity.
+        // recover_bottle() synced state.state with known peers. new_user_identity()
+        // clears state.state, and fetch_shares_for() needs those peers to verify
+        // each share's sender signature (it silently skips shares whose sender
+        // is not in state.state). Moving this before new_user_identity() ensures
+        // we actually recover the TLK keys needed for keychain decryption.
+        let shares = self.fetch_shares_for(&other_identity).await?;
+
         let new_identity = self.new_user_identity().await?;
         let state = self.state.read().await;
         let my_identity = state.user_identity.as_ref().unwrap();
@@ -1864,7 +1888,6 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         drop(state);
 
-        let shares = self.fetch_shares_for(&other_identity).await?;
         self.join_clique(device_password, &new_identity, Some(voucher), &shares, vec![]).await?;
         Ok(())
     }
