@@ -58,25 +58,31 @@ WHOAMI=$("$BBCTL" whoami 2>&1 || true)
 WHOAMI=$(echo "$WHOAMI" | head -1)
 echo "✓ Logged in: $WHOAMI"
 
+# ── Check for existing bridge registration ────────────────────
+# If the bridge is already registered on the server but we're about to
+# generate a fresh config (no local config file), the old registration's
+# rooms would be orphaned.  Delete it first so the server cleans up rooms.
+EXISTING_BRIDGE=$("$BBCTL" whoami 2>&1 | grep "^\s*$BRIDGE_NAME " || true)
+if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
+    echo ""
+    echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
+    echo "   Deleting old registration to avoid orphaned rooms..."
+    "$BBCTL" delete --force "$BRIDGE_NAME" <<< "y" 2>/dev/null \
+        || "$BBCTL" delete "$BRIDGE_NAME" <<< "y" 2>/dev/null \
+        || echo "   (Could not auto-delete — you may need to run: bbctl delete $BRIDGE_NAME)"
+    echo "✓ Old registration cleaned up"
+fi
+
 # ── Generate config via bbctl ─────────────────────────────────
 mkdir -p "$DATA_DIR"
-if [ -f "$CONFIG" ]; then
-    # Verify the as_token is still valid (bbctl delete invalidates it)
-    AS_TOKEN=$(grep 'as_token:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*as_token: *//')
-    HS_URL=$(grep 'address:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*address: *//')
-    if [ -n "$AS_TOKEN" ] && [ -n "$HS_URL" ]; then
-        HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $AS_TOKEN" "$HS_URL/_matrix/client/v3/account/whoami" 2>/dev/null || echo "000")
-        if [ "$HTTP_CODE" = "401" ]; then
-            echo "⚠ Config as_token is no longer valid (bridge was deleted?). Regenerating..."
-            rm -f "$CONFIG"
-            # The DB has portal rows pointing at Matrix rooms that no longer exist
-            DB_FILE="$DATA_DIR/mautrix-imessage.db"
-            if [ -f "$DB_FILE" ]; then
-                echo "  Removing stale database (old rooms were deleted)..."
-                rm -f "$DB_FILE" "$DB_FILE"-wal "$DB_FILE"-shm
-            fi
-        fi
-    fi
+if [ -f "$CONFIG" ] && [ -z "$EXISTING_BRIDGE" ]; then
+    # Config exists locally but bridge isn't registered on server (e.g. bbctl
+    # delete was run manually).  The stale config has an invalid as_token and
+    # the DB references rooms that no longer exist.
+    echo "⚠  Local config exists but bridge is not registered on server."
+    echo "   Removing stale config and database to re-register..."
+    rm -f "$CONFIG"
+    rm -f "$DATA_DIR"/mautrix-imessage.db*
 fi
 if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
