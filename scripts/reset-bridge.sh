@@ -52,7 +52,18 @@ echo "  (confirm the deletion when prompted)"
 # ── Re-register and get fresh config ─────────────────────────
 echo "Re-registering bridge with Beeper..."
 rm -f "$CONFIG"
-"$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
+# bbctl delete is async — retry registration until the server is ready
+for i in 1 2 3 4 5 6; do
+    if "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>/dev/null; then
+        break
+    fi
+    echo "  Waiting for deletion to complete... (attempt $i/6)"
+    sleep 5
+done
+if [ ! -f "$CONFIG" ]; then
+    echo "ERROR: Failed to re-register bridge after 30s. Try again in a minute."
+    exit 1
+fi
 
 # Patch config: absolute DB path
 if [ "$UNAME_S" = "Darwin" ]; then
