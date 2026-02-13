@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -96,16 +97,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	log.Info().Msg("Cloud bootstrap sync start")
 
 	// Dump raw CloudKit chat records to disk for debugging
-	if dumpJSON, dumpErr := c.client.CloudDumpChatsJson(); dumpErr != nil {
-		log.Warn().Err(dumpErr).Msg("Failed to dump raw CloudKit chats")
-	} else {
-		dumpPath := "cloudkit_chats_dump.json"
-		if writeErr := os.WriteFile(dumpPath, []byte(dumpJSON), 0644); writeErr != nil {
-			log.Warn().Err(writeErr).Msg("Failed to write CloudKit dump file")
-		} else {
-			log.Info().Str("path", dumpPath).Int("bytes", len(dumpJSON)).Msg("Dumped raw CloudKit chat records")
-		}
-	}
+	c.dumpCloudKitChats(ctx, log)
 
 	counts, err := c.runIncrementalCloudSync(ctx, log)
 	if err != nil {
@@ -555,6 +547,66 @@ func maxInt64(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func (c *IMClient) dumpCloudKitChats(ctx context.Context, log zerolog.Logger) {
+	var allChats []rustpushgo.WrappedCloudSyncChat
+	var token *string
+	for page := 0; page < 256; page++ {
+		resp, err := c.client.CloudSyncChats(token)
+		if err != nil {
+			log.Warn().Err(err).Int("page", page).Msg("CloudKit dump failed")
+			return
+		}
+		allChats = append(allChats, resp.Chats...)
+		log.Info().Int("page", page).Int("count", len(resp.Chats)).Bool("done", resp.Done).Msg("CloudKit dump page")
+		if resp.Done {
+			break
+		}
+		token = resp.ContinuationToken
+	}
+
+	// Build JSON manually since WrappedCloudSyncChat isn't tagged
+	type chatDump struct {
+		RecordName   string   `json:"record_name"`
+		CloudChatID  string   `json:"cloud_chat_id"`
+		GroupID      string   `json:"group_id"`
+		Style        int64    `json:"style"`
+		Service      string   `json:"service"`
+		DisplayName  string   `json:"display_name"`
+		Participants []string `json:"participants"`
+		Deleted      bool     `json:"deleted"`
+	}
+	dump := make([]chatDump, len(allChats))
+	for i, ch := range allChats {
+		dn := ""
+		if ch.DisplayName != nil {
+			dn = *ch.DisplayName
+		}
+		dump[i] = chatDump{
+			RecordName:   ch.RecordName,
+			CloudChatID:  ch.CloudChatId,
+			GroupID:      ch.GroupId,
+			Style:        ch.Style,
+			Service:      ch.Service,
+			DisplayName:  dn,
+			Participants: ch.Participants,
+			Deleted:      ch.Deleted,
+		}
+	}
+
+	jsonBytes, err := json.MarshalIndent(dump, "", "  ")
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to marshal CloudKit dump")
+		return
+	}
+
+	dumpPath := "cloudkit_chats_dump.json"
+	if err := os.WriteFile(dumpPath, jsonBytes, 0644); err != nil {
+		log.Warn().Err(err).Msg("Failed to write CloudKit dump")
+		return
+	}
+	log.Info().Str("path", dumpPath).Int("chats", len(allChats)).Msg("Dumped raw CloudKit chat records")
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {

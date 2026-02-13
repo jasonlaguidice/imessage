@@ -1137,27 +1137,6 @@ func (_self *Client) CloudSyncChats(continuationToken *string) (WrappedCloudSync
 		})
 }
 
-func (_self *Client) CloudDumpChatsJson() (string, error) {
-	_pointer := _self.ffiObject.incrementPointer("*Client")
-	defer _self.ffiObject.decrementPointer()
-	return uniffiRustCallAsyncWithErrorAndResult(
-		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
-			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_dump_chats_json(
-				_pointer,
-				status,
-			))
-		},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
-			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
-		},
-		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
-			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
-		})
-}
-
 func (_self *Client) CloudSyncMessages(continuationToken *string) (WrappedCloudSyncMessagesPage, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
