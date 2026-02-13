@@ -222,7 +222,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName)
+		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId)
 		if portalID == "" {
 			counts.Skipped++
 			continue
@@ -329,7 +329,7 @@ func (c *IMClient) ingestCloudMessages(
 	return nil
 }
 
-func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string) string {
+func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string) string {
 	normalizedParticipants := make([]string, 0, len(participants))
 	for _, participant := range participants {
 		normalized := normalizeIdentifierForPortalID(participant)
@@ -342,12 +342,22 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 		return ""
 	}
 
+	// For groups with a persistent group UUID (gid), use gid:<UUID> as portal ID
+	isGroup := len(normalizedParticipants) > 2 || displayName != nil
+	if isGroup && groupID != "" {
+		return "gid:" + groupID
+	}
+
 	groupName := displayName
 	if len(normalizedParticipants) <= 2 {
 		groupName = nil
 	}
 
-	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil)
+	var senderGuidPtr *string
+	if groupID != "" {
+		senderGuidPtr = &groupID
+	}
+	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr)
 	return string(portalKey.ID)
 }
 

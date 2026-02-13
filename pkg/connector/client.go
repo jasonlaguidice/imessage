@@ -10,17 +10,27 @@ package connector
 
 import (
 	"bytes"
+	"compress/lzw"
+	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/jpeg"
+	"io"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	_ "image/gif"
+	_ "image/png"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/ptr"
@@ -75,6 +85,30 @@ type IMClient struct {
 	// SMS portal tracking: portal IDs known to be SMS-only contacts
 	smsPortals     map[string]bool
 	smsPortalsLock sync.RWMutex
+
+	// Initial sync gate: closed once initial sync completes (or is skipped),
+	// so real-time messages don't race ahead of backfill.
+
+	// Group portal fuzzy-matching index: maps each member to the set of
+	// group portal IDs containing that member. Lazily populated from DB.
+	groupPortalIndex map[string]map[string]bool
+	groupPortalMu    sync.RWMutex
+
+	// Actual iMessage group names (cv_name) keyed by portal ID.
+	// Populated from incoming messages; used for outbound routing.
+	imGroupNames   map[string]string
+	imGroupNamesMu sync.RWMutex
+
+	// Persistent iMessage group UUIDs (sender_guid/gid) keyed by portal ID.
+	// Populated from incoming messages; used for outbound routing so that
+	// Apple Messages recipients match messages to the correct group thread.
+	imGroupGuids   map[string]string
+	imGroupGuidsMu sync.RWMutex
+
+	// Last active group portal per member. Updated on every incoming group
+	// message so typing indicators route to the correct group.
+	lastGroupForMember   map[string]networkid.PortalKey
+	lastGroupForMemberMu sync.RWMutex
 }
 
 var _ bridgev2.NetworkAPI = (*IMClient)(nil)
@@ -90,6 +124,43 @@ var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
 // ============================================================================
 // Lifecycle
 // ============================================================================
+
+func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
+	ctx := context.Background()
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to load portals for sender_guid cache")
+		return
+	}
+
+	loadedGuids := 0
+	loadedNames := 0
+	for _, portal := range portals {
+		if portal.Receiver != c.UserLogin.ID {
+			continue // Skip portals for other users
+		}
+		if meta, ok := portal.Metadata.(*PortalMetadata); ok {
+			if meta.SenderGuid != "" {
+				c.imGroupGuidsMu.Lock()
+				c.imGroupGuids[string(portal.ID)] = meta.SenderGuid
+				c.imGroupGuidsMu.Unlock()
+				loadedGuids++
+			}
+			if meta.GroupName != "" {
+				c.imGroupNamesMu.Lock()
+				c.imGroupNames[string(portal.ID)] = meta.GroupName
+				c.imGroupNamesMu.Unlock()
+				loadedNames++
+			}
+		}
+	}
+	if loadedGuids > 0 {
+		log.Info().Int("count", loadedGuids).Msg("Pre-populated sender_guid cache from database")
+	}
+	if loadedNames > 0 {
+		log.Info().Int("count", loadedNames).Msg("Pre-populated group name cache from database")
+	}
+}
 
 func (c *IMClient) Connect(ctx context.Context) {
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
@@ -167,12 +238,27 @@ func (c *IMClient) Connect(ctx context.Context) {
 				log.Warn().Str("preferred", preferred).Strs("available", handles).
 					Msg("Preferred handle not found among registered handles, using first available")
 			}
+		} else {
+			log.Warn().Strs("available", handles).
+				Msg("No preferred_handle configured — using first available. Run the install script to select one.")
 		}
 	}
+
+	// Persist the selected handle to metadata so it's stable across restarts.
+	if c.handle != "" {
+		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != c.handle {
+			meta.PreferredHandle = c.handle
+			log.Info().Str("handle", c.handle).Msg("Persisted selected handle to metadata")
+		}
+	}
+
 	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
 
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
+
+	// Pre-populate sender_guid cache from existing portal metadata
+	go c.loadSenderGuidsFromDB(log)
 
 	// Start periodic state saver (every 5 minutes)
 	c.stopChan = make(chan struct{})
@@ -205,6 +291,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	if cloudStoreReady {
 		c.startCloudSyncController(log)
 	}
+
 }
 
 func (c *IMClient) Disconnect() {
@@ -338,7 +425,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	sender := c.makeEventSender(msg.Sender)
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 
 	// Track SMS portals so outbound replies use the correct service type
 	if msg.IsSms {
@@ -398,7 +485,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	targetGUID := ptrStringOr(msg.TapbackTargetUuid, "")
 	emoji := tapbackTypeToEmoji(msg.TapbackType, msg.TapbackEmoji)
 
@@ -420,7 +507,7 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	targetGUID := ptrStringOr(msg.EditTargetUuid, "")
 	newText := ptrStringOr(msg.EditNewText, "")
 
@@ -454,7 +541,7 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 }
 
 func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	targetGUID := ptrStringOr(msg.UnsendTargetUuid, "")
 
 	c.trackUnsend(targetGUID)
@@ -471,8 +558,36 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 }
 
 func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	newName := ptrStringOr(msg.NewChatName, "")
+
+	// Update the cached iMessage group name to the NEW name so outbound
+	// messages (portalToConversation) use it. makePortalKey cached whatever
+	// was in the conversation envelope (msg.GroupName), which may be the old
+	// name. Also persist to portal metadata so it survives restarts.
+	if newName != "" {
+		portalID := string(portalKey.ID)
+		c.imGroupNamesMu.Lock()
+		c.imGroupNames[portalID] = newName
+		c.imGroupNamesMu.Unlock()
+
+		go func() {
+			ctx := context.Background()
+			portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+			if err == nil && portal != nil {
+				meta := &PortalMetadata{}
+				if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+					*meta = *existing
+				}
+				if meta.GroupName != newName {
+					meta.GroupName = newName
+					portal.Metadata = meta
+					_ = portal.Save(ctx)
+				}
+			}
+		}()
+	}
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventChatInfoChange,
@@ -489,18 +604,193 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 }
 
 func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
-	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
+	// Resolve the existing portal from the OLD participant list.
+	oldPortalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+
+	if len(msg.NewParticipants) == 0 {
+		// No new participant list — fall back to a resync with current info.
+		log.Warn().Msg("Participant change with empty NewParticipants, falling back to resync")
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatResync,
+				PortalKey: oldPortalKey,
+			},
+			GetChatInfoFunc: c.GetChatInfo,
+		})
+		return
+	}
+
+	// Compute new portal ID from the NEW participant list using the same
+	// normalization / dedup / sort logic as makePortalKey's group branch.
+	sorted := make([]string, 0, len(msg.NewParticipants))
+	for _, p := range msg.NewParticipants {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized == "" || c.isMyHandle(normalized) {
+			continue
+		}
+		sorted = append(sorted, normalized)
+	}
+	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+	sort.Strings(sorted)
+	deduped := sorted[:0]
+	for i, s := range sorted {
+		if i == 0 || s != sorted[i-1] {
+			deduped = append(deduped, s)
+		}
+	}
+	newPortalIDStr := strings.Join(deduped, ",")
+	oldPortalIDStr := string(oldPortalKey.ID)
+
+	// If the portal ID changed (member added/removed), re-key it in the DB.
+	finalPortalKey := oldPortalKey
+	if newPortalIDStr != oldPortalIDStr {
+		ctx := context.Background()
+		newPortalKey := networkid.PortalKey{
+			ID:       networkid.PortalID(newPortalIDStr),
+			Receiver: c.UserLogin.ID,
+		}
+		result, _, err := c.reIDPortalWithCacheUpdate(ctx, oldPortalKey, newPortalKey)
+		if err != nil {
+			log.Err(err).
+				Str("old_portal_id", oldPortalIDStr).
+				Str("new_portal_id", newPortalIDStr).
+				Msg("Failed to ReID portal for participant change")
+			return
+		}
+		log.Info().
+			Str("old_portal_id", oldPortalIDStr).
+			Str("new_portal_id", newPortalIDStr).
+			Int("result", int(result)).
+			Msg("ReID portal for participant change")
+		finalPortalKey = newPortalKey
+	}
+
+	// Cache sender_guid and group_name under the (possibly new) portal ID.
+	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		c.imGroupGuidsMu.Lock()
+		c.imGroupGuids[string(finalPortalKey.ID)] = *msg.SenderGuid
+		c.imGroupGuidsMu.Unlock()
+	}
+	if msg.GroupName != nil && *msg.GroupName != "" {
+		c.imGroupNamesMu.Lock()
+		c.imGroupNames[string(finalPortalKey.ID)] = *msg.GroupName
+		c.imGroupNamesMu.Unlock()
+	}
+
+	// Build the full new member list for Matrix room sync.
+	memberMap := make(map[networkid.UserID]bridgev2.ChatMember, len(msg.NewParticipants))
+	for _, p := range msg.NewParticipants {
+		normalized := normalizeIdentifierForPortalID(p)
+		if normalized == "" {
+			continue
+		}
+		userID := makeUserID(normalized)
+		if c.isMyHandle(normalized) {
+			memberMap[userID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{
+					IsFromMe:    true,
+					SenderLogin: c.UserLogin.ID,
+					Sender:      userID,
+				},
+				Membership: event.MembershipJoin,
+			}
+		} else {
+			memberMap[userID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{Sender: userID},
+				Membership:  event.MembershipJoin,
+			}
+		}
+	}
+
+	// Queue a ChatInfoChange with the full member list so bridgev2 syncs
+	// the Matrix room membership (invites new members, kicks removed ones).
+	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventChatResync,
-			PortalKey: portalKey,
+			Type:      bridgev2.RemoteEventChatInfoChange,
+			PortalKey: finalPortalKey,
+			Sender:    c.makeEventSender(msg.Sender),
+			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
 		},
-		GetChatInfoFunc: c.GetChatInfo,
+		ChatInfoChange: &bridgev2.ChatInfoChange{
+			MemberChanges: &bridgev2.ChatMemberList{
+				IsFull:    true,
+				MemberMap: memberMap,
+			},
+		},
 	})
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	ctx := context.Background()
+
+	// UUID lookup FIRST — most reliable for both DM and group receipts.
+	// Group read receipts (command 102) arrive without conversation data
+	// (aps_client.rs passes None), so makeReceiptPortalKey resolves to a
+	// DM portal. The UUID lookup finds the actual portal from the DB.
+	if msg.Uuid != "" {
+		msgID := makeMessageID(msg.Uuid)
+		dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, c.UserLogin.ID, msgID)
+		if err == nil && len(dbMessages) > 0 {
+			portalKey = dbMessages[0].Room
+			log.Debug().
+				Str("msg_uuid", msg.Uuid).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved read receipt portal via message UUID lookup")
+			goto resolved
+		}
+	}
+
+	// Try sender_guid lookup — first check gid: portal ID, then cache
+	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		gidPortalKey := networkid.PortalKey{ID: networkid.PortalID("gid:" + *msg.SenderGuid), Receiver: c.UserLogin.ID}
+		if gidPortal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, gidPortalKey); gidPortal != nil && gidPortal.MXID != "" {
+			portalKey = gidPortalKey
+			log.Debug().
+				Str("sender_guid", *msg.SenderGuid).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved read receipt portal via gid: lookup")
+			goto resolved
+		}
+		c.imGroupGuidsMu.RLock()
+		for portalIDStr, guid := range c.imGroupGuids {
+			if guid == *msg.SenderGuid {
+				portalKey = networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+				c.imGroupGuidsMu.RUnlock()
+				log.Debug().
+					Str("sender_guid", *msg.SenderGuid).
+					Str("resolved_portal", string(portalKey.ID)).
+					Msg("Resolved read receipt portal via sender_guid cache lookup")
+				goto resolved
+			}
+		}
+		c.imGroupGuidsMu.RUnlock()
+	}
+
+	// Fall back to group member tracking
+	if msg.Sender != nil {
+		if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
+			portalKey = groupKey
+			log.Debug().
+				Str("sender", *msg.Sender).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved read receipt portal via group member lookup")
+			goto resolved
+		}
+	}
+
+	// Last resort: use the initial portal key if it resolves to a valid portal.
+	// For DM receipts (no conversation data), makeReceiptPortalKey already
+	// resolved to the correct DM portal. For group receipts, this is a wrong
+	// guess but we've exhausted all group-specific lookups above.
+	{
+		portal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if portal != nil && portal.MXID != "" {
+			goto resolved
+		}
+	}
+resolved:
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventReadReceipt,
@@ -513,10 +803,18 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	ctx := context.Background()
 
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if (err != nil || portal == nil || portal.MXID == "") && msg.Uuid != "" {
+		// Group delivery receipts may lack conversation data. Try message UUID lookup.
+		msgID := makeMessageID(msg.Uuid)
+		if dbMsgs, err2 := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, c.UserLogin.ID, msgID); err2 == nil && len(dbMsgs) > 0 {
+			portalKey = dbMsgs[0].Room
+			portal, err = c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		}
+	}
 	if err != nil || portal == nil || portal.MXID == "" {
 		return
 	}
@@ -547,7 +845,51 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 }
 
 func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+
+	// For group typing indicators, iMessage may only include [sender, target]
+	// without the full participant list. If the portal key resolves to a
+	// non-existent portal (DM-style key), try sender_guid lookup first.
+	ctx := context.Background()
+	portal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if (portal == nil || portal.MXID == "") && msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		// Try gid: portal ID first
+		gidKey := networkid.PortalKey{ID: networkid.PortalID("gid:" + *msg.SenderGuid), Receiver: c.UserLogin.ID}
+		if gidPortal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, gidKey); gidPortal != nil && gidPortal.MXID != "" {
+			portalKey = gidKey
+			log.Debug().
+				Str("sender_guid", *msg.SenderGuid).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved typing portal via gid: lookup")
+			goto found
+		}
+		// Fall back to cache lookup for legacy portals
+		c.imGroupGuidsMu.RLock()
+		for portalIDStr, guid := range c.imGroupGuids {
+			if guid == *msg.SenderGuid {
+				portalKey = networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+				c.imGroupGuidsMu.RUnlock()
+				log.Debug().
+					Str("sender_guid", *msg.SenderGuid).
+					Str("resolved_portal", string(portalKey.ID)).
+					Msg("Resolved typing portal via sender_guid cache lookup")
+				goto found
+			}
+		}
+		c.imGroupGuidsMu.RUnlock()
+	}
+	// Fall back to member tracking
+	if (portal == nil || portal.MXID == "") && msg.Sender != nil {
+		if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
+			portalKey = groupKey
+			log.Debug().
+				Str("sender", *msg.Sender).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved typing portal via group member lookup")
+		}
+	}
+found:
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Typing{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventTyping,
@@ -676,6 +1018,54 @@ func (c *IMClient) addOutboundURLPreview(eventID id.EventID, roomID id.RoomID, b
 	}
 }
 
+// fixOutboundImage re-uploads a corrected image to Matrix and edits the
+// original event so all Beeper clients (desktop, Android, etc.) see the
+// image with the right format, MIME type, and dimensions.
+func (c *IMClient) fixOutboundImage(msg *bridgev2.MatrixMessage, data []byte, mimeType, fileName string, width, height int) {
+	log := c.UserLogin.Log.With().
+		Str("component", "image_fix").
+		Stringer("event_id", msg.Event.ID).
+		Logger()
+	ctx := log.WithContext(context.Background())
+
+	intent := c.UserLogin.User.DoublePuppet(ctx)
+	if intent == nil {
+		log.Debug().Msg("No double puppet available, skipping outbound image fix")
+		return
+	}
+
+	url, encFile, err := intent.UploadMedia(ctx, "", data, fileName, mimeType)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to upload corrected image")
+		return
+	}
+
+	editContent := &event.MessageEventContent{
+		MsgType: event.MsgImage,
+		Body:    fileName,
+		Info: &event.FileInfo{
+			MimeType: mimeType,
+			Size:     len(data),
+			Width:    width,
+			Height:   height,
+		},
+	}
+	if encFile != nil {
+		editContent.File = encFile
+	} else {
+		editContent.URL = url
+	}
+	editContent.SetEdit(msg.Event.ID)
+
+	wrappedContent := &event.Content{Parsed: editContent}
+	_, err = intent.SendMessage(ctx, msg.Portal.MXID, event.EventMessage, wrappedContent, nil)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to edit outbound image event")
+	} else {
+		log.Debug().Str("mime", mimeType).Int("size", len(data)).Msg("Fixed outbound image on Matrix")
+	}
+}
+
 func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMessage, conv rustpushgo.WrappedConversation) (*bridgev2.MatrixMessageResponse, error) {
 	var data []byte
 	var err error
@@ -700,6 +1090,54 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 
 	// Convert OGG Opus voice recordings to CAF Opus for native iMessage playback
 	data, mimeType, fileName = convertAudioForIMessage(data, mimeType, fileName)
+
+	// Process outbound images: detect actual format, convert non-JPEG to JPEG,
+	// correct MIME type, and edit the Matrix event so all clients see it right.
+	var matrixEdited bool
+	if looksLikeImage(data) {
+		origMime := mimeType
+		if mimeType == "image/gif" {
+			// GIFs are fine as-is, just detect correct MIME
+			if detected := detectImageMIME(data); detected != "" && detected != mimeType {
+				mimeType = detected
+				fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".gif"
+			}
+		} else if img, _, isJPEG := decodeImageData(data); img != nil {
+			if !isJPEG {
+				var buf bytes.Buffer
+				if encErr := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); encErr == nil {
+					data = buf.Bytes()
+					mimeType = "image/jpeg"
+					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+				}
+			} else if detected := detectImageMIME(data); detected != "" && detected != mimeType {
+				mimeType = detected
+				fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+			}
+			// Edit the Matrix event with corrected image so other Beeper clients see it right
+			if mimeType != origMime {
+				b := img.Bounds()
+				go c.fixOutboundImage(msg, data, mimeType, fileName, b.Dx(), b.Dy())
+				matrixEdited = true
+			}
+		} else {
+			// Can't decode but fix MIME type at least
+			if detected := detectImageMIME(data); detected != "" && detected != mimeType {
+				mimeType = detected
+				ext := ".bin"
+				switch detected {
+				case "image/jpeg":
+					ext = ".jpg"
+				case "image/png":
+					ext = ".png"
+				case "image/tiff":
+					ext = ".tiff"
+				}
+				fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ext
+			}
+		}
+	}
+	_ = matrixEdited
 
 	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle)
 	if err != nil {
@@ -809,8 +1247,8 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*bridgev2.ChatInfo, error) {
 	portalID := string(portal.ID)
-	// Groups use comma-separated participants (e.g., "tel:+15551234567,tel:+15559876543")
-	isGroup := strings.Contains(portalID, ",")
+	// Groups use "gid:<UUID>" portal IDs, or legacy comma-separated participant IDs
+	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 
 	canBackfill := false
 	if c.cloudStore != nil {
@@ -825,7 +1263,20 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 
 	if isGroup {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
-		memberList := strings.Split(portalID, ",")
+
+		// For gid: portals, look up members from cloud_chat table;
+		// for legacy comma-separated IDs, parse from the portal ID.
+		var memberList []string
+		if strings.HasPrefix(portalID, "gid:") {
+			if c.cloudStore != nil {
+				if participants, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(participants) > 0 {
+					memberList = participants
+				}
+			}
+		} else {
+			memberList = strings.Split(portalID, ",")
+		}
+
 		memberMap := make(map[networkid.UserID]bridgev2.ChatMember)
 		for _, member := range memberList {
 			userID := makeUserID(member)
@@ -848,10 +1299,45 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		chatInfo.Members = &bridgev2.ChatMemberList{
 			IsFull:    true,
 			MemberMap: memberMap,
+			PowerLevels: &bridgev2.PowerLevelOverrides{
+				Invite: ptr.Ptr(95), // Prevent Matrix users from inviting — the bridge manages membership
+			},
 		}
 
-		// Build group name from members
-		chatInfo.Name = ptr.Ptr(c.buildGroupName(memberList))
+		// Use the iMessage group name if available, otherwise build from members
+		c.imGroupNamesMu.RLock()
+		groupName := c.imGroupNames[portalID]
+		c.imGroupNamesMu.RUnlock()
+		if groupName != "" {
+			chatInfo.Name = &groupName
+		} else {
+			chatInfo.Name = ptr.Ptr(c.buildGroupName(memberList))
+		}
+
+		// Persist sender_guid to portal metadata for gid: portals
+		if strings.HasPrefix(portalID, "gid:") {
+			gid := strings.TrimPrefix(portalID, "gid:")
+			cachedName := groupName
+			chatInfo.ExtraUpdates = func(ctx context.Context, p *bridgev2.Portal) bool {
+				meta, ok := p.Metadata.(*PortalMetadata)
+				if !ok {
+					meta = &PortalMetadata{}
+				}
+				changed := false
+				if meta.SenderGuid != gid {
+					meta.SenderGuid = gid
+					changed = true
+				}
+				if cachedName != "" && meta.GroupName != cachedName {
+					meta.GroupName = cachedName
+					changed = true
+				}
+				if changed {
+					p.Metadata = meta
+				}
+				return changed
+			}
+		}
 	} else {
 		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
 		otherUser := makeUserID(portalID)
@@ -1421,18 +1907,321 @@ func (c *IMClient) resolveExistingDMPortalID(identifier string) networkid.Portal
 	return defaultID
 }
 
-func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string) networkid.PortalKey {
+// ensureGroupPortalIndex lazily loads all existing group portals from the DB
+// and builds an in-memory index mapping each member to its group portal IDs.
+func (c *IMClient) ensureGroupPortalIndex() {
+	c.groupPortalMu.Lock()
+	defer c.groupPortalMu.Unlock()
+	if c.groupPortalIndex != nil {
+		return // already loaded
+	}
+
+	idx := make(map[string]map[string]bool)
+	ctx := context.Background()
+	portals, err := c.Main.Bridge.DB.Portal.GetAllWithMXID(ctx)
+	if err != nil {
+		c.UserLogin.Log.Err(err).Msg("Failed to load portals for group index")
+		return // leave c.groupPortalIndex nil so next call retries
+	}
+	for _, p := range portals {
+		portalID := string(p.ID)
+		if !strings.Contains(portalID, ",") {
+			continue // skip DMs
+		}
+		if p.Receiver != c.UserLogin.ID {
+			continue // skip other users' portals
+		}
+		for _, member := range strings.Split(portalID, ",") {
+			if idx[member] == nil {
+				idx[member] = make(map[string]bool)
+			}
+			idx[member][portalID] = true
+		}
+	}
+	c.groupPortalIndex = idx
+	c.UserLogin.Log.Debug().
+		Int("portals_indexed", len(c.groupPortalIndex)).
+		Msg("Built group portal fuzzy-match index")
+}
+
+// indexGroupPortalLocked adds a group portal ID to the in-memory index.
+// Caller must hold groupPortalMu write lock.
+func (c *IMClient) indexGroupPortalLocked(portalID string) {
+	for _, member := range strings.Split(portalID, ",") {
+		if c.groupPortalIndex[member] == nil {
+			c.groupPortalIndex[member] = make(map[string]bool)
+		}
+		c.groupPortalIndex[member][portalID] = true
+	}
+}
+
+// registerGroupPortal thread-safely indexes a new group portal.
+func (c *IMClient) registerGroupPortal(portalID string) {
+	c.groupPortalMu.Lock()
+	defer c.groupPortalMu.Unlock()
+	c.indexGroupPortalLocked(portalID)
+}
+
+// reIDPortalWithCacheUpdate atomically re-keys a portal in the DB and updates
+// all in-memory caches. Holding all group cache write locks during the entire
+// operation prevents concurrent handlers (read receipts, typing indicators)
+// from observing a state where the DB key changed but caches still reference
+// the old portal ID.
+func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey networkid.PortalKey) (bridgev2.ReIDResult, *bridgev2.Portal, error) {
+	oldID := string(oldKey.ID)
+	newID := string(newKey.ID)
+
+	c.imGroupNamesMu.Lock()
+	c.imGroupGuidsMu.Lock()
+	c.groupPortalMu.Lock()
+	c.lastGroupForMemberMu.Lock()
+	defer c.lastGroupForMemberMu.Unlock()
+	defer c.groupPortalMu.Unlock()
+	defer c.imGroupGuidsMu.Unlock()
+	defer c.imGroupNamesMu.Unlock()
+
+	result, portal, err := c.Main.Bridge.ReIDPortal(ctx, oldKey, newKey)
+	if err != nil {
+		return result, portal, err
+	}
+
+	// Move group name cache
+	if name, ok := c.imGroupNames[oldID]; ok {
+		c.imGroupNames[newID] = name
+		delete(c.imGroupNames, oldID)
+	}
+	// Move group guid cache
+	if guid, ok := c.imGroupGuids[oldID]; ok {
+		c.imGroupGuids[newID] = guid
+		delete(c.imGroupGuids, oldID)
+	}
+	// Update group portal index: remove old members, add new
+	for _, member := range strings.Split(oldID, ",") {
+		if portals, ok := c.groupPortalIndex[member]; ok {
+			delete(portals, oldID)
+			if len(portals) == 0 {
+				delete(c.groupPortalIndex, member)
+			}
+		}
+	}
+	c.indexGroupPortalLocked(newID)
+	// Update lastGroupForMember entries pointing to old portal
+	for member, key := range c.lastGroupForMember {
+		if key == oldKey {
+			c.lastGroupForMember[member] = newKey
+		}
+	}
+
+	return result, portal, nil
+}
+
+// resolveExistingGroupPortalID checks whether an existing group portal matches
+// the computed portal ID via fuzzy matching (differs by at most 1 member).
+// If senderGuid is provided, fuzzy matches are validated against the cached
+// sender_guid — a mismatch means a different group even if members overlap.
+// If a match is found, returns the existing portal ID; otherwise registers the
+// new ID and returns it as-is.
+func (c *IMClient) resolveExistingGroupPortalID(computedID string, senderGuid *string) networkid.PortalID {
+	c.ensureGroupPortalIndex()
+
+	// Fast path: exact match in DB
+	ctx := context.Background()
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+		ID:       networkid.PortalID(computedID),
+		Receiver: c.UserLogin.ID,
+	})
+	if err == nil && portal != nil && portal.MXID != "" {
+		return networkid.PortalID(computedID)
+	}
+
+	// Fuzzy match: find existing portals that share members with the candidate.
+	candidateMembers := strings.Split(computedID, ",")
+	candidateSize := len(candidateMembers)
+
+	// Count how many members each existing portal shares with the candidate.
+	overlap := make(map[string]int) // existing portal ID -> shared member count
+	c.groupPortalMu.RLock()
+	for _, member := range candidateMembers {
+		for existingID := range c.groupPortalIndex[member] {
+			overlap[existingID]++
+		}
+	}
+	c.groupPortalMu.RUnlock()
+
+	for existingID, sharedCount := range overlap {
+		existingSize := len(strings.Split(existingID, ","))
+		diff := (candidateSize - sharedCount) + (existingSize - sharedCount)
+		if diff > 1 {
+			continue
+		}
+
+		// If we have a sender_guid, reject fuzzy matches with a different
+		// sender_guid — they are genuinely different group conversations
+		// that happen to share most members.
+		if senderGuid != nil && *senderGuid != "" {
+			c.imGroupGuidsMu.RLock()
+			existingGuid := c.imGroupGuids[existingID]
+			c.imGroupGuidsMu.RUnlock()
+			if existingGuid != "" && existingGuid != *senderGuid {
+				continue
+			}
+		}
+
+		// Verify the match actually exists in DB with a Matrix room.
+		existing, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       networkid.PortalID(existingID),
+			Receiver: c.UserLogin.ID,
+		})
+		if err != nil || existing == nil || existing.MXID == "" {
+			continue
+		}
+
+		c.UserLogin.Log.Info().
+			Str("computed", computedID).
+			Str("resolved", existingID).
+			Int("diff", diff).
+			Msg("Fuzzy-matched group portal to existing room")
+		return networkid.PortalID(existingID)
+	}
+
+	// No match — register this as a new group portal.
+	c.registerGroupPortal(computedID)
+	return networkid.PortalID(computedID)
+}
+
+// findGroupPortalForMember returns the most likely group portal for a member.
+// Prefers the group where the member last sent a message; falls back to the
+// sole group containing them. Used when typing/read receipts lack full
+// participant lists.
+func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey, bool) {
+	normalized := normalizeIdentifierForPortalID(member)
+	if normalized == "" {
+		return networkid.PortalKey{}, false
+	}
+
+	// Prefer last active group for this member.
+	c.lastGroupForMemberMu.RLock()
+	lastGroup, ok := c.lastGroupForMember[normalized]
+	c.lastGroupForMemberMu.RUnlock()
+	if ok {
+		return lastGroup, true
+	}
+
+	// Fall back to group portal index — works if they're in exactly one group.
+	c.ensureGroupPortalIndex()
+	c.groupPortalMu.RLock()
+	portals := c.groupPortalIndex[normalized]
+	c.groupPortalMu.RUnlock()
+
+	if len(portals) != 1 {
+		return networkid.PortalKey{}, false
+	}
+
+	for portalID := range portals {
+		return networkid.PortalKey{
+			ID:       networkid.PortalID(portalID),
+			Receiver: c.UserLogin.ID,
+		}, true
+	}
+	return networkid.PortalKey{}, false
+}
+
+func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
 	isGroup := len(participants) > 2 || groupName != nil
 
 	if isGroup {
-		// Sort for consistent portal ID regardless of participant order
-		sorted := make([]string, 0, len(participants))
-		for _, p := range participants {
-			sorted = append(sorted, normalizeIdentifierForPortalID(p))
+		// When a persistent group UUID (sender_guid / gid) is available,
+		// use "gid:<UUID>" as the stable portal ID. This avoids the
+		// fragility of participant-based IDs that break when membership
+		// changes or participants normalize differently.
+		var portalID networkid.PortalID
+		if senderGuid != nil && *senderGuid != "" {
+			portalID = networkid.PortalID("gid:" + *senderGuid)
+		} else {
+			// Fallback: build a participant-based ID for groups without a UUID.
+			sorted := make([]string, 0, len(participants))
+			for _, p := range participants {
+				normalized := normalizeIdentifierForPortalID(p)
+				if normalized == "" || c.isMyHandle(normalized) {
+					continue
+				}
+				sorted = append(sorted, normalized)
+			}
+			sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+			sort.Strings(sorted)
+			deduped := sorted[:0]
+			for i, s := range sorted {
+				if i == 0 || s != sorted[i-1] {
+					deduped = append(deduped, s)
+				}
+			}
+			sorted = deduped
+			computedID := strings.Join(sorted, ",")
+			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
-		sort.Strings(sorted)
-		portalID := strings.Join(sorted, ",")
-		return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+		// Cache the actual iMessage group name (cv_name) so outbound
+		// messages can route to the correct conversation.
+		if groupName != nil && *groupName != "" {
+			c.imGroupNamesMu.Lock()
+			c.imGroupNames[string(portalID)] = *groupName
+			c.imGroupNamesMu.Unlock()
+		}
+		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
+
+		// Cache the persistent group UUID (sender_guid/gid) so outbound
+		// messages reuse the same UUID and Apple Messages recipients match
+		// them to the existing group thread. Only for multi-member groups.
+		if senderGuid != nil && *senderGuid != "" && strings.Contains(string(portalID), ",") {
+			c.imGroupGuidsMu.Lock()
+			c.imGroupGuids[string(portalID)] = *senderGuid
+			c.imGroupGuidsMu.Unlock()
+		}
+
+		// Persist sender_guid and group name to database so they survive restarts
+		persistGuid := ""
+		if senderGuid != nil {
+			persistGuid = *senderGuid
+		}
+		persistName := ""
+		if groupName != nil {
+			persistName = *groupName
+		}
+		if persistGuid != "" || persistName != "" {
+			go func(pk networkid.PortalKey, guid, gname string) {
+				ctx := context.Background()
+				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, pk)
+				if err == nil && portal != nil {
+					meta := &PortalMetadata{}
+					if existing, ok := portal.Metadata.(*PortalMetadata); ok {
+						*meta = *existing
+					}
+					changed := false
+					if guid != "" && meta.SenderGuid != guid {
+						meta.SenderGuid = guid
+						changed = true
+					}
+					if gname != "" && meta.GroupName != gname {
+						meta.GroupName = gname
+						changed = true
+					}
+					if changed {
+						portal.Metadata = meta
+						_ = portal.Save(ctx)
+					}
+				}
+			}(portalKey, persistGuid, persistName)
+		}
+		// Track which group each member last sent a message in, so typing
+		// indicators (which lack full participant lists) can be routed.
+		if sender != nil && *sender != "" {
+			normalized := normalizeIdentifierForPortalID(*sender)
+			if normalized != "" && !c.isMyHandle(normalized) {
+				c.lastGroupForMemberMu.Lock()
+				c.lastGroupForMember[normalized] = portalKey
+				c.lastGroupForMemberMu.Unlock()
+			}
+		}
+		return portalKey
 	}
 
 	for _, p := range participants {
@@ -1481,9 +2270,9 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 // makeReceiptPortalKey handles receipt messages where participants may be empty.
 // When participants is empty (rustpush sets conversation: None for receipts),
 // use the sender field to identify the DM portal.
-func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string) networkid.PortalKey {
+func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
 	if len(participants) > 0 {
-		return c.makePortalKey(participants, groupName, sender)
+		return c.makePortalKey(participants, groupName, sender, senderGuid)
 	}
 	if sender != nil && *sender != "" {
 		// Resolve to existing portal for contacts with multiple numbers
@@ -1512,15 +2301,68 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	portalID := string(portal.ID)
 	isSms := c.isPortalSMS(portalID)
 
-	if strings.Contains(portalID, ",") {
-		participants := strings.Split(portalID, ",")
+	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
+	if isGroup {
+		// For gid: portals, get the sender_guid from the portal ID itself
+		// and look up participants from the cloud store or portal metadata.
+		var participants []string
+		var guid string
+		if strings.HasPrefix(portalID, "gid:") {
+			guid = strings.TrimPrefix(portalID, "gid:")
+			// Look up participants from cloud store
+			if c.cloudStore != nil {
+				ctx := context.Background()
+				if parts, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(parts) > 0 {
+					participants = parts
+				}
+			}
+		} else {
+			participants = strings.Split(portalID, ",")
+		}
+
+		// Use the actual iMessage group name (cv_name) from the protocol,
+		// NOT the bridge-generated display name (portal.Name). Using the
+		// bridge display name causes Messages.app to split conversations.
+		c.imGroupNamesMu.RLock()
+		name := c.imGroupNames[portalID]
+		c.imGroupNamesMu.RUnlock()
+		if name == "" {
+			// Not in memory cache - try loading from portal metadata
+			if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.GroupName != "" {
+				name = meta.GroupName
+				c.imGroupNamesMu.Lock()
+				c.imGroupNames[portalID] = name
+				c.imGroupNamesMu.Unlock()
+			}
+		}
 		var groupName *string
-		if portal.Name != "" {
-			groupName = &portal.Name
+		if name != "" {
+			groupName = &name
+		}
+
+		// For gid: portals, guid is already set from portal ID.
+		// For legacy comma-separated portals, look up from cache/metadata.
+		if guid == "" {
+			c.imGroupGuidsMu.RLock()
+			guid = c.imGroupGuids[portalID]
+			c.imGroupGuidsMu.RUnlock()
+			if guid == "" {
+				if meta, ok := portal.Metadata.(*PortalMetadata); ok && meta.SenderGuid != "" {
+					guid = meta.SenderGuid
+					c.imGroupGuidsMu.Lock()
+					c.imGroupGuids[portalID] = guid
+					c.imGroupGuidsMu.Unlock()
+				}
+			}
+		}
+		var senderGuid *string
+		if guid != "" {
+			senderGuid = &guid
 		}
 		return rustpushgo.WrappedConversation{
 			Participants: participants,
 			GroupName:    groupName,
+			SenderGuid:   senderGuid,
 			IsSms:        isSms,
 		}
 	}
@@ -1712,6 +2554,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 
 	// Convert CAF Opus voice messages to OGG Opus for Matrix clients
 	var inlineData []byte
+	zerolog.Ctx(ctx).Debug().Bool("is_inline", att.IsInline).Bool("has_data", att.InlineData != nil).Str("mime", mimeType).Str("file", fileName).Uint64("size", att.Size).Msg("convertAttachment called")
 	if att.IsInline && att.InlineData != nil {
 		inlineData = *att.InlineData
 		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
@@ -1719,14 +2562,60 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
+	// Process images: extract dimensions, convert non-JPEG to JPEG, generate thumbnail
+	var imgWidth, imgHeight int
+	var thumbData []byte
+	var thumbW, thumbH int
+	if inlineData != nil && (strings.HasPrefix(mimeType, "image/") || looksLikeImage(inlineData)) {
+		log := zerolog.Ctx(ctx)
+		log.Debug().Str("mime_type", mimeType).Str("file_name", fileName).Int("data_len", len(inlineData)).Msg("Processing image attachment")
+		if mimeType == "image/gif" {
+			cfg, _, err := image.DecodeConfig(bytes.NewReader(inlineData))
+			if err == nil {
+				imgWidth, imgHeight = cfg.Width, cfg.Height
+			}
+		} else if img, fmtName, isJPEG := decodeImageData(inlineData); img != nil {
+			b := img.Bounds()
+			imgWidth, imgHeight = b.Dx(), b.Dy()
+			log.Debug().Str("decoded_format", fmtName).Int("width", imgWidth).Int("height", imgHeight).Bool("is_jpeg", isJPEG).Msg("Image decoded successfully")
+			// Re-encode non-JPEG images (PNG, TIFF, etc.) as JPEG for compatibility
+			if !isJPEG {
+				var buf bytes.Buffer
+				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+					inlineData = buf.Bytes()
+					mimeType = "image/jpeg"
+					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+					log.Debug().Int("jpeg_size", len(inlineData)).Msg("Re-encoded image as JPEG")
+				} else {
+					log.Warn().Err(err).Msg("Failed to re-encode image as JPEG")
+				}
+			}
+			if imgWidth > 800 || imgHeight > 800 {
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+			}
+		} else {
+			log.Warn().Str("mime_type", mimeType).Msg("Failed to decode image data")
+			// Log first few bytes for debugging
+			if len(inlineData) >= 4 {
+				log.Debug().Hex("magic_bytes", inlineData[:4]).Msg("Image magic bytes")
+			}
+		}
+	}
+
 	msgType := mimeToMsgType(mimeType)
 
+	fileSize := int(att.Size)
+	if inlineData != nil {
+		fileSize = len(inlineData)
+	}
 	content := &event.MessageEventContent{
 		MsgType: msgType,
 		Body:    fileName,
 		Info: &event.FileInfo{
 			MimeType: mimeType,
-			Size:     int(att.Size),
+			Size:     fileSize,
+			Width:    imgWidth,
+			Height:   imgHeight,
 		},
 	}
 
@@ -1749,6 +2638,26 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		} else {
 			content.URL = url
 		}
+
+		// Upload image thumbnail
+		if thumbData != nil {
+			thumbURL, thumbEnc, err := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
+			if err == nil {
+				if thumbEnc != nil {
+					content.Info.ThumbnailFile = thumbEnc
+				} else {
+					content.Info.ThumbnailURL = thumbURL
+				}
+				content.Info.ThumbnailInfo = &event.FileInfo{
+					MimeType: "image/jpeg",
+					Size:     len(thumbData),
+					Width:    thumbW,
+					Height:   thumbH,
+				}
+			} else {
+				zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to upload image thumbnail")
+			}
+		}
 	}
 
 	return &bridgev2.ConvertedMessage{
@@ -1763,6 +2672,333 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 // ============================================================================
 // Static helpers
 // ============================================================================
+
+// scaleAndEncodeThumb generates a JPEG thumbnail capped at 800px on the
+// longest side using nearest-neighbor scaling (no external dependencies).
+func scaleAndEncodeThumb(img image.Image, origW, origH int) ([]byte, int, int) {
+	scale := min(800.0/float64(origW), 800.0/float64(origH))
+	thumbW := int(float64(origW) * scale)
+	thumbH := int(float64(origH) * scale)
+	if thumbW < 1 {
+		thumbW = 1
+	}
+	if thumbH < 1 {
+		thumbH = 1
+	}
+
+	srcBounds := img.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, thumbW, thumbH))
+	for y := range thumbH {
+		srcY := srcBounds.Min.Y + y*srcBounds.Dy()/thumbH
+		for x := range thumbW {
+			srcX := srcBounds.Min.X + x*srcBounds.Dx()/thumbW
+			dst.Set(x, y, img.At(srcX, srcY))
+		}
+	}
+
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 75}); err != nil {
+		return nil, 0, 0
+	}
+	return buf.Bytes(), thumbW, thumbH
+}
+
+// detectImageMIME returns the correct MIME type based on magic bytes.
+func detectImageMIME(data []byte) string {
+	if len(data) < 8 {
+		return ""
+	}
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "image/jpeg"
+	}
+	if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return "image/png"
+	}
+	if string(data[:4]) == "GIF8" {
+		return "image/gif"
+	}
+	if (data[0] == 'I' && data[1] == 'I' && data[2] == 0x2a && data[3] == 0x00) ||
+		(data[0] == 'M' && data[1] == 'M' && data[2] == 0x00 && data[3] == 0x2a) {
+		return "image/tiff"
+	}
+	return ""
+}
+
+// looksLikeImage checks magic bytes to detect images even when MIME type is wrong.
+func looksLikeImage(data []byte) bool {
+	if len(data) < 8 {
+		return false
+	}
+	// JPEG: FF D8 FF
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return true
+	}
+	// PNG: 89 50 4E 47
+	if data[0] == 0x89 && data[1] == 0x50 && data[2] == 0x4E && data[3] == 0x47 {
+		return true
+	}
+	// GIF: GIF8
+	if string(data[:4]) == "GIF8" {
+		return true
+	}
+	// TIFF: II*\0 or MM\0*
+	if (data[0] == 'I' && data[1] == 'I' && data[2] == 0x2a && data[3] == 0x00) ||
+		(data[0] == 'M' && data[1] == 'M' && data[2] == 0x00 && data[3] == 0x2a) {
+		return true
+	}
+	return false
+}
+
+// decodeImageData tries to decode image bytes using stdlib decoders (PNG,
+// JPEG, GIF) and falls back to a minimal TIFF parser. Returns the decoded
+// image, detected format name, and whether the data is already JPEG (so
+// callers can skip re-encoding).
+func decodeImageData(data []byte) (image.Image, string, bool) {
+	// Try stdlib decoders first (handles PNG, JPEG, GIF)
+	if img, fmtName, err := image.Decode(bytes.NewReader(data)); err == nil {
+		return img, fmtName, fmtName == "jpeg"
+	}
+	// Fallback: try TIFF parser (handles uncompressed, LZW, Deflate, PackBits)
+	if img, err := decodeTIFF(data); err == nil {
+		return img, "tiff", false
+	}
+	return nil, "", false
+}
+
+// decodeTIFF parses RGB/RGBA TIFF images with support for common compression
+// formats (uncompressed, LZW, Deflate, PackBits) without needing golang.org/x/image.
+func decodeTIFF(data []byte) (image.Image, error) {
+	if len(data) < 8 {
+		return nil, fmt.Errorf("too short for TIFF")
+	}
+
+	var bo binary.ByteOrder
+	switch string(data[0:2]) {
+	case "II":
+		bo = binary.LittleEndian
+	case "MM":
+		bo = binary.BigEndian
+	default:
+		return nil, fmt.Errorf("not TIFF")
+	}
+	if bo.Uint16(data[2:4]) != 42 {
+		return nil, fmt.Errorf("bad TIFF magic")
+	}
+
+	ifdOffset := int(bo.Uint32(data[4:8]))
+	if ifdOffset+2 > len(data) {
+		return nil, fmt.Errorf("IFD offset out of range")
+	}
+	numEntries := int(bo.Uint16(data[ifdOffset : ifdOffset+2]))
+
+	var width, height, compression, samplesPerPixel, predictor int
+	var bitsPerSample []int
+	var stripOffsets []int
+	var stripByteCounts []int
+	var rowsPerStrip int
+
+	for i := range numEntries {
+		off := ifdOffset + 2 + i*12
+		if off+12 > len(data) {
+			break
+		}
+		tag := bo.Uint16(data[off : off+2])
+		typ := bo.Uint16(data[off+2 : off+4])
+		count := int(bo.Uint32(data[off+4 : off+8]))
+		valOff := off + 8
+
+		readVal := func() int {
+			switch typ {
+			case 3: // SHORT
+				return int(bo.Uint16(data[valOff : valOff+2]))
+			case 4: // LONG
+				return int(bo.Uint32(data[valOff : valOff+4]))
+			default:
+				return int(bo.Uint32(data[valOff : valOff+4]))
+			}
+		}
+		readVals := func() []int {
+			size := 2
+			if typ == 4 {
+				size = 4
+			}
+			src := valOff
+			if count*size > 4 {
+				src = int(bo.Uint32(data[valOff : valOff+4]))
+			}
+			vals := make([]int, count)
+			for j := range count {
+				p := src + j*size
+				if p+size > len(data) {
+					break
+				}
+				if typ == 3 {
+					vals[j] = int(bo.Uint16(data[p : p+2]))
+				} else {
+					vals[j] = int(bo.Uint32(data[p : p+4]))
+				}
+			}
+			return vals
+		}
+
+		switch tag {
+		case 256: // ImageWidth
+			width = readVal()
+		case 257: // ImageLength
+			height = readVal()
+		case 258: // BitsPerSample
+			bitsPerSample = readVals()
+		case 259: // Compression
+			compression = readVal()
+		case 277: // SamplesPerPixel
+			samplesPerPixel = readVal()
+		case 273: // StripOffsets
+			stripOffsets = readVals()
+		case 278: // RowsPerStrip
+			rowsPerStrip = readVal()
+		case 279: // StripByteCounts
+			stripByteCounts = readVals()
+		case 317: // Predictor
+			predictor = readVal()
+		}
+	}
+
+	if compression != 1 && compression != 5 && compression != 8 && compression != 32773 {
+		return nil, fmt.Errorf("unsupported TIFF compression: %d", compression)
+	}
+	if width == 0 || height == 0 {
+		return nil, fmt.Errorf("invalid dimensions")
+	}
+	if samplesPerPixel == 0 {
+		samplesPerPixel = len(bitsPerSample)
+	}
+	if samplesPerPixel != 3 && samplesPerPixel != 4 {
+		return nil, fmt.Errorf("unsupported samples per pixel: %d", samplesPerPixel)
+	}
+	for _, b := range bitsPerSample {
+		if b != 8 {
+			return nil, fmt.Errorf("unsupported bits per sample: %d", b)
+		}
+	}
+	if rowsPerStrip == 0 {
+		rowsPerStrip = height
+	}
+	if len(stripOffsets) == 0 {
+		return nil, fmt.Errorf("TIFF has no strip offsets")
+	}
+
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	y := 0
+	bytesPerRow := width * samplesPerPixel
+	for i, sOff := range stripOffsets {
+		sLen := 0
+		if i < len(stripByteCounts) {
+			sLen = stripByteCounts[i]
+		} else {
+			sLen = len(data) - sOff
+		}
+		if sOff+sLen > len(data) {
+			sLen = len(data) - sOff
+		}
+		if sLen <= 0 {
+			break
+		}
+		rawStrip := data[sOff : sOff+sLen]
+
+		// Decompress the strip
+		stripData, err := decompressTIFFStrip(rawStrip, compression)
+		if err != nil {
+			return nil, fmt.Errorf("strip %d decompress: %w", i, err)
+		}
+
+		// Apply horizontal differencing predictor if needed
+		if predictor == 2 {
+			for r := 0; r < len(stripData)/bytesPerRow; r++ {
+				rowStart := r * bytesPerRow
+				for x := samplesPerPixel; x < bytesPerRow; x++ {
+					stripData[rowStart+x] += stripData[rowStart+x-samplesPerPixel]
+				}
+			}
+		}
+
+		for row := 0; row < rowsPerStrip && y < height; row++ {
+			rowStart := row * bytesPerRow
+			if rowStart+bytesPerRow > len(stripData) {
+				break
+			}
+			rowData := stripData[rowStart : rowStart+bytesPerRow]
+			for x := range width {
+				px := x * samplesPerPixel
+				dstIdx := (y*width + x) * 4
+				img.Pix[dstIdx+0] = rowData[px+0]
+				img.Pix[dstIdx+1] = rowData[px+1]
+				img.Pix[dstIdx+2] = rowData[px+2]
+				if samplesPerPixel == 4 {
+					img.Pix[dstIdx+3] = rowData[px+3]
+				} else {
+					img.Pix[dstIdx+3] = 0xFF
+				}
+			}
+			y++
+		}
+	}
+	return img, nil
+}
+
+// decompressTIFFStrip decompresses a single TIFF strip.
+func decompressTIFFStrip(data []byte, compression int) ([]byte, error) {
+	switch compression {
+	case 1: // No compression
+		out := make([]byte, len(data))
+		copy(out, data)
+		return out, nil
+	case 5: // LZW (TIFF uses MSB bit order, 8-bit codes)
+		r := lzw.NewReader(bytes.NewReader(data), lzw.MSB, 8)
+		defer r.Close()
+		return io.ReadAll(r)
+	case 8: // Deflate/zlib
+		r, err := zlib.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return io.ReadAll(r)
+	case 32773: // PackBits
+		return decompressPackBits(data)
+	default:
+		return nil, fmt.Errorf("unsupported compression: %d", compression)
+	}
+}
+
+// decompressPackBits implements the PackBits decompression algorithm.
+func decompressPackBits(data []byte) ([]byte, error) {
+	var out []byte
+	i := 0
+	for i < len(data) {
+		n := int(int8(data[i]))
+		i++
+		if n >= 0 {
+			cnt := n + 1
+			if i+cnt > len(data) {
+				break
+			}
+			out = append(out, data[i:i+cnt]...)
+			i += cnt
+		} else if n > -128 {
+			if i >= len(data) {
+				break
+			}
+			cnt := 1 - n
+			b := data[i]
+			i++
+			for j := 0; j < cnt; j++ {
+				out = append(out, b)
+			}
+		}
+		// n == -128: no-op
+	}
+	return out, nil
+}
 
 func tapbackTypeToEmoji(tapbackType *uint32, tapbackEmoji *string) string {
 	if tapbackType == nil {
