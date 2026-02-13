@@ -375,6 +375,31 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 	return out, nil
 }
 
+func (s *cloudBackfillStore) listAllPortalIDs(ctx context.Context) ([]string, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT DISTINCT portal_id
+		FROM cloud_chat
+		WHERE login_id=$1
+			AND portal_id IS NOT NULL
+			AND portal_id <> ''
+		ORDER BY portal_id
+	`, s.loginID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var portalIDs []string
+	for rows.Next() {
+		var portalID string
+		if err = rows.Scan(&portalID); err != nil {
+			return nil, err
+		}
+		portalIDs = append(portalIDs, portalID)
+	}
+	return portalIDs, rows.Err()
+}
+
 func (s *cloudBackfillStore) listActiveChatsSince(ctx context.Context, sinceTS int64, limit int) ([]cloudActiveChat, error) {
 	rows, err := s.db.Query(ctx, `
 		SELECT chat_id, portal_id
