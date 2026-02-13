@@ -45,10 +45,9 @@ else
 fi
 
 # ── Delete server-side registration (cleans up Matrix rooms) ──
-echo "Deleting bridge registration from Beeper (cleaning up rooms)..."
-"$BBCTL" delete --force "$BRIDGE_NAME" <<< "y" 2>/dev/null \
-    || "$BBCTL" delete "$BRIDGE_NAME" <<< "y" 2>/dev/null \
-    || echo "  (bridge may already be unregistered)"
+echo "Deleting bridge registration from Beeper..."
+echo "  (confirm the deletion when prompted)"
+"$BBCTL" delete "$BRIDGE_NAME" || echo "  (bridge may already be unregistered)"
 
 # ── Re-register and get fresh config ─────────────────────────
 echo "Re-registering bridge with Beeper..."
