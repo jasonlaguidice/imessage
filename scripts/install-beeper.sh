@@ -131,8 +131,15 @@ fi
 DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 NEEDS_LOGIN=false
 
+SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
-    NEEDS_LOGIN=true
+    # DB missing, but if session.json exists the bridge will auto-restore the login
+    if [ -f "$SESSION_FILE" ] && grep -q '"aps_state"' "$SESSION_FILE" 2>/dev/null; then
+        NEEDS_LOGIN=false
+    else
+        NEEDS_LOGIN=true
+    fi
 elif command -v sqlite3 >/dev/null 2>&1; then
     LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
     if [ "$LOGIN_COUNT" = "0" ]; then
@@ -147,7 +154,6 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
 if [ "$NEEDS_LOGIN" = "false" ]; then
