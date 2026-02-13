@@ -144,10 +144,14 @@ if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
 elif command -v sqlite3 >/dev/null 2>&1; then
     LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
     if [ "$LOGIN_COUNT" = "0" ]; then
-        NEEDS_LOGIN=true
+        if [ -f "$SESSION_FILE" ] && { grep -q '"hardware_key"' "$SESSION_FILE" 2>/dev/null || [ "$(uname -s)" = "Darwin" ]; }; then
+            echo "✓ No login in database, but session state found — bridge will auto-restore"
+            NEEDS_LOGIN=false
+        else
+            NEEDS_LOGIN=true
+        fi
     fi
 else
-    # sqlite3 not available — can't verify DB has logins, assume login needed
     NEEDS_LOGIN=true
 fi
 
