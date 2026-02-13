@@ -36,6 +36,11 @@ type PersistedSessionState struct {
 	IDSUsers        string `json:"ids_users,omitempty"`
 	PreferredHandle string `json:"preferred_handle,omitempty"`
 
+	// Login platform and device identity (needed for auto-restore on Linux)
+	Platform    string `json:"platform,omitempty"`
+	HardwareKey string `json:"hardware_key,omitempty"`
+	DeviceID    string `json:"device_id,omitempty"`
+
 	// iCloud account persist data (for TokenProvider restoration across restarts)
 	AccountUsername          string `json:"account_username,omitempty"`
 	AccountHashedPasswordHex string `json:"account_hashed_password_hex,omitempty"`

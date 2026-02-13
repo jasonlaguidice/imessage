@@ -137,8 +137,15 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		Str("username", username).
 		Msg("Auto-restoring login from backup session state")
 
+	platform := state.Platform
+	if platform == "" {
+		platform = runtime.GOOS
+	}
+
 	meta := &UserLoginMetadata{
-		Platform:                 runtime.GOOS,
+		Platform:                 platform,
+		HardwareKey:              state.HardwareKey,
+		DeviceID:                 state.DeviceID,
 		ChatsSynced:              false,
 		APSState:                 state.APSState,
 		IDSUsers:                 state.IDSUsers,
@@ -240,6 +247,9 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		APSState:                 meta.APSState,
 		IDSUsers:                 meta.IDSUsers,
 		PreferredHandle:          meta.PreferredHandle,
+		Platform:                 meta.Platform,
+		HardwareKey:              meta.HardwareKey,
+		DeviceID:                 meta.DeviceID,
 		AccountUsername:          meta.AccountUsername,
 		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
 		AccountPET:               meta.AccountPET,

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Reset the bridge: wipe all Matrix rooms and synced data, re-register with
-# Beeper, and re-sync from CloudKit. Keeps the iCloud login intact.
+# Beeper, and re-sync from CloudKit. Keeps the iCloud login intact (session
+# files in ~/.local/share/mautrix-imessage/ are untouched).
 #
 # Usage: make reset
 #
@@ -9,34 +10,17 @@ set -euo pipefail
 
 DATA_DIR="${1:-$(pwd)/data}"
 BUNDLE_ID="${2:-com.lrhodin.mautrix-imessage}"
-CONFIG="$DATA_DIR/config.yaml"
 BRIDGE_NAME="sh-imessage"
-BBCTL_LINUX="$HOME/.local/share/mautrix-imessage/bridge-manager/bbctl"
 UNAME_S=$(uname -s)
 
 if [ "$UNAME_S" = "Darwin" ]; then
     BBCTL="$HOME/.local/share/mautrix-imessage/bridge-manager/bbctl"
 else
-    BBCTL="$BBCTL_LINUX"
+    BBCTL="$HOME/.local/share/mautrix-imessage/bridge-manager/bbctl"
 fi
 
 if [ ! -x "$BBCTL" ]; then
     echo "ERROR: bbctl not found at $BBCTL"
-    exit 1
-fi
-
-DB_URI=""
-if [ -f "$CONFIG" ]; then
-    DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
-fi
-# Fallback: check default location
-if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
-    DB_URI="$DATA_DIR/mautrix-imessage.db"
-fi
-
-if [ ! -f "$DB_URI" ]; then
-    echo "ERROR: No existing bridge database found."
-    echo "  Run 'make install-beeper' first."
     exit 1
 fi
 
@@ -53,39 +37,36 @@ echo "Deleting bridge registration from Beeper..."
 echo "  (confirm the deletion when prompted)"
 "$BBCTL" delete "$BRIDGE_NAME" || echo "  (bridge may already be unregistered)"
 
+# ── Wipe the bridge DB entirely ──────────────────────────────
+# The iCloud login is persisted separately in session.json + keystore.plist
+# and will be auto-restored on next start.
+echo "Removing bridge database..."
+rm -f "$DATA_DIR"/mautrix-imessage.db*
+
 # ── Re-register and get fresh config ─────────────────────────
 echo "Re-registering bridge with Beeper..."
-rm -f "$CONFIG"
-# bbctl delete is async — retry registration until the server is ready
+rm -f "$DATA_DIR/config.yaml"
 for i in 1 2 3 4 5 6; do
-    if "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME" 2>/dev/null; then
+    if "$BBCTL" config --type imessage-v2 -o "$DATA_DIR/config.yaml" "$BRIDGE_NAME" 2>/dev/null; then
         break
     fi
     echo "  Waiting for deletion to complete... (attempt $i/6)"
     sleep 5
 done
-if [ ! -f "$CONFIG" ]; then
+if [ ! -f "$DATA_DIR/config.yaml" ]; then
     echo "ERROR: Failed to re-register bridge after 30s. Try again in a minute."
     exit 1
 fi
 
-# Patch config: absolute DB path
+# Patch config
 if [ "$UNAME_S" = "Darwin" ]; then
     DATA_ABS="$(cd "$DATA_DIR" && pwd)"
-    sed -i '' "s|uri: file:mautrix-imessage.db|uri: file:$DATA_ABS/mautrix-imessage.db|" "$CONFIG"
-    sed -i '' 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    sed -i '' "s|uri: file:mautrix-imessage.db|uri: file:$DATA_ABS/mautrix-imessage.db|" "$DATA_DIR/config.yaml"
+    sed -i '' 's/max_batches: 0$/max_batches: -1/' "$DATA_DIR/config.yaml"
 else
-    sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
-    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$DATA_DIR/config.yaml"
+    sed -i 's/max_batches: 0$/max_batches: -1/' "$DATA_DIR/config.yaml"
 fi
-
-# ── Wipe synced data but keep user_login ─────────────────────
-echo "Clearing synced data (keeping iCloud login)..."
-for table in portal ghost user_portal message reaction disappearing_message \
-             backfill_task cloud_chat cloud_message cloud_sync_state cloud_repair_task; do
-    sqlite3 "$DB_URI" "DELETE FROM $table;" 2>/dev/null || true
-done
-echo "✓ Cleared portals, messages, cloud sync state, and backfill tasks"
 
 # ── Restart ──────────────────────────────────────────────────
 echo "Starting bridge..."
