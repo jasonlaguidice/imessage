@@ -132,8 +132,15 @@ DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//
 NEEDS_LOGIN=false
 
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
+SESSION_FILE="$SESSION_DIR/session.json"
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
-    NEEDS_LOGIN=true
+    # DB missing — check if session.json can auto-restore (has hardware_key for Linux, or macOS)
+    if [ -f "$SESSION_FILE" ] && { grep -q '"hardware_key"' "$SESSION_FILE" 2>/dev/null || [ "$(uname -s)" = "Darwin" ]; }; then
+        echo "✓ No database yet, but session state found — bridge will auto-restore login"
+        NEEDS_LOGIN=false
+    else
+        NEEDS_LOGIN=true
+    fi
 elif command -v sqlite3 >/dev/null 2>&1; then
     LOGIN_COUNT=$(sqlite3 "$DB_URI" "SELECT count(*) FROM user_login;" 2>/dev/null || echo "0")
     if [ "$LOGIN_COUNT" = "0" ]; then
