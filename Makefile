@@ -71,6 +71,7 @@ ifeq ($(UNAME_S),Darwin)
 	command -v go >/dev/null 2>&1    || missing="$$missing go"; \
 	command -v cargo >/dev/null 2>&1 || missing="$$missing rust"; \
 	command -v protoc >/dev/null 2>&1|| missing="$$missing protobuf"; \
+	command -v tmux >/dev/null 2>&1  || missing="$$missing tmux"; \
 	[ -f /opt/homebrew/include/olm/olm.h ] || [ -f /usr/local/include/olm/olm.h ] || missing="$$missing libolm"; \
 	if [ -n "$$missing" ]; then \
 		echo "Installing dependencies:$$missing"; \
