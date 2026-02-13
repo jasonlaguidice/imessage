@@ -61,8 +61,19 @@ echo "✓ Logged in: $WHOAMI"
 # ── Generate config via bbctl ─────────────────────────────────
 mkdir -p "$DATA_DIR"
 if [ -f "$CONFIG" ]; then
+    # Verify the as_token is still valid (bbctl delete invalidates it)
+    AS_TOKEN=$(grep 'as_token:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*as_token: *//')
+    HS_URL=$(grep 'address:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*address: *//')
+    if [ -n "$AS_TOKEN" ] && [ -n "$HS_URL" ]; then
+        HTTP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $AS_TOKEN" "$HS_URL/_matrix/client/v3/account/whoami" 2>/dev/null || echo "000")
+        if [ "$HTTP_CODE" = "401" ]; then
+            echo "⚠ Config as_token is no longer valid (bridge was deleted?). Regenerating..."
+            rm -f "$CONFIG"
+        fi
+    fi
+fi
+if [ -f "$CONFIG" ]; then
     echo "✓ Config already exists at $CONFIG"
-    echo "  Delete it to regenerate from Beeper."
 else
     echo "Generating Beeper config..."
     "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
