@@ -208,6 +208,22 @@ func (s *cloudBackfillStore) setSyncStateSuccess(ctx context.Context, zone strin
 	return err
 }
 
+func (s *cloudBackfillStore) clearSyncTokens(ctx context.Context) error {
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM cloud_sync_state WHERE login_id=$1`,
+		s.loginID)
+	return err
+}
+
+func (s *cloudBackfillStore) hasAnyMessages(ctx context.Context) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 LIMIT 1`,
+		s.loginID,
+	).Scan(&count)
+	return count > 0, err
+}
+
 func (s *cloudBackfillStore) setSyncStateError(ctx context.Context, zone, errMsg string) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
