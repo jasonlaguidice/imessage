@@ -176,24 +176,8 @@ FORCE_CLEAR_STATE=false
 if [ "$NEEDS_LOGIN" = "false" ]; then
     HAS_CLIQUE=false
     if [ -f "$TRUSTEDPEERS_FILE" ]; then
-        if command -v python3 >/dev/null 2>&1; then
-            if python3 - <<PY >/dev/null 2>&1
-import plistlib, sys
-p = "$TRUSTEDPEERS_FILE"
-try:
-    d = plistlib.load(open(p, "rb"))
-except Exception:
-    sys.exit(1)
-ui = d.get("userIdentity", d.get("user_identity"))
-sys.exit(0 if ui else 1)
-PY
-            then
-                HAS_CLIQUE=true
-            fi
-        else
-            if grep -q "<key>userIdentity</key>" "$TRUSTEDPEERS_FILE" || grep -q "<key>user_identity</key>" "$TRUSTEDPEERS_FILE"; then
-                HAS_CLIQUE=true
-            fi
+        if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
+            HAS_CLIQUE=true
         fi
     fi
 
