@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -233,7 +234,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId)
+		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
 		if portalID == "" {
 			counts.Skipped++
 			continue
@@ -341,7 +342,7 @@ func (c *IMClient) ingestCloudMessages(
 	return nil
 }
 
-func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string) string {
+func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string, style int64) string {
 	normalizedParticipants := make([]string, 0, len(participants))
 	for _, participant := range participants {
 		normalized := normalizeIdentifierForPortalID(participant)
@@ -354,19 +355,37 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 		return ""
 	}
 
-	// For groups with a persistent group UUID (gid), use gid:<UUID> as portal ID
-	isGroup := len(normalizedParticipants) > 2 || displayName != nil
+	// CloudKit chat style: 43 = group, 45 = DM.
+	// Use style as the authoritative group/DM signal. The group_id (gid)
+	// field is set for ALL CloudKit chats, even DMs, so we can't use its
+	// presence alone.
+	isGroup := style == 43
+
+	// For groups with a persistent group UUID, use gid:<UUID> as portal ID
 	if isGroup && groupID != "" {
-		return "gid:" + groupID
+		normalizedGID := strings.ToLower(groupID)
+		return "gid:" + normalizedGID
 	}
 
+	// For DMs: use the single remote participant as the portal ID
+	// (e.g., "tel:+15551234567" or "mailto:user@example.com").
+	// Filter out our own handle so only the remote side remains.
+	remoteParticipants := make([]string, 0, len(normalizedParticipants))
+	for _, p := range normalizedParticipants {
+		if !c.isMyHandle(p) {
+			remoteParticipants = append(remoteParticipants, p)
+		}
+	}
+
+	if len(remoteParticipants) == 1 {
+		// Standard DM — portal ID is the remote participant
+		return remoteParticipants[0]
+	}
+
+	// Fallback for edge cases (unknown style, multi-participant without group style)
 	groupName := displayName
-	if len(normalizedParticipants) <= 2 {
-		groupName = nil
-	}
-
 	var senderGuidPtr *string
-	if groupID != "" {
+	if isGroup && groupID != "" {
 		senderGuidPtr = &groupID
 	}
 	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr)

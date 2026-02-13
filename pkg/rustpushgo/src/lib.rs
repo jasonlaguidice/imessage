@@ -763,6 +763,8 @@ pub struct WrappedCloudSyncChat {
     pub record_name: String,
     pub cloud_chat_id: String,
     pub group_id: String,
+    /// CloudKit chat style: 43 = group, 45 = DM
+    pub style: i64,
     pub service: String,
     pub display_name: Option<String>,
     pub participants: Vec<String>,
@@ -2229,6 +2231,7 @@ impl Client {
                     record_name,
                     cloud_chat_id,
                     group_id: chat.group_id,
+                    style: chat.style,
                     service: chat.service_name,
                     display_name: chat.display_name,
                     participants: chat.participants.into_iter().map(|p| p.uri).collect(),
@@ -2239,6 +2242,7 @@ impl Client {
                 normalized.push(WrappedCloudSyncChat {
                     cloud_chat_id: record_name.clone(),
                     group_id: String::new(),
+                    style: 0,
                     record_name,
                     service: String::new(),
                     display_name: None,

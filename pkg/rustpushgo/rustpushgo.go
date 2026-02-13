@@ -2377,6 +2377,7 @@ type WrappedCloudSyncChat struct {
 	RecordName         string
 	CloudChatId        string
 	GroupId            string
+	Style              int64
 	Service            string
 	DisplayName        *string
 	Participants       []string
@@ -2388,6 +2389,7 @@ func (r *WrappedCloudSyncChat) Destroy() {
 	FfiDestroyerString{}.Destroy(r.RecordName)
 	FfiDestroyerString{}.Destroy(r.CloudChatId)
 	FfiDestroyerString{}.Destroy(r.GroupId)
+	FfiDestroyerInt64{}.Destroy(r.Style)
 	FfiDestroyerString{}.Destroy(r.Service)
 	FfiDestroyerOptionalString{}.Destroy(r.DisplayName)
 	FfiDestroyerSequenceString{}.Destroy(r.Participants)
@@ -2408,6 +2410,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Read(reader io.Reader) WrappedClou
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterSequenceStringINSTANCE.Read(reader),
@@ -2424,6 +2427,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Write(writer io.Writer, value Wrap
 	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
 	FfiConverterStringINSTANCE.Write(writer, value.CloudChatId)
 	FfiConverterStringINSTANCE.Write(writer, value.GroupId)
+	FfiConverterInt64INSTANCE.Write(writer, value.Style)
 	FfiConverterStringINSTANCE.Write(writer, value.Service)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.DisplayName)
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.Participants)
