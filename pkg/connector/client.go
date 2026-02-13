@@ -2181,7 +2181,7 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		// changes or participants normalize differently.
 		var portalID networkid.PortalID
 		if senderGuid != nil && *senderGuid != "" {
-			portalID = networkid.PortalID("gid:" + *senderGuid)
+			portalID = networkid.PortalID("gid:" + strings.ToLower(*senderGuid))
 		} else {
 			// Fallback: build a participant-based ID for groups without a UUID.
 			sorted := make([]string, 0, len(participants))
