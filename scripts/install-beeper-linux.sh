@@ -84,6 +84,12 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
+# Ensure backward backfill is enabled (default from bbctl is 0 which disables it)
+if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    echo "✓ Enabled backward backfill (max_batches: -1)"
+fi
+
 if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     echo ""
     echo "WARNING: Config doesn't appear to contain Beeper details."
