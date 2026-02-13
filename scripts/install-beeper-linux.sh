@@ -108,8 +108,10 @@ else
     NEEDS_LOGIN=true
 fi
 
-# Also require login if keychain trust-circle state is missing.
-# Without this, CloudKit sync fails with "Not in clique" even if DB has a login.
+# Require re-login if keychain trust-circle state is missing.
+# This catches upgrades from pre-keychain versions where the device-passcode
+# step was never run. If trustedpeers.plist exists with a user_identity, the
+# keychain was joined successfully and any transient PCS errors are harmless.
 SESSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/mautrix-imessage"
 TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
@@ -141,19 +143,6 @@ PY
     if [ "$HAS_CLIQUE" != "true" ]; then
         echo "⚠ Existing login found, but keychain trust-circle is not initialized."
         echo "  Forcing fresh login so device-passcode step can run."
-        NEEDS_LOGIN=true
-        FORCE_CLEAR_STATE=true
-    fi
-fi
-
-# Also require login if CloudKit last error indicates missing PCS keys.
-if [ "$NEEDS_LOGIN" = "false" ] && command -v sqlite3 >/dev/null 2>&1 && [ -n "$DB_URI" ] && [ -f "$DB_URI" ]; then
-    PCS_MISSING=$(sqlite3 "$DB_URI" "SELECT count(*) FROM cloud_sync_state WHERE coalesce(last_error, '') LIKE '%PCS Share key%not found%';" 2>/dev/null || echo "0")
-    PCS_MISSING=$(echo "$PCS_MISSING" | tr -dc '0-9')
-    [ -z "$PCS_MISSING" ] && PCS_MISSING=0
-    if [ "$PCS_MISSING" -gt 0 ]; then
-        echo "⚠ Existing login found, but CloudKit PCS keys are missing."
-        echo "  Forcing fresh login to regenerate keychain/PCS state."
         NEEDS_LOGIN=true
         FORCE_CLEAR_STATE=true
     fi
