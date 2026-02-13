@@ -50,6 +50,10 @@ type UserLoginMetadata struct {
 	AccountADSID             string `json:"account_adsid,omitempty"`
 	AccountDSID              string `json:"account_dsid,omitempty"`
 	AccountSPDBase64         string `json:"account_spd_base64,omitempty"`
+
+	// Cached MobileMe delegate JSON — seeded on restore so contacts work
+	// without needing to refresh (which requires a still-valid PET).
+	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {

@@ -48,7 +48,7 @@ pub use util::{NSArrayClass, EntitlementsResponse, EntitlementAuthState, Resourc
 pub use ids::user::{IDSUser, register, IDSUserIdentity, IDSNGMIdentity, PrivateDeviceInfo, SupportAlert, SupportAction, ReportMessage};
 pub use ids::identity_manager::{SendJob, MessageTarget, IdentityManager, KeyCache};
 pub use ids::CertifiedContext;
-pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider};
+pub use auth::{authenticate_apple, login_apple_delegates, authenticate_phone, authenticate_smsless, AuthPhone, LoginDelegate, CircleClientSession, TokenProvider, MobileMeDelegateResponse};
 pub use error::PushError;
 pub use cloudkit_proto;
 pub use cloudkit_derive;

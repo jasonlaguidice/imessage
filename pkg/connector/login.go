@@ -632,6 +632,14 @@ func completeLoginWithMeta(
 		meta.AccountDSID = result.AccountPersist.Dsid
 		meta.AccountSPDBase64 = result.AccountPersist.SpdBase64
 		log.Info().Str("dsid", meta.AccountDSID).Msg("iCloud account credentials available for TokenProvider")
+		// Also capture the MobileMe delegate so it can be seeded on restore
+		if result.TokenProvider != nil && *result.TokenProvider != nil {
+			tp := *result.TokenProvider
+			if delegateJSON, mmeErr := tp.GetMmeDelegateJson(); mmeErr == nil && delegateJSON != nil {
+				meta.MmeDelegateJSON = *delegateJSON
+				log.Info().Msg("Captured MobileMe delegate for persistence")
+			}
+		}
 	} else {
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
 	}
@@ -651,6 +659,7 @@ func completeLoginWithMeta(
 		AccountADSID:             meta.AccountADSID,
 		AccountDSID:              meta.AccountDSID,
 		AccountSPDBase64:         meta.AccountSPDBase64,
+		MmeDelegateJSON:          meta.MmeDelegateJSON,
 	})
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))

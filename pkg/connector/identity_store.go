@@ -48,6 +48,9 @@ type PersistedSessionState struct {
 	AccountADSID             string `json:"account_adsid,omitempty"`
 	AccountDSID              string `json:"account_dsid,omitempty"`
 	AccountSPDBase64         string `json:"account_spd_base64,omitempty"`
+
+	// Cached MobileMe delegate for seeding on restore
+	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:
