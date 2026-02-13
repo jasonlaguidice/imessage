@@ -197,6 +197,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
 				c.tokenProvider = &tp
+				// Seed the cached MobileMe delegate so contacts work immediately
+				// without needing to call refresh_mme() (which requires a valid PET).
+				if meta.MmeDelegateJSON != "" {
+					if seedErr := tp.SeedMmeDelegateJson(meta.MmeDelegateJSON); seedErr != nil {
+						log.Warn().Err(seedErr).Msg("Failed to seed MobileMe delegate from cache")
+					} else {
+						log.Info().Msg("Seeded MobileMe delegate from cached state")
+					}
+				}
 			}
 		}
 	}
@@ -279,11 +288,15 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
 		} else {
 			c.setContactsReady(log)
+			c.persistMmeDelegate(log)
 		}
 		go c.periodicCloudContactSync(log)
 	} else {
-		// No cloud contacts available means we can't satisfy the readiness gate.
-		log.Warn().Msg("Cloud contacts unavailable, CloudKit message sync will stay gated")
+		// No cloud contacts available — retry periodically.
+		// The MobileMe delegate may have been expired on startup;
+		// periodic retries will pick up a fresh delegate once available.
+		log.Warn().Msg("Cloud contacts unavailable on startup, will retry periodically")
+		go c.retryCloudContacts(log)
 	}
 
 	if cloudStoreReady {
@@ -1685,6 +1698,64 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
 			} else {
 				c.setContactsReady(log)
+				c.persistMmeDelegate(log)
+			}
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// persistMmeDelegate saves the current MobileMe delegate to user_login metadata
+// so it can be seeded on restore without needing a fresh PET-based auth.
+func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
+	if c.tokenProvider == nil || *c.tokenProvider == nil {
+		return
+	}
+	tp := *c.tokenProvider
+	delegateJSON, err := tp.GetMmeDelegateJson()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to get MobileMe delegate for persistence")
+		return
+	}
+	if delegateJSON == nil || *delegateJSON == "" {
+		return
+	}
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if meta.MmeDelegateJSON == *delegateJSON {
+		return // unchanged
+	}
+	meta.MmeDelegateJSON = *delegateJSON
+	if err = c.UserLogin.Save(context.Background()); err != nil {
+		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate")
+	} else {
+		log.Info().Msg("Persisted MobileMe delegate to user_login metadata")
+	}
+}
+
+// retryCloudContacts retries the cloud contacts initialization periodically
+// when it fails on startup (e.g., expired MobileMe delegate). Once contacts
+// succeed, the readiness gate opens and cloud sync begins.
+func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
+	ticker := time.NewTicker(2 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			log.Info().Msg("Retrying cloud contacts initialization...")
+			c.cloudContacts = newCloudContactsClient(c.client, log)
+			if c.cloudContacts != nil {
+				if syncErr := c.cloudContacts.SyncContacts(log); syncErr != nil {
+					log.Warn().Err(syncErr).Msg("Cloud contacts retry: sync failed")
+				} else {
+					c.setContactsReady(log)
+					c.persistMmeDelegate(log)
+					log.Info().Msg("Cloud contacts retry succeeded, starting periodic sync")
+					go c.periodicCloudContactSync(log)
+					return
+				}
+			} else {
+				log.Warn().Msg("Cloud contacts retry: still unavailable")
 			}
 		case <-c.stopChan:
 			return

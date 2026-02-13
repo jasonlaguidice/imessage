@@ -219,9 +219,10 @@ impl<T: AnisetteProvider> TokenProvider<T> {
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
-        // refresh every week
+        // Refresh every 2 hours to keep the MobileMe delegate fresh.
+        // PET tokens expire after a few hours, so we must refresh while still valid.
         if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
-            > Duration::from_secs(60 * 60 * 24 * 7) {
+            > Duration::from_secs(60 * 60 * 2) {
             self.refresh_mme().await?;
         }
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
@@ -325,7 +326,7 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(rename = "com.apple.mobileme")]

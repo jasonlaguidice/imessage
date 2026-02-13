@@ -427,6 +427,27 @@ impl WrappedTokenProvider {
         Ok(self.inner.get_dsid().await?)
     }
 
+    /// Get the serialized MobileMe delegate as JSON (for persistence).
+    /// Returns None if no delegate is cached.
+    pub async fn get_mme_delegate_json(&self) -> Result<Option<String>, WrappedError> {
+        match self.inner.get_mme_delegate().await {
+            Ok(delegate) => {
+                let json = serde_json::to_string(&delegate)
+                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize MobileMe delegate: {}", e) })?;
+                Ok(Some(json))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Seed the MobileMe delegate from persisted JSON.
+    pub async fn seed_mme_delegate_json(&self, json: String) -> Result<(), WrappedError> {
+        let delegate: rustpush::MobileMeDelegateResponse = serde_json::from_str(&json)
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to deserialize MobileMe delegate: {}", e) })?;
+        self.inner.seed_mme_delegate(delegate).await;
+        Ok(())
+    }
+
     /// Join the iCloud Keychain trust circle using a device passcode.
     /// Required before CloudKit Messages can decrypt PCS-encrypted records.
     /// The passcode is the 6-digit PIN or password used to unlock an iPhone/Mac.
