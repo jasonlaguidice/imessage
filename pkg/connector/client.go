@@ -1500,6 +1500,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 
 	if params.Forward {
+		fetchCount := count + 1
 		var rows []cloudMessageRow
 		var err error
 		if params.AnchorMessage != nil {
@@ -1508,14 +1509,20 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				portalID,
 				params.AnchorMessage.Timestamp.UnixMilli(),
 				string(params.AnchorMessage.ID),
-				count,
+				fetchCount,
 			)
 		} else {
-			rows, err = c.cloudStore.listLatestMessages(ctx, portalID, count)
-			reverseCloudMessageRows(rows)
+			// No anchor: start from the oldest message (beginning of time)
+			rows, err = c.cloudStore.listForwardMessages(ctx, portalID, 0, "", fetchCount)
 		}
 		if err != nil {
 			return nil, err
+		}
+
+		hasMore := false
+		if len(rows) > count {
+			hasMore = true
+			rows = rows[:count]
 		}
 
 		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
@@ -1524,7 +1531,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}
 		return &bridgev2.FetchMessagesResponse{
 			Messages: messages,
-			HasMore:  false,
+			HasMore:  hasMore,
 			Forward:  true,
 		}, nil
 	}
