@@ -80,6 +80,17 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		return
 	}
 
+	// On a fresh DB (no messages), clear any stale continuation tokens
+	// so the bootstrap does a full sync from scratch.
+	hasMessages, _ := c.cloudStore.hasAnyMessages(ctx)
+	if !hasMessages {
+		if err := c.cloudStore.clearSyncTokens(ctx); err != nil {
+			log.Warn().Err(err).Msg("Failed to clear stale sync tokens")
+		} else {
+			log.Info().Msg("Fresh database detected, cleared sync tokens for full bootstrap")
+		}
+	}
+
 	log.Info().Msg("Cloud bootstrap sync start")
 	counts, err := c.runIncrementalCloudSync(ctx, log)
 	if err != nil {
