@@ -69,6 +69,12 @@ if [ -f "$CONFIG" ]; then
         if [ "$HTTP_CODE" = "401" ]; then
             echo "⚠ Config as_token is no longer valid (bridge was deleted?). Regenerating..."
             rm -f "$CONFIG"
+            # The DB has portal rows pointing at Matrix rooms that no longer exist
+            DB_FILE="$DATA_DIR/mautrix-imessage.db"
+            if [ -f "$DB_FILE" ]; then
+                echo "  Removing stale database (old rooms were deleted)..."
+                rm -f "$DB_FILE" "$DB_FILE"-wal "$DB_FILE"-shm
+            fi
         fi
     fi
 fi
