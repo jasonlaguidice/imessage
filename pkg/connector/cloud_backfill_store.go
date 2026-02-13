@@ -99,6 +99,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS cloud_chat (
 			login_id TEXT NOT NULL,
 			cloud_chat_id TEXT NOT NULL,
+			record_name TEXT NOT NULL DEFAULT '',
 			portal_id TEXT NOT NULL,
 			service TEXT,
 			display_name TEXT,
@@ -123,8 +124,11 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			PRIMARY KEY (login_id, guid)
 		)`,
 		repairTaskTable,
+		`ALTER TABLE cloud_chat ADD COLUMN IF NOT EXISTS record_name TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
 			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
+		`CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
+			ON cloud_chat (login_id, record_name) WHERE record_name <> ''`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
 			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
@@ -187,7 +191,7 @@ func (s *cloudBackfillStore) setSyncStateError(ctx context.Context, zone, errMsg
 
 func (s *cloudBackfillStore) upsertChat(
 	ctx context.Context,
-	cloudChatID, portalID, service string,
+	cloudChatID, recordName, portalID, service string,
 	displayName *string,
 	participants []string,
 	updatedTS int64,
@@ -199,23 +203,27 @@ func (s *cloudBackfillStore) upsertChat(
 	nowMS := time.Now().UnixMilli()
 	_, err = s.db.Exec(ctx, `
 		INSERT INTO cloud_chat (
-			login_id, cloud_chat_id, portal_id, service, display_name,
+			login_id, cloud_chat_id, record_name, portal_id, service, display_name,
 			participants_json, updated_ts, created_ts
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
+			record_name=excluded.record_name,
 			portal_id=excluded.portal_id,
 			service=excluded.service,
 			display_name=excluded.display_name,
 			participants_json=excluded.participants_json,
 			updated_ts=excluded.updated_ts
-	`, s.loginID, cloudChatID, portalID, service, nullableString(displayName), string(participantsJSON), updatedTS, nowMS)
+	`, s.loginID, cloudChatID, recordName, portalID, service, nullableString(displayName), string(participantsJSON), updatedTS, nowMS)
 	return err
 }
 
 func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID string) (string, error) {
 	var portalID string
+	// Try matching by cloud_chat_id first, then by record_name.
+	// Messages reference chats by record_name (CloudKit record ID),
+	// while cloud_chat stores chat_identifier as cloud_chat_id.
 	err := s.db.QueryRow(ctx,
-		`SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND cloud_chat_id=$2`,
+		`SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND (cloud_chat_id=$2 OR record_name=$2)`,
 		s.loginID, cloudChatID,
 	).Scan(&portalID)
 	if err != nil {
