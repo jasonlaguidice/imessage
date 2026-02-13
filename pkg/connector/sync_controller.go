@@ -6,6 +6,9 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/simplevent"
 
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
@@ -89,6 +92,8 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Int("deleted", counts.Deleted).
 			Msg("Cloud bootstrap sync end")
 	}
+
+	c.createPortalsFromCloudSync(ctx, log)
 
 	if err = c.enqueueRecentRepairTasks(ctx, log); err != nil {
 		log.Warn().Err(err).Msg("Failed to enqueue initial repair tasks")
@@ -445,6 +450,48 @@ func (c *IMClient) executeRepairTasks(ctx context.Context, log zerolog.Logger, l
 			Int("deleted", counts.Deleted).
 			Msg("Repair task completed")
 	}
+}
+
+func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+
+	portalIDs, err := c.cloudStore.listAllPortalIDs(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to list cloud chat portal IDs")
+		return
+	}
+	if len(portalIDs) == 0 {
+		return
+	}
+
+	log.Info().Int("chat_count", len(portalIDs)).Msg("Creating portals from cloud sync")
+
+	created := 0
+	for _, portalID := range portalIDs {
+		portalKey := networkid.PortalKey{
+			ID:       networkid.PortalID(portalID),
+			Receiver: c.UserLogin.ID,
+		}
+
+		res := c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:         bridgev2.RemoteEventChatResync,
+				PortalKey:    portalKey,
+				CreatePortal: true,
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("portal_id", portalID).Str("source", "cloud_sync")
+				},
+			},
+			GetChatInfoFunc: c.GetChatInfo,
+		})
+		if res.Success {
+			created++
+		}
+	}
+
+	log.Info().Int("created", created).Int("total", len(portalIDs)).Msg("Finished creating portals from cloud sync")
 }
 
 func maxInt64(a, b int64) int64 {
