@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"go.mau.fi/util/dbutil"
@@ -242,6 +243,12 @@ func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID st
 	).Scan(&portalID)
 	if err != nil {
 		if err == sql.ErrNoRows {
+			// Messages use chat_identifier format like "SMS;-;+14158138533" or "iMessage;-;user@example.com"
+			// but cloud_chat stores just the identifier part ("+14158138533" or "user@example.com").
+			// Try stripping the service prefix.
+			if parts := strings.SplitN(cloudChatID, ";-;", 2); len(parts) == 2 {
+				return s.getChatPortalID(ctx, parts[1])
+			}
 			return "", nil
 		}
 		return "", err
