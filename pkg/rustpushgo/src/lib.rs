@@ -2261,6 +2261,45 @@ impl Client {
         })
     }
 
+    /// Dump ALL CloudKit chat records as raw JSON (paginating until done).
+    /// Returns a JSON array of objects with record_name + all CloudChat fields.
+    pub async fn cloud_dump_chats_json(&self) -> Result<String, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        let mut all_records: Vec<serde_json::Value> = Vec::new();
+        let mut token: Option<Vec<u8>> = None;
+
+        for page in 0..256 {
+            let (next_token, chats, status) = cloud_messages.sync_chats(token).await
+                .map_err(|e| WrappedError::GenericError {
+                    msg: format!("CloudKit chat dump page {} failed: {}", page, e),
+                })?;
+
+            for (record_name, chat_opt) in &chats {
+                let mut obj = if let Some(chat) = chat_opt {
+                    serde_json::to_value(chat).unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::json!({"deleted": true})
+                };
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("_record_name".to_string(), serde_json::Value::String(record_name.clone()));
+                }
+                all_records.push(obj);
+            }
+
+            info!("CloudKit chat dump page {}: {} records, status={}", page, chats.len(), status);
+
+            if status == 3 {
+                break;
+            }
+            token = Some(next_token);
+        }
+
+        serde_json::to_string_pretty(&all_records).map_err(|e| WrappedError::GenericError {
+            msg: format!("JSON serialization failed: {}", e),
+        })
+    }
+
     pub async fn cloud_sync_messages(
         &self,
         continuation_token: Option<String>,

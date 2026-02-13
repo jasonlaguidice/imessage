@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -93,6 +94,19 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 
 	log.Info().Msg("Cloud bootstrap sync start")
+
+	// Dump raw CloudKit chat records to disk for debugging
+	if dumpJSON, dumpErr := c.client.CloudDumpChatsJson(); dumpErr != nil {
+		log.Warn().Err(dumpErr).Msg("Failed to dump raw CloudKit chats")
+	} else {
+		dumpPath := "cloudkit_chats_dump.json"
+		if writeErr := os.WriteFile(dumpPath, []byte(dumpJSON), 0644); writeErr != nil {
+			log.Warn().Err(writeErr).Msg("Failed to write CloudKit dump file")
+		} else {
+			log.Info().Str("path", dumpPath).Int("bytes", len(dumpJSON)).Msg("Dumped raw CloudKit chat records")
+		}
+	}
+
 	counts, err := c.runIncrementalCloudSync(ctx, log)
 	if err != nil {
 		log.Error().Err(err).Msg("Cloud bootstrap sync failed")
