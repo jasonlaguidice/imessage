@@ -29,8 +29,12 @@ DB_URI=""
 if [ -f "$CONFIG" ]; then
     DB_URI=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
 fi
-
+# Fallback: check default location
 if [ -z "$DB_URI" ] || [ ! -f "$DB_URI" ]; then
+    DB_URI="$DATA_DIR/mautrix-imessage.db"
+fi
+
+if [ ! -f "$DB_URI" ]; then
     echo "ERROR: No existing bridge database found."
     echo "  Run 'make install-beeper' first."
     exit 1
