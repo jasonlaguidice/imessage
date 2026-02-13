@@ -236,6 +236,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		if err = c.cloudStore.upsertChat(
 			ctx,
 			chat.CloudChatId,
+			chat.RecordName,
 			portalID,
 			chat.Service,
 			chat.DisplayName,
