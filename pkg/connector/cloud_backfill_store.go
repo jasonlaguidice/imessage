@@ -124,7 +124,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			PRIMARY KEY (login_id, guid)
 		)`,
 		repairTaskTable,
-		`ALTER TABLE cloud_chat ADD COLUMN IF NOT EXISTS record_name TEXT NOT NULL DEFAULT ''`,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
 			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
@@ -142,6 +141,16 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to ensure cloud backfill schema: %w", err)
 		}
 	}
+
+	// Migration: add record_name column if missing (SQLite doesn't support IF NOT EXISTS on ALTER)
+	var hasRecordName int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='record_name'`).Scan(&hasRecordName)
+	if hasRecordName == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN record_name TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("failed to add record_name column: %w", err)
+		}
+	}
+
 	return nil
 }
 
