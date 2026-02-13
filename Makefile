@@ -23,7 +23,7 @@ ifneq ($(COMMIT),$(PREV_COMMIT))
   $(shell echo $(COMMIT) > $(COMMIT_FILE))
 endif
 
-.PHONY: build clean install install-beeper uninstall rust bindings check-deps check-deps-linux
+.PHONY: build clean install install-beeper uninstall reset rust bindings check-deps check-deps-linux
 
 # ===========================================================================
 # Path validation – spaces in the working directory break CGO linker flags
@@ -145,6 +145,13 @@ ifeq ($(UNAME_S),Darwin)
 	@scripts/install-beeper.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)"
 else
 	@scripts/install-beeper-linux.sh "$(BINARY)" "$(DATA_DIR)"
+endif
+
+reset:
+ifeq ($(UNAME_S),Darwin)
+	@scripts/reset-bridge.sh "$(DATA_DIR)" "$(BUNDLE_ID)"
+else
+	@scripts/reset-bridge.sh "$(DATA_DIR)"
 endif
 
 uninstall:
