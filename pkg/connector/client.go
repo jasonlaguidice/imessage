@@ -1499,6 +1499,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
+	// Skip backward backfill entirely — forward backfill during ChatResync
+	// already sends all messages oldest→newest. The backward backfill tasks
+	// queued by the framework are redundant and just waste ~2 hours doing nothing.
+	if !params.Forward {
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+	}
+
 	if params.Forward {
 		fetchCount := count + 1
 		var rows []cloudMessageRow
