@@ -29,8 +29,24 @@ else
 fi
 
 # ── Delete server-side registration (cleans up Matrix rooms) ──
+# bbctl delete uses a survey prompt requiring a real TTY.
+# We use 'expect'-style approach: run in a tmux session and send "y".
 echo "Deleting bridge registration from Beeper..."
-"$BBCTL" delete "$BRIDGE_NAME" || echo "  (bridge may already be unregistered)"
+if command -v tmux >/dev/null 2>&1; then
+    tmux kill-session -t _bbctl_del 2>/dev/null || true
+    tmux new-session -d -s _bbctl_del "$BBCTL delete $BRIDGE_NAME; sleep 2"
+    sleep 2
+    # Send "y" + Enter to the confirmation prompt
+    tmux send-keys -t _bbctl_del 'y' Enter
+    # Wait for it to finish
+    for i in $(seq 1 15); do
+        if ! tmux has-session -t _bbctl_del 2>/dev/null; then break; fi
+        sleep 1
+    done
+    tmux kill-session -t _bbctl_del 2>/dev/null || true
+else
+    "$BBCTL" delete "$BRIDGE_NAME" || echo "  (bridge may already be unregistered)"
+fi
 
 # ── Wipe local state ─────────────────────────────────────────
 echo "Removing bridge database and config..."
