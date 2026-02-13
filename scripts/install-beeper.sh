@@ -106,7 +106,15 @@ else
     # Make DB path absolute so it doesn't depend on working directory
     DATA_ABS_TMP="$(cd "$DATA_DIR" && pwd)"
     sed -i '' "s|uri: file:mautrix-imessage.db|uri: file:$DATA_ABS_TMP/mautrix-imessage.db|" "$CONFIG"
+    # Enable unlimited backward backfill (default is 0 which disables it)
+    sed -i '' 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
     echo "✓ Config saved to $CONFIG"
+fi
+
+# Ensure backward backfill is enabled (default from bbctl is 0 which disables it)
+if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
+    sed -i '' 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    echo "✓ Enabled backward backfill (max_batches: -1)"
 fi
 
 if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
