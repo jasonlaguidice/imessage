@@ -237,6 +237,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			ctx,
 			chat.CloudChatId,
 			chat.RecordName,
+			chat.GroupId,
 			portalID,
 			chat.Service,
 			chat.DisplayName,
