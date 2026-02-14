@@ -18,8 +18,10 @@ import (
 )
 
 const (
-	cloudIncrementalInterval = 10 * time.Minute
-	cloudRepairInterval      = 60 * time.Minute
+	// TODO: Subscribe to CloudKit zone change notifications (APNs push)
+	// for instant sync like iPhone/Mac. Polling is a stopgap.
+	cloudIncrementalInterval = 30 * time.Second
+	cloudRepairInterval      = 30 * time.Minute
 	cloudRepairLookback      = 6 * time.Hour
 )
 
