@@ -20,6 +20,7 @@ import (
 	"image/jpeg"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -31,6 +32,7 @@ import (
 	_ "golang.org/x/image/tiff"
 
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -1487,7 +1489,11 @@ type cloudBackfillCursor struct {
 }
 
 func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	fetchStart := time.Now()
+	log := zerolog.Ctx(ctx)
+
 	if c.cloudStore == nil {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: no cloud store, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
@@ -1497,31 +1503,48 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 
 	if params.Portal == nil || params.ThreadRoot != "" {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: nil portal or thread root, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 	portalID := string(params.Portal.ID)
 	if portalID == "" {
+		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: empty portal ID, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
 	// Forward backfill: return the newest messages for this portal.
-	// This populates the room immediately on portal creation instead of
-	// waiting for the backward backfill queue to get around to it.
+	// Triggered by the mautrix bridgev2 framework when a portal is first
+	// created (ChatResync / CreatePortal). Populates the room immediately
+	// instead of waiting for the backward backfill queue.
 	if params.Forward {
-		log := zerolog.Ctx(ctx)
-		log.Info().Str("portal_id", portalID).Int("count", count).Msg("Forward backfill: querying listLatestMessages")
+		log.Info().
+			Str("portal_id", portalID).
+			Int("count", count).
+			Str("trigger", "portal_creation").
+			Msg("Forward backfill START — fetching newest messages for new portal")
+		queryStart := time.Now()
 		rows, err := c.cloudStore.listLatestMessages(ctx, portalID, count)
 		if err != nil {
-			log.Err(err).Str("portal_id", portalID).Msg("Forward backfill: listLatestMessages failed")
+			log.Err(err).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Forward backfill: listLatestMessages FAILED")
 			return nil, err
 		}
-		log.Info().Str("portal_id", portalID).Int("rows", len(rows)).Msg("Forward backfill: listLatestMessages result")
+		queryElapsed := time.Since(queryStart)
 		// listLatestMessages returns newest-first; reverse to chronological order
 		reverseCloudMessageRows(rows)
+		convertStart := time.Now()
 		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
 		for _, row := range rows {
 			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row)...)
 		}
+		convertElapsed := time.Since(convertStart)
+		log.Info().
+			Str("portal_id", portalID).
+			Int("db_rows", len(rows)).
+			Int("backfill_msgs", len(messages)).
+			Dur("query_ms", queryElapsed).
+			Dur("convert_ms", convertElapsed).
+			Dur("total_ms", time.Since(fetchStart)).
+			Msg("Forward backfill COMPLETE — newest messages returned for portal creation")
 		return &bridgev2.FetchMessagesResponse{
 			Messages: messages,
 			HasMore:  false,
@@ -1529,6 +1552,10 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}, nil
 	}
 
+	// Backward backfill: triggered by the mautrix bridgev2 backfill queue
+	// for portals with CanBackfill=true (set in GetChatInfo when cloud store
+	// has messages for this portal). Paginates through older messages.
+	cursorDesc := "none (initial page)"
 	fetchCount := count + 1
 	beforeTS := int64(0)
 	beforeGUID := ""
@@ -1539,15 +1566,27 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}
 		beforeTS = cursor.TimestampMS
 		beforeGUID = cursor.GUID
+		cursorDesc = fmt.Sprintf("before ts=%d guid=%s", beforeTS, beforeGUID)
 	} else if params.AnchorMessage != nil {
 		beforeTS = params.AnchorMessage.Timestamp.UnixMilli()
 		beforeGUID = string(params.AnchorMessage.ID)
+		cursorDesc = fmt.Sprintf("anchor ts=%d id=%s", beforeTS, beforeGUID)
 	}
 
+	log.Info().
+		Str("portal_id", portalID).
+		Int("count", count).
+		Str("cursor", cursorDesc).
+		Str("trigger", "backfill_queue").
+		Msg("Backward backfill START — paginating older messages")
+
+	queryStart := time.Now()
 	rows, err := c.cloudStore.listBackwardMessages(ctx, portalID, beforeTS, beforeGUID, fetchCount)
 	if err != nil {
+		log.Err(err).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Backward backfill: query FAILED")
 		return nil, err
 	}
+	queryElapsed := time.Since(queryStart)
 
 	hasMore := false
 	if len(rows) > count {
@@ -1556,10 +1595,12 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 	reverseCloudMessageRows(rows)
 
+	convertStart := time.Now()
 	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
 	for _, row := range rows {
 		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row)...)
 	}
+	convertElapsed := time.Since(convertStart)
 
 	var nextCursor networkid.PaginationCursor
 	if hasMore && len(rows) > 0 {
@@ -1572,6 +1613,16 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}
 		nextCursor = cursor
 	}
+
+	log.Info().
+		Str("portal_id", portalID).
+		Int("db_rows", len(rows)).
+		Int("backfill_msgs", len(messages)).
+		Bool("has_more", hasMore).
+		Dur("query_ms", queryElapsed).
+		Dur("convert_ms", convertElapsed).
+		Dur("total_ms", time.Since(fetchStart)).
+		Msg("Backward backfill COMPLETE — older messages returned")
 
 	return &bridgev2.FetchMessagesResponse{
 		Messages: messages,
@@ -1687,8 +1738,15 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	return nil
 }
 
+// cloudAttachmentResult holds the result of a concurrent attachment download+upload.
+type cloudAttachmentResult struct {
+	Index   int
+	Message *bridgev2.BackfillMessage
+}
+
 // cloudAttachmentsToBackfill downloads CloudKit attachments, uploads them to
 // the Matrix media repo, and returns backfill messages with media URLs set.
+// Downloads and uploads run concurrently (up to 4 at a time) for speed.
 func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMessageRow, sender bridgev2.EventSender, ts time.Time, hasText bool) []*bridgev2.BackfillMessage {
 	if row.AttachmentsJSON == "" {
 		return nil
@@ -1698,81 +1756,154 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		return nil
 	}
 
-	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
-	intent := c.Main.Bridge.Bot
-	var messages []*bridgev2.BackfillMessage
+	// Filter to downloadable attachments.
+	type indexedAtt struct {
+		index int
+		att   cloudAttachmentRow
+	}
+	var downloadable []indexedAtt
 	for i, att := range atts {
-		if att.RecordName == "" {
-			continue
+		if att.RecordName != "" {
+			downloadable = append(downloadable, indexedAtt{index: i, att: att})
 		}
+	}
+	if len(downloadable) == 0 {
+		return nil
+	}
 
-		// Download attachment from CloudKit
-		data, err := c.client.CloudDownloadAttachment(att.RecordName)
-		if err != nil {
-			log.Warn().Err(err).
-				Str("guid", row.GUID).
-				Str("att_guid", att.GUID).
-				Str("record_name", att.RecordName).
-				Msg("Failed to download CloudKit attachment, skipping")
-			continue
-		}
-		if len(data) == 0 {
-			continue
-		}
+	// For a single attachment, skip goroutine overhead.
+	if len(downloadable) == 1 {
+		return c.downloadAndUploadAttachment(ctx, row, sender, ts, hasText, downloadable[0].index, downloadable[0].att)
+	}
 
-		// Determine message ID
-		attID := row.GUID
-		if i > 0 || hasText {
-			attID = fmt.Sprintf("%s_att%d", row.GUID, i)
-		}
+	// Concurrent download+upload with bounded parallelism.
+	const maxParallel = 4
+	sem := make(chan struct{}, maxParallel)
+	results := make(chan cloudAttachmentResult, len(downloadable))
+	var wg sync.WaitGroup
 
-		mimeType := att.MimeType
-		if mimeType == "" {
-			mimeType = "application/octet-stream"
-		}
-		fileName := att.Filename
-		if fileName == "" {
-			fileName = "attachment"
-		}
+	for _, da := range downloadable {
+		wg.Add(1)
+		go func(idx int, att cloudAttachmentRow) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			msgs := c.downloadAndUploadAttachment(ctx, row, sender, ts, hasText, idx, att)
+			for _, m := range msgs {
+				results <- cloudAttachmentResult{Index: idx, Message: m}
+			}
+		}(da.index, da.att)
+	}
 
-		msgType := mimeToMsgType(mimeType)
-		content := &event.MessageEventContent{
-			MsgType: msgType,
-			Body:    fileName,
-			Info: &event.FileInfo{
-				MimeType: mimeType,
-				Size:     len(data),
-			},
-		}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
 
-		// Upload to Matrix media repo
-		url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
-		if uploadErr != nil {
-			log.Warn().Err(uploadErr).
-				Str("guid", row.GUID).
-				Str("att_guid", att.GUID).
-				Msg("Failed to upload attachment to Matrix, skipping")
-			continue
-		}
-		if encFile != nil {
-			content.File = encFile
-		} else {
-			content.URL = url
-		}
+	// Collect results and sort by original index for deterministic ordering.
+	var collected []cloudAttachmentResult
+	for r := range results {
+		collected = append(collected, r)
+	}
+	sort.Slice(collected, func(i, j int) bool {
+		return collected[i].Index < collected[j].Index
+	})
 
-		messages = append(messages, &bridgev2.BackfillMessage{
-			Sender:    sender,
-			ID:        makeMessageID(attID),
-			Timestamp: ts,
-			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: content,
-				}},
-			},
-		})
+	messages := make([]*bridgev2.BackfillMessage, 0, len(collected))
+	for _, r := range collected {
+		messages = append(messages, r.Message)
 	}
 	return messages
+}
+
+// safeCloudDownloadAttachment wraps the FFI call with panic recovery.
+func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) (data []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			log.Error().Str("ffi_method", "CloudDownloadAttachment").Str("record_name", recordName).Str("stack", stack).Msgf("FFI panic recovered: %v", r)
+			err = fmt.Errorf("FFI panic in CloudDownloadAttachment: %v", r)
+		}
+	}()
+	return client.CloudDownloadAttachment(recordName)
+}
+
+// downloadAndUploadAttachment handles a single attachment: download from CloudKit,
+// upload to Matrix, return as a backfill message.
+func (c *IMClient) downloadAndUploadAttachment(
+	ctx context.Context,
+	row cloudMessageRow,
+	sender bridgev2.EventSender,
+	ts time.Time,
+	hasText bool,
+	i int,
+	att cloudAttachmentRow,
+) []*bridgev2.BackfillMessage {
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
+	intent := c.Main.Bridge.Bot
+
+	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
+	if err != nil {
+		log.Warn().Err(err).
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Str("record_name", att.RecordName).
+			Msg("Failed to download CloudKit attachment, skipping")
+		return nil
+	}
+	if len(data) == 0 {
+		return nil
+	}
+
+	attID := row.GUID
+	if i > 0 || hasText {
+		attID = fmt.Sprintf("%s_att%d", row.GUID, i)
+	}
+
+	mimeType := att.MimeType
+	if mimeType == "" {
+		mimeType = "application/octet-stream"
+	}
+	fileName := att.Filename
+	if fileName == "" {
+		fileName = "attachment"
+	}
+
+	msgType := mimeToMsgType(mimeType)
+	content := &event.MessageEventContent{
+		MsgType: msgType,
+		Body:    fileName,
+		Info: &event.FileInfo{
+			MimeType: mimeType,
+			Size:     len(data),
+		},
+	}
+
+	url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
+	if uploadErr != nil {
+		log.Warn().Err(uploadErr).
+			Str("guid", row.GUID).
+			Str("att_guid", att.GUID).
+			Msg("Failed to upload attachment to Matrix, skipping")
+		return nil
+	}
+	if encFile != nil {
+		content.File = encFile
+	} else {
+		content.URL = url
+	}
+
+	return []*bridgev2.BackfillMessage{{
+		Sender:    sender,
+		ID:        makeMessageID(attID),
+		Timestamp: ts,
+		ConvertedMessage: &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				Type:    event.EventMessage,
+				Content: content,
+			}},
+		},
+	}}
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {

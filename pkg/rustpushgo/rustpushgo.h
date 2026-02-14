@@ -347,6 +347,11 @@ void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_dsid(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_escrow_devices(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_icloud_auth_headers(
 	void* ptr,
 	RustCallStatus* out_status
@@ -360,6 +365,13 @@ void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_mme_delegate_json(
 void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_join_keychain_clique(
 	void* ptr,
 	RustBuffer passcode,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_join_keychain_clique_for_device(
+	void* ptr,
+	RustBuffer passcode,
+	uint32_t device_index,
 	RustCallStatus* out_status
 );
 
@@ -913,6 +925,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_dsid(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_escrow_devices(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_icloud_auth_headers(
 	RustCallStatus* out_status
 );
@@ -922,6 +938,10 @@ uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_mme_delegate
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique_for_device(
 	RustCallStatus* out_status
 );
 

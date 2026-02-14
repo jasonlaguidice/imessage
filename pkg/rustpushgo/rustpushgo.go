@@ -762,6 +762,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_escrow_devices(uniffiStatus)
+		})
+		if checksum != 27126 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_escrow_devices: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_icloud_auth_headers(uniffiStatus)
 		})
 		if checksum != 3524 {
@@ -785,6 +794,15 @@ func uniffiCheckChecksums() {
 		if checksum != 14380 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique_for_device(uniffiStatus)
+		})
+		if checksum != 59097 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_join_keychain_clique_for_device: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -986,9 +1004,6 @@ func (FfiConverterString) Lift(rb RustBufferI) string {
 
 func (FfiConverterString) Read(reader io.Reader) string {
 	length := readInt32(reader)
-	if length == 0 {
-		return ""
-	}
 	buffer := make([]byte, length)
 	read_length, err := reader.Read(buffer)
 	if err != nil {
@@ -2208,6 +2223,31 @@ func (_self *WrappedTokenProvider) GetDsid() (string, error) {
 		})
 }
 
+func (_self *WrappedTokenProvider) GetEscrowDevices() ([]EscrowDeviceInfo, error) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_get_escrow_devices(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterSequenceTypeEscrowDeviceInfoINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *WrappedTokenProvider) GetIcloudAuthHeaders() (map[string]string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
 	defer _self.ffiObject.decrementPointer()
@@ -2266,6 +2306,31 @@ func (_self *WrappedTokenProvider) JoinKeychainClique(passcode string) (string, 
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_join_keychain_clique(
 				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(passcode)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *WrappedTokenProvider) JoinKeychainCliqueForDevice(passcode string, deviceIndex uint32) (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_join_keychain_clique_for_device(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(passcode)), FfiConverterUint32INSTANCE.Lower(deviceIndex),
 				status,
 			))
 		},
@@ -2405,6 +2470,58 @@ func (c FfiConverterTypeAccountPersistData) Write(writer io.Writer, value Accoun
 type FfiDestroyerTypeAccountPersistData struct{}
 
 func (_ FfiDestroyerTypeAccountPersistData) Destroy(value AccountPersistData) {
+	value.Destroy()
+}
+
+type EscrowDeviceInfo struct {
+	Index       uint32
+	DeviceName  string
+	DeviceModel string
+	Serial      string
+	Timestamp   string
+}
+
+func (r *EscrowDeviceInfo) Destroy() {
+	FfiDestroyerUint32{}.Destroy(r.Index)
+	FfiDestroyerString{}.Destroy(r.DeviceName)
+	FfiDestroyerString{}.Destroy(r.DeviceModel)
+	FfiDestroyerString{}.Destroy(r.Serial)
+	FfiDestroyerString{}.Destroy(r.Timestamp)
+}
+
+type FfiConverterTypeEscrowDeviceInfo struct{}
+
+var FfiConverterTypeEscrowDeviceInfoINSTANCE = FfiConverterTypeEscrowDeviceInfo{}
+
+func (c FfiConverterTypeEscrowDeviceInfo) Lift(rb RustBufferI) EscrowDeviceInfo {
+	return LiftFromRustBuffer[EscrowDeviceInfo](c, rb)
+}
+
+func (c FfiConverterTypeEscrowDeviceInfo) Read(reader io.Reader) EscrowDeviceInfo {
+	return EscrowDeviceInfo{
+		FfiConverterUint32INSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeEscrowDeviceInfo) Lower(value EscrowDeviceInfo) RustBuffer {
+	return LowerIntoRustBuffer[EscrowDeviceInfo](c, value)
+}
+
+func (c FfiConverterTypeEscrowDeviceInfo) Write(writer io.Writer, value EscrowDeviceInfo) {
+	FfiConverterUint32INSTANCE.Write(writer, value.Index)
+	FfiConverterStringINSTANCE.Write(writer, value.DeviceName)
+	FfiConverterStringINSTANCE.Write(writer, value.DeviceModel)
+	FfiConverterStringINSTANCE.Write(writer, value.Serial)
+	FfiConverterStringINSTANCE.Write(writer, value.Timestamp)
+}
+
+type FfiDestroyerTypeEscrowDeviceInfo struct{}
+
+func (_ FfiDestroyerTypeEscrowDeviceInfo) Destroy(value EscrowDeviceInfo) {
 	value.Destroy()
 }
 
@@ -2746,7 +2863,7 @@ type WrappedCloudSyncMessage struct {
 	TapbackType       *uint32
 	TapbackTargetGuid *string
 	TapbackEmoji      *string
-	Attachments       []WrappedCloudAttachmentInfo
+	AttachmentGuids   []string
 }
 
 func (r *WrappedCloudSyncMessage) Destroy() {
@@ -2763,7 +2880,7 @@ func (r *WrappedCloudSyncMessage) Destroy() {
 	FfiDestroyerOptionalUint32{}.Destroy(r.TapbackType)
 	FfiDestroyerOptionalString{}.Destroy(r.TapbackTargetGuid)
 	FfiDestroyerOptionalString{}.Destroy(r.TapbackEmoji)
-	FfiDestroyerSequenceTypeWrappedCloudAttachmentInfo{}.Destroy(r.Attachments)
+	FfiDestroyerSequenceString{}.Destroy(r.AttachmentGuids)
 }
 
 type FfiConverterTypeWrappedCloudSyncMessage struct{}
@@ -2789,7 +2906,7 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Read(reader io.Reader) WrappedC
 		FfiConverterOptionalUint32INSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
-		FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
 	}
 }
 
@@ -2811,7 +2928,7 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Write(writer io.Writer, value W
 	FfiConverterOptionalUint32INSTANCE.Write(writer, value.TapbackType)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackTargetGuid)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackEmoji)
-	FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE.Write(writer, value.Attachments)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.AttachmentGuids)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncMessage struct{}
@@ -3761,6 +3878,49 @@ type FfiDestroyerSequenceString struct{}
 func (FfiDestroyerSequenceString) Destroy(sequence []string) {
 	for _, value := range sequence {
 		FfiDestroyerString{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeEscrowDeviceInfo struct{}
+
+var FfiConverterSequenceTypeEscrowDeviceInfoINSTANCE = FfiConverterSequenceTypeEscrowDeviceInfo{}
+
+func (c FfiConverterSequenceTypeEscrowDeviceInfo) Lift(rb RustBufferI) []EscrowDeviceInfo {
+	return LiftFromRustBuffer[[]EscrowDeviceInfo](c, rb)
+}
+
+func (c FfiConverterSequenceTypeEscrowDeviceInfo) Read(reader io.Reader) []EscrowDeviceInfo {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]EscrowDeviceInfo, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeEscrowDeviceInfoINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeEscrowDeviceInfo) Lower(value []EscrowDeviceInfo) RustBuffer {
+	return LowerIntoRustBuffer[[]EscrowDeviceInfo](c, value)
+}
+
+func (c FfiConverterSequenceTypeEscrowDeviceInfo) Write(writer io.Writer, value []EscrowDeviceInfo) {
+	if len(value) > math.MaxInt32 {
+		panic("[]EscrowDeviceInfo is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeEscrowDeviceInfoINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeEscrowDeviceInfo struct{}
+
+func (FfiDestroyerSequenceTypeEscrowDeviceInfo) Destroy(sequence []EscrowDeviceInfo) {
+	for _, value := range sequence {
+		FfiDestroyerTypeEscrowDeviceInfo{}.Destroy(value)
 	}
 }
 

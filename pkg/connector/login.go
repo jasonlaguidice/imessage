@@ -28,22 +28,25 @@ const (
 	LoginStepAppleIDPassword = "fi.mau.imessage.login.appleid"
 	LoginStepExternalKey     = "fi.mau.imessage.login.externalkey"
 	LoginStepTwoFactor       = "fi.mau.imessage.login.2fa"
+	LoginStepSelectDevice    = "fi.mau.imessage.login.select_device"
 	LoginStepDevicePasscode  = "fi.mau.imessage.login.device_passcode"
 	LoginStepSelectHandle    = "fi.mau.imessage.login.select_handle"
 	LoginStepComplete        = "fi.mau.imessage.login.complete"
 )
 
 // AppleIDLogin implements the multi-step login flow:
-// Apple ID + password → 2FA code → IDS registration → handle selection → connected.
+// Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
 type AppleIDLogin struct {
-	User     *bridgev2.User
-	Main     *IMConnector
-	username string
-	cfg      *rustpushgo.WrappedOsConfig
-	conn     *rustpushgo.WrappedApsConnection
-	session  *rustpushgo.LoginSession
-	result   *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle   string                                  // chosen handle
+	User          *bridgev2.User
+	Main          *IMConnector
+	username      string
+	cfg           *rustpushgo.WrappedOsConfig
+	conn          *rustpushgo.WrappedApsConnection
+	session       *rustpushgo.LoginSession
+	result        *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle        string                                  // chosen handle
+	devices       []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
+	selectedDevice int                                    // index into devices (-1 = not yet selected)
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -88,9 +91,14 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 }
 
 func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
-	// Device passcode step (after IDS registration, before handle selection)
+	// Device passcode step (after device selection, before handle selection)
 	if passcode, ok := input["passcode"]; ok && l.result != nil {
 		return l.handlePasscodeAndContinue(ctx, passcode)
+	}
+
+	// Device selection step (after IDS registration, before passcode)
+	if device, ok := input["device"]; ok && l.result != nil {
+		return l.handleDeviceSelection(device)
 	}
 
 	// Handle selection step (after device passcode)
@@ -190,13 +198,19 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		return nil, fmt.Errorf("login completion failed: %w", err)
 	}
 	l.result = &result
+	l.selectedDevice = -1
 
-	return devicePasscodeStep(), nil
+	return fetchDevicesAndPrompt(log, l.result.TokenProvider, &l.devices, &l.selectedDevice)
+}
+
+func (l *AppleIDLogin) handleDeviceSelection(device string) (*bridgev2.LoginStep, error) {
+	l.selectedDevice = parseDeviceSelection(device, l.devices)
+	return devicePasscodeStepForDevice(l.devices, l.selectedDevice), nil
 }
 
 func (l *AppleIDLogin) handlePasscodeAndContinue(ctx context.Context, passcode string) (*bridgev2.LoginStep, error) {
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
-	if err := joinKeychainWithPasscode(log, l.result.TokenProvider, passcode); err != nil {
+	if err := joinKeychainWithPasscode(log, l.result.TokenProvider, passcode, l.devices, l.selectedDevice); err != nil {
 		return nil, err
 	}
 
@@ -228,17 +242,19 @@ func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, 
 // ============================================================================
 
 // ExternalKeyLogin implements the multi-step login flow for non-macOS platforms:
-// Hardware key → Apple ID + password → 2FA code → IDS registration → handle selection → connected.
+// Hardware key → Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
 type ExternalKeyLogin struct {
-	User        *bridgev2.User
-	Main        *IMConnector
-	hardwareKey string
-	username    string
-	cfg         *rustpushgo.WrappedOsConfig
-	conn        *rustpushgo.WrappedApsConnection
-	session     *rustpushgo.LoginSession
-	result      *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle      string                                  // chosen handle
+	User           *bridgev2.User
+	Main           *IMConnector
+	hardwareKey    string
+	username       string
+	cfg            *rustpushgo.WrappedOsConfig
+	conn           *rustpushgo.WrappedApsConnection
+	session        *rustpushgo.LoginSession
+	result         *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle         string                                  // chosen handle
+	devices        []rustpushgo.EscrowDeviceInfo           // escrow devices (fetched after IDS registration)
+	selectedDevice int                                     // index into devices (-1 = not yet selected)
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -263,9 +279,14 @@ func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, erro
 }
 
 func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
-	// Device passcode step (after IDS registration, before handle selection)
+	// Device passcode step (after device selection, before handle selection)
 	if passcode, ok := input["passcode"]; ok && l.result != nil {
 		return l.handlePasscodeAndContinue(ctx, passcode)
+	}
+
+	// Device selection step (after IDS registration, before passcode)
+	if device, ok := input["device"]; ok && l.result != nil {
+		return l.handleDeviceSelection(device)
 	}
 
 	// Handle selection step (after device passcode)
@@ -405,13 +426,19 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		return nil, fmt.Errorf("login completion failed: %w", err)
 	}
 	l.result = &result
+	l.selectedDevice = -1
 
-	return devicePasscodeStep(), nil
+	return fetchDevicesAndPrompt(log, l.result.TokenProvider, &l.devices, &l.selectedDevice)
+}
+
+func (l *ExternalKeyLogin) handleDeviceSelection(device string) (*bridgev2.LoginStep, error) {
+	l.selectedDevice = parseDeviceSelection(device, l.devices)
+	return devicePasscodeStepForDevice(l.devices, l.selectedDevice), nil
 }
 
 func (l *ExternalKeyLogin) handlePasscodeAndContinue(ctx context.Context, passcode string) (*bridgev2.LoginStep, error) {
 	log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
-	if err := joinKeychainWithPasscode(log, l.result.TokenProvider, passcode); err != nil {
+	if err := joinKeychainWithPasscode(log, l.result.TokenProvider, passcode, l.devices, l.selectedDevice); err != nil {
 		return nil, err
 	}
 
@@ -547,16 +574,108 @@ func getExistingUsers(session *cachedSessionState, log zerolog.Logger) *rustpush
 // Shared login helpers
 // ============================================================================
 
-// devicePasscodeStep returns a login step prompting the user for their iPhone/Mac
-// device passcode, needed to join the iCloud Keychain trust circle for message backfill.
-func devicePasscodeStep() *bridgev2.LoginStep {
+// formatDeviceLabel returns a human-readable label for a device, e.g.
+// "Ludvig's iPhone (iPhone15,2)".
+func formatDeviceLabel(d rustpushgo.EscrowDeviceInfo) string {
+	if d.DeviceName != "" && d.DeviceModel != "" {
+		return fmt.Sprintf("%s (%s)", d.DeviceName, d.DeviceModel)
+	}
+	if d.DeviceName != "" {
+		return d.DeviceName
+	}
+	if d.DeviceModel != "" {
+		return fmt.Sprintf("Device (%s)", d.DeviceModel)
+	}
+	return fmt.Sprintf("Device (serial: %s)", d.Serial)
+}
+
+// fetchDevicesAndPrompt fetches escrow devices from the token provider and returns
+// either a device selection step (multiple devices) or skips straight to the
+// passcode step (single device, auto-selected). On failure, falls back to a
+// generic passcode step.
+func fetchDevicesAndPrompt(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvider, devices *[]rustpushgo.EscrowDeviceInfo, selectedDevice *int) (*bridgev2.LoginStep, error) {
+	if tp == nil || *tp == nil {
+		log.Warn().Msg("No TokenProvider available, skipping device discovery")
+		return devicePasscodeStepForDevice(nil, -1), nil
+	}
+
+	devs, err := (*tp).GetEscrowDevices()
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to fetch escrow devices, falling back to generic passcode prompt")
+		return devicePasscodeStepForDevice(nil, -1), nil
+	}
+	*devices = devs
+
+	if len(devs) == 1 {
+		// Auto-select the only device and go straight to passcode
+		*selectedDevice = 0
+		log.Info().Str("device", formatDeviceLabel(devs[0])).Msg("Single escrow device found, auto-selected")
+		return devicePasscodeStepForDevice(devs, 0), nil
+	}
+
+	// Multiple devices — let the user choose
+	options := make([]string, len(devs))
+	for i, d := range devs {
+		options[i] = formatDeviceLabel(d)
+	}
+
 	return &bridgev2.LoginStep{
 		Type:   bridgev2.LoginStepTypeUserInput,
-		StepID: LoginStepDevicePasscode,
-		Instructions: "Enter the passcode you use to unlock your iPhone or Mac.\n\n" +
+		StepID: LoginStepSelectDevice,
+		Instructions: "Multiple Apple devices were found on your account.\n" +
+			"Choose which device's passcode you want to use to join the iCloud Keychain.\n\n" +
+			"Pick the device whose lock-screen passcode you know.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type:    bridgev2.LoginInputFieldTypeSelect,
+				ID:      "device",
+				Name:    "Device",
+				Options: options,
+			}},
+		},
+	}, nil
+}
+
+// parseDeviceSelection converts the user's device selection (the label string)
+// back to an index into the devices list.
+func parseDeviceSelection(selected string, devices []rustpushgo.EscrowDeviceInfo) int {
+	for i, d := range devices {
+		if formatDeviceLabel(d) == selected {
+			return i
+		}
+	}
+	// Shouldn't happen with a select field, but default to first device
+	if len(devices) > 0 {
+		return 0
+	}
+	return -1
+}
+
+// devicePasscodeStepForDevice returns a login step prompting for the passcode,
+// with context about which device the passcode is for.
+func devicePasscodeStepForDevice(devices []rustpushgo.EscrowDeviceInfo, selectedDevice int) *bridgev2.LoginStep {
+	var instructions string
+	if selectedDevice >= 0 && selectedDevice < len(devices) {
+		d := devices[selectedDevice]
+		instructions = fmt.Sprintf(
+			"Enter the passcode for %s.\n\n"+
+				"This is the PIN or password you use to unlock this device. "+
+				"It's needed to join the iCloud Keychain trust circle, which gives the bridge "+
+				"access to your Messages in iCloud for backfilling chat history.\n\n"+
+				"Your passcode is only used once during setup and is not stored.",
+			formatDeviceLabel(d),
+		)
+	} else {
+		instructions = "Enter the passcode you use to unlock your iPhone or Mac.\n\n" +
 			"This is needed to join the iCloud Keychain trust circle, which gives the bridge " +
 			"access to your Messages in iCloud for backfilling chat history.\n\n" +
-			"Your passcode is only used once during setup and is not stored.",
+			"Your passcode is only used once during setup and is not stored."
+	}
+
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeUserInput,
+		StepID:       LoginStepDevicePasscode,
+		Instructions: instructions,
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{{
 				Type: bridgev2.LoginInputFieldTypePassword,
@@ -570,13 +689,24 @@ func devicePasscodeStep() *bridgev2.LoginStep {
 // joinKeychainWithPasscode calls the Rust FFI to join the iCloud Keychain trust
 // circle using the provided device passcode. This is required for PCS-encrypted
 // CloudKit records (Messages in iCloud).
-func joinKeychainWithPasscode(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvider, passcode string) error {
+// If a specific device was selected, the corresponding bottle is tried first.
+func joinKeychainWithPasscode(log zerolog.Logger, tp **rustpushgo.WrappedTokenProvider, passcode string, devices []rustpushgo.EscrowDeviceInfo, selectedDevice int) error {
 	if tp == nil || *tp == nil {
 		log.Warn().Msg("No TokenProvider available, skipping keychain join")
 		return nil
 	}
 	log.Info().Msg("Joining iCloud Keychain trust circle...")
-	result, err := (*tp).JoinKeychainClique(passcode)
+
+	var result string
+	var err error
+	if selectedDevice >= 0 && selectedDevice < len(devices) {
+		deviceIndex := devices[selectedDevice].Index
+		log.Info().Uint32("device_index", deviceIndex).Str("device", formatDeviceLabel(devices[selectedDevice])).Msg("Using preferred device bottle")
+		result, err = (*tp).JoinKeychainCliqueForDevice(passcode, deviceIndex)
+	} else {
+		result, err = (*tp).JoinKeychainClique(passcode)
+	}
+
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to join keychain trust circle")
 		return fmt.Errorf("failed to join iCloud Keychain: %w", err)

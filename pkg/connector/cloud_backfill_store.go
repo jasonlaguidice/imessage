@@ -260,6 +260,173 @@ func (s *cloudBackfillStore) upsertChat(
 	return err
 }
 
+// beginTx starts a database transaction for batch operations.
+func (s *cloudBackfillStore) beginTx(ctx context.Context) (*sql.Tx, error) {
+	return s.db.RawDB.BeginTx(ctx, nil)
+}
+
+// upsertMessageBatch inserts multiple messages in a single transaction.
+func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []cloudMessageRow) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO cloud_message (
+			login_id, guid, chat_id, portal_id, timestamp_ms,
+			sender, is_from_me, text, subject, service, deleted,
+			tapback_type, tapback_target_guid, tapback_emoji,
+			attachments_json,
+			created_ts, updated_ts
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (login_id, guid) DO UPDATE SET
+			chat_id=excluded.chat_id,
+			portal_id=excluded.portal_id,
+			timestamp_ms=excluded.timestamp_ms,
+			sender=excluded.sender,
+			is_from_me=excluded.is_from_me,
+			text=excluded.text,
+			subject=excluded.subject,
+			service=excluded.service,
+			deleted=excluded.deleted,
+			tapback_type=excluded.tapback_type,
+			tapback_target_guid=excluded.tapback_target_guid,
+			tapback_emoji=excluded.tapback_emoji,
+			attachments_json=excluded.attachments_json,
+			updated_ts=excluded.updated_ts
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare batch statement: %w", err)
+	}
+	defer stmt.Close()
+
+	nowMS := time.Now().UnixMilli()
+	for _, row := range rows {
+		_, err = stmt.ExecContext(ctx,
+			s.loginID, row.GUID, row.CloudChatID, row.PortalID, row.TimestampMS,
+			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
+			row.TapbackType, row.TapbackTargetGUID, row.TapbackEmoji,
+			row.AttachmentsJSON,
+			nowMS, nowMS,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert message %s: %w", row.GUID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// upsertChatBatch inserts multiple chats in a single transaction.
+func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudChatUpsertRow) error {
+	if len(chats) == 0 {
+		return nil
+	}
+	tx, err := s.beginTx(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	stmt, err := tx.PrepareContext(ctx, `
+		INSERT INTO cloud_chat (
+			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
+			participants_json, updated_ts, created_ts
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
+			record_name=excluded.record_name,
+			group_id=excluded.group_id,
+			portal_id=excluded.portal_id,
+			service=excluded.service,
+			display_name=excluded.display_name,
+			participants_json=excluded.participants_json,
+			updated_ts=excluded.updated_ts
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to prepare batch statement: %w", err)
+	}
+	defer stmt.Close()
+
+	nowMS := time.Now().UnixMilli()
+	for _, chat := range chats {
+		_, err = stmt.ExecContext(ctx,
+			s.loginID, chat.CloudChatID, chat.RecordName, chat.GroupID,
+			chat.PortalID, chat.Service, chat.DisplayName,
+			chat.ParticipantsJSON, chat.UpdatedTS, nowMS,
+		)
+		if err != nil {
+			return fmt.Errorf("failed to insert chat %s: %w", chat.CloudChatID, err)
+		}
+	}
+
+	return tx.Commit()
+}
+
+// hasMessageBatch checks existence of multiple GUIDs in a single query and
+// returns the set of GUIDs that already exist.
+func (s *cloudBackfillStore) hasMessageBatch(ctx context.Context, guids []string) (map[string]bool, error) {
+	if len(guids) == 0 {
+		return nil, nil
+	}
+	existing := make(map[string]bool, len(guids))
+	// SQLite has a limit on the number of variables. Process in chunks.
+	const chunkSize = 500
+	for i := 0; i < len(guids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(guids) {
+			end = len(guids)
+		}
+		chunk := guids[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.loginID)
+		for j, g := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, g)
+		}
+
+		query := fmt.Sprintf(
+			`SELECT guid FROM cloud_message WHERE login_id=$1 AND guid IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.db.Query(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var guid string
+			if err := rows.Scan(&guid); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			existing[guid] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return existing, nil
+}
+
+// cloudChatUpsertRow holds the pre-serialized data for a batch chat upsert.
+type cloudChatUpsertRow struct {
+	CloudChatID      string
+	RecordName       string
+	GroupID          string
+	PortalID         string
+	Service          string
+	DisplayName      any // nil or string
+	ParticipantsJSON string
+	UpdatedTS        int64
+}
+
 func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID string) (string, error) {
 	var portalID string
 	// Try matching by cloud_chat_id, record_name, or group_id.
@@ -295,6 +462,53 @@ func (s *cloudBackfillStore) hasChat(ctx context.Context, cloudChatID string) (b
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// hasChatBatch checks existence of multiple cloud chat IDs in a single query
+// and returns the set of IDs that already exist.
+func (s *cloudBackfillStore) hasChatBatch(ctx context.Context, chatIDs []string) (map[string]bool, error) {
+	if len(chatIDs) == 0 {
+		return nil, nil
+	}
+	existing := make(map[string]bool, len(chatIDs))
+	const chunkSize = 500
+	for i := 0; i < len(chatIDs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(chatIDs) {
+			end = len(chatIDs)
+		}
+		chunk := chatIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.loginID)
+		for j, id := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(
+			`SELECT cloud_chat_id FROM cloud_chat WHERE login_id=$1 AND cloud_chat_id IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.db.Query(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			existing[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return existing, nil
 }
 
 func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, portalID string) ([]string, error) {
