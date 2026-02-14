@@ -206,7 +206,9 @@ if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
         rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
     fi
 
-    "$BINARY" login -c "$CONFIG"
+    # Run login from DATA_DIR so that relative paths (state/anisette/)
+    # resolve to the same location as when systemd runs the bridge.
+    (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
     echo ""
 elif [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""

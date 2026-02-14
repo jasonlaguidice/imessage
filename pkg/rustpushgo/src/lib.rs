@@ -629,11 +629,13 @@ pub async fn restore_token_provider(
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid SPD plist: {}", e) })?;
     account.spd = Some(spd);
 
-    // Inject the PET token with a far-future expiration so TokenProvider
-    // can use it for refresh_mme() without needing to re-login.
+    // Inject the PET token with an already-expired expiration.
+    // This forces get_token() to call login_email_pass() on first use,
+    // which will obtain a fresh PET via SRP (no 2FA needed if the machine
+    // is trusted via consistent anisette state).
     account.tokens.insert("com.apple.gs.idms.pet".to_string(), icloud_auth::FetchedToken {
         token: pet,
-        expiration: std::time::SystemTime::now() + std::time::Duration::from_secs(60 * 60 * 24 * 30), // 30 days
+        expiration: std::time::UNIX_EPOCH, // expired — forces auto-refresh on first use
     });
 
     let account = Arc::new(tokio::sync::Mutex::new(account));

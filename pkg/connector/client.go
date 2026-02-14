@@ -197,15 +197,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
 				c.tokenProvider = &tp
-				// Seed the cached MobileMe delegate so contacts work immediately
-				// without needing to call refresh_mme() (which requires a valid PET).
-				if meta.MmeDelegateJSON != "" {
-					if seedErr := tp.SeedMmeDelegateJson(meta.MmeDelegateJSON); seedErr != nil {
-						log.Warn().Err(seedErr).Msg("Failed to seed MobileMe delegate from cache")
-					} else {
-						log.Info().Msg("Seeded MobileMe delegate from cached state")
-					}
-				}
+				// Don't seed the cached MobileMe delegate — it's likely expired.
+				// Instead, let get_mme_token() detect the empty delegate and call
+				// refresh_mme(), which triggers the full auto-refresh chain:
+				//   expired PET → get_token() → login_email_pass() → fresh PET
+				//   → login_apple_delegates() → fresh MobileMe delegate
+				log.Info().Msg("TokenProvider restored — MobileMe delegate will be refreshed on first use")
 			}
 		}
 	}
