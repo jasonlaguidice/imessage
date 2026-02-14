@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
@@ -193,9 +196,11 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	ctx := context.Background()
+	controllerStart := time.Now()
 	if !c.waitForContactsReady(log) {
 		return
 	}
+	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
 	// On a fresh DB (no messages), clear any stale continuation tokens
 	// so the bootstrap does a full sync from scratch.
@@ -208,53 +213,99 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		}
 	}
 
-	log.Info().Msg("CloudKit bootstrap sync start (historical backfill)")
+	log.Info().Bool("incremental", hasMessages).Msg("CloudKit bootstrap sync start (historical backfill)")
 
+	backfillStart := time.Now()
 	counts, err := c.runCloudKitBackfill(ctx, log)
 	if err != nil {
-		log.Error().Err(err).Msg("CloudKit bootstrap sync failed")
+		log.Error().Err(err).Dur("elapsed", time.Since(backfillStart)).Msg("CloudKit bootstrap sync failed")
 	} else {
 		log.Info().
 			Int("imported", counts.Imported).
 			Int("updated", counts.Updated).
 			Int("skipped", counts.Skipped).
 			Int("deleted", counts.Deleted).
-			Msg("CloudKit bootstrap sync complete")
+			Dur("elapsed", time.Since(backfillStart)).
+			Msg("CloudKit bootstrap sync complete — now creating portals (triggers forward backfill for each)")
 	}
 
+	portalStart := time.Now()
 	c.createPortalsFromCloudSync(ctx, log)
-
-	// No polling loop — real-time messages arrive via APNs push on
-	// com.apple.madrid, handled by the rustpush receive path.
-	log.Info().Msg("CloudKit backfill done, real-time messages via APNs")
+	log.Info().
+		Dur("portal_creation_elapsed", time.Since(portalStart)).
+		Dur("total_elapsed", time.Since(controllerStart)).
+		Msg("CloudKit backfill pipeline complete — backward backfill will run asynchronously via framework queue; real-time messages via APNs")
 }
 
 func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {
 	var total cloudSyncCounters
+	backfillStart := time.Now()
 
-	chatCounts, chatToken, err := c.syncCloudChats(ctx)
-	if err != nil {
-		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneChats, err.Error())
-		return total, err
+	// Phase 1: Sync chats and attachments in parallel — they are independent.
+	// Messages depend on both (chats for portal ID resolution, attachments for
+	// GUID→record_name mapping), so they must wait.
+	phase1Start := time.Now()
+
+	var chatCounts cloudSyncCounters
+	var chatToken *string
+	var chatErr error
+	var attMap map[string]cloudAttachmentRow
+	var attToken *string
+	var attErr error
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+		chatStart := time.Now()
+		chatCounts, chatToken, chatErr = c.syncCloudChats(ctx)
+		log.Info().
+			Dur("elapsed", time.Since(chatStart)).
+			Int("imported", chatCounts.Imported).
+			Int("updated", chatCounts.Updated).
+			Int("skipped", chatCounts.Skipped).
+			Err(chatErr).
+			Msg("CloudKit chat sync complete")
+	}()
+
+	go func() {
+		defer wg.Done()
+		attStart := time.Now()
+		attMap, attToken, attErr = c.syncCloudAttachments(ctx)
+		attCount := 0
+		if attMap != nil {
+			attCount = len(attMap)
+		}
+		log.Info().
+			Dur("elapsed", time.Since(attStart)).
+			Int("attachments", attCount).
+			Err(attErr).
+			Msg("CloudKit attachment sync complete")
+	}()
+
+	wg.Wait()
+	log.Info().Dur("phase1_elapsed", time.Since(phase1Start)).Msg("CloudKit phase 1 (chats + attachments) complete")
+
+	if chatErr != nil {
+		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneChats, chatErr.Error())
+		return total, chatErr
 	}
-	if err = c.cloudStore.setSyncStateSuccess(ctx, cloudZoneChats, chatToken); err != nil {
+	if err := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneChats, chatToken); err != nil {
 		log.Warn().Err(err).Msg("Failed to persist chat sync token")
 	}
 	total.add(chatCounts)
 
-	// Sync attachment zone to build GUID→record_name mapping.
-	// Must happen before message sync so we can correlate attachment GUIDs
-	// extracted from message attributedBody with CloudKit record names.
-	attMap, attToken, attErr := c.syncCloudAttachments(ctx)
 	if attErr != nil {
 		log.Warn().Err(attErr).Msg("Failed to sync CloudKit attachments (continuing without)")
 	} else {
-		if err = c.cloudStore.setSyncStateSuccess(ctx, cloudZoneAttachments, attToken); err != nil {
+		if err := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneAttachments, attToken); err != nil {
 			log.Warn().Err(err).Msg("Failed to persist attachment sync token")
 		}
-		log.Info().Int("attachments", len(attMap)).Msg("CloudKit attachment zone synced")
 	}
 
+	// Phase 2: Sync messages (depends on chats + attachments).
+	phase2Start := time.Now()
 	msgCounts, msgToken, err := c.syncCloudMessages(ctx, attMap)
 	if err != nil {
 		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneMessages, err.Error())
@@ -264,6 +315,14 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 		log.Warn().Err(err).Msg("Failed to persist message sync token")
 	}
 	total.add(msgCounts)
+
+	log.Info().
+		Dur("phase2_elapsed", time.Since(phase2Start)).
+		Int("imported", msgCounts.Imported).
+		Int("updated", msgCounts.Updated).
+		Int("skipped", msgCounts.Skipped).
+		Dur("total_elapsed", time.Since(backfillStart)).
+		Msg("CloudKit phase 2 (messages) complete")
 
 	return total, nil
 }
@@ -277,7 +336,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 	}
 
 	for page := 0; page < 256; page++ {
-		resp, syncErr := c.client.CloudSyncAttachments(token)
+		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			return attMap, token, syncErr
 		}
@@ -323,7 +382,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	}
 
 	for page := 0; page < 256; page++ {
-		resp, syncErr := c.client.CloudSyncChats(token)
+		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			return counts, token, syncErr
 		}
@@ -349,10 +408,36 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 func safeCloudSyncMessages(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncMessagesPage, err error) {
 	defer func() {
 		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			log.Error().Str("ffi_method", "CloudSyncMessages").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
 			err = fmt.Errorf("FFI panic in CloudSyncMessages: %v", r)
 		}
 	}()
 	return client.CloudSyncMessages(token)
+}
+
+// safeCloudSyncChats wraps the FFI call with panic recovery.
+func safeCloudSyncChats(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncChatsPage, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			log.Error().Str("ffi_method", "CloudSyncChats").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
+			err = fmt.Errorf("FFI panic in CloudSyncChats: %v", r)
+		}
+	}()
+	return client.CloudSyncChats(token)
+}
+
+// safeCloudSyncAttachments wraps the FFI call with panic recovery.
+func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncAttachmentsPage, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			stack := string(debug.Stack())
+			log.Error().Str("ffi_method", "CloudSyncAttachments").Str("stack", stack).Msgf("FFI panic recovered: %v", r)
+			err = fmt.Errorf("FFI panic in CloudSyncAttachments: %v", r)
+		}
+	}()
+	return client.CloudSyncAttachments(token)
 }
 
 func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]cloudAttachmentRow) (cloudSyncCounters, *string, error) {
@@ -366,7 +451,13 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
-			return counts, token, syncErr
+			// FFI panic or deserialization error on this page.
+			// Log and stop pagination — keep messages from previous pages.
+			log.Warn().Err(syncErr).
+				Int("page", page).
+				Int("imported_so_far", counts.Imported).
+				Msg("CloudKit message sync page failed (FFI error), stopping pagination with partial data")
+			break
 		}
 
 		if len(resp.Messages) > 0 {
@@ -394,6 +485,21 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 
 func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.WrappedCloudSyncChat) (cloudSyncCounters, error) {
 	var counts cloudSyncCounters
+
+	// Batch existence check for all non-deleted chat IDs.
+	chatIDs := make([]string, 0, len(chats))
+	for _, chat := range chats {
+		if !chat.Deleted {
+			chatIDs = append(chatIDs, chat.CloudChatId)
+		}
+	}
+	existingSet, err := c.cloudStore.hasChatBatch(ctx, chatIDs)
+	if err != nil {
+		return counts, fmt.Errorf("batch chat existence check failed: %w", err)
+	}
+
+	// Build batch of rows.
+	batch := make([]cloudChatUpsertRow, 0, len(chats))
 	for _, chat := range chats {
 		if chat.Deleted {
 			counts.Deleted++
@@ -406,31 +512,34 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		exists, err := c.cloudStore.hasChat(ctx, chat.CloudChatId)
-		if err != nil {
-			return counts, err
+		participantsJSON, jsonErr := json.Marshal(chat.Participants)
+		if jsonErr != nil {
+			return counts, jsonErr
 		}
 
-		if err = c.cloudStore.upsertChat(
-			ctx,
-			chat.CloudChatId,
-			chat.RecordName,
-			strings.ToLower(chat.GroupId),
-			portalID,
-			chat.Service,
-			chat.DisplayName,
-			chat.Participants,
-			int64(chat.UpdatedTimestampMs),
-		); err != nil {
-			return counts, err
-		}
+		batch = append(batch, cloudChatUpsertRow{
+			CloudChatID:      chat.CloudChatId,
+			RecordName:       chat.RecordName,
+			GroupID:          strings.ToLower(chat.GroupId),
+			PortalID:         portalID,
+			Service:          chat.Service,
+			DisplayName:      nullableString(chat.DisplayName),
+			ParticipantsJSON: string(participantsJSON),
+			UpdatedTS:        int64(chat.UpdatedTimestampMs),
+		})
 
-		if exists {
+		if existingSet[chat.CloudChatId] {
 			counts.Updated++
 		} else {
 			counts.Imported++
 		}
 	}
+
+	// Batch insert all chats in a single transaction.
+	if err := c.cloudStore.upsertChatBatch(ctx, batch); err != nil {
+		return counts, err
+	}
+
 	return counts, nil
 }
 
@@ -492,6 +601,20 @@ func (c *IMClient) ingestCloudMessages(
 	attMap map[string]cloudAttachmentRow,
 ) error {
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
+
+	// Phase 1: Resolve portal IDs and build rows (no DB writes yet).
+	guids := make([]string, 0, len(messages))
+	for _, msg := range messages {
+		if msg.Guid != "" {
+			guids = append(guids, msg.Guid)
+		}
+	}
+	existingSet, err := c.cloudStore.hasMessageBatch(ctx, guids)
+	if err != nil {
+		return fmt.Errorf("batch existence check failed: %w", err)
+	}
+
+	batch := make([]cloudMessageRow, 0, len(messages))
 	for _, msg := range messages {
 		if msg.Guid == "" {
 			log.Warn().
@@ -521,11 +644,6 @@ func (c *IMClient) ingestCloudMessages(
 			continue
 		}
 
-		existing, err := c.cloudStore.hasMessage(ctx, msg.Guid)
-		if err != nil {
-			return err
-		}
-
 		text := ""
 		if msg.Text != nil {
 			text = *msg.Text
@@ -549,16 +667,14 @@ func (c *IMClient) ingestCloudMessages(
 		}
 
 		// Enrich and serialize attachment metadata.
-		// Messages contain attachment GUIDs extracted from attributedBody;
-		// the attachment zone map provides record_name + metadata.
 		attachmentsJSON := ""
-		if len(msg.Attachments) > 0 && attMap != nil {
+		if len(msg.AttachmentGuids) > 0 && attMap != nil {
 			var attRows []cloudAttachmentRow
-			for _, att := range msg.Attachments {
-				if att.Guid == "" {
+			for _, guid := range msg.AttachmentGuids {
+				if guid == "" {
 					continue
 				}
-				if enriched, ok := attMap[att.Guid]; ok {
+				if enriched, ok := attMap[guid]; ok {
 					attRows = append(attRows, enriched)
 				}
 			}
@@ -569,7 +685,7 @@ func (c *IMClient) ingestCloudMessages(
 			}
 		}
 
-		if err = c.cloudStore.upsertMessage(ctx, cloudMessageRow{
+		batch = append(batch, cloudMessageRow{
 			GUID:              msg.Guid,
 			CloudChatID:       msg.CloudChatId,
 			PortalID:          portalID,
@@ -584,18 +700,21 @@ func (c *IMClient) ingestCloudMessages(
 			TapbackTargetGUID: tapbackTargetGUID,
 			TapbackEmoji:      tapbackEmoji,
 			AttachmentsJSON:   attachmentsJSON,
-		}); err != nil {
-			return err
-		}
+		})
 
 		if msg.Deleted {
 			counts.Deleted++
 		}
-		if existing {
+		if existingSet[msg.Guid] {
 			counts.Updated++
 		} else {
 			counts.Imported++
 		}
+	}
+
+	// Phase 2: Batch insert all rows in a single transaction.
+	if err := c.cloudStore.upsertMessageBatch(ctx, batch); err != nil {
+		return err
 	}
 
 	return nil
@@ -665,10 +784,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		return
 	}
 
-	log.Info().Int("chat_count", len(portalIDs)).Msg("Creating portals from cloud sync")
+	portalStart := time.Now()
+	log.Info().Int("chat_count", len(portalIDs)).Msg("Creating portals from cloud sync — each triggers a forward backfill via ChatResync/CreatePortal")
 
 	created := 0
-	for _, portalID := range portalIDs {
+	for i, portalID := range portalIDs {
 		portalKey := networkid.PortalKey{
 			ID:       networkid.PortalID(portalID),
 			Receiver: c.UserLogin.ID,
@@ -688,9 +808,22 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		if res.Success {
 			created++
 		}
+		// Progress log every 50 portals
+		if (i+1)%50 == 0 {
+			log.Info().
+				Int("progress", i+1).
+				Int("total", len(portalIDs)).
+				Int("created_so_far", created).
+				Dur("elapsed", time.Since(portalStart)).
+				Msg("Portal creation progress")
+		}
 	}
 
-	log.Info().Int("created", created).Int("total", len(portalIDs)).Msg("Finished creating portals from cloud sync")
+	log.Info().
+		Int("created", created).
+		Int("total", len(portalIDs)).
+		Dur("elapsed", time.Since(portalStart)).
+		Msg("Finished creating portals from cloud sync (backward backfill will follow via backfill queue for portals with CanBackfill=true)")
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {

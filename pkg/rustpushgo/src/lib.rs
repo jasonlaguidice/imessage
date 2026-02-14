@@ -401,11 +401,226 @@ async fn finalize_keychain_setup_with_probe(
 // Token Provider (iCloud auth for CardDAV, CloudKit, etc.)
 // ============================================================================
 
+/// Information about a device that has an escrow bottle in the iCloud Keychain
+/// trust circle. Used to let the user choose which device's passcode to enter.
+#[derive(uniffi::Record)]
+pub struct EscrowDeviceInfo {
+    /// Index into the bottles list (used when calling join_keychain_clique_for_device).
+    pub index: u32,
+    /// Human-readable device name (e.g. "Ludvig's iPhone").
+    pub device_name: String,
+    /// Device model identifier (e.g. "iPhone15,2").
+    pub device_model: String,
+    /// Device serial number.
+    pub serial: String,
+    /// When the escrow bottle was created.
+    pub timestamp: String,
+}
+
 /// Wraps a TokenProvider that manages MobileMe auth tokens with auto-refresh.
 /// Used for iCloud services like CardDAV contacts and CloudKit messages.
 #[derive(uniffi::Object)]
 pub struct WrappedTokenProvider {
     inner: Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
+}
+
+/// Helper: create CloudKit + Keychain clients from a TokenProvider.
+/// Shared by get_escrow_devices, join_keychain_clique, and join_keychain_clique_for_device.
+async fn create_keychain_clients(
+    token_provider: &Arc<TokenProvider<omnisette::DefaultAnisetteProvider>>,
+) -> Result<(
+    Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
+    Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+), WrappedError> {
+    let dsid = token_provider.get_dsid().await?;
+    let adsid = token_provider.get_adsid().await?;
+    let mme_delegate = token_provider.get_mme_delegate().await?;
+    let account = token_provider.get_account();
+    let os_config = token_provider.get_os_config();
+    let anisette = account.lock().await.anisette.clone();
+
+    let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
+        .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
+    let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
+        state: tokio::sync::RwLock::new(cloudkit_state),
+        anisette: anisette.clone(),
+        config: os_config.clone(),
+        token_provider: token_provider.clone(),
+    });
+    let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+    let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+        Ok(data) => match plist::from_bytes(&data) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+                None
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+            None
+        }
+    };
+    if keychain_state.is_none() {
+        keychain_state = Some(
+            rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+                .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?
+        );
+    }
+    let path_for_closure = keychain_state_path.clone();
+    let keychain = Arc::new(rustpush::keychain::KeychainClient {
+        anisette: anisette.clone(),
+        token_provider: token_provider.clone(),
+        state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
+        config: os_config.clone(),
+        update_state: Box::new(move |state| {
+            if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+                warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+            } else {
+                info!("Persisted keychain state to {}", path_for_closure);
+            }
+        }),
+        container: tokio::sync::Mutex::new(None),
+        security_container: tokio::sync::Mutex::new(None),
+        client: cloudkit.clone(),
+    });
+
+    Ok((keychain, cloudkit))
+}
+
+/// Extract device name and model from an EscrowMetadata's client_metadata dictionary.
+fn extract_device_info(meta: &rustpush::keychain::EscrowMetadata) -> (String, String) {
+    let dict = meta.client_metadata.as_dictionary();
+    let device_name = dict
+        .and_then(|d| d.get("device_name"))
+        .and_then(|v| v.as_string())
+        .unwrap_or("Unknown Device")
+        .to_string();
+    let device_model = dict
+        .and_then(|d| d.get("device_model"))
+        .and_then(|v| v.as_string())
+        .unwrap_or("Unknown")
+        .to_string();
+    (device_name, device_model)
+}
+
+/// Core keychain joining logic used by both join_keychain_clique and join_keychain_clique_for_device.
+/// If `preferred_index` is Some, the bottle at that index is tried first before falling back to others.
+async fn join_keychain_with_bottles(
+    keychain: Arc<rustpush::keychain::KeychainClient<omnisette::DefaultAnisetteProvider>>,
+    cloudkit: Arc<rustpush::cloudkit::CloudKitClient<omnisette::DefaultAnisetteProvider>>,
+    bottles: &[(rustpush::cloudkit_proto::EscrowData, rustpush::keychain::EscrowMetadata)],
+    passcode: &str,
+    preferred_index: Option<u32>,
+) -> Result<String, WrappedError> {
+    let passcode_bytes = passcode.as_bytes();
+    let mut last_err = String::new();
+
+    // Build iteration order: preferred bottle first (if specified), then the rest.
+    let indices: Vec<usize> = if let Some(pref) = preferred_index {
+        let pref = pref as usize;
+        let mut order = vec![pref];
+        order.extend((0..bottles.len()).filter(|&i| i != pref));
+        order
+    } else {
+        (0..bottles.len()).collect()
+    };
+
+    // If there are many escrow bottles, do a quick probe per bottle first,
+    // then one extended probe at the end on the latest successful join.
+    let per_bottle_probe_attempts = if bottles.len() > 1 { 3 } else { 24 };
+
+    // Outer stability loop: after joining + probe, verify we stay in the clique.
+    // Other devices can exclude us within seconds of joining.
+    const MAX_REJOIN_ATTEMPTS: usize = 3;
+    let mut rejoin_attempt = 0;
+
+    'stability: loop {
+        let mut joined_any = false;
+        let mut last_joined_meta: Option<(String, String)> = None;
+
+        for &i in &indices {
+            let (data, meta) = &bottles[i];
+            info!("Trying bottle {} (serial={})...", i, meta.serial);
+            match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
+                Ok(()) => {
+                    joined_any = true;
+                    last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
+                    info!("Successfully joined keychain trust circle via bottle {}", i);
+                    info!(
+                        "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
+                        per_bottle_probe_attempts
+                    );
+                    match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
+                        Ok(()) => {
+                            break; // probe passed, go to stability check
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Bottle {} joined, but CloudKit decrypt probe failed: {}. Trying next bottle...",
+                                i,
+                                e
+                            );
+                            last_err = format!("{}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Bottle {} failed: {}", i, e);
+                    last_err = format!("{}", e);
+                }
+            }
+        }
+
+        if !joined_any {
+            return Err(WrappedError::GenericError {
+                msg: format!("All {} bottles failed. Last error: {}", bottles.len(), last_err)
+            });
+        }
+
+        // If no bottle's probe succeeded, try an extended probe
+        if !keychain.is_in_clique().await {
+            if rejoin_attempt >= MAX_REJOIN_ATTEMPTS {
+                return Err(WrappedError::GenericError {
+                    msg: format!("Excluded from clique after {} rejoin attempts. Last error: {}", rejoin_attempt, last_err)
+                });
+            }
+            rejoin_attempt += 1;
+            warn!("Not in clique after bottle probes, rejoin attempt {}/{}", rejoin_attempt, MAX_REJOIN_ATTEMPTS);
+            continue 'stability;
+        }
+
+        // Stability check: wait, re-sync trust, verify we're still included.
+        // Other devices can exclude us within seconds of joining.
+        info!("Verifying clique membership stability...");
+        for check in 0..3 {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if !keychain.is_in_clique().await {
+                rejoin_attempt += 1;
+                warn!(
+                    "Excluded from clique during stability check {} — re-joining (attempt {}/{})",
+                    check + 1, rejoin_attempt, MAX_REJOIN_ATTEMPTS
+                );
+                if rejoin_attempt > MAX_REJOIN_ATTEMPTS {
+                    return Err(WrappedError::GenericError {
+                        msg: "Repeatedly excluded from iCloud Keychain trust circle by another device. \
+                              Try disabling and re-enabling 'Messages in iCloud' on your iPhone, then retry."
+                            .into()
+                    });
+                }
+                continue 'stability;
+            }
+        }
+
+        // Still in clique after stability checks
+        let (serial, build) = last_joined_meta.unwrap_or(("unknown".into(), "unknown".into()));
+        info!("Clique membership stable after {} stability checks", 3);
+        return Ok(format!(
+            "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
+            serial, build,
+        ));
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -448,66 +663,46 @@ impl WrappedTokenProvider {
         Ok(())
     }
 
+    /// List devices that have escrow bottles in the iCloud Keychain trust circle.
+    /// Returns device info (name, model, serial, timestamp) for each bottle.
+    /// Call this before join_keychain_clique_for_device to let the user choose.
+    pub async fn get_escrow_devices(&self) -> Result<Vec<EscrowDeviceInfo>, WrappedError> {
+        info!("Fetching escrow devices...");
+        let (keychain, _cloudkit) = create_keychain_clients(&self.inner).await?;
+
+        let bottles = keychain.get_viable_bottles().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
+
+        if bottles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac.".into()
+            });
+        }
+
+        let devices: Vec<EscrowDeviceInfo> = bottles.iter().enumerate().map(|(i, (_data, meta))| {
+            let (device_name, device_model) = extract_device_info(meta);
+            info!("  [{}] name={:?} model={} serial={} timestamp={}", i, device_name, device_model, meta.serial, meta.timestamp);
+            EscrowDeviceInfo {
+                index: i as u32,
+                device_name,
+                device_model,
+                serial: meta.serial.clone(),
+                timestamp: meta.timestamp.clone(),
+            }
+        }).collect();
+
+        info!("Found {} escrow device(s)", devices.len());
+        Ok(devices)
+    }
+
     /// Join the iCloud Keychain trust circle using a device passcode.
+    /// Tries all available escrow bottles in order.
     /// Required before CloudKit Messages can decrypt PCS-encrypted records.
     /// The passcode is the 6-digit PIN or password used to unlock an iPhone/Mac.
     /// Returns a description of the escrow bottle used.
     pub async fn join_keychain_clique(&self, passcode: String) -> Result<String, WrappedError> {
         info!("=== Joining iCloud Keychain Trust Circle ===");
-
-        let dsid = self.inner.get_dsid().await?;
-        let adsid = self.inner.get_adsid().await?;
-        let mme_delegate = self.inner.get_mme_delegate().await?;
-        let account = self.inner.get_account();
-        let os_config = self.inner.get_os_config();
-        let anisette = account.lock().await.anisette.clone();
-
-        let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
-            .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
-        let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: tokio::sync::RwLock::new(cloudkit_state),
-            anisette: anisette.clone(),
-            config: os_config.clone(),
-            token_provider: self.inner.clone(),
-        });
-        let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
-        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
-            Ok(data) => match plist::from_bytes(&data) {
-                Ok(state) => Some(state),
-                Err(e) => {
-                    warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
-                    None
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            Err(e) => {
-                warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
-                None
-            }
-        };
-        if keychain_state.is_none() {
-            keychain_state = Some(
-                rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
-                    .ok_or(WrappedError::GenericError { msg: "Missing KeychainSync config in MobileMe delegate".into() })?
-            );
-        }
-        let path_for_closure = keychain_state_path.clone();
-        let keychain = Arc::new(rustpush::keychain::KeychainClient {
-            anisette: anisette.clone(),
-            token_provider: self.inner.clone(),
-            state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
-            config: os_config.clone(),
-            update_state: Box::new(move |state| {
-                if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
-                    warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
-                } else {
-                    info!("Persisted keychain state to {}", path_for_closure);
-                }
-            }),
-            container: tokio::sync::Mutex::new(None),
-            security_container: tokio::sync::Mutex::new(None),
-            client: cloudkit.clone(),
-        });
+        let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
 
         info!("Fetching escrow bottles...");
         let bottles = keychain.get_viable_bottles().await
@@ -524,102 +719,40 @@ impl WrappedTokenProvider {
             info!("  [{}] serial={} build={} timestamp={}", i, meta.serial, meta.build, meta.timestamp);
         }
 
-        let passcode_bytes = passcode.as_bytes();
-        let mut last_err = String::new();
+        join_keychain_with_bottles(keychain, cloudkit, &bottles, &passcode, None).await
+    }
 
-        // If there are many escrow bottles, do a quick probe per bottle first,
-        // then one extended probe at the end on the latest successful join.
-        let per_bottle_probe_attempts = if bottles.len() > 1 { 3 } else { 24 };
+    /// Join the iCloud Keychain trust circle, trying the specified device first.
+    /// `device_index` is the index from get_escrow_devices(). If that bottle fails,
+    /// falls back to trying other bottles.
+    pub async fn join_keychain_clique_for_device(&self, passcode: String, device_index: u32) -> Result<String, WrappedError> {
+        info!("=== Joining iCloud Keychain Trust Circle (preferred device {}) ===", device_index);
+        let (keychain, cloudkit) = create_keychain_clients(&self.inner).await?;
 
-        // Outer stability loop: after joining + probe, verify we stay in the clique.
-        // Other devices can exclude us within seconds of joining.
-        const MAX_REJOIN_ATTEMPTS: usize = 3;
-        let mut rejoin_attempt = 0;
+        info!("Fetching escrow bottles...");
+        let bottles = keychain.get_viable_bottles().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
 
-        'stability: loop {
-            let mut joined_any = false;
-            let mut last_joined_meta: Option<(String, String)> = None;
-
-            for (i, (data, meta)) in bottles.iter().enumerate() {
-                info!("Trying bottle {} (serial={})...", i, meta.serial);
-                match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
-                    Ok(()) => {
-                        joined_any = true;
-                        last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
-                        info!("Successfully joined keychain trust circle via bottle {}", i);
-                        info!(
-                            "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
-                            per_bottle_probe_attempts
-                        );
-                        match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
-                            Ok(()) => {
-                                break; // probe passed, go to stability check
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Bottle {} joined, but CloudKit decrypt probe failed: {}. Trying next bottle...",
-                                    i,
-                                    e
-                                );
-                                last_err = format!("{}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Bottle {} failed: {}", i, e);
-                        last_err = format!("{}", e);
-                    }
-                }
-            }
-
-            if !joined_any {
-                return Err(WrappedError::GenericError {
-                    msg: format!("All {} bottles failed. Last error: {}", bottles.len(), last_err)
-                });
-            }
-
-            // If no bottle's probe succeeded, try an extended probe
-            if !keychain.is_in_clique().await {
-                if rejoin_attempt >= MAX_REJOIN_ATTEMPTS {
-                    return Err(WrappedError::GenericError {
-                        msg: format!("Excluded from clique after {} rejoin attempts. Last error: {}", rejoin_attempt, last_err)
-                    });
-                }
-                rejoin_attempt += 1;
-                warn!("Not in clique after bottle probes, rejoin attempt {}/{}", rejoin_attempt, MAX_REJOIN_ATTEMPTS);
-                continue 'stability;
-            }
-
-            // Stability check: wait, re-sync trust, verify we're still included.
-            // Other devices can exclude us within seconds of joining.
-            info!("Verifying clique membership stability...");
-            for check in 0..3 {
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                if !keychain.is_in_clique().await {
-                    rejoin_attempt += 1;
-                    warn!(
-                        "Excluded from clique during stability check {} — re-joining (attempt {}/{})",
-                        check + 1, rejoin_attempt, MAX_REJOIN_ATTEMPTS
-                    );
-                    if rejoin_attempt > MAX_REJOIN_ATTEMPTS {
-                        return Err(WrappedError::GenericError {
-                            msg: "Repeatedly excluded from iCloud Keychain trust circle by another device. \
-                                  Try disabling and re-enabling 'Messages in iCloud' on your iPhone, then retry."
-                                .into()
-                        });
-                    }
-                    continue 'stability;
-                }
-            }
-
-            // Still in clique after stability checks
-            let (serial, build) = last_joined_meta.unwrap_or(("unknown".into(), "unknown".into()));
-            info!("Clique membership stable after {} stability checks", 3);
-            return Ok(format!(
-                "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
-                serial, build,
-            ));
+        if bottles.is_empty() {
+            return Err(WrappedError::GenericError {
+                msg: "No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac.".into()
+            });
         }
+
+        info!("Found {} escrow bottle(s)", bottles.len());
+        for (i, (_data, meta)) in bottles.iter().enumerate() {
+            let (name, model) = extract_device_info(meta);
+            info!("  [{}] name={:?} model={} serial={} build={} timestamp={}", i, name, model, meta.serial, meta.build, meta.timestamp);
+        }
+
+        let preferred = if (device_index as usize) < bottles.len() {
+            Some(device_index)
+        } else {
+            warn!("Device index {} out of range (have {} bottles), trying all", device_index, bottles.len());
+            None
+        };
+
+        join_keychain_with_bottles(keychain, cloudkit, &bottles, &passcode, preferred).await
     }
 }
 
@@ -821,8 +954,9 @@ pub struct WrappedCloudSyncMessage {
     pub tapback_target_guid: Option<String>,
     pub tapback_emoji: Option<String>,
 
-    // Attachment info extracted from messageSummaryInfo / attributedBody
-    pub attachments: Vec<WrappedCloudAttachmentInfo>,
+    // Attachment GUIDs extracted from messageSummaryInfo / attributedBody.
+    // These are matched against the attachment zone to download files.
+    pub attachment_guids: Vec<String>,
 }
 
 /// Metadata for an attachment referenced by a CloudKit message.
@@ -2478,59 +2612,73 @@ impl Client {
         };
 
         let mut normalized = Vec::with_capacity(messages.len());
+        let mut skipped_messages = 0usize;
         for (record_name, msg_opt) in messages {
             if let Some(msg) = msg_opt {
-                let guid = if msg.guid.is_empty() {
-                    record_name.clone()
-                } else {
-                    msg.guid.clone()
-                };
-                let text = msg.msg_proto.text.clone();
-                let subject = msg.msg_proto.subject.clone();
+                // Wrap per-message normalization in catch_unwind so one bad
+                // CloudKit record doesn't fail the entire page.
+                let rn = record_name.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let guid = if msg.guid.is_empty() {
+                        rn.clone()
+                    } else {
+                        msg.guid.clone()
+                    };
+                    let text = msg.msg_proto.text.clone();
+                    let subject = msg.msg_proto.subject.clone();
 
-                // Extract tapback/reaction info from proto fields
-                let tapback_type = msg.msg_proto.associated_message_type;
-                let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
-                let tapback_emoji = msg.msg_proto_4.as_ref()
-                    .and_then(|p4| p4.associated_message_emoji.clone());
+                    // Extract tapback/reaction info from proto fields
+                    let tapback_type = msg.msg_proto.associated_message_type;
+                    let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
+                    let tapback_emoji = msg.msg_proto_4.as_ref()
+                        .and_then(|p4| p4.associated_message_emoji.clone());
 
-                // Extract attachment GUIDs from attributedBody
-                let att_guids = msg.msg_proto.attributed_body
-                    .as_ref()
-                    .map(|body| extract_attachment_guids_from_attributed_body(body))
-                    .unwrap_or_default();
+                    // Extract attachment GUIDs from attributedBody
+                    let attachment_guids: Vec<String> = msg.msg_proto.attributed_body
+                        .as_ref()
+                        .map(|body| extract_attachment_guids_from_attributed_body(body))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
+                        .collect();
 
-                // Create placeholder attachment info with GUIDs (record_name filled later)
-                let attachments: Vec<WrappedCloudAttachmentInfo> = att_guids.into_iter()
-                    .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
-                    .map(|g| WrappedCloudAttachmentInfo {
-                        guid: g,
-                        mime_type: None,
-                        uti_type: None,
-                        filename: None,
-                        file_size: 0,
-                        record_name: String::new(),
-                    })
-                    .collect();
+                    WrappedCloudSyncMessage {
+                        record_name: rn,
+                        guid,
+                        cloud_chat_id: msg.chat_id.clone(),
+                        sender: msg.sender.clone(),
+                        is_from_me: msg
+                            .flags
+                            .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
+                        text,
+                        subject,
+                        service: msg.service.clone(),
+                        timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
+                        deleted: false,
+                        tapback_type,
+                        tapback_target_guid,
+                        tapback_emoji,
+                        attachment_guids,
+                    }
+                }));
 
-                normalized.push(WrappedCloudSyncMessage {
-                    record_name,
-                    guid,
-                    cloud_chat_id: msg.chat_id,
-                    sender: msg.sender,
-                    is_from_me: msg
-                        .flags
-                        .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
-                    text,
-                    subject,
-                    service: msg.service,
-                    timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
-                    deleted: false,
-                    tapback_type,
-                    tapback_target_guid,
-                    tapback_emoji,
-                    attachments,
-                });
+                match result {
+                    Ok(wrapped) => normalized.push(wrapped),
+                    Err(panic_val) => {
+                        let panic_msg = if let Some(s) = panic_val.downcast_ref::<String>() {
+                            s.clone()
+                        } else if let Some(s) = panic_val.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        warn!(
+                            "Skipping CloudKit message {} due to normalization panic: {}",
+                            record_name, panic_msg
+                        );
+                        skipped_messages += 1;
+                    }
+                }
             } else {
                 normalized.push(WrappedCloudSyncMessage {
                     guid: record_name.clone(),
@@ -2546,10 +2694,22 @@ impl Client {
                     tapback_type: None,
                     tapback_target_guid: None,
                     tapback_emoji: None,
-                    attachments: vec![],
+                    attachment_guids: vec![],
                 });
             }
         }
+
+        if skipped_messages > 0 {
+            warn!(
+                "CloudKit message sync: skipped {} message(s) due to normalization errors",
+                skipped_messages
+            );
+        }
+
+        info!(
+            "CloudKit message sync page: {} messages normalized, {} skipped",
+            normalized.len(), skipped_messages
+        );
 
         Ok(WrappedCloudSyncMessagesPage {
             continuation_token: encode_continuation_token(next_token),
@@ -2781,7 +2941,7 @@ impl Client {
                         tapback_type,
                         tapback_target_guid,
                         tapback_emoji,
-                        attachments: vec![],
+                        attachment_guids: vec![],
                     },
                 );
 
