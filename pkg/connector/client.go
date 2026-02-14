@@ -1278,16 +1278,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 
 		// For gid: portals, look up members from cloud_chat table;
 		// for legacy comma-separated IDs, parse from the portal ID.
-		var memberList []string
-		if strings.HasPrefix(portalID, "gid:") {
-			if c.cloudStore != nil {
-				if participants, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(participants) > 0 {
-					memberList = participants
-				}
-			}
-		} else {
-			memberList = strings.Split(portalID, ",")
-		}
+		memberList := c.resolveGroupMembers(ctx, portalID)
 
 		memberMap := make(map[networkid.UserID]bridgev2.ChatMember)
 		for _, member := range memberList {
@@ -1331,20 +1322,18 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			},
 		}
 
-		// Use the iMessage group name if available, otherwise build from members
-		c.imGroupNamesMu.RLock()
-		groupName := c.imGroupNames[portalID]
-		c.imGroupNamesMu.RUnlock()
-		if groupName != "" {
-			chatInfo.Name = &groupName
-		} else {
-			chatInfo.Name = ptr.Ptr(c.buildGroupName(memberList))
-		}
+		groupName := c.resolveGroupName(ctx, portalID)
+		chatInfo.Name = &groupName
 
-		// Persist sender_guid to portal metadata for gid: portals
+		// Persist sender_guid to portal metadata for gid: portals.
+		// Only persist iMessage protocol-level group names (cv_name) to
+		// metadata — NOT auto-generated contact-resolved names — since
+		// the metadata GroupName is used for outbound message routing.
 		if strings.HasPrefix(portalID, "gid:") {
 			gid := strings.TrimPrefix(portalID, "gid:")
-			cachedName := groupName
+			c.imGroupNamesMu.RLock()
+			protocolName := c.imGroupNames[portalID]
+			c.imGroupNamesMu.RUnlock()
 			chatInfo.ExtraUpdates = func(ctx context.Context, p *bridgev2.Portal) bool {
 				meta, ok := p.Metadata.(*PortalMetadata)
 				if !ok {
@@ -1355,8 +1344,8 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 					meta.SenderGuid = gid
 					changed = true
 				}
-				if cachedName != "" && meta.GroupName != cachedName {
-					meta.GroupName = cachedName
+				if protocolName != "" && meta.GroupName != protocolName {
+					meta.GroupName = protocolName
 					changed = true
 				}
 				if changed {
@@ -2476,6 +2465,53 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 		Participants: []string{c.handle, sendTo},
 		IsSms:        isSms,
 	}
+}
+
+// resolveGroupMembers returns the participant list for a group portal.
+// For gid: portals it queries the cloud store; for legacy comma-separated
+// portal IDs it splits the ID string.
+func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []string {
+	if strings.HasPrefix(portalID, "gid:") {
+		if c.cloudStore != nil {
+			if participants, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(participants) > 0 {
+				return participants
+			}
+		}
+		return nil
+	}
+	return strings.Split(portalID, ",")
+}
+
+// resolveGroupName determines the best display name for a group portal.
+// Priority: 1) in-memory cache (user-set iMessage group name from real-time)
+//
+//	2) CloudKit display_name (user-set group name from cloud_chat DB)
+//	3) contact-resolved member names via buildGroupName
+func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
+	// 1) In-memory cache (populated from real-time messages / renames)
+	c.imGroupNamesMu.RLock()
+	name := c.imGroupNames[portalID]
+	c.imGroupNamesMu.RUnlock()
+	if name != "" {
+		return name
+	}
+
+	// 2) CloudKit display_name from cloud_chat DB
+	if c.cloudStore != nil {
+		if cloudName, err := c.cloudStore.getChatDisplayNameByPortalID(ctx, portalID); err == nil && cloudName != "" {
+			c.imGroupNamesMu.Lock()
+			c.imGroupNames[portalID] = cloudName
+			c.imGroupNamesMu.Unlock()
+			return cloudName
+		}
+	}
+
+	// 3) Build from contact-resolved member names
+	members := c.resolveGroupMembers(ctx, portalID)
+	if len(members) == 0 {
+		return "Group Chat"
+	}
+	return c.buildGroupName(members)
 }
 
 // buildGroupName creates a human-readable group name from member identifiers
