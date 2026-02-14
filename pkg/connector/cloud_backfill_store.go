@@ -467,11 +467,13 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 
 func (s *cloudBackfillStore) listAllPortalIDs(ctx context.Context) ([]string, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT DISTINCT portal_id
-		FROM cloud_chat
-		WHERE login_id=$1
-			AND portal_id IS NOT NULL
-			AND portal_id <> ''
+		SELECT DISTINCT portal_id FROM (
+			SELECT portal_id FROM cloud_chat
+			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> ''
+			UNION
+			SELECT portal_id FROM cloud_message
+			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE
+		)
 		ORDER BY portal_id
 	`, s.loginID)
 	if err != nil {
