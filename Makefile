@@ -4,7 +4,7 @@ BUNDLE_ID   := com.lrhodin.mautrix-imessage
 VERSION     := 0.1.0
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-DATA_DIR    ?= $(shell pwd)/data
+DATA_DIR    ?= $(HOME)/.local/share/mautrix-imessage
 UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
@@ -150,9 +150,9 @@ endif
 
 reset:
 ifeq ($(UNAME_S),Darwin)
-	@scripts/reset-bridge.sh "$(DATA_DIR)" "$(BUNDLE_ID)"
+	@scripts/reset-bridge.sh "$(BUNDLE_ID)"
 else
-	@scripts/reset-bridge.sh "$(DATA_DIR)"
+	@scripts/reset-bridge.sh
 endif
 
 uninstall:
