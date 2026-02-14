@@ -1308,6 +1308,21 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				}
 			}
 		}
+
+		// CloudKit doesn't include the owner in the participant list (it's
+		// implied). Always ensure we're in the member map so Beeper knows
+		// we belong to this conversation.
+		myUserID := makeUserID(c.handle)
+		if _, hasSelf := memberMap[myUserID]; !hasSelf {
+			memberMap[myUserID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{
+					IsFromMe:    true,
+					SenderLogin: c.UserLogin.ID,
+					Sender:      myUserID,
+				},
+				Membership: event.MembershipJoin,
+			}
+		}
 		chatInfo.Members = &bridgev2.ChatMemberList{
 			IsFull:    true,
 			MemberMap: memberMap,
