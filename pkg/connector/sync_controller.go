@@ -50,6 +50,58 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 		close(readyCh)
 	}
 	log.Info().Msg("Contacts readiness gate satisfied")
+
+	// Re-resolve ghost names now that contacts are available.
+	// Ghosts created before contacts loaded have raw phone numbers as names.
+	go c.refreshGhostNamesFromContacts(log)
+}
+
+func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
+	if c.cloudContacts == nil {
+		return
+	}
+	ctx := context.Background()
+
+	// Get all ghost IDs from the database via the raw DB handle
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id, name FROM ghost")
+	if err != nil {
+		log.Err(err).Msg("Failed to query ghosts for contact name refresh")
+		return
+	}
+	defer rows.Close()
+
+	updated := 0
+	total := 0
+	for rows.Next() {
+		var ghostID, ghostName string
+		if err := rows.Scan(&ghostID, &ghostName); err != nil {
+			continue
+		}
+		total++
+		localID := stripIdentifierPrefix(ghostID)
+		if localID == "" {
+			continue
+		}
+		contact, _ := c.cloudContacts.GetContactInfo(localID)
+		if contact == nil || !contact.HasName() {
+			continue
+		}
+		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+			FirstName: contact.FirstName,
+			LastName:  contact.LastName,
+			Nickname:  contact.Nickname,
+			ID:        localID,
+		})
+		if ghostName != name {
+			ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostID))
+			if err != nil || ghost == nil {
+				continue
+			}
+			ghost.UpdateInfo(ctx, &bridgev2.UserInfo{Name: &name})
+			updated++
+		}
+	}
+	log.Info().Int("updated", updated).Int("total", total).Msg("Refreshed ghost names from contacts")
 }
 
 func (c *IMClient) waitForContactsReady(log zerolog.Logger) bool {
