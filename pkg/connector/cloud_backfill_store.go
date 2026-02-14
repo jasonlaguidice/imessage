@@ -594,24 +594,6 @@ func (s *cloudBackfillStore) markRepairTaskFailed(ctx context.Context, id int64,
 	return err
 }
 
-func (s *cloudBackfillStore) getChatDisplayNameByPortalID(ctx context.Context, portalID string) (string, error) {
-	var displayName sql.NullString
-	err := s.db.QueryRow(ctx,
-		`SELECT display_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND display_name IS NOT NULL AND display_name <> '' LIMIT 1`,
-		s.loginID, portalID,
-	).Scan(&displayName)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return "", nil
-		}
-		return "", err
-	}
-	if !displayName.Valid {
-		return "", nil
-	}
-	return displayName.String, nil
-}
-
 func nullableString(value *string) any {
 	if value == nil {
 		return nil

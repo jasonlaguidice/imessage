@@ -393,14 +393,6 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			return counts, err
 		}
 
-		// Cache the CloudKit display name (user-set group name) so it's
-		// available when GetChatInfo runs during portal creation.
-		if chat.DisplayName != nil && *chat.DisplayName != "" {
-			c.imGroupNamesMu.Lock()
-			c.imGroupNames[portalID] = *chat.DisplayName
-			c.imGroupNamesMu.Unlock()
-		}
-
 		if exists {
 			counts.Updated++
 		} else {

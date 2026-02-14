@@ -2483,12 +2483,16 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 }
 
 // resolveGroupName determines the best display name for a group portal.
-// Priority: 1) in-memory cache (user-set iMessage group name from real-time)
+// Priority: 1) in-memory cache (user-set iMessage group name from real-time
+//              protocol cv_name, e.g. when someone explicitly renames a group)
 //
-//	2) CloudKit display_name (user-set group name from cloud_chat DB)
-//	3) contact-resolved member names via buildGroupName
+//	2) contact-resolved member names via buildGroupName
+//
+// Note: CloudKit's display_name field is NOT used — it contains Apple's
+// auto-generated label (raw emails/phone numbers) rather than user-set names.
+// The nice contact-resolved names shown in Messages.app are generated locally.
 func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
-	// 1) In-memory cache (populated from real-time messages / renames)
+	// 1) In-memory cache (populated from real-time iMessage rename messages)
 	c.imGroupNamesMu.RLock()
 	name := c.imGroupNames[portalID]
 	c.imGroupNamesMu.RUnlock()
@@ -2496,17 +2500,7 @@ func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string
 		return name
 	}
 
-	// 2) CloudKit display_name from cloud_chat DB
-	if c.cloudStore != nil {
-		if cloudName, err := c.cloudStore.getChatDisplayNameByPortalID(ctx, portalID); err == nil && cloudName != "" {
-			c.imGroupNamesMu.Lock()
-			c.imGroupNames[portalID] = cloudName
-			c.imGroupNamesMu.Unlock()
-			return cloudName
-		}
-	}
-
-	// 3) Build from contact-resolved member names
+	// 2) Build from contact-resolved member names
 	members := c.resolveGroupMembers(ctx, portalID)
 	if len(members) == 0 {
 		return "Group Chat"
