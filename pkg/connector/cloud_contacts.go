@@ -339,6 +339,11 @@ func (c *cloudContactsClient) fetchAllVCards(log zerolog.Logger, addressBookURL 
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	log.Debug().
+		Int("response_bytes", len(data)).
+		Str("address_book", addressBookURL).
+		Msg("CardDAV: REPORT response received")
+
 	return c.parseVCardMultistatus(data, log), nil
 }
 
