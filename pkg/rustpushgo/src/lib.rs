@@ -4,7 +4,7 @@ pub mod local_config;
 #[cfg(test)]
 mod test_hwinfo;
 
-use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use icloud_auth::{AppleAccount, FetchedToken};
@@ -1909,7 +1909,22 @@ pub async fn new_client(
         .await,
     );
 
-    // Start receive loop
+    // Start receive loop.
+    //
+    // Architecture: two tasks connected by an unbounded mpsc channel.
+    //
+    // 1. **Drain task** — reads from the tokio broadcast channel as fast as
+    //    possible and forwards every APSMessage into the mpsc.  Because it does
+    //    zero processing, it will almost never lag behind the broadcast.  If it
+    //    *does* lag (broadcast capacity 9999 exhausted), it logs the count and
+    //    continues — there is nothing we can do about already-dropped broadcast
+    //    messages, but we won't compound the loss by being slow.
+    //
+    // 2. **Process task** — reads from the mpsc (unbounded, so no back-pressure
+    //    on the drain task) and handles each message: decrypting, downloading
+    //    MMCS attachments, and calling the Go callback.  Transient errors are
+    //    retried with exponential back-off.  This task can take as long as it
+    //    needs without risking broadcast lag.
     let client_for_recv = client.clone();
     let callback = Arc::new(message_callback);
 
@@ -1917,34 +1932,106 @@ pub async fn new_client(
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
         async move {
-            let mut recv = conn.messages_cont.subscribe();
-            loop {
-                match recv.recv().await {
-                    Ok(msg) => {
-                        match client_for_recv.handle(msg).await {
-                            Ok(Some(msg_inst)) => {
-                                if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
-                                    let mut wrapped = message_inst_to_wrapped(&msg_inst);
-                                    // Download MMCS attachments so Go receives inline data
-                                    download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
-                                    callback.on_message(wrapped);
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<rustpush::APSMessage>();
+            let pending = Arc::new(AtomicU64::new(0));
+
+            // --- Drain task: broadcast → mpsc ---------------------------
+            let drain_pending = pending.clone();
+            let drain_handle = tokio::spawn({
+                let conn = conn.clone();
+                async move {
+                    let mut recv = conn.messages_cont.subscribe();
+                    loop {
+                        match recv.recv().await {
+                            Ok(msg) => {
+                                drain_pending.fetch_add(1, Ordering::Relaxed);
+                                if tx.send(msg).is_err() {
+                                    info!("Process task gone, stopping drain");
+                                    break;
                                 }
                             }
-                            Ok(None) => {}
-                            Err(e) => {
-                                error!("Error handling message: {:?}", e);
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                error!(
+                                    "APS broadcast receiver lagged — {} messages were DROPPED by the \
+                                     broadcast channel before we could read them. Real-time messages \
+                                     may have been lost. Consider increasing broadcast capacity or \
+                                     investigating processing backlog (pending={}).",
+                                    n,
+                                    drain_pending.load(Ordering::Relaxed),
+                                );
+                                // Continue processing — we can't recover the
+                                // dropped broadcast messages, but we must keep
+                                // draining so we don't lose more.
+                            }
+                            Err(broadcast::error::RecvError::Closed) => {
+                                info!("Broadcast channel closed, stopping drain task");
+                                break;
                             }
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Message receiver lagged by {} messages", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        info!("Message channel closed, stopping receive loop");
-                        break;
+                }
+            });
+
+            // --- Process task: mpsc → handle + callback -----------------
+            const MAX_RETRIES: u32 = 5;
+            const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+
+            while let Some(msg) = rx.recv().await {
+                let mut retries = 0u32;
+                let mut backoff = INITIAL_BACKOFF;
+
+                loop {
+                    match client_for_recv.handle(msg.clone()).await {
+                        Ok(Some(msg_inst)) => {
+                            if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
+                                let mut wrapped = message_inst_to_wrapped(&msg_inst);
+                                // Download MMCS attachments so Go receives inline data
+                                download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                callback.on_message(wrapped);
+                            }
+                            break; // success
+                        }
+                        Ok(None) => {
+                            break; // message intentionally ignored by handle()
+                        }
+                        Err(e) => {
+                            // Classify: retryable vs permanent
+                            let is_permanent = matches!(
+                                e,
+                                rustpush::PushError::BadMsg
+                                    | rustpush::PushError::DoNotRetry(_)
+                                    | rustpush::PushError::VerificationFailed
+                            );
+
+                            if is_permanent || retries >= MAX_RETRIES {
+                                error!(
+                                    "Failed to handle APS message after {} attempt(s) (permanent={}): {:?}",
+                                    retries + 1,
+                                    is_permanent,
+                                    e
+                                );
+                                break;
+                            }
+
+                            retries += 1;
+                            warn!(
+                                "Transient error handling APS message (attempt {}/{}), retrying in {:?}: {:?}",
+                                retries,
+                                MAX_RETRIES,
+                                backoff,
+                                e
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff = std::cmp::min(backoff * 2, Duration::from_secs(15));
+                        }
                     }
                 }
+
+                pending.fetch_sub(1, Ordering::Relaxed);
             }
+
+            drain_handle.abort();
+            info!("Receive loop exited");
         }
     });
 
