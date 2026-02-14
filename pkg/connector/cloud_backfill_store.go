@@ -29,26 +29,9 @@ type cloudMessageRow struct {
 	Deleted     bool
 }
 
-type cloudRepairTask struct {
-	ID          int64
-	TaskType    string
-	CloudChatID string
-	PortalID    string
-	SinceTSMS   int64
-	Attempts    int
-}
-
-type cloudActiveChat struct {
-	CloudChatID string
-	PortalID    string
-}
-
 const (
 	cloudZoneChats    = "chatManateeZone"
 	cloudZoneMessages = "messageManateeZone"
-
-	repairTaskActiveRecent = "active_chat_recent"
-	repairTaskGlobalRecent = "global_recent"
 )
 
 func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *cloudBackfillStore {
@@ -56,37 +39,6 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 }
 
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
-	repairTaskTable := `CREATE TABLE IF NOT EXISTS cloud_repair_task (
-		id BIGSERIAL PRIMARY KEY,
-		login_id TEXT NOT NULL,
-		task_type TEXT NOT NULL,
-		cloud_chat_id TEXT,
-		portal_id TEXT,
-		since_ts_ms BIGINT NOT NULL,
-		not_before_ts BIGINT NOT NULL,
-		attempts INTEGER NOT NULL DEFAULT 0,
-		last_error TEXT,
-		created_ts BIGINT NOT NULL,
-		updated_ts BIGINT NOT NULL,
-		done_ts BIGINT
-	)`
-	if s.db.Dialect == dbutil.SQLite {
-		repairTaskTable = `CREATE TABLE IF NOT EXISTS cloud_repair_task (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			login_id TEXT NOT NULL,
-			task_type TEXT NOT NULL,
-			cloud_chat_id TEXT,
-			portal_id TEXT,
-			since_ts_ms BIGINT NOT NULL,
-			not_before_ts BIGINT NOT NULL,
-			attempts INTEGER NOT NULL DEFAULT 0,
-			last_error TEXT,
-			created_ts BIGINT NOT NULL,
-			updated_ts BIGINT NOT NULL,
-			done_ts BIGINT
-		)`
-	}
-
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
 			login_id TEXT NOT NULL,
@@ -125,15 +77,12 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			updated_ts BIGINT NOT NULL,
 			PRIMARY KEY (login_id, guid)
 		)`,
-		repairTaskTable,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
 			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
 			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
 		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
 			ON cloud_message (login_id, chat_id, timestamp_ms, guid)`,
-		`CREATE INDEX IF NOT EXISTS cloud_repair_due_idx
-			ON cloud_repair_task (login_id, done_ts, not_before_ts, id)`,
 	}
 
 	// Run table creation queries first (without indexes that depend on migrations)
@@ -490,108 +439,6 @@ func (s *cloudBackfillStore) listAllPortalIDs(ctx context.Context) ([]string, er
 		portalIDs = append(portalIDs, portalID)
 	}
 	return portalIDs, rows.Err()
-}
-
-func (s *cloudBackfillStore) listActiveChatsSince(ctx context.Context, sinceTS int64, limit int) ([]cloudActiveChat, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT chat_id, portal_id
-		FROM cloud_message
-		WHERE login_id=$1
-			AND deleted=FALSE
-			AND chat_id IS NOT NULL
-			AND chat_id <> ''
-			AND portal_id IS NOT NULL
-			AND portal_id <> ''
-			AND timestamp_ms >= $2
-		GROUP BY chat_id, portal_id
-		ORDER BY MAX(timestamp_ms) DESC
-		LIMIT $3
-	`, s.loginID, sinceTS, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var chats []cloudActiveChat
-	for rows.Next() {
-		var chat cloudActiveChat
-		if err = rows.Scan(&chat.CloudChatID, &chat.PortalID); err != nil {
-			return nil, err
-		}
-		chats = append(chats, chat)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	return chats, nil
-}
-
-func (s *cloudBackfillStore) enqueueRepairTask(
-	ctx context.Context,
-	taskType, cloudChatID, portalID string,
-	sinceTSMS, notBeforeTS int64,
-) error {
-	nowMS := time.Now().UnixMilli()
-	_, err := s.db.Exec(ctx, `
-		INSERT INTO cloud_repair_task (
-			login_id, task_type, cloud_chat_id, portal_id,
-			since_ts_ms, not_before_ts, attempts, created_ts, updated_ts
-		) VALUES ($1, $2, $3, $4, $5, $6, 0, $7, $8)
-	`, s.loginID, taskType, cloudChatID, portalID, sinceTSMS, notBeforeTS, nowMS, nowMS)
-	return err
-}
-
-func (s *cloudBackfillStore) getDueRepairTasks(ctx context.Context, limit int) ([]cloudRepairTask, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT id, task_type, COALESCE(cloud_chat_id, ''), COALESCE(portal_id, ''), since_ts_ms, attempts
-		FROM cloud_repair_task
-		WHERE login_id=$1
-			AND done_ts IS NULL
-			AND not_before_ts <= $2
-		ORDER BY id ASC
-		LIMIT $3
-	`, s.loginID, time.Now().UnixMilli(), limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var tasks []cloudRepairTask
-	for rows.Next() {
-		var task cloudRepairTask
-		if err = rows.Scan(&task.ID, &task.TaskType, &task.CloudChatID, &task.PortalID, &task.SinceTSMS, &task.Attempts); err != nil {
-			return nil, err
-		}
-		tasks = append(tasks, task)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	return tasks, nil
-}
-
-func (s *cloudBackfillStore) markRepairTaskDone(ctx context.Context, id int64) error {
-	nowMS := time.Now().UnixMilli()
-	_, err := s.db.Exec(ctx, `
-		UPDATE cloud_repair_task
-		SET done_ts=$2, updated_ts=$2
-		WHERE login_id=$1 AND id=$3
-	`, s.loginID, nowMS, id)
-	return err
-}
-
-func (s *cloudBackfillStore) markRepairTaskFailed(ctx context.Context, id int64, errMsg string) error {
-	nowMS := time.Now().UnixMilli()
-	nextRetry := nowMS + int64((5 * time.Minute).Milliseconds())
-	_, err := s.db.Exec(ctx, `
-		UPDATE cloud_repair_task
-		SET attempts=attempts+1,
-			last_error=$2,
-			not_before_ts=$3,
-			updated_ts=$4
-		WHERE login_id=$1 AND id=$5
-	`, s.loginID, errMsg, nextRetry, nowMS, id)
-	return err
 }
 
 func nullableString(value *string) any {
