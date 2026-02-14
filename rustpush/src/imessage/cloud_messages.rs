@@ -722,7 +722,21 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
-        self.sync_records("messageManateeZone", continuation_token).await
+        // Try the newer zone first; fall back to legacy zone
+        match self.sync_records::<CloudMessage>("message1ManateeZone", continuation_token.clone()).await {
+            Ok((token, records, status)) if !records.is_empty() => {
+                info!("CloudKit: message1ManateeZone returned {} records", records.len());
+                Ok((token, records, status))
+            }
+            Ok(_) => {
+                info!("CloudKit: message1ManateeZone empty, trying messageManateeZone");
+                self.sync_records("messageManateeZone", continuation_token).await
+            }
+            Err(e) => {
+                info!("CloudKit: message1ManateeZone failed ({}), trying messageManateeZone", e);
+                self.sync_records("messageManateeZone", continuation_token).await
+            }
+        }
     }
 
     pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
