@@ -722,27 +722,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
-        // Sync from legacy zone
-        let (token, mut records, status) = self.sync_records("messageManateeZone", continuation_token).await?;
-
-        // Also try the newer zone (iOS 17+). On FullResetNeeded, retry with no token.
-        match self.sync_records::<CloudMessage>("message1ManateeZone", None).await {
-            Ok((_v2_token, v2_records, _v2_status)) => {
-                if !v2_records.is_empty() {
-                    info!("CloudKit: message1ManateeZone returned {} records", v2_records.len());
-                    // Merge v2 records into results (v2 takes precedence for duplicates)
-                    for (k, v) in v2_records {
-                        records.insert(k, v);
-                    }
-                }
-            }
-            Err(e) => {
-                // Non-fatal: v2 zone may not exist for this account
-                warn!("CloudKit: message1ManateeZone sync failed (non-fatal): {}", e);
-            }
-        }
-
-        Ok((token, records, status))
+        self.sync_records("messageManateeZone", continuation_token).await
     }
 
     pub async fn save_messages(&self, messages: HashMap<String, CloudMessage>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
