@@ -2228,6 +2228,27 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		if groupName != nil {
 			persistName = *groupName
 		}
+		// Persist participants to cloud_chat so portalToConversation can
+		// find them for outbound messages (even if CloudKit never synced this group).
+		if strings.HasPrefix(string(portalID), "gid:") && len(participants) > 0 {
+			go func(pk networkid.PortalKey, parts []string, guid string) {
+				if c.cloudStore == nil {
+					return
+				}
+				ctx := context.Background()
+				// Only insert if no cloud_chat record exists yet
+				existing, err := c.cloudStore.getChatParticipantsByPortalID(ctx, string(pk.ID))
+				if err == nil && len(existing) > 0 {
+					return // already have participants
+				}
+				if upsertErr := c.cloudStore.upsertChat(ctx, guid, "", guid, string(pk.ID), "iMessage", nil, parts, 0); upsertErr != nil {
+					c.Main.Bridge.Log.Warn().Err(upsertErr).Str("portal_id", string(pk.ID)).Msg("Failed to persist real-time group participants")
+				} else {
+					c.Main.Bridge.Log.Info().Str("portal_id", string(pk.ID)).Int("participants", len(parts)).Msg("Persisted real-time group participants to cloud_chat")
+				}
+			}(portalKey, participants, persistGuid)
+		}
+
 		if persistGuid != "" || persistName != "" {
 			go func(pk networkid.PortalKey, guid, gname string) {
 				ctx := context.Background()
