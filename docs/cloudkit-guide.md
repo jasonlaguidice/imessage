@@ -203,10 +203,6 @@ DELETE FROM cloud_chat;
 DELETE FROM cloud_message;
 ```
 
-### The ck-probe Tool
-
-`cmd/ck-probe/main.go` is a standalone tool that connects to CloudKit and counts records without going through the bridge. Useful for verifying what CloudKit actually has vs. what the bridge synced.
-
 ## References
 
 - [Apple CloudKit Documentation](https://developer.apple.com/documentation/cloudkit/)
