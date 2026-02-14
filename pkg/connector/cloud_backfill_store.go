@@ -25,13 +25,33 @@ type cloudMessageRow struct {
 	Sender      string
 	IsFromMe    bool
 	Text        string
+	Subject     string
 	Service     string
 	Deleted     bool
+
+	// Tapback/reaction fields
+	TapbackType       *uint32
+	TapbackTargetGUID string
+	TapbackEmoji      string
+
+	// Attachment metadata JSON (serialized []cloudAttachmentRow)
+	AttachmentsJSON string
+}
+
+// cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
+type cloudAttachmentRow struct {
+	GUID       string `json:"guid"`
+	MimeType   string `json:"mime_type,omitempty"`
+	UTIType    string `json:"uti_type,omitempty"`
+	Filename   string `json:"filename,omitempty"`
+	FileSize   int64  `json:"file_size"`
+	RecordName string `json:"record_name"`
 }
 
 const (
-	cloudZoneChats    = "chatManateeZone"
-	cloudZoneMessages = "messageManateeZone"
+	cloudZoneChats       = "chatManateeZone"
+	cloudZoneMessages    = "messageManateeZone"
+	cloudZoneAttachments = "attachmentManateeZone"
 )
 
 func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *cloudBackfillStore {
@@ -71,8 +91,13 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			sender TEXT,
 			is_from_me BOOLEAN NOT NULL,
 			text TEXT,
+			subject TEXT,
 			service TEXT,
 			deleted BOOLEAN NOT NULL DEFAULT FALSE,
+			tapback_type INTEGER,
+			tapback_target_guid TEXT,
+			tapback_emoji TEXT,
+			attachments_json TEXT,
 			created_ts BIGINT NOT NULL,
 			updated_ts BIGINT NOT NULL,
 			PRIMARY KEY (login_id, guid)
@@ -107,6 +132,27 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if hasGroupID == 0 {
 		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN group_id TEXT NOT NULL DEFAULT ''`); err != nil {
 			return fmt.Errorf("failed to add group_id column: %w", err)
+		}
+	}
+
+	// Migration: add rich content columns to cloud_message if missing
+	richCols := []struct {
+		name string
+		def  string
+	}{
+		{"subject", "TEXT"},
+		{"tapback_type", "INTEGER"},
+		{"tapback_target_guid", "TEXT"},
+		{"tapback_emoji", "TEXT"},
+		{"attachments_json", "TEXT"},
+	}
+	for _, col := range richCols {
+		var exists int
+		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
+		if exists == 0 {
+			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_message ADD COLUMN %s %s`, col.name, col.def)); err != nil {
+				return fmt.Errorf("failed to add %s column: %w", col.name, err)
+			}
 		}
 	}
 
@@ -308,9 +354,11 @@ func (s *cloudBackfillStore) upsertMessage(ctx context.Context, row cloudMessage
 	_, err := s.db.Exec(ctx, `
 		INSERT INTO cloud_message (
 			login_id, guid, chat_id, portal_id, timestamp_ms,
-			sender, is_from_me, text, service, deleted,
+			sender, is_from_me, text, subject, service, deleted,
+			tapback_type, tapback_target_guid, tapback_emoji,
+			attachments_json,
 			created_ts, updated_ts
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			chat_id=excluded.chat_id,
 			portal_id=excluded.portal_id,
@@ -318,16 +366,28 @@ func (s *cloudBackfillStore) upsertMessage(ctx context.Context, row cloudMessage
 			sender=excluded.sender,
 			is_from_me=excluded.is_from_me,
 			text=excluded.text,
+			subject=excluded.subject,
 			service=excluded.service,
 			deleted=excluded.deleted,
+			tapback_type=excluded.tapback_type,
+			tapback_target_guid=excluded.tapback_target_guid,
+			tapback_emoji=excluded.tapback_emoji,
+			attachments_json=excluded.attachments_json,
 			updated_ts=excluded.updated_ts
 	`,
 		s.loginID, row.GUID, row.CloudChatID, row.PortalID, row.TimestampMS,
-		row.Sender, row.IsFromMe, row.Text, row.Service, row.Deleted,
+		row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
+		row.TapbackType, row.TapbackTargetGUID, row.TapbackEmoji,
+		row.AttachmentsJSON,
 		nowMS, nowMS,
 	)
 	return err
 }
+
+const cloudMessageSelectCols = `guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
+	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
+	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
+	COALESCE(attachments_json, '')`
 
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
@@ -336,8 +396,7 @@ func (s *cloudBackfillStore) listBackwardMessages(
 	beforeGUID string,
 	count int,
 ) ([]cloudMessageRow, error) {
-	query := `
-		SELECT guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, COALESCE(text, ''), COALESCE(service, ''), deleted
+	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 	`
@@ -361,8 +420,7 @@ func (s *cloudBackfillStore) listForwardMessages(
 	afterGUID string,
 	count int,
 ) ([]cloudMessageRow, error) {
-	query := `
-		SELECT guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, COALESCE(text, ''), COALESCE(service, ''), deleted
+	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 			AND (timestamp_ms > $3 OR (timestamp_ms = $3 AND guid > $4))
@@ -373,8 +431,7 @@ func (s *cloudBackfillStore) listForwardMessages(
 }
 
 func (s *cloudBackfillStore) listLatestMessages(ctx context.Context, portalID string, count int) ([]cloudMessageRow, error) {
-	query := `
-		SELECT guid, chat_id, portal_id, timestamp_ms, sender, is_from_me, COALESCE(text, ''), COALESCE(service, ''), deleted
+	query := `SELECT ` + cloudMessageSelectCols + `
 		FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		ORDER BY timestamp_ms DESC, guid DESC
@@ -401,8 +458,13 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.Sender,
 			&row.IsFromMe,
 			&row.Text,
+			&row.Subject,
 			&row.Service,
 			&row.Deleted,
+			&row.TapbackType,
+			&row.TapbackTargetGUID,
+			&row.TapbackEmoji,
+			&row.AttachmentsJSON,
 		); err != nil {
 			return nil, err
 		}

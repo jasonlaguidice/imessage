@@ -526,71 +526,100 @@ impl WrappedTokenProvider {
 
         let passcode_bytes = passcode.as_bytes();
         let mut last_err = String::new();
-        let mut joined_any = false;
-        let mut last_joined_meta: Option<(String, String)> = None;
 
         // If there are many escrow bottles, do a quick probe per bottle first,
         // then one extended probe at the end on the latest successful join.
         let per_bottle_probe_attempts = if bottles.len() > 1 { 3 } else { 24 };
 
-        for (i, (data, meta)) in bottles.iter().enumerate() {
-            info!("Trying bottle {} (serial={})...", i, meta.serial);
-            match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
-                Ok(()) => {
-                    joined_any = true;
-                    last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
-                    info!("Successfully joined keychain trust circle via bottle {}", i);
-                    info!(
-                        "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
-                        per_bottle_probe_attempts
+        // Outer stability loop: after joining + probe, verify we stay in the clique.
+        // Other devices can exclude us within seconds of joining.
+        const MAX_REJOIN_ATTEMPTS: usize = 3;
+        let mut rejoin_attempt = 0;
+
+        'stability: loop {
+            let mut joined_any = false;
+            let mut last_joined_meta: Option<(String, String)> = None;
+
+            for (i, (data, meta)) in bottles.iter().enumerate() {
+                info!("Trying bottle {} (serial={})...", i, meta.serial);
+                match keychain.join_clique_from_escrow(data, passcode_bytes, passcode_bytes).await {
+                    Ok(()) => {
+                        joined_any = true;
+                        last_joined_meta = Some((meta.serial.clone(), meta.build.clone()));
+                        info!("Successfully joined keychain trust circle via bottle {}", i);
+                        info!(
+                            "Finalizing keychain setup (sync + CloudKit decrypt probe), attempts={}",
+                            per_bottle_probe_attempts
+                        );
+                        match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
+                            Ok(()) => {
+                                break; // probe passed, go to stability check
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Bottle {} joined, but CloudKit decrypt probe failed: {}. Trying next bottle...",
+                                    i,
+                                    e
+                                );
+                                last_err = format!("{}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Bottle {} failed: {}", i, e);
+                        last_err = format!("{}", e);
+                    }
+                }
+            }
+
+            if !joined_any {
+                return Err(WrappedError::GenericError {
+                    msg: format!("All {} bottles failed. Last error: {}", bottles.len(), last_err)
+                });
+            }
+
+            // If no bottle's probe succeeded, try an extended probe
+            if !keychain.is_in_clique().await {
+                if rejoin_attempt >= MAX_REJOIN_ATTEMPTS {
+                    return Err(WrappedError::GenericError {
+                        msg: format!("Excluded from clique after {} rejoin attempts. Last error: {}", rejoin_attempt, last_err)
+                    });
+                }
+                rejoin_attempt += 1;
+                warn!("Not in clique after bottle probes, rejoin attempt {}/{}", rejoin_attempt, MAX_REJOIN_ATTEMPTS);
+                continue 'stability;
+            }
+
+            // Stability check: wait, re-sync trust, verify we're still included.
+            // Other devices can exclude us within seconds of joining.
+            info!("Verifying clique membership stability...");
+            for check in 0..3 {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if !keychain.is_in_clique().await {
+                    rejoin_attempt += 1;
+                    warn!(
+                        "Excluded from clique during stability check {} — re-joining (attempt {}/{})",
+                        check + 1, rejoin_attempt, MAX_REJOIN_ATTEMPTS
                     );
-                    match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), per_bottle_probe_attempts).await {
-                        Ok(()) => {
-                            return Ok(format!(
-                                "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
-                                meta.serial,
-                                meta.build,
-                            ));
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Bottle {} joined, but CloudKit decrypt probe failed: {}. Trying next bottle...",
-                                i,
-                                e
-                            );
-                            last_err = format!("{}", e);
-                        }
+                    if rejoin_attempt > MAX_REJOIN_ATTEMPTS {
+                        return Err(WrappedError::GenericError {
+                            msg: "Repeatedly excluded from iCloud Keychain trust circle by another device. \
+                                  Try disabling and re-enabling 'Messages in iCloud' on your iPhone, then retry."
+                                .into()
+                        });
                     }
-                }
-                Err(e) => {
-                    warn!("Bottle {} failed: {}", i, e);
-                    last_err = format!("{}", e);
+                    continue 'stability;
                 }
             }
-        }
 
-        if joined_any {
-            info!("All bottle-specific probes failed; running extended CloudKit decrypt probe retries...");
-            match finalize_keychain_setup_with_probe(keychain.clone(), cloudkit.clone(), 24).await {
-                Ok(()) => {
-                    if let Some((serial, build)) = last_joined_meta {
-                        return Ok(format!(
-                            "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
-                            serial,
-                            build,
-                        ));
-                    }
-                    return Ok("Joined iCloud Keychain and verified CloudKit access".to_string());
-                }
-                Err(e) => {
-                    last_err = format!("{}", e);
-                }
-            }
+            // Still in clique after stability checks
+            let (serial, build) = last_joined_meta.unwrap_or(("unknown".into(), "unknown".into()));
+            info!("Clique membership stable after {} stability checks", 3);
+            return Ok(format!(
+                "Joined iCloud Keychain and verified CloudKit access (device: serial={}, build={})",
+                serial, build,
+            ));
         }
-
-        Err(WrappedError::GenericError {
-            msg: format!("All {} bottles failed to produce CloudKit-ready keychain state. Last error: {}", bottles.len(), last_err)
-        })
     }
 }
 
@@ -782,9 +811,36 @@ pub struct WrappedCloudSyncMessage {
     pub sender: String,
     pub is_from_me: bool,
     pub text: Option<String>,
+    pub subject: Option<String>,
     pub service: String,
     pub timestamp_ms: i64,
     pub deleted: bool,
+
+    // Tapback/reaction fields (from msg_proto.associatedMessageType/Guid)
+    pub tapback_type: Option<u32>,
+    pub tapback_target_guid: Option<String>,
+    pub tapback_emoji: Option<String>,
+
+    // Attachment info extracted from messageSummaryInfo / attributedBody
+    pub attachments: Vec<WrappedCloudAttachmentInfo>,
+}
+
+/// Metadata for an attachment referenced by a CloudKit message.
+/// The actual file data must be downloaded separately via cloud_download_attachment.
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudAttachmentInfo {
+    /// Attachment GUID (from AttachmentMeta.guid / attributedBody __kIMFileTransferGUID)
+    pub guid: String,
+    /// MIME type (from AttachmentMeta.mime_type)
+    pub mime_type: Option<String>,
+    /// UTI type (from AttachmentMeta.uti)
+    pub uti_type: Option<String>,
+    /// Filename (from AttachmentMeta.transfer_name)
+    pub filename: Option<String>,
+    /// File size in bytes (from AttachmentMeta.total_bytes)
+    pub file_size: i64,
+    /// CloudKit record name in attachmentManateeZone (needed for download)
+    pub record_name: String,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -801,6 +857,76 @@ pub struct WrappedCloudSyncMessagesPage {
     pub status: i32,
     pub done: bool,
     pub messages: Vec<WrappedCloudSyncMessage>,
+}
+
+#[derive(uniffi::Record, Clone)]
+pub struct WrappedCloudSyncAttachmentsPage {
+    pub continuation_token: Option<String>,
+    pub status: i32,
+    pub done: bool,
+    pub attachments: Vec<WrappedCloudAttachmentInfo>,
+}
+
+/// A clonable writer backed by a shared Vec<u8>.
+/// Used to recover written bytes after passing ownership to a consuming API.
+#[derive(Clone)]
+struct SharedWriter {
+    inner: Arc<std::sync::Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn new() -> Self {
+        Self { inner: Arc::new(std::sync::Mutex::new(Vec::new())) }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match Arc::try_unwrap(self.inner) {
+            Ok(mutex) => mutex.into_inner().unwrap(),
+            Err(arc) => arc.lock().unwrap().clone(),
+        }
+    }
+}
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.lock().unwrap().write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Extract attachment GUIDs from a CloudKit message's attributedBody.
+/// The attributedBody is an NSAttributedString containing ranges with
+/// __kIMFileTransferGUIDAttributeName → attachment GUID.
+fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
+    use rustpush::util::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
+
+    let decoded = match std::panic::catch_unwind(|| {
+        let flat = coder_decode_flattened(data);
+        if flat.is_empty() {
+            return None;
+        }
+        Some(NSAttributedString::decode(&flat[0]))
+    }) {
+        Ok(Some(attr_str)) => attr_str,
+        _ => return vec![],
+    };
+
+    let mut guids = Vec::new();
+    for (_len, dict) in &decoded.ranges {
+        if let Some(StCollapsedValue::Object { fields, .. }) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
+            if let Some(first) = fields.first().and_then(|f| f.first()) {
+                if let StCollapsedValue::String(s) = first {
+                    guids.push(s.clone());
+                }
+            }
+        } else if let Some(StCollapsedValue::String(s)) = dict.0.get("__kIMFileTransferGUIDAttributeName") {
+            guids.push(s.clone());
+        }
+    }
+    guids
 }
 
 fn apple_timestamp_ns_to_unix_ms(timestamp_ns: i64) -> i64 {
@@ -2359,7 +2485,34 @@ impl Client {
                 } else {
                     msg.guid.clone()
                 };
-                let text = msg.msg_proto.text.clone().or_else(|| msg.msg_proto.subject.clone());
+                let text = msg.msg_proto.text.clone();
+                let subject = msg.msg_proto.subject.clone();
+
+                // Extract tapback/reaction info from proto fields
+                let tapback_type = msg.msg_proto.associated_message_type;
+                let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
+                let tapback_emoji = msg.msg_proto_4.as_ref()
+                    .and_then(|p4| p4.associated_message_emoji.clone());
+
+                // Extract attachment GUIDs from attributedBody
+                let att_guids = msg.msg_proto.attributed_body
+                    .as_ref()
+                    .map(|body| extract_attachment_guids_from_attributed_body(body))
+                    .unwrap_or_default();
+
+                // Create placeholder attachment info with GUIDs (record_name filled later)
+                let attachments: Vec<WrappedCloudAttachmentInfo> = att_guids.into_iter()
+                    .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
+                    .map(|g| WrappedCloudAttachmentInfo {
+                        guid: g,
+                        mime_type: None,
+                        uti_type: None,
+                        filename: None,
+                        file_size: 0,
+                        record_name: String::new(),
+                    })
+                    .collect();
+
                 normalized.push(WrappedCloudSyncMessage {
                     record_name,
                     guid,
@@ -2369,9 +2522,14 @@ impl Client {
                         .flags
                         .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
                     text,
+                    subject,
                     service: msg.service,
                     timestamp_ms: apple_timestamp_ns_to_unix_ms(msg.time),
                     deleted: false,
+                    tapback_type,
+                    tapback_target_guid,
+                    tapback_emoji,
+                    attachments,
                 });
             } else {
                 normalized.push(WrappedCloudSyncMessage {
@@ -2381,9 +2539,14 @@ impl Client {
                     sender: String::new(),
                     is_from_me: false,
                     text: None,
+                    subject: None,
                     service: String::new(),
                     timestamp_ms: 0,
                     deleted: true,
+                    tapback_type: None,
+                    tapback_target_guid: None,
+                    tapback_emoji: None,
+                    attachments: vec![],
                 });
             }
         }
@@ -2394,6 +2557,64 @@ impl Client {
             done: status == 3,
             messages: normalized,
         })
+    }
+
+    /// Sync CloudKit attachment zone and return metadata for all attachments.
+    /// Returns a page of attachment metadata (record_name → attachment info).
+    /// Paginate with continuation_token until done == true.
+    pub async fn cloud_sync_attachments(
+        &self,
+        continuation_token: Option<String>,
+    ) -> Result<WrappedCloudSyncAttachmentsPage, WrappedError> {
+        let token = decode_continuation_token(continuation_token)?;
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        let (next_token, attachments, status) = cloud_messages.sync_attachments(token).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to sync CloudKit attachments: {}", e),
+            })?;
+
+        let mut normalized = Vec::with_capacity(attachments.len());
+        for (record_name, att_opt) in attachments {
+            if let Some(att) = att_opt {
+                normalized.push(WrappedCloudAttachmentInfo {
+                    guid: att.cm.guid.clone(),
+                    mime_type: att.cm.mime_type.clone(),
+                    uti_type: att.cm.uti.clone(),
+                    filename: att.cm.transfer_name.clone().or_else(|| att.cm.filename.clone()),
+                    file_size: att.cm.total_bytes,
+                    record_name,
+                });
+            }
+            // Deleted attachments are simply not included
+        }
+
+        Ok(WrappedCloudSyncAttachmentsPage {
+            continuation_token: encode_continuation_token(next_token),
+            status,
+            done: status == 3,
+            attachments: normalized,
+        })
+    }
+
+    /// Download an attachment from CloudKit by its record name.
+    /// Returns the raw file bytes.
+    pub async fn cloud_download_attachment(
+        &self,
+        record_name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        // download_attachment consumes the writer via into_values().
+        // Use a SharedWriter so we can recover the written bytes after the call.
+        let shared = SharedWriter::new();
+        let mut files = HashMap::new();
+        files.insert(record_name.clone(), shared.clone());
+        cloud_messages.download_attachment(files).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+            })?;
+        Ok(shared.into_bytes())
     }
 
     /// Diagnostic: do a full fresh sync from scratch (no continuation token)
@@ -2537,6 +2758,11 @@ impl Client {
                     msg.guid.clone()
                 };
 
+                let tapback_type = msg.msg_proto.associated_message_type;
+                let tapback_target_guid = msg.msg_proto.associated_message_guid.clone();
+                let tapback_emoji = msg.msg_proto_4.as_ref()
+                    .and_then(|p4| p4.associated_message_emoji.clone());
+
                 deduped.insert(
                     guid.clone(),
                     WrappedCloudSyncMessage {
@@ -2547,10 +2773,15 @@ impl Client {
                         is_from_me: msg
                             .flags
                             .contains(rustpush::cloud_messages::MessageFlags::IS_FROM_ME),
-                        text: msg.msg_proto.text.clone().or_else(|| msg.msg_proto.subject.clone()),
+                        text: msg.msg_proto.text.clone(),
+                        subject: msg.msg_proto.subject.clone(),
                         service: msg.service,
                         timestamp_ms,
                         deleted: false,
+                        tapback_type,
+                        tapback_target_guid,
+                        tapback_emoji,
+                        attachments: vec![],
                     },
                 );
 

@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strings"
@@ -241,7 +242,20 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 	}
 	total.add(chatCounts)
 
-	msgCounts, msgToken, err := c.syncCloudMessages(ctx)
+	// Sync attachment zone to build GUID→record_name mapping.
+	// Must happen before message sync so we can correlate attachment GUIDs
+	// extracted from message attributedBody with CloudKit record names.
+	attMap, attToken, attErr := c.syncCloudAttachments(ctx)
+	if attErr != nil {
+		log.Warn().Err(attErr).Msg("Failed to sync CloudKit attachments (continuing without)")
+	} else {
+		if err = c.cloudStore.setSyncStateSuccess(ctx, cloudZoneAttachments, attToken); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist attachment sync token")
+		}
+		log.Info().Int("attachments", len(attMap)).Msg("CloudKit attachment zone synced")
+	}
+
+	msgCounts, msgToken, err := c.syncCloudMessages(ctx, attMap)
 	if err != nil {
 		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneMessages, err.Error())
 		return total, err
@@ -252,6 +266,53 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 	total.add(msgCounts)
 
 	return total, nil
+}
+
+// syncCloudAttachments syncs the attachment zone and builds a GUID→attachment info map.
+func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAttachmentRow, *string, error) {
+	attMap := make(map[string]cloudAttachmentRow)
+	token, err := c.cloudStore.getSyncState(ctx, cloudZoneAttachments)
+	if err != nil {
+		return attMap, nil, err
+	}
+
+	for page := 0; page < 256; page++ {
+		resp, syncErr := c.client.CloudSyncAttachments(token)
+		if syncErr != nil {
+			return attMap, token, syncErr
+		}
+
+		for _, att := range resp.Attachments {
+			mime := ""
+			if att.MimeType != nil {
+				mime = *att.MimeType
+			}
+			uti := ""
+			if att.UtiType != nil {
+				uti = *att.UtiType
+			}
+			filename := ""
+			if att.Filename != nil {
+				filename = *att.Filename
+			}
+			attMap[att.Guid] = cloudAttachmentRow{
+				GUID:       att.Guid,
+				MimeType:   mime,
+				UTIType:    uti,
+				Filename:   filename,
+				FileSize:   att.FileSize,
+				RecordName: att.RecordName,
+			}
+		}
+
+		prev := ptrStringOr(token, "")
+		token = resp.ContinuationToken
+		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
+			break
+		}
+	}
+
+	return attMap, token, nil
 }
 
 func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *string, error) {
@@ -283,7 +344,18 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	return counts, token, nil
 }
 
-func (c *IMClient) syncCloudMessages(ctx context.Context) (cloudSyncCounters, *string, error) {
+// safeCloudSyncMessages wraps the FFI call with panic recovery.
+// UniFFI deserialization panics on malformed buffers; this prevents bridge crashes.
+func safeCloudSyncMessages(client *rustpushgo.Client, token *string) (resp rustpushgo.WrappedCloudSyncMessagesPage, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("FFI panic in CloudSyncMessages: %v", r)
+		}
+	}()
+	return client.CloudSyncMessages(token)
+}
+
+func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]cloudAttachmentRow) (cloudSyncCounters, *string, error) {
 	var counts cloudSyncCounters
 	token, err := c.cloudStore.getSyncState(ctx, cloudZoneMessages)
 	if err != nil {
@@ -292,7 +364,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context) (cloudSyncCounters, *s
 
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	for page := 0; page < 256; page++ {
-		resp, syncErr := c.client.CloudSyncMessages(token)
+		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			return counts, token, syncErr
 		}
@@ -306,7 +378,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context) (cloudSyncCounters, *s
 				Msg("CloudKit message sync page")
 		}
 
-		if err = c.ingestCloudMessages(ctx, resp.Messages, "", &counts); err != nil {
+		if err = c.ingestCloudMessages(ctx, resp.Messages, "", &counts, attMap); err != nil {
 			return counts, token, err
 		}
 
@@ -417,6 +489,7 @@ func (c *IMClient) ingestCloudMessages(
 	messages []rustpushgo.WrappedCloudSyncMessage,
 	preferredPortalID string,
 	counts *cloudSyncCounters,
+	attMap map[string]cloudAttachmentRow,
 ) error {
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	for _, msg := range messages {
@@ -457,21 +530,60 @@ func (c *IMClient) ingestCloudMessages(
 		if msg.Text != nil {
 			text = *msg.Text
 		}
+		subject := ""
+		if msg.Subject != nil {
+			subject = *msg.Subject
+		}
 		timestampMS := msg.TimestampMs
 		if timestampMS <= 0 {
 			timestampMS = time.Now().UnixMilli()
 		}
 
+		tapbackTargetGUID := ""
+		if msg.TapbackTargetGuid != nil {
+			tapbackTargetGUID = *msg.TapbackTargetGuid
+		}
+		tapbackEmoji := ""
+		if msg.TapbackEmoji != nil {
+			tapbackEmoji = *msg.TapbackEmoji
+		}
+
+		// Enrich and serialize attachment metadata.
+		// Messages contain attachment GUIDs extracted from attributedBody;
+		// the attachment zone map provides record_name + metadata.
+		attachmentsJSON := ""
+		if len(msg.Attachments) > 0 && attMap != nil {
+			var attRows []cloudAttachmentRow
+			for _, att := range msg.Attachments {
+				if att.Guid == "" {
+					continue
+				}
+				if enriched, ok := attMap[att.Guid]; ok {
+					attRows = append(attRows, enriched)
+				}
+			}
+			if len(attRows) > 0 {
+				if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
+					attachmentsJSON = string(attJSON)
+				}
+			}
+		}
+
 		if err = c.cloudStore.upsertMessage(ctx, cloudMessageRow{
-			GUID:        msg.Guid,
-			CloudChatID: msg.CloudChatId,
-			PortalID:    portalID,
-			TimestampMS: timestampMS,
-			Sender:      msg.Sender,
-			IsFromMe:    msg.IsFromMe,
-			Text:        text,
-			Service:     msg.Service,
-			Deleted:     msg.Deleted,
+			GUID:              msg.Guid,
+			CloudChatID:       msg.CloudChatId,
+			PortalID:          portalID,
+			TimestampMS:       timestampMS,
+			Sender:            msg.Sender,
+			IsFromMe:          msg.IsFromMe,
+			Text:              text,
+			Subject:           subject,
+			Service:           msg.Service,
+			Deleted:           msg.Deleted,
+			TapbackType:       msg.TapbackType,
+			TapbackTargetGUID: tapbackTargetGUID,
+			TapbackEmoji:      tapbackEmoji,
+			AttachmentsJSON:   attachmentsJSON,
 		}); err != nil {
 			return err
 		}

@@ -447,11 +447,47 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(uniffiStatus)
+		})
+		if checksum != 27287 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_download_attachment(uniffiStatus)
+		})
+		if checksum != 39378 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_download_attachment: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_dump_chats_json(uniffiStatus)
+		})
+		if checksum != 18960 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_dump_chats_json: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_fetch_recent_messages(uniffiStatus)
 		})
 		if checksum != 26669 {
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_fetch_recent_messages: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_sync_attachments(uniffiStatus)
+		})
+		if checksum != 29066 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_sync_attachments: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -950,6 +986,9 @@ func (FfiConverterString) Lift(rb RustBufferI) string {
 
 func (FfiConverterString) Read(reader io.Reader) string {
 	length := readInt32(reader)
+	if length == 0 {
+		return ""
+	}
 	buffer := make([]byte, length)
 	read_length, err := reader.Read(buffer)
 	if err != nil {
@@ -1087,6 +1126,81 @@ type Client struct {
 	ffiObject FfiObject
 }
 
+func (_self *Client) CloudDiagFullCount() (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_diag_full_count(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudDownloadAttachment(recordName string) ([]byte, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_download_attachment(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(recordName)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterBytesINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudDumpChatsJson() (string, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_dump_chats_json(
+				_pointer,
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) CloudFetchRecentMessages(sinceTimestampMs uint64, chatId *string, maxPages uint32, maxResults uint32) ([]WrappedCloudSyncMessage, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -1107,6 +1221,31 @@ func (_self *Client) CloudFetchRecentMessages(sinceTimestampMs uint64, chatId *s
 			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
 		},
 		FfiConverterSequenceTypeWrappedCloudSyncMessageINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudSyncAttachments(continuationToken *string) (WrappedCloudSyncAttachmentsPage, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_sync_attachments(
+				_pointer, rustBufferToC(FfiConverterOptionalStringINSTANCE.Lower(continuationToken)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterTypeWrappedCloudSyncAttachmentsPageINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
@@ -2373,6 +2512,110 @@ func (_ FfiDestroyerTypeWrappedAttachment) Destroy(value WrappedAttachment) {
 	value.Destroy()
 }
 
+type WrappedCloudAttachmentInfo struct {
+	Guid       string
+	MimeType   *string
+	UtiType    *string
+	Filename   *string
+	FileSize   int64
+	RecordName string
+}
+
+func (r *WrappedCloudAttachmentInfo) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Guid)
+	FfiDestroyerOptionalString{}.Destroy(r.MimeType)
+	FfiDestroyerOptionalString{}.Destroy(r.UtiType)
+	FfiDestroyerOptionalString{}.Destroy(r.Filename)
+	FfiDestroyerInt64{}.Destroy(r.FileSize)
+	FfiDestroyerString{}.Destroy(r.RecordName)
+}
+
+type FfiConverterTypeWrappedCloudAttachmentInfo struct{}
+
+var FfiConverterTypeWrappedCloudAttachmentInfoINSTANCE = FfiConverterTypeWrappedCloudAttachmentInfo{}
+
+func (c FfiConverterTypeWrappedCloudAttachmentInfo) Lift(rb RustBufferI) WrappedCloudAttachmentInfo {
+	return LiftFromRustBuffer[WrappedCloudAttachmentInfo](c, rb)
+}
+
+func (c FfiConverterTypeWrappedCloudAttachmentInfo) Read(reader io.Reader) WrappedCloudAttachmentInfo {
+	return WrappedCloudAttachmentInfo{
+		FfiConverterStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedCloudAttachmentInfo) Lower(value WrappedCloudAttachmentInfo) RustBuffer {
+	return LowerIntoRustBuffer[WrappedCloudAttachmentInfo](c, value)
+}
+
+func (c FfiConverterTypeWrappedCloudAttachmentInfo) Write(writer io.Writer, value WrappedCloudAttachmentInfo) {
+	FfiConverterStringINSTANCE.Write(writer, value.Guid)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.MimeType)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.UtiType)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Filename)
+	FfiConverterInt64INSTANCE.Write(writer, value.FileSize)
+	FfiConverterStringINSTANCE.Write(writer, value.RecordName)
+}
+
+type FfiDestroyerTypeWrappedCloudAttachmentInfo struct{}
+
+func (_ FfiDestroyerTypeWrappedCloudAttachmentInfo) Destroy(value WrappedCloudAttachmentInfo) {
+	value.Destroy()
+}
+
+type WrappedCloudSyncAttachmentsPage struct {
+	ContinuationToken *string
+	Status            int32
+	Done              bool
+	Attachments       []WrappedCloudAttachmentInfo
+}
+
+func (r *WrappedCloudSyncAttachmentsPage) Destroy() {
+	FfiDestroyerOptionalString{}.Destroy(r.ContinuationToken)
+	FfiDestroyerInt32{}.Destroy(r.Status)
+	FfiDestroyerBool{}.Destroy(r.Done)
+	FfiDestroyerSequenceTypeWrappedCloudAttachmentInfo{}.Destroy(r.Attachments)
+}
+
+type FfiConverterTypeWrappedCloudSyncAttachmentsPage struct{}
+
+var FfiConverterTypeWrappedCloudSyncAttachmentsPageINSTANCE = FfiConverterTypeWrappedCloudSyncAttachmentsPage{}
+
+func (c FfiConverterTypeWrappedCloudSyncAttachmentsPage) Lift(rb RustBufferI) WrappedCloudSyncAttachmentsPage {
+	return LiftFromRustBuffer[WrappedCloudSyncAttachmentsPage](c, rb)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncAttachmentsPage) Read(reader io.Reader) WrappedCloudSyncAttachmentsPage {
+	return WrappedCloudSyncAttachmentsPage{
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterInt32INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterTypeWrappedCloudSyncAttachmentsPage) Lower(value WrappedCloudSyncAttachmentsPage) RustBuffer {
+	return LowerIntoRustBuffer[WrappedCloudSyncAttachmentsPage](c, value)
+}
+
+func (c FfiConverterTypeWrappedCloudSyncAttachmentsPage) Write(writer io.Writer, value WrappedCloudSyncAttachmentsPage) {
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.ContinuationToken)
+	FfiConverterInt32INSTANCE.Write(writer, value.Status)
+	FfiConverterBoolINSTANCE.Write(writer, value.Done)
+	FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE.Write(writer, value.Attachments)
+}
+
+type FfiDestroyerTypeWrappedCloudSyncAttachmentsPage struct{}
+
+func (_ FfiDestroyerTypeWrappedCloudSyncAttachmentsPage) Destroy(value WrappedCloudSyncAttachmentsPage) {
+	value.Destroy()
+}
+
 type WrappedCloudSyncChat struct {
 	RecordName         string
 	CloudChatId        string
@@ -2490,15 +2733,20 @@ func (_ FfiDestroyerTypeWrappedCloudSyncChatsPage) Destroy(value WrappedCloudSyn
 }
 
 type WrappedCloudSyncMessage struct {
-	RecordName  string
-	Guid        string
-	CloudChatId string
-	Sender      string
-	IsFromMe    bool
-	Text        *string
-	Service     string
-	TimestampMs int64
-	Deleted     bool
+	RecordName        string
+	Guid              string
+	CloudChatId       string
+	Sender            string
+	IsFromMe          bool
+	Text              *string
+	Subject           *string
+	Service           string
+	TimestampMs       int64
+	Deleted           bool
+	TapbackType       *uint32
+	TapbackTargetGuid *string
+	TapbackEmoji      *string
+	Attachments       []WrappedCloudAttachmentInfo
 }
 
 func (r *WrappedCloudSyncMessage) Destroy() {
@@ -2508,9 +2756,14 @@ func (r *WrappedCloudSyncMessage) Destroy() {
 	FfiDestroyerString{}.Destroy(r.Sender)
 	FfiDestroyerBool{}.Destroy(r.IsFromMe)
 	FfiDestroyerOptionalString{}.Destroy(r.Text)
+	FfiDestroyerOptionalString{}.Destroy(r.Subject)
 	FfiDestroyerString{}.Destroy(r.Service)
 	FfiDestroyerInt64{}.Destroy(r.TimestampMs)
 	FfiDestroyerBool{}.Destroy(r.Deleted)
+	FfiDestroyerOptionalUint32{}.Destroy(r.TapbackType)
+	FfiDestroyerOptionalString{}.Destroy(r.TapbackTargetGuid)
+	FfiDestroyerOptionalString{}.Destroy(r.TapbackEmoji)
+	FfiDestroyerSequenceTypeWrappedCloudAttachmentInfo{}.Destroy(r.Attachments)
 }
 
 type FfiConverterTypeWrappedCloudSyncMessage struct{}
@@ -2529,9 +2782,14 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Read(reader io.Reader) WrappedC
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterStringINSTANCE.Read(reader),
 		FfiConverterInt64INSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalUint32INSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE.Read(reader),
 	}
 }
 
@@ -2546,9 +2804,14 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Write(writer io.Writer, value W
 	FfiConverterStringINSTANCE.Write(writer, value.Sender)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsFromMe)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.Text)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Subject)
 	FfiConverterStringINSTANCE.Write(writer, value.Service)
 	FfiConverterInt64INSTANCE.Write(writer, value.TimestampMs)
 	FfiConverterBoolINSTANCE.Write(writer, value.Deleted)
+	FfiConverterOptionalUint32INSTANCE.Write(writer, value.TapbackType)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackTargetGuid)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackEmoji)
+	FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE.Write(writer, value.Attachments)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncMessage struct{}
@@ -3541,6 +3804,49 @@ type FfiDestroyerSequenceTypeWrappedAttachment struct{}
 func (FfiDestroyerSequenceTypeWrappedAttachment) Destroy(sequence []WrappedAttachment) {
 	for _, value := range sequence {
 		FfiDestroyerTypeWrappedAttachment{}.Destroy(value)
+	}
+}
+
+type FfiConverterSequenceTypeWrappedCloudAttachmentInfo struct{}
+
+var FfiConverterSequenceTypeWrappedCloudAttachmentInfoINSTANCE = FfiConverterSequenceTypeWrappedCloudAttachmentInfo{}
+
+func (c FfiConverterSequenceTypeWrappedCloudAttachmentInfo) Lift(rb RustBufferI) []WrappedCloudAttachmentInfo {
+	return LiftFromRustBuffer[[]WrappedCloudAttachmentInfo](c, rb)
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudAttachmentInfo) Read(reader io.Reader) []WrappedCloudAttachmentInfo {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]WrappedCloudAttachmentInfo, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterTypeWrappedCloudAttachmentInfoINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudAttachmentInfo) Lower(value []WrappedCloudAttachmentInfo) RustBuffer {
+	return LowerIntoRustBuffer[[]WrappedCloudAttachmentInfo](c, value)
+}
+
+func (c FfiConverterSequenceTypeWrappedCloudAttachmentInfo) Write(writer io.Writer, value []WrappedCloudAttachmentInfo) {
+	if len(value) > math.MaxInt32 {
+		panic("[]WrappedCloudAttachmentInfo is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterTypeWrappedCloudAttachmentInfoINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceTypeWrappedCloudAttachmentInfo struct{}
+
+func (FfiDestroyerSequenceTypeWrappedCloudAttachmentInfo) Destroy(sequence []WrappedCloudAttachmentInfo) {
+	for _, value := range sequence {
+		FfiDestroyerTypeWrappedCloudAttachmentInfo{}.Destroy(value)
 	}
 }
 
