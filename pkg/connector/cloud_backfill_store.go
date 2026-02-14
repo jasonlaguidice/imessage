@@ -717,6 +717,41 @@ func (s *cloudBackfillStore) listAllPortalIDs(ctx context.Context) ([]string, er
 	return portalIDs, rows.Err()
 }
 
+// portalWithNewestMessage pairs a portal ID with its newest message timestamp
+// and message count. Used to prioritize portal creation during initial sync.
+type portalWithNewestMessage struct {
+	PortalID     string
+	NewestTS     int64
+	MessageCount int
+}
+
+// listPortalIDsWithNewestTimestamp returns all portal IDs that have at least
+// one non-deleted message, ordered by newest message timestamp descending
+// (most recent activity first).
+func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context) ([]portalWithNewestMessage, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT portal_id, MAX(timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE
+		GROUP BY portal_id
+		ORDER BY newest_ts DESC
+	`, s.loginID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []portalWithNewestMessage
+	for rows.Next() {
+		var p portalWithNewestMessage
+		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.MessageCount); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 func nullableString(value *string) any {
 	if value == nil {
 		return nil

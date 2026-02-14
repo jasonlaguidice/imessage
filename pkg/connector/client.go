@@ -109,6 +109,14 @@ type IMClient struct {
 	// message so typing indicators route to the correct group.
 	lastGroupForMember   map[string]networkid.PortalKey
 	lastGroupForMemberMu sync.RWMutex
+
+	// initialSyncSkipForwardBackfill is a set of portal IDs for which forward
+	// backfill should be skipped during initial CloudKit sync. These portals
+	// will get their messages via the backward backfill queue instead, avoiding
+	// expensive megolm session creation + sendToDevice round-trips during the
+	// critical startup path. Only populated for non-priority (old) portals.
+	initialSyncSkipForwardBackfill map[string]bool
+	initialSyncSkipMu              sync.RWMutex
 }
 
 var _ bridgev2.NetworkAPI = (*IMClient)(nil)
@@ -1517,6 +1525,19 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	// created (ChatResync / CreatePortal). Populates the room immediately
 	// instead of waiting for the backward backfill queue.
 	if params.Forward {
+		// During initial CloudKit sync, non-priority (old) portals skip forward
+		// backfill to avoid the megolm session + sendToDevice bottleneck. The
+		// backward backfill queue will fill them in gradually afterwards.
+		c.initialSyncSkipMu.RLock()
+		skipForward := c.initialSyncSkipForwardBackfill[portalID]
+		c.initialSyncSkipMu.RUnlock()
+		if skipForward {
+			log.Info().
+				Str("portal_id", portalID).
+				Msg("Skipping forward backfill for non-priority portal during initial sync (backward backfill queue will handle it)")
+			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
+		}
+
 		log.Info().
 			Str("portal_id", portalID).
 			Int("count", count).

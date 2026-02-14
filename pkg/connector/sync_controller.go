@@ -775,32 +775,107 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		return
 	}
 
-	portalIDs, err := c.cloudStore.listAllPortalIDs(ctx)
+	// Get portal IDs sorted by newest message timestamp (most recent first).
+	// This lets us prioritize forward backfill for active conversations.
+	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
 	if err != nil {
-		log.Err(err).Msg("Failed to list cloud chat portal IDs")
-		return
-	}
-	if len(portalIDs) == 0 {
+		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
 		return
 	}
 
+	// Also get portals that exist in cloud_chat but have zero messages.
+	// These still need rooms but won't have any forward backfill to do.
+	allPortalIDs, err := c.cloudStore.listAllPortalIDs(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to list all cloud chat portal IDs")
+		return
+	}
+	if len(allPortalIDs) == 0 && len(portalInfos) == 0 {
+		return
+	}
+
+	// Build set of portals that have messages (already in portalInfos).
+	hasMessages := make(map[string]bool, len(portalInfos))
+	for _, p := range portalInfos {
+		hasMessages[p.PortalID] = true
+	}
+
+	// Portals with no messages — create room but skip all backfill.
+	var noMessagePortals []string
+	for _, pid := range allPortalIDs {
+		if !hasMessages[pid] {
+			noMessagePortals = append(noMessagePortals, pid)
+		}
+	}
+
+	// Split portals with messages into priority (recent) vs deferred (old).
+	// Priority portals get immediate forward backfill (megolm session created
+	// inline). Deferred portals skip forward backfill — the backward backfill
+	// queue fills them gradually, spreading megolm cost over time.
+	const priorityCutoffDays = 14
+	cutoffTS := time.Now().Add(-priorityCutoffDays * 24 * time.Hour).UnixMilli()
+
+	var priorityPortals []string   // recent activity → forward backfill
+	var deferredPortals []string   // old activity → backward backfill only
+
+	for _, p := range portalInfos {
+		if p.NewestTS >= cutoffTS {
+			priorityPortals = append(priorityPortals, p.PortalID)
+		} else {
+			deferredPortals = append(deferredPortals, p.PortalID)
+		}
+	}
+
+	// Register the skip-set so FetchMessages returns 0 messages for
+	// deferred + no-message portals during forward backfill.
+	skipSet := make(map[string]bool, len(deferredPortals)+len(noMessagePortals))
+	for _, pid := range deferredPortals {
+		skipSet[pid] = true
+	}
+	for _, pid := range noMessagePortals {
+		skipSet[pid] = true
+	}
+	c.initialSyncSkipMu.Lock()
+	c.initialSyncSkipForwardBackfill = skipSet
+	c.initialSyncSkipMu.Unlock()
+
+	totalPortals := len(priorityPortals) + len(deferredPortals) + len(noMessagePortals)
 	portalStart := time.Now()
-	log.Info().Int("chat_count", len(portalIDs)).Msg("Creating portals from cloud sync — each triggers a forward backfill via ChatResync/CreatePortal")
+	log.Info().
+		Int("total", totalPortals).
+		Int("priority", len(priorityPortals)).
+		Int("deferred", len(deferredPortals)).
+		Int("no_messages", len(noMessagePortals)).
+		Int("cutoff_days", priorityCutoffDays).
+		Msg("Creating portals from cloud sync — priority portals get forward backfill first, deferred portals use backward backfill queue")
+
+	// Queue events: priority portals first (most recent activity first within
+	// that group), then deferred, then no-message portals.
+	// portalInfos is already sorted by newest_ts DESC, so priorityPortals
+	// and deferredPortals preserve that order.
+	ordered := make([]string, 0, totalPortals)
+	ordered = append(ordered, priorityPortals...)
+	ordered = append(ordered, deferredPortals...)
+	ordered = append(ordered, noMessagePortals...)
 
 	created := 0
-	for i, portalID := range portalIDs {
+	for i, portalID := range ordered {
 		portalKey := networkid.PortalKey{
 			ID:       networkid.PortalID(portalID),
 			Receiver: c.UserLogin.ID,
 		}
 
+		isPriority := i < len(priorityPortals)
 		res := c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
 				PortalKey:    portalKey,
 				CreatePortal: true,
 				LogContext: func(lc zerolog.Context) zerolog.Context {
-					return lc.Str("portal_id", portalID).Str("source", "cloud_sync")
+					return lc.
+						Str("portal_id", portalID).
+						Str("source", "cloud_sync").
+						Bool("priority", isPriority)
 				},
 			},
 			GetChatInfoFunc: c.GetChatInfo,
@@ -808,11 +883,16 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		if res.Success {
 			created++
 		}
-		// Progress log every 50 portals
-		if (i+1)%50 == 0 {
+		// Progress log at phase transitions and every 100 portals.
+		if i+1 == len(priorityPortals) {
+			log.Info().
+				Int("priority_queued", len(priorityPortals)).
+				Dur("elapsed", time.Since(portalStart)).
+				Msg("All priority portals queued — now queuing deferred portals")
+		} else if (i+1)%100 == 0 {
 			log.Info().
 				Int("progress", i+1).
-				Int("total", len(portalIDs)).
+				Int("total", totalPortals).
 				Int("created_so_far", created).
 				Dur("elapsed", time.Since(portalStart)).
 				Msg("Portal creation progress")
@@ -821,9 +901,12 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 
 	log.Info().
 		Int("created", created).
-		Int("total", len(portalIDs)).
+		Int("total", totalPortals).
+		Int("priority_forward_backfill", len(priorityPortals)).
+		Int("deferred_backward_only", len(deferredPortals)).
+		Int("no_messages_skipped", len(noMessagePortals)).
 		Dur("elapsed", time.Since(portalStart)).
-		Msg("Finished creating portals from cloud sync (backward backfill will follow via backfill queue for portals with CanBackfill=true)")
+		Msg("Finished queuing portals from cloud sync")
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
