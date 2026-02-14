@@ -1504,10 +1504,14 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	// This populates the room immediately on portal creation instead of
 	// waiting for the backward backfill queue to get around to it.
 	if params.Forward {
+		log := zerolog.Ctx(ctx)
+		log.Info().Str("portal_id", portalID).Int("count", count).Msg("Forward backfill: querying listLatestMessages")
 		rows, err := c.cloudStore.listLatestMessages(ctx, portalID, count)
 		if err != nil {
+			log.Err(err).Str("portal_id", portalID).Msg("Forward backfill: listLatestMessages failed")
 			return nil, err
 		}
+		log.Info().Str("portal_id", portalID).Int("rows", len(rows)).Msg("Forward backfill: listLatestMessages result")
 		// listLatestMessages returns newest-first; reverse to chronological order
 		reverseCloudMessageRows(rows)
 		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
