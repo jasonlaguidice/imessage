@@ -2396,6 +2396,67 @@ impl Client {
         })
     }
 
+    /// Diagnostic: do a full fresh sync from scratch (no continuation token)
+    /// and return total record count + the newest message timestamps per chat.
+    /// This bypasses any stored token to check what CloudKit actually has.
+    pub async fn cloud_diag_full_count(
+        &self,
+    ) -> Result<String, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        
+        let mut token: Option<Vec<u8>> = None;
+        let mut total_records: usize = 0;
+        let mut total_deleted: usize = 0;
+        let mut total_skipped: usize = 0;
+        let mut chat_id_counts: HashMap<String, usize> = HashMap::new();
+        let mut newest_ts: i64 = 0;
+        let mut newest_guid = String::new();
+        let mut newest_chat = String::new();
+        
+        for page in 0..512 {
+            let (next_token, messages, status) = cloud_messages.sync_messages(token).await
+                .map_err(|e| WrappedError::GenericError { msg: format!("diag sync page {} failed: {}", page, e) })?;
+            
+            let page_total = messages.len();
+            let mut page_present = 0usize;
+            let mut page_deleted = 0usize;
+            for (_record_name, msg_opt) in &messages {
+                if let Some(msg) = msg_opt {
+                    page_present += 1;
+                    total_records += 1;
+                    let ts = apple_timestamp_ns_to_unix_ms(msg.time);
+                    let chat = &msg.chat_id;
+                    *chat_id_counts.entry(chat.clone()).or_insert(0) += 1;
+                    if ts > newest_ts {
+                        newest_ts = ts;
+                        newest_guid = msg.guid.clone();
+                        newest_chat = chat.clone();
+                    }
+                } else {
+                    page_deleted += 1;
+                    total_deleted += 1;
+                }
+            }
+            // Records that are neither present nor deleted were skipped by PCS errors in sync_records
+            total_skipped += page_total.saturating_sub(page_present + page_deleted);
+            
+            info!("diag page {} => {} records (status={})", page, page_total, status);
+            
+            if status == 3 {
+                break;
+            }
+            token = Some(next_token);
+        }
+        
+        let unique_chats = chat_id_counts.len();
+        let result = format!(
+            "total_records={} deleted={} unique_chats={} newest_ts={} newest_guid={} newest_chat={}",
+            total_records, total_deleted, unique_chats, newest_ts, newest_guid, newest_chat
+        );
+        info!("CloudKit diag: {}", result);
+        Ok(result)
+    }
+
     pub async fn cloud_fetch_recent_messages(
         &self,
         since_timestamp_ms: u64,

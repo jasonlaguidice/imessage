@@ -166,6 +166,14 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Msg("Cloud bootstrap sync end")
 	}
 
+	// Diagnostic: do a fresh full sync from scratch to see if CloudKit
+	// returns different records than the token-based sync did.
+	if diagResult, diagErr := c.client.CloudDiagFullCount(); diagErr != nil {
+		log.Warn().Err(diagErr).Msg("CloudKit diagnostic full count failed")
+	} else {
+		log.Info().Str("diag", diagResult).Msg("CloudKit diagnostic full count result")
+	}
+
 	c.createPortalsFromCloudSync(ctx, log)
 
 	if err = c.enqueueRecentRepairTasks(ctx, log); err != nil {
