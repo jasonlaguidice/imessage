@@ -337,9 +337,9 @@ func (c *IMClient) ingestCloudMessages(
 			continue
 		}
 
-		portalID := preferredPortalID
+		portalID := c.resolveConversationID(ctx, msg)
 		if portalID == "" {
-			portalID = c.resolveConversationID(ctx, msg)
+			portalID = preferredPortalID
 		}
 		if portalID == "" {
 			counts.Skipped++
