@@ -1500,10 +1500,25 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
-	// Forward backfill is a no-op — we let the framework's backfill queue
-	// drive everything via backward backfill (newest-first pagination).
+	// Forward backfill: return the newest messages for this portal.
+	// This populates the room immediately on portal creation instead of
+	// waiting for the backward backfill queue to get around to it.
 	if params.Forward {
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
+		rows, err := c.cloudStore.listLatestMessages(ctx, portalID, count)
+		if err != nil {
+			return nil, err
+		}
+		// listLatestMessages returns newest-first; reverse to chronological order
+		reverseCloudMessageRows(rows)
+		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
+		for _, row := range rows {
+			messages = append(messages, c.cloudRowToBackfillMessage(row))
+		}
+		return &bridgev2.FetchMessagesResponse{
+			Messages: messages,
+			HasMore:  false,
+			Forward:  true,
+		}, nil
 	}
 
 	fetchCount := count + 1
