@@ -1178,6 +1178,10 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 	var forUuid *string
 	if receipt.ExactMessage != nil {
 		uuid := string(receipt.ExactMessage.ID)
+		// Strip attachment suffixes like _att0, _att1 — Rust expects a pure UUID
+		if idx := strings.Index(uuid, "_att"); idx > 0 {
+			uuid = uuid[:idx]
+		}
 		forUuid = &uuid
 	}
 	return c.client.SendReadReceipt(conv, c.handle, forUuid)
