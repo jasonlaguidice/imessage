@@ -40,22 +40,30 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 }
 
 func (c *IMClient) setContactsReady(log zerolog.Logger) {
+	firstTime := false
 	c.contactsReadyLock.Lock()
-	if c.contactsReady {
+	if !c.contactsReady {
+		c.contactsReady = true
+		firstTime = true
+		readyCh := c.contactsReadyCh
 		c.contactsReadyLock.Unlock()
-		return
+		if readyCh != nil {
+			close(readyCh)
+		}
+		log.Info().Msg("Contacts readiness gate satisfied")
+	} else {
+		c.contactsReadyLock.Unlock()
 	}
-	c.contactsReady = true
-	readyCh := c.contactsReadyCh
-	c.contactsReadyLock.Unlock()
-	if readyCh != nil {
-		close(readyCh)
-	}
-	log.Info().Msg("Contacts readiness gate satisfied")
 
-	// Re-resolve ghost names now that contacts are available.
-	// Ghosts created before contacts loaded have raw phone numbers as names.
+	// Re-resolve ghost and group names from contacts on every sync,
+	// not just the first time. Contacts may have been added/edited in iCloud.
+	if firstTime {
+		log.Info().Msg("Running initial contact name resolution for ghosts and group portals")
+	} else {
+		log.Info().Msg("Re-syncing contact names for ghosts and group portals")
+	}
 	go c.refreshGhostNamesFromContacts(log)
+	go c.refreshGroupPortalNamesFromContacts(log)
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
@@ -104,6 +112,62 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		}
 	}
 	log.Info().Int("updated", updated).Int("total", total).Msg("Refreshed ghost names from contacts")
+}
+
+// refreshGroupPortalNamesFromContacts re-resolves group portal names using
+// contact data. Portals created before contacts loaded may have raw phone
+// numbers / email addresses as the room name. This also picks up contact
+// edits on subsequent periodic syncs.
+func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
+	if c.cloudContacts == nil {
+		return
+	}
+	ctx := context.Background()
+
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+	if err != nil {
+		log.Err(err).Msg("Failed to load portals for group name refresh")
+		return
+	}
+
+	updated := 0
+	total := 0
+	for _, portal := range portals {
+		if portal.Receiver != c.UserLogin.ID {
+			continue
+		}
+		portalID := string(portal.ID)
+		isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
+		if !isGroup {
+			continue
+		}
+		total++
+
+		newName := c.resolveGroupName(ctx, portalID)
+		if newName == "" || newName == portal.Name {
+			continue
+		}
+
+		c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+			EventMeta: simplevent.EventMeta{
+				Type: bridgev2.RemoteEventChatInfoChange,
+				PortalKey: networkid.PortalKey{
+					ID:       portal.ID,
+					Receiver: c.UserLogin.ID,
+				},
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("portal_id", portalID).Str("source", "group_name_refresh")
+				},
+			},
+			ChatInfoChange: &bridgev2.ChatInfoChange{
+				ChatInfo: &bridgev2.ChatInfo{
+					Name: &newName,
+				},
+			},
+		})
+		updated++
+	}
+	log.Info().Int("updated", updated).Int("total_groups", total).Msg("Refreshed group portal names from contacts")
 }
 
 func (c *IMClient) waitForContactsReady(log zerolog.Logger) bool {
@@ -327,6 +391,14 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			int64(chat.UpdatedTimestampMs),
 		); err != nil {
 			return counts, err
+		}
+
+		// Cache the CloudKit display name (user-set group name) so it's
+		// available when GetChatInfo runs during portal creation.
+		if chat.DisplayName != nil && *chat.DisplayName != "" {
+			c.imGroupNamesMu.Lock()
+			c.imGroupNames[portalID] = *chat.DisplayName
+			c.imGroupNamesMu.Unlock()
 		}
 
 		if exists {
