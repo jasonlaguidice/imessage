@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -274,6 +275,56 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	return counts, nil
 }
 
+// uuidPattern matches a UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).
+var uuidPattern = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// resolveConversationID determines the canonical portal ID for a cloud message.
+//
+// Rule 1: If chat_id is a UUID → it's a group conversation → "gid:<lowercase-uuid>"
+// Rule 2: Otherwise derive from sender (DM) → "tel:+..." or "mailto:..."
+// Rule 3: Messages create conversations. Never discard a message because
+//         we haven't seen the chat record yet.
+func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.WrappedCloudSyncMessage) string {
+	// Check if chat_id is a UUID (= group conversation)
+	if msg.CloudChatId != "" && uuidPattern.MatchString(msg.CloudChatId) {
+		return "gid:" + strings.ToLower(msg.CloudChatId)
+	}
+
+	// Try to look up the chat record for non-UUID chat_ids
+	// (e.g., "iMessage;-;+16692858317" or "chat12345...")
+	if msg.CloudChatId != "" {
+		if portalID, err := c.cloudStore.getChatPortalID(ctx, msg.CloudChatId); err == nil && portalID != "" {
+			return portalID
+		}
+	}
+
+	// DM: derive from sender
+	if msg.Sender != "" && !msg.IsFromMe {
+		normalized := normalizeIdentifierForPortalID(msg.Sender)
+		if normalized != "" {
+			resolved := c.resolveContactPortalID(normalized)
+			resolved = c.resolveExistingDMPortalID(string(resolved))
+			return string(resolved)
+		}
+	}
+
+	// is_from_me DMs: derive from destination
+	if msg.IsFromMe && msg.CloudChatId != "" {
+		// chat_id for DMs is like "iMessage;-;+16692858317"
+		parts := strings.Split(msg.CloudChatId, ";")
+		if len(parts) == 3 {
+			normalized := normalizeIdentifierForPortalID(parts[2])
+			if normalized != "" {
+				resolved := c.resolveContactPortalID(normalized)
+				resolved = c.resolveExistingDMPortalID(string(resolved))
+				return string(resolved)
+			}
+		}
+	}
+
+	return ""
+}
+
 func (c *IMClient) ingestCloudMessages(
 	ctx context.Context,
 	messages []rustpushgo.WrappedCloudSyncMessage,
@@ -287,20 +338,8 @@ func (c *IMClient) ingestCloudMessages(
 		}
 
 		portalID := preferredPortalID
-		if portalID == "" && msg.CloudChatId != "" {
-			resolvedPortalID, err := c.cloudStore.getChatPortalID(ctx, msg.CloudChatId)
-			if err != nil {
-				return err
-			}
-			portalID = resolvedPortalID
-		}
-		if portalID == "" && msg.Sender != "" && !msg.IsFromMe {
-			normalizedSender := normalizeIdentifierForPortalID(msg.Sender)
-			if normalizedSender != "" {
-				resolvedPortal := c.resolveContactPortalID(normalizedSender)
-				resolvedPortal = c.resolveExistingDMPortalID(string(resolvedPortal))
-				portalID = string(resolvedPortal)
-			}
+		if portalID == "" {
+			portalID = c.resolveConversationID(ctx, msg)
 		}
 		if portalID == "" {
 			counts.Skipped++
