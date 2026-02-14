@@ -310,6 +310,10 @@ func (c *cloudContactsClient) listAddressBooks(log zerolog.Logger, homeSetURL st
 		return nil, fmt.Errorf("failed to read response: %w", err)
 	}
 
+	log.Debug().
+		Int("response_bytes", len(data)).
+		Str("body_preview", string(data[:min(len(data), 3000)])).
+		Msg("CardDAV: listAddressBooks PROPFIND response")
 	return c.parseAddressBookList(data, homeSetURL, log), nil
 }
 
