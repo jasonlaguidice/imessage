@@ -394,8 +394,15 @@ func (c *IMClient) ingestCloudMessages(
 	preferredPortalID string,
 	counts *cloudSyncCounters,
 ) error {
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	for _, msg := range messages {
 		if msg.Guid == "" {
+			log.Warn().
+				Str("cloud_chat_id", msg.CloudChatId).
+				Str("sender", msg.Sender).
+				Bool("is_from_me", msg.IsFromMe).
+				Int64("timestamp_ms", msg.TimestampMs).
+				Msg("Skipping message with empty GUID")
 			counts.Skipped++
 			continue
 		}
@@ -405,6 +412,14 @@ func (c *IMClient) ingestCloudMessages(
 			portalID = preferredPortalID
 		}
 		if portalID == "" {
+			log.Warn().
+				Str("guid", msg.Guid).
+				Str("cloud_chat_id", msg.CloudChatId).
+				Str("sender", msg.Sender).
+				Bool("is_from_me", msg.IsFromMe).
+				Int64("timestamp_ms", msg.TimestampMs).
+				Str("service", msg.Service).
+				Msg("Skipping message: could not resolve portal ID")
 			counts.Skipped++
 			continue
 		}
