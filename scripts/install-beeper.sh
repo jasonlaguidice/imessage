@@ -79,9 +79,7 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
     echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
     echo "   Deleting old registration to avoid orphaned rooms..."
-    "$BBCTL" delete --force "$BRIDGE_NAME" <<< "y" 2>/dev/null \
-        || "$BBCTL" delete "$BRIDGE_NAME" <<< "y" 2>/dev/null \
-        || echo "   (Could not auto-delete — you may need to run: bbctl delete $BRIDGE_NAME)"
+    "$BBCTL" delete "$BRIDGE_NAME"
     echo "✓ Old registration cleaned up"
 fi
 
@@ -207,7 +205,7 @@ if [ "$NEEDS_LOGIN" = "false" ]; then
     fi
 fi
 
-if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
     echo "│  No valid iMessage login found — starting login │"
@@ -226,11 +224,6 @@ if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     # Run login from the data directory so the keystore (state/keystore.plist)
     # is written to the same location the launchd service will read from.
     (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
-    echo ""
-elif [ "$NEEDS_LOGIN" = "true" ]; then
-    echo ""
-    echo "  ℹ No iMessage login found. Run interactively to log in:"
-    echo "    $BINARY login -c $CONFIG"
     echo ""
 fi
 

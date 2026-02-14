@@ -67,9 +67,7 @@ if [ -n "$EXISTING_BRIDGE" ] && [ ! -f "$CONFIG" ]; then
     echo ""
     echo "⚠  Found existing '$BRIDGE_NAME' registration on server but no local config."
     echo "   Deleting old registration to avoid orphaned rooms..."
-    "$BBCTL" delete --force "$BRIDGE_NAME" <<< "y" 2>/dev/null \
-        || "$BBCTL" delete "$BRIDGE_NAME" <<< "y" 2>/dev/null \
-        || echo "   (Could not auto-delete — you may need to run: bbctl delete $BRIDGE_NAME)"
+    "$BBCTL" delete "$BRIDGE_NAME"
     echo "✓ Old registration cleaned up"
 fi
 
@@ -188,7 +186,7 @@ if [ "$NEEDS_LOGIN" = "false" ]; then
     fi
 fi
 
-if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
     echo "│  No valid iMessage login found — starting login │"
@@ -208,11 +206,6 @@ if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     # Run login from DATA_DIR so that relative paths (state/anisette/)
     # resolve to the same location as when systemd runs the bridge.
     (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
-    echo ""
-elif [ "$NEEDS_LOGIN" = "true" ]; then
-    echo ""
-    echo "  ℹ No iMessage login found. Run interactively to log in:"
-    echo "    $BINARY login -c $CONFIG"
     echo ""
 fi
 
@@ -250,8 +243,7 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>
         install_systemd
         systemctl --user restart mautrix-imessage
         echo "✓ Bridge restarted"
-    elif [ -t 0 ]; then
-        # Fresh install with TTY: ask
+    else
         echo ""
         read -p "Install as a systemd user service? [Y/n] " answer
         case "$answer" in
@@ -260,11 +252,6 @@ if command -v systemctl >/dev/null 2>&1 && systemctl --user status >/dev/null 2>
                    systemctl --user start mautrix-imessage
                    echo "✓ Bridge started (systemd user service installed)" ;;
         esac
-    else
-        # Fresh install without TTY: install automatically
-        install_systemd
-        systemctl --user start mautrix-imessage
-        echo "✓ Bridge started (systemd user service installed)"
     fi
 fi
 
