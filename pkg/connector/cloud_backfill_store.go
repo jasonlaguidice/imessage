@@ -210,6 +210,21 @@ func (s *cloudBackfillStore) clearSyncTokens(ctx context.Context) error {
 	return err
 }
 
+// clearAllData removes all cloud cache data for this login: sync tokens,
+// cached chats, and cached messages. Used on fresh bootstrap when the bridge
+// DB was reset but the cloud tables survived.
+func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
+	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message"} {
+		if _, err := s.db.Exec(ctx,
+			fmt.Sprintf(`DELETE FROM %s WHERE login_id=$1`, table),
+			s.loginID,
+		); err != nil {
+			return fmt.Errorf("failed to clear %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
 func (s *cloudBackfillStore) hasAnyMessages(ctx context.Context) (bool, error) {
 	var count int
 	err := s.db.QueryRow(ctx,
@@ -320,6 +335,70 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 	}
 
 	return tx.Commit()
+}
+
+// deleteMessageBatch removes messages by GUID in a single transaction.
+func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []string) error {
+	if len(guids) == 0 {
+		return nil
+	}
+	const chunkSize = 500
+	for i := 0; i < len(guids); i += chunkSize {
+		end := i + chunkSize
+		if end > len(guids) {
+			end = len(guids)
+		}
+		chunk := guids[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.loginID)
+		for j, g := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, g)
+		}
+
+		query := fmt.Sprintf(
+			`DELETE FROM cloud_message WHERE login_id=$1 AND guid IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := s.db.Exec(ctx, query, args...); err != nil {
+			return fmt.Errorf("failed to delete message batch: %w", err)
+		}
+	}
+	return nil
+}
+
+// deleteChatBatch removes chats by cloud_chat_id in a single transaction.
+func (s *cloudBackfillStore) deleteChatBatch(ctx context.Context, chatIDs []string) error {
+	if len(chatIDs) == 0 {
+		return nil
+	}
+	const chunkSize = 500
+	for i := 0; i < len(chatIDs); i += chunkSize {
+		end := i + chunkSize
+		if end > len(chatIDs) {
+			end = len(chatIDs)
+		}
+		chunk := chatIDs[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.loginID)
+		for j, id := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, id)
+		}
+
+		query := fmt.Sprintf(
+			`DELETE FROM cloud_chat WHERE login_id=$1 AND cloud_chat_id IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := s.db.Exec(ctx, query, args...); err != nil {
+			return fmt.Errorf("failed to delete chat batch: %w", err)
+		}
+	}
+	return nil
 }
 
 // upsertChatBatch inserts multiple chats in a single transaction.
