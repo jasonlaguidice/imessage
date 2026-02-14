@@ -473,6 +473,8 @@ func (c *cloudContactsClient) parseVCardMultistatus(data []byte, log zerolog.Log
 	}
 
 	var contacts []*imessage.Contact
+	skippedNoData := 0
+	skippedNoInfo := 0
 	for _, resp := range ms.Responses {
 		for _, ps := range resp.Propstat {
 			if !strings.Contains(ps.Status, "200") {
@@ -480,14 +482,23 @@ func (c *cloudContactsClient) parseVCardMultistatus(data []byte, log zerolog.Log
 			}
 			vcardData := strings.TrimSpace(ps.Prop.AddressData)
 			if vcardData == "" {
+				skippedNoData++
 				continue
 			}
 			contact := parseVCard(vcardData)
 			if contact != nil && (contact.HasName() || len(contact.Phones) > 0 || len(contact.Emails) > 0) {
 				contacts = append(contacts, contact)
+			} else {
+				skippedNoInfo++
 			}
 		}
 	}
+	log.Debug().
+		Int("responses", len(ms.Responses)).
+		Int("parsed", len(contacts)).
+		Int("skipped_no_data", skippedNoData).
+		Int("skipped_no_info", skippedNoInfo).
+		Msg("CardDAV REPORT parsing stats")
 	return contacts
 }
 
