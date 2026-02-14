@@ -267,11 +267,20 @@ func (c *IMClient) syncCloudMessages(ctx context.Context) (cloudSyncCounters, *s
 		return counts, nil, err
 	}
 
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	for page := 0; page < 256; page++ {
 		resp, syncErr := c.client.CloudSyncMessages(token)
 		if syncErr != nil {
 			return counts, token, syncErr
 		}
+
+		log.Info().
+			Int("page", page).
+			Int("messages", len(resp.Messages)).
+			Int32("status", resp.Status).
+			Bool("done", resp.Done).
+			Bool("has_token", token != nil).
+			Msg("CloudKit message sync page")
 
 		if err = c.ingestCloudMessages(ctx, resp.Messages, "", &counts); err != nil {
 			return counts, token, err
