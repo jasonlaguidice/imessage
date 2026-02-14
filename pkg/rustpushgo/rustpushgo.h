@@ -73,12 +73,34 @@ void uniffi_rustpushgo_fn_free_client(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_cloud_diag_full_count(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_cloud_download_attachment(
+	void* ptr,
+	RustBuffer record_name,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_cloud_dump_chats_json(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_fetch_recent_messages(
 	void* ptr,
 	uint64_t since_timestamp_ms,
 	RustBuffer chat_id,
 	uint32_t max_pages,
 	uint32_t max_results,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_cloud_sync_attachments(
+	void* ptr,
+	RustBuffer continuation_token,
 	RustCallStatus* out_status
 );
 
@@ -751,7 +773,23 @@ uint16_t uniffi_rustpushgo_checksum_func_restore_token_provider(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_download_attachment(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_dump_chats_json(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_fetch_recent_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_sync_attachments(
 	RustCallStatus* out_status
 );
 

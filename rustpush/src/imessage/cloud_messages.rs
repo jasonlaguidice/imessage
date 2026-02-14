@@ -709,6 +709,20 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(())
     }
 
+    /// Pre-fetch and cache zone encryption configs for all three Manatee zones.
+    /// Call this while still in the clique so that subsequent sync_records calls
+    /// hit the cache and don't need to re-check clique membership.
+    pub async fn warm_zone_keys(&self) -> Result<(), PushError> {
+        let container = self.get_container().await?;
+        for zone_name in ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"] {
+            let zone_id = container.private_zone(zone_name.to_string());
+            container
+                .get_zone_encryption_config(&zone_id, &self.keychain, &MESSAGES_SERVICE)
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn sync_chats(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32), PushError> {
         self.sync_records("chatManateeZone", continuation_token).await
     }

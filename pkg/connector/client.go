@@ -1520,7 +1520,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		reverseCloudMessageRows(rows)
 		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
 		for _, row := range rows {
-			messages = append(messages, c.cloudRowToBackfillMessage(row))
+			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row)...)
 		}
 		return &bridgev2.FetchMessagesResponse{
 			Messages: messages,
@@ -1558,7 +1558,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 
 	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
 	for _, row := range rows {
-		messages = append(messages, c.cloudRowToBackfillMessage(row))
+		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row)...)
 	}
 
 	var nextCursor networkid.PaginationCursor
@@ -1581,41 +1581,198 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}, nil
 }
 
-func (c *IMClient) cloudRowToBackfillMessage(row cloudMessageRow) *bridgev2.BackfillMessage {
-	var sender bridgev2.EventSender
+func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow) []*bridgev2.BackfillMessage {
+	sender := c.makeCloudSender(row)
+	ts := time.UnixMilli(row.TimestampMS)
+
+	// Tapback/reaction: return as a reaction event, not a text message.
+	if row.TapbackType != nil && *row.TapbackType >= 2000 {
+		return c.cloudTapbackToBackfill(row, sender, ts)
+	}
+
+	var messages []*bridgev2.BackfillMessage
+
+	// Text message
+	body := row.Text
+	if row.Subject != "" {
+		if body != "" {
+			body = fmt.Sprintf("**%s**\n%s", row.Subject, body)
+		} else {
+			body = row.Subject
+		}
+	}
+	hasText := strings.TrimSpace(body) != "" && strings.TrimRight(body, "\ufffc \n") != ""
+	if hasText {
+		messages = append(messages, &bridgev2.BackfillMessage{
+			Sender:    sender,
+			ID:        makeMessageID(row.GUID),
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type: event.EventMessage,
+					Content: &event.MessageEventContent{
+						MsgType: event.MsgText,
+						Body:    body,
+					},
+				}},
+			},
+		})
+	}
+
+	// Attachments
+	attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
+	messages = append(messages, attMessages...)
+
+	// No text, no attachments, no tapback → likely a deleted/unsent message
+	// whose content was wiped from CloudKit.  Skip silently.
+
+	return messages
+}
+
+func (c *IMClient) makeCloudSender(row cloudMessageRow) bridgev2.EventSender {
 	if row.IsFromMe {
-		sender = bridgev2.EventSender{
+		return bridgev2.EventSender{
 			IsFromMe:    true,
 			SenderLogin: c.UserLogin.ID,
 			Sender:      makeUserID(c.handle),
 		}
-	} else {
-		normalizedSender := normalizeIdentifierForPortalID(row.Sender)
-		if normalizedSender == "" {
-			normalizedSender = row.Sender
-		}
-		sender = bridgev2.EventSender{Sender: makeUserID(normalizedSender)}
+	}
+	normalizedSender := normalizeIdentifierForPortalID(row.Sender)
+	if normalizedSender == "" {
+		normalizedSender = row.Sender
+	}
+	return bridgev2.EventSender{Sender: makeUserID(normalizedSender)}
+}
+
+// cloudTapbackToBackfill converts a CloudKit reaction record to a backfill reaction event.
+func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.EventSender, ts time.Time) []*bridgev2.BackfillMessage {
+	tapbackType := *row.TapbackType
+	isRemove := tapbackType >= 3000
+	idx := tapbackType - 2000
+	if isRemove {
+		idx = tapbackType - 3000
+	}
+	emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
+
+	// Parse target GUID from "p:0/GUID" format
+	targetGUID := row.TapbackTargetGUID
+	if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
+		targetGUID = parts[1]
+	}
+	if targetGUID == "" {
+		return nil
 	}
 
-	body := row.Text
-	if strings.TrimSpace(body) == "" {
-		body = "[Unsupported message type]"
+	evtType := bridgev2.RemoteEventReaction
+	if isRemove {
+		evtType = bridgev2.RemoteEventReactionRemove
 	}
 
-	return &bridgev2.BackfillMessage{
-		Sender:    sender,
-		ID:        makeMessageID(row.GUID),
-		Timestamp: time.UnixMilli(row.TimestampMS),
-		ConvertedMessage: &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{{
-				Type: event.EventMessage,
-				Content: &event.MessageEventContent{
-					MsgType: event.MsgText,
-					Body:    body,
-				},
-			}},
+	// Reactions are sent as remote events, not backfill messages.
+	// We queue them so the bridge handles dedup and target resolution.
+	portalKey := networkid.PortalKey{
+		ID:       networkid.PortalID(row.PortalID),
+		Receiver: c.UserLogin.ID,
+	}
+	c.UserLogin.QueueRemoteEvent(&simplevent.Reaction{
+		EventMeta: simplevent.EventMeta{
+			Type:      evtType,
+			PortalKey: portalKey,
+			Sender:    sender,
+			Timestamp: ts,
 		},
+		TargetMessage: makeMessageID(targetGUID),
+		Emoji:         emoji,
+	})
+	return nil
+}
+
+// cloudAttachmentsToBackfill downloads CloudKit attachments, uploads them to
+// the Matrix media repo, and returns backfill messages with media URLs set.
+func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMessageRow, sender bridgev2.EventSender, ts time.Time, hasText bool) []*bridgev2.BackfillMessage {
+	if row.AttachmentsJSON == "" {
+		return nil
 	}
+	var atts []cloudAttachmentRow
+	if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+		return nil
+	}
+
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
+	intent := c.Main.Bridge.Bot
+	var messages []*bridgev2.BackfillMessage
+	for i, att := range atts {
+		if att.RecordName == "" {
+			continue
+		}
+
+		// Download attachment from CloudKit
+		data, err := c.client.CloudDownloadAttachment(att.RecordName)
+		if err != nil {
+			log.Warn().Err(err).
+				Str("guid", row.GUID).
+				Str("att_guid", att.GUID).
+				Str("record_name", att.RecordName).
+				Msg("Failed to download CloudKit attachment, skipping")
+			continue
+		}
+		if len(data) == 0 {
+			continue
+		}
+
+		// Determine message ID
+		attID := row.GUID
+		if i > 0 || hasText {
+			attID = fmt.Sprintf("%s_att%d", row.GUID, i)
+		}
+
+		mimeType := att.MimeType
+		if mimeType == "" {
+			mimeType = "application/octet-stream"
+		}
+		fileName := att.Filename
+		if fileName == "" {
+			fileName = "attachment"
+		}
+
+		msgType := mimeToMsgType(mimeType)
+		content := &event.MessageEventContent{
+			MsgType: msgType,
+			Body:    fileName,
+			Info: &event.FileInfo{
+				MimeType: mimeType,
+				Size:     len(data),
+			},
+		}
+
+		// Upload to Matrix media repo
+		url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
+		if uploadErr != nil {
+			log.Warn().Err(uploadErr).
+				Str("guid", row.GUID).
+				Str("att_guid", att.GUID).
+				Msg("Failed to upload attachment to Matrix, skipping")
+			continue
+		}
+		if encFile != nil {
+			content.File = encFile
+		} else {
+			content.URL = url
+		}
+
+		messages = append(messages, &bridgev2.BackfillMessage{
+			Sender:    sender,
+			ID:        makeMessageID(attID),
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type:    event.EventMessage,
+					Content: content,
+				}},
+			},
+		})
+	}
+	return messages
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {

@@ -1586,7 +1586,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 modified = true;
             }
 
+            let my_id = &state.user_identity.as_ref().unwrap().identifier;
             for excluded in &trust.excludeds {
+                if excluded == my_id {
+                    warn!(
+                        "Ignoring exclusion of ourselves ({}) from peer {}",
+                        excluded,
+                        peer.0.hash.as_ref().unwrap()
+                    );
+                    continue;
+                }
                 if current_state.excludeds.contains(excluded) { continue }
                 if current_state.includeds.contains(excluded) {
                     current_state.includeds.retain(|a| a != excluded);
