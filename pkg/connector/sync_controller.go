@@ -2,9 +2,7 @@ package connector
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -17,13 +15,9 @@ import (
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
-const (
-	// TODO: Subscribe to CloudKit zone change notifications (APNs push)
-	// for instant sync like iPhone/Mac. Polling is a stopgap.
-	cloudIncrementalInterval = 30 * time.Second
-	cloudRepairInterval      = 30 * time.Minute
-	cloudRepairLookback      = 6 * time.Hour
-)
+// No periodic polling needed: real-time messages arrive via APNs push
+// on com.apple.madrid. CloudKit sync is only used for initial backfill
+// of historical messages (bootstrap).
 
 type cloudSyncCounters struct {
 	Imported int
@@ -213,63 +207,28 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		}
 	}
 
-	log.Info().Msg("Cloud bootstrap sync start")
+	log.Info().Msg("CloudKit bootstrap sync start (historical backfill)")
 
-	// Dump raw CloudKit chat records to disk for debugging
-	c.dumpCloudKitChats(ctx, log)
-
-	counts, err := c.runIncrementalCloudSync(ctx, log)
+	counts, err := c.runCloudKitBackfill(ctx, log)
 	if err != nil {
-		log.Error().Err(err).Msg("Cloud bootstrap sync failed")
+		log.Error().Err(err).Msg("CloudKit bootstrap sync failed")
 	} else {
 		log.Info().
 			Int("imported", counts.Imported).
 			Int("updated", counts.Updated).
 			Int("skipped", counts.Skipped).
 			Int("deleted", counts.Deleted).
-			Msg("Cloud bootstrap sync end")
+			Msg("CloudKit bootstrap sync complete")
 	}
 
 	c.createPortalsFromCloudSync(ctx, log)
 
-	if err = c.enqueueRecentRepairTasks(ctx, log); err != nil {
-		log.Warn().Err(err).Msg("Failed to enqueue initial repair tasks")
-	}
-	c.executeRepairTasks(ctx, log, 50)
-
-	incrementalTicker := time.NewTicker(cloudIncrementalInterval)
-	repairTicker := time.NewTicker(cloudRepairInterval)
-	defer incrementalTicker.Stop()
-	defer repairTicker.Stop()
-
-	for {
-		select {
-		case <-incrementalTicker.C:
-			log.Info().Msg("Cloud incremental sync start")
-			counts, err = c.runIncrementalCloudSync(ctx, log)
-			if err != nil {
-				log.Warn().Err(err).Msg("Cloud incremental sync failed")
-			} else {
-				log.Info().
-					Int("imported", counts.Imported).
-					Int("updated", counts.Updated).
-					Int("skipped", counts.Skipped).
-					Int("deleted", counts.Deleted).
-					Msg("Cloud incremental sync end")
-			}
-			c.executeRepairTasks(ctx, log, 20)
-		case <-repairTicker.C:
-			if err = c.enqueueRecentRepairTasks(ctx, log); err != nil {
-				log.Warn().Err(err).Msg("Failed to enqueue repair tasks")
-			}
-			c.executeRepairTasks(ctx, log, 100)
-		case <-c.stopChan:
-			return
-		}
-	}
+	// No polling loop — real-time messages arrive via APNs push on
+	// com.apple.madrid, handled by the rustpush receive path.
+	log.Info().Msg("CloudKit backfill done, real-time messages via APNs")
 }
 
-func (c *IMClient) runIncrementalCloudSync(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {
+func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {
 	var total cloudSyncCounters
 
 	chatCounts, chatToken, err := c.syncCloudChats(ctx)
@@ -338,13 +297,14 @@ func (c *IMClient) syncCloudMessages(ctx context.Context) (cloudSyncCounters, *s
 			return counts, token, syncErr
 		}
 
-		log.Info().
-			Int("page", page).
-			Int("messages", len(resp.Messages)).
-			Int32("status", resp.Status).
-			Bool("done", resp.Done).
-			Bool("has_token", token != nil).
-			Msg("CloudKit message sync page")
+		if len(resp.Messages) > 0 {
+			log.Info().
+				Int("page", page).
+				Int("messages", len(resp.Messages)).
+				Int32("status", resp.Status).
+				Bool("done", resp.Done).
+				Msg("CloudKit message sync page")
+		}
 
 		if err = c.ingestCloudMessages(ctx, resp.Messages, "", &counts); err != nil {
 			return counts, token, err
@@ -579,108 +539,6 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	return string(portalKey.ID)
 }
 
-func (c *IMClient) enqueueRecentRepairTasks(ctx context.Context, log zerolog.Logger) error {
-	now := time.Now()
-	notBefore := now.UnixMilli()
-	sinceActive := now.Add(-24 * time.Hour).UnixMilli()
-	reconcileSince := now.Add(-cloudRepairLookback).UnixMilli()
-
-	activeChats, err := c.cloudStore.listActiveChatsSince(ctx, sinceActive, 25)
-	if err != nil {
-		return err
-	}
-
-	enqueued := 0
-	for _, chat := range activeChats {
-		if err = c.cloudStore.enqueueRepairTask(
-			ctx,
-			repairTaskActiveRecent,
-			chat.CloudChatID,
-			chat.PortalID,
-			reconcileSince,
-			notBefore,
-		); err != nil {
-			return err
-		}
-		enqueued++
-	}
-
-	if err = c.cloudStore.enqueueRepairTask(
-		ctx,
-		repairTaskGlobalRecent,
-		"",
-		"",
-		reconcileSince,
-		notBefore,
-	); err != nil {
-		return err
-	}
-	enqueued++
-
-	log.Info().
-		Int("enqueued", enqueued).
-		Int("active_chat_tasks", len(activeChats)).
-		Msg("Repair tasks enqueued")
-	return nil
-}
-
-func (c *IMClient) executeRepairTasks(ctx context.Context, log zerolog.Logger, limit int) {
-	tasks, err := c.cloudStore.getDueRepairTasks(ctx, limit)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to load due repair tasks")
-		return
-	}
-	if len(tasks) == 0 {
-		return
-	}
-
-	for _, task := range tasks {
-		taskLog := log.With().
-			Int64("task_id", task.ID).
-			Str("task_type", task.TaskType).
-			Str("cloud_chat_id", task.CloudChatID).
-			Int("attempts", task.Attempts).
-			Logger()
-
-		taskLog.Info().Msg("Executing repair task")
-
-		var chatID *string
-		if task.TaskType == repairTaskActiveRecent && task.CloudChatID != "" {
-			chatID = &task.CloudChatID
-		}
-
-		recentMessages, fetchErr := c.client.CloudFetchRecentMessages(
-			uint64(maxInt64(task.SinceTSMS, 0)),
-			chatID,
-			8,
-			1000,
-		)
-		if fetchErr != nil {
-			_ = c.cloudStore.markRepairTaskFailed(ctx, task.ID, fetchErr.Error())
-			taskLog.Warn().Err(fetchErr).Msg("Repair task failed: cloud fetch error")
-			continue
-		}
-
-		counts := cloudSyncCounters{}
-		ingestErr := c.ingestCloudMessages(ctx, recentMessages, task.PortalID, &counts)
-		if ingestErr != nil {
-			_ = c.cloudStore.markRepairTaskFailed(ctx, task.ID, ingestErr.Error())
-			taskLog.Warn().Err(ingestErr).Msg("Repair task failed: ingest error")
-			continue
-		}
-
-		if err = c.cloudStore.markRepairTaskDone(ctx, task.ID); err != nil {
-			taskLog.Warn().Err(err).Msg("Failed to mark repair task done")
-		}
-		taskLog.Info().
-			Int("imported", counts.Imported).
-			Int("updated", counts.Updated).
-			Int("skipped", counts.Skipped).
-			Int("deleted", counts.Deleted).
-			Msg("Repair task completed")
-	}
-}
-
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger) {
 	if c.cloudStore == nil {
 		return
@@ -721,73 +579,6 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 
 	log.Info().Int("created", created).Int("total", len(portalIDs)).Msg("Finished creating portals from cloud sync")
-}
-
-func maxInt64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func (c *IMClient) dumpCloudKitChats(ctx context.Context, log zerolog.Logger) {
-	var allChats []rustpushgo.WrappedCloudSyncChat
-	var token *string
-	for page := 0; page < 256; page++ {
-		resp, err := c.client.CloudSyncChats(token)
-		if err != nil {
-			log.Warn().Err(err).Int("page", page).Msg("CloudKit dump failed")
-			return
-		}
-		allChats = append(allChats, resp.Chats...)
-		log.Info().Int("page", page).Int("count", len(resp.Chats)).Bool("done", resp.Done).Msg("CloudKit dump page")
-		if resp.Done {
-			break
-		}
-		token = resp.ContinuationToken
-	}
-
-	// Build JSON manually since WrappedCloudSyncChat isn't tagged
-	type chatDump struct {
-		RecordName   string   `json:"record_name"`
-		CloudChatID  string   `json:"cloud_chat_id"`
-		GroupID      string   `json:"group_id"`
-		Style        int64    `json:"style"`
-		Service      string   `json:"service"`
-		DisplayName  string   `json:"display_name"`
-		Participants []string `json:"participants"`
-		Deleted      bool     `json:"deleted"`
-	}
-	dump := make([]chatDump, len(allChats))
-	for i, ch := range allChats {
-		dn := ""
-		if ch.DisplayName != nil {
-			dn = *ch.DisplayName
-		}
-		dump[i] = chatDump{
-			RecordName:   ch.RecordName,
-			CloudChatID:  ch.CloudChatId,
-			GroupID:      ch.GroupId,
-			Style:        ch.Style,
-			Service:      ch.Service,
-			DisplayName:  dn,
-			Participants: ch.Participants,
-			Deleted:      ch.Deleted,
-		}
-	}
-
-	jsonBytes, err := json.MarshalIndent(dump, "", "  ")
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to marshal CloudKit dump")
-		return
-	}
-
-	dumpPath := "cloudkit_chats_dump.json"
-	if err := os.WriteFile(dumpPath, jsonBytes, 0644); err != nil {
-		log.Warn().Err(err).Msg("Failed to write CloudKit dump")
-		return
-	}
-	log.Info().Str("path", dumpPath).Int("chats", len(allChats)).Msg("Dumped raw CloudKit chat records")
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
