@@ -93,6 +93,8 @@ else
     sed -i "s|uri: sqlite:mautrix-imessage.db|uri: sqlite:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
     # Enable unlimited backward backfill (default is 0 which disables it)
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    # Remove artificial delay between backfill batches (default 20s is way too slow)
+    sed -i 's/batch_delay: [0-9]*/batch_delay: 0/' "$CONFIG"
     echo "✓ Config saved to $CONFIG"
 fi
 
