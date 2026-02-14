@@ -40,6 +40,17 @@ echo "(Answer the confirmation prompt below)"
 echo ""
 "$BBCTL" delete "$BRIDGE_NAME"
 
+# ── Clear journal logs ───────────────────────────────────────
+echo ""
+echo "Clearing bridge journal logs..."
+if [ "$UNAME_S" != "Darwin" ]; then
+    journalctl --user --unit=mautrix-imessage --rotate 2>/dev/null || true
+    journalctl --user --unit=mautrix-imessage --vacuum-time=1s 2>/dev/null || true
+    echo "✓ Logs cleared"
+else
+    echo "  (macOS — logs managed by launchd, skipping)"
+fi
+
 # ── Wipe EVERYTHING ─────────────────────────────────────────
 echo ""
 echo "Wiping all state in $STATE_DIR/ ..."
