@@ -89,8 +89,10 @@ if [ -f "$CONFIG" ]; then
 else
     echo "Generating Beeper config..."
     "$BBCTL" config --type imessage-v2 -o "$CONFIG" "$BRIDGE_NAME"
-    # Make DB path absolute so it doesn't depend on working directory
+    # Make DB path absolute — everything lives in DATA_DIR
     sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
+    # Also catch sqlite:// URIs from newer bbctl versions
+    sed -i "s|uri: sqlite:mautrix-imessage.db|uri: sqlite:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
     # Enable unlimited backward backfill (default is 0 which disables it)
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
     echo "✓ Config saved to $CONFIG"
@@ -228,7 +230,7 @@ After=network.target
 
 [Service]
 Type=simple
-WorkingDirectory=$(dirname "$BINARY")
+WorkingDirectory=$DATA_DIR
 ExecStart=$BINARY -c $CONFIG
 Restart=always
 RestartSec=5
