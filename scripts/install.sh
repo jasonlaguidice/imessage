@@ -212,7 +212,7 @@ if [ "$NEEDS_LOGIN" = "false" ]; then
     fi
 fi
 
-if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
+if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
     echo "┌─────────────────────────────────────────────────┐"
     echo "│  No valid iMessage login found — starting login │"
@@ -228,11 +228,6 @@ if [ "$NEEDS_LOGIN" = "true" ] && [ -t 0 ]; then
     fi
 
     (cd "$DATA_DIR" && "$BINARY" login -c "$CONFIG")
-    echo ""
-elif [ "$NEEDS_LOGIN" = "true" ]; then
-    echo ""
-    echo "  ⚠ No iMessage login found. Run interactively to log in:"
-    echo "    $BINARY login -c $CONFIG"
     echo ""
 fi
 
