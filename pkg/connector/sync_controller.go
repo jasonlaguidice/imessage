@@ -202,18 +202,31 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
-	// On a fresh DB (no messages), clear any stale continuation tokens
-	// so the bootstrap does a full sync from scratch.
-	hasMessages, _ := c.cloudStore.hasAnyMessages(ctx)
-	if !hasMessages {
-		if err := c.cloudStore.clearSyncTokens(ctx); err != nil {
-			log.Warn().Err(err).Msg("Failed to clear stale sync tokens")
+	// Detect a fresh start: if the bridge has no portals for this login,
+	// the DB was reset. Clear stale cloud cache tables and sync tokens so
+	// the bootstrap does a full sync from scratch. We check bridge portals
+	// (not cloud_message) because cloud_* tables survive a bridge DB reset.
+	isFresh := false
+	if portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx); err == nil {
+		hasOwnPortal := false
+		for _, p := range portals {
+			if p.Receiver == c.UserLogin.ID {
+				hasOwnPortal = true
+				break
+			}
+		}
+		isFresh = !hasOwnPortal
+	}
+
+	if isFresh {
+		if err := c.cloudStore.clearAllData(ctx); err != nil {
+			log.Warn().Err(err).Msg("Failed to clear stale cloud data")
 		} else {
-			log.Info().Msg("Fresh database detected, cleared sync tokens for full bootstrap")
+			log.Info().Msg("Fresh database detected, cleared cloud cache and sync tokens for full bootstrap")
 		}
 	}
 
-	log.Info().Bool("incremental", hasMessages).Msg("CloudKit bootstrap sync start (historical backfill)")
+	log.Info().Bool("incremental", !isFresh).Msg("CloudKit bootstrap sync start (historical backfill)")
 
 	backfillStart := time.Now()
 	counts, err := c.runCloudKitBackfill(ctx, log)
@@ -498,11 +511,15 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		return counts, fmt.Errorf("batch chat existence check failed: %w", err)
 	}
 
+	// Collect deleted chat IDs for batch deletion from DB.
+	var deletedChatIDs []string
+
 	// Build batch of rows.
 	batch := make([]cloudChatUpsertRow, 0, len(chats))
 	for _, chat := range chats {
 		if chat.Deleted {
 			counts.Deleted++
+			deletedChatIDs = append(deletedChatIDs, chat.CloudChatId)
 			continue
 		}
 
@@ -535,9 +552,14 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		}
 	}
 
-	// Batch insert all chats in a single transaction.
+	// Batch insert all non-deleted chats.
 	if err := c.cloudStore.upsertChatBatch(ctx, batch); err != nil {
 		return counts, err
+	}
+
+	// Remove deleted chats from DB so they don't produce portals.
+	if err := c.cloudStore.deleteChatBatch(ctx, deletedChatIDs); err != nil {
+		return counts, fmt.Errorf("failed to delete chats: %w", err)
 	}
 
 	return counts, nil
@@ -602,9 +624,30 @@ func (c *IMClient) ingestCloudMessages(
 ) error {
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 
-	// Phase 1: Resolve portal IDs and build rows (no DB writes yet).
-	guids := make([]string, 0, len(messages))
+	// Separate deleted messages from live messages up front.
+	// Deleted messages are removed from the DB (they may have been stored
+	// in a previous sync before the user deleted them in iCloud).
+	var deletedGUIDs []string
+	var liveMessages []rustpushgo.WrappedCloudSyncMessage
 	for _, msg := range messages {
+		if msg.Deleted {
+			counts.Deleted++
+			if msg.Guid != "" {
+				deletedGUIDs = append(deletedGUIDs, msg.Guid)
+			}
+			continue
+		}
+		liveMessages = append(liveMessages, msg)
+	}
+
+	// Remove deleted messages from DB.
+	if err := c.cloudStore.deleteMessageBatch(ctx, deletedGUIDs); err != nil {
+		return fmt.Errorf("failed to delete messages: %w", err)
+	}
+
+	// Phase 1: Resolve portal IDs and build rows for live messages (no DB writes yet).
+	guids := make([]string, 0, len(liveMessages))
+	for _, msg := range liveMessages {
 		if msg.Guid != "" {
 			guids = append(guids, msg.Guid)
 		}
@@ -614,8 +657,8 @@ func (c *IMClient) ingestCloudMessages(
 		return fmt.Errorf("batch existence check failed: %w", err)
 	}
 
-	batch := make([]cloudMessageRow, 0, len(messages))
-	for _, msg := range messages {
+	batch := make([]cloudMessageRow, 0, len(liveMessages))
+	for _, msg := range liveMessages {
 		if msg.Guid == "" {
 			log.Warn().
 				Str("cloud_chat_id", msg.CloudChatId).
@@ -695,16 +738,13 @@ func (c *IMClient) ingestCloudMessages(
 			Text:              text,
 			Subject:           subject,
 			Service:           msg.Service,
-			Deleted:           msg.Deleted,
+			Deleted:           false,
 			TapbackType:       msg.TapbackType,
 			TapbackTargetGUID: tapbackTargetGUID,
 			TapbackEmoji:      tapbackEmoji,
 			AttachmentsJSON:   attachmentsJSON,
 		})
 
-		if msg.Deleted {
-			counts.Deleted++
-		}
 		if existingSet[msg.Guid] {
 			counts.Updated++
 		} else {
@@ -712,7 +752,7 @@ func (c *IMClient) ingestCloudMessages(
 		}
 	}
 
-	// Phase 2: Batch insert all rows in a single transaction.
+	// Phase 2: Batch insert all live rows in a single transaction.
 	if err := c.cloudStore.upsertMessageBatch(ctx, batch); err != nil {
 		return err
 	}
