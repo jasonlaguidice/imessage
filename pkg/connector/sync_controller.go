@@ -65,7 +65,7 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
-	if c.cloudContacts == nil {
+	if c.contacts == nil {
 		return
 	}
 	ctx := context.Background()
@@ -90,7 +90,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 		if localID == "" {
 			continue
 		}
-		contact, _ := c.cloudContacts.GetContactInfo(localID)
+		contact, _ := c.contacts.GetContactInfo(localID)
 		if contact == nil || !contact.HasName() {
 			continue
 		}
@@ -117,7 +117,7 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 // numbers / email addresses as the room name. This also picks up contact
 // edits on subsequent periodic syncs.
 func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
-	if c.cloudContacts == nil {
+	if c.contacts == nil {
 		return
 	}
 	ctx := context.Background()

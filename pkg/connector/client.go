@@ -64,8 +64,8 @@ type IMClient struct {
 	// iCloud token provider (auth for CardDAV, CloudKit, etc.)
 	tokenProvider **rustpushgo.WrappedTokenProvider
 
-	// Cloud contacts (iCloud CardDAV)
-	cloudContacts *cloudContactsClient
+	// Contact source for name resolution (iCloud or external CardDAV)
+	contacts contactSource
 
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
@@ -287,23 +287,40 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
-	// Set up contact source: iCloud CardDAV via TokenProvider
-	c.cloudContacts = newCloudContactsClient(c.client, log)
-	if c.cloudContacts != nil {
-		log.Info().Str("url", c.cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
-		if syncErr := c.cloudContacts.SyncContacts(log); syncErr != nil {
-			log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
+	// Set up contact source: external CardDAV if configured, else iCloud
+	if c.Main.Config.CardDAV.IsConfigured() {
+		c.contacts = newExternalCardDAVClient(c.Main.Config.CardDAV, log)
+		if c.contacts != nil {
+			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
+			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
+			} else {
+				c.setContactsReady(log)
+			}
+			go c.periodicCloudContactSync(log)
 		} else {
-			c.setContactsReady(log)
-			c.persistMmeDelegate(log)
+			log.Warn().Msg("External CardDAV configured but failed to initialize")
 		}
-		go c.periodicCloudContactSync(log)
 	} else {
-		// No cloud contacts available — retry periodically.
-		// The MobileMe delegate may have been expired on startup;
-		// periodic retries will pick up a fresh delegate once available.
-		log.Warn().Msg("Cloud contacts unavailable on startup, will retry periodically")
-		go c.retryCloudContacts(log)
+		c.contacts = newCloudContactsClient(c.client, log)
+		if c.contacts != nil {
+			if cc, ok := c.contacts.(*cloudContactsClient); ok {
+				log.Info().Str("url", cc.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
+			}
+			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+				log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
+			} else {
+				c.setContactsReady(log)
+				c.persistMmeDelegate(log)
+			}
+			go c.periodicCloudContactSync(log)
+		} else {
+			// No cloud contacts available — retry periodically.
+			// The MobileMe delegate may have been expired on startup;
+			// periodic retries will pick up a fresh delegate once available.
+			log.Warn().Msg("Cloud contacts unavailable on startup, will retry periodically")
+			go c.retryCloudContacts(log)
+		}
 	}
 
 	if cloudStoreReady {
@@ -1412,8 +1429,8 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 	// Try contact info from cloud contacts (iCloud CardDAV)
 	localID := stripIdentifierPrefix(identifier)
 	var contact *imessage.Contact
-	if c.cloudContacts != nil {
-		contact, _ = c.cloudContacts.GetContactInfo(localID)
+	if c.contacts != nil {
+		contact, _ = c.contacts.GetContactInfo(localID)
 	}
 
 	if contact != nil && contact.HasName() {
@@ -2005,7 +2022,7 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	for {
 		select {
 		case <-ticker.C:
-			if err := c.cloudContacts.SyncContacts(log); err != nil {
+			if err := c.contacts.SyncContacts(log); err != nil {
 				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
 			} else {
 				c.setContactsReady(log)
@@ -2054,9 +2071,9 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 		select {
 		case <-ticker.C:
 			log.Info().Msg("Retrying cloud contacts initialization...")
-			c.cloudContacts = newCloudContactsClient(c.client, log)
-			if c.cloudContacts != nil {
-				if syncErr := c.cloudContacts.SyncContacts(log); syncErr != nil {
+			c.contacts = newCloudContactsClient(c.client, log)
+			if c.contacts != nil {
+				if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 					log.Warn().Err(syncErr).Msg("Cloud contacts retry: sync failed")
 				} else {
 					c.setContactsReady(log)
@@ -2831,8 +2848,8 @@ func (c *IMClient) buildGroupName(members []string) string {
 		lookupID := stripIdentifierPrefix(memberID)
 		name := ""
 		var contact *imessage.Contact
-		if c.cloudContacts != nil {
-			contact, _ = c.cloudContacts.GetContactInfo(lookupID)
+		if c.contacts != nil {
+			contact, _ = c.contacts.GetContactInfo(lookupID)
 		}
 
 		if contact != nil && contact.HasName() {

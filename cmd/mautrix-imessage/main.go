@@ -61,6 +61,10 @@ func main() {
 				fmt.Fprintln(os.Stderr, "[-] No valid backup session state — login required")
 				os.Exit(1)
 			}
+		case "carddav-setup":
+			// Discover CardDAV URL + encrypt password for install scripts.
+			runCardDAVSetup()
+			return
 		}
 	}
 
