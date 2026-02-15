@@ -37,6 +37,18 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 	c.Deleted += other.Deleted
 }
 
+func (c *IMClient) setCloudSyncDone() {
+	c.cloudSyncDoneLock.Lock()
+	c.cloudSyncDone = true
+	c.cloudSyncDoneLock.Unlock()
+}
+
+func (c *IMClient) isCloudSyncDone() bool {
+	c.cloudSyncDoneLock.RLock()
+	defer c.cloudSyncDoneLock.RUnlock()
+	return c.cloudSyncDone
+}
+
 func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	firstTime := false
 	c.contactsReadyLock.Lock()
@@ -168,6 +180,11 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 	log.Info().Int("updated", updated).Int("total_groups", total).Msg("Refreshed group portal names from contacts")
 }
 
+// contactsWaitTimeout is how long CloudKit sync waits for the contacts
+// readiness gate before proceeding without contacts. Contacts are nice-to-have
+// for name resolution but shouldn't block backfill indefinitely.
+const contactsWaitTimeout = 30 * time.Second
+
 func (c *IMClient) waitForContactsReady(log zerolog.Logger) bool {
 	c.contactsReadyLock.RLock()
 	alreadyReady := c.contactsReady
@@ -177,10 +194,13 @@ func (c *IMClient) waitForContactsReady(log zerolog.Logger) bool {
 		return true
 	}
 
-	log.Info().Msg("Waiting for contacts readiness gate before CloudKit sync")
+	log.Info().Dur("timeout", contactsWaitTimeout).Msg("Waiting for contacts readiness gate before CloudKit sync")
 	select {
 	case <-readyCh:
 		log.Info().Msg("Contacts readiness gate opened")
+		return true
+	case <-time.After(contactsWaitTimeout):
+		log.Warn().Msg("Contacts readiness timed out — proceeding with CloudKit sync without contacts")
 		return true
 	case <-c.stopChan:
 		return false
@@ -188,66 +208,121 @@ func (c *IMClient) waitForContactsReady(log zerolog.Logger) bool {
 }
 
 func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
-	if c.cloudStore == nil || c.client == nil {
+	if c.cloudStore == nil {
+		log.Warn().Msg("CloudKit sync controller not started: cloud store is nil")
 		return
 	}
+	if c.client == nil {
+		log.Warn().Msg("CloudKit sync controller not started: client is nil")
+		return
+	}
+	log.Info().Msg("Starting CloudKit sync controller goroutine")
 	go c.runCloudSyncController(log.With().Str("component", "cloud_sync").Logger())
 }
+
+// cloudSyncRetryInterval is the interval used when a bootstrap sync attempt
+// fails, so recovery happens quickly.
+const cloudSyncRetryInterval = 1 * time.Minute
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	ctx := context.Background()
 	controllerStart := time.Now()
 	if !c.waitForContactsReady(log) {
+		c.setCloudSyncDone() // unblock APNs portal creation
 		return
 	}
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
-	// Detect a fresh start: if the bridge has no portals for this login,
-	// the DB was reset. Clear stale cloud cache tables and sync tokens so
-	// the bootstrap does a full sync from scratch. We check bridge portals
-	// (not cloud_message) because cloud_* tables survive a bridge DB reset.
-	isFresh := false
-	if portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx); err == nil {
-		hasOwnPortal := false
-		for _, p := range portals {
-			if p.Receiver == c.UserLogin.ID {
-				hasOwnPortal = true
-				break
+	// Bootstrap: download CloudKit data with retries until successful.
+	for {
+		err := c.runCloudSyncOnce(ctx, log, true)
+		if err != nil {
+			c.setCloudSyncDone() // unblock APNs even on failure
+			log.Error().Err(err).
+				Dur("retry_in", cloudSyncRetryInterval).
+				Msg("CloudKit sync failed, will retry")
+			select {
+			case <-time.After(cloudSyncRetryInterval):
+				continue
+			case <-c.stopChan:
+				return
 			}
 		}
-		isFresh = !hasOwnPortal
+		break
 	}
 
-	if isFresh {
-		if err := c.cloudStore.clearAllData(ctx); err != nil {
-			log.Warn().Err(err).Msg("Failed to clear stale cloud data")
-		} else {
-			log.Info().Msg("Fresh database detected, cleared cloud cache and sync tokens for full bootstrap")
+	// Create portals and queue forward backfill for all of them.
+	portalStart := time.Now()
+	c.createPortalsFromCloudSync(ctx, log)
+	c.setCloudSyncDone()
+
+	log.Info().
+		Dur("portal_creation_elapsed", time.Since(portalStart)).
+		Dur("total_elapsed", time.Since(controllerStart)).
+		Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+}
+
+// runCloudSyncOnce performs a single CloudKit sync pass. On the first run
+// (isBootstrap=true) it detects fresh vs. interrupted state and clears stale
+// data if needed. On subsequent runs it's purely incremental — the saved
+// continuation tokens mean CloudKit only returns changes since last sync.
+func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
+	if isBootstrap {
+		// Detect a fresh start: if the bridge has no portals AND no cloud sync
+		// state for this login, the DB was never synced. Clear stale cloud cache
+		// tables and sync tokens so the bootstrap does a full sync from scratch.
+		//
+		// We check BOTH bridge portals AND cloud sync state because:
+		// - Portals only exist after createPortalsFromCloudSync completes
+		// - Sync state exists as soon as the first CloudKit page is downloaded
+		// - If we only checked portals, a restart mid-sync would look "fresh"
+		//   and wipe all progress, causing an infinite restart loop
+		isFresh := false
+		hasOwnPortal := false
+		if portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx); err == nil {
+			for _, p := range portals {
+				if p.Receiver == c.UserLogin.ID {
+					hasOwnPortal = true
+					break
+				}
+			}
 		}
-	}
+		hasSyncState := false
+		if c.cloudStore != nil {
+			if has, err := c.cloudStore.hasAnySyncState(ctx); err == nil {
+				hasSyncState = has
+			}
+		}
+		isFresh = !hasOwnPortal && !hasSyncState
 
-	log.Info().Bool("incremental", !isFresh).Msg("CloudKit bootstrap sync start (historical backfill)")
+		if isFresh {
+			if err := c.cloudStore.clearAllData(ctx); err != nil {
+				log.Warn().Err(err).Msg("Failed to clear stale cloud data")
+			} else {
+				log.Info().Msg("Fresh database detected, cleared cloud cache and sync tokens for full bootstrap")
+			}
+		} else if !hasOwnPortal && hasSyncState {
+			log.Info().Msg("Resuming interrupted CloudKit sync (sync state exists but no portals yet)")
+		}
+
+		log.Info().Bool("incremental", !isFresh).Msg("CloudKit sync start")
+	}
 
 	backfillStart := time.Now()
 	counts, err := c.runCloudKitBackfill(ctx, log)
 	if err != nil {
-		log.Error().Err(err).Dur("elapsed", time.Since(backfillStart)).Msg("CloudKit bootstrap sync failed")
-	} else {
-		log.Info().
-			Int("imported", counts.Imported).
-			Int("updated", counts.Updated).
-			Int("skipped", counts.Skipped).
-			Int("deleted", counts.Deleted).
-			Dur("elapsed", time.Since(backfillStart)).
-			Msg("CloudKit bootstrap sync complete — now creating portals (triggers forward backfill for each)")
+		return fmt.Errorf("CloudKit sync failed after %s: %w", time.Since(backfillStart).Round(time.Second), err)
 	}
 
-	portalStart := time.Now()
-	c.createPortalsFromCloudSync(ctx, log)
 	log.Info().
-		Dur("portal_creation_elapsed", time.Since(portalStart)).
-		Dur("total_elapsed", time.Since(controllerStart)).
-		Msg("CloudKit backfill pipeline complete — backward backfill will run asynchronously via framework queue; real-time messages via APNs")
+		Int("imported", counts.Imported).
+		Int("updated", counts.Updated).
+		Int("skipped", counts.Skipped).
+		Int("deleted", counts.Deleted).
+		Bool("bootstrap", isBootstrap).
+		Dur("elapsed", time.Since(backfillStart)).
+		Msg("CloudKit sync pass complete")
+	return nil
 }
 
 func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {
@@ -304,14 +379,19 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneChats, chatErr.Error())
 		return total, chatErr
 	}
-	if err := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneChats, chatToken); err != nil {
-		log.Warn().Err(err).Msg("Failed to persist chat sync token")
+	// Only persist the chat token if non-nil — a nil token from a "no changes"
+	// response would overwrite the saved watermark and force a full re-download
+	// on the next restart.
+	if chatToken != nil {
+		if err := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneChats, chatToken); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist chat sync token")
+		}
 	}
 	total.add(chatCounts)
 
 	if attErr != nil {
 		log.Warn().Err(attErr).Msg("Failed to sync CloudKit attachments (continuing without)")
-	} else {
+	} else if attToken != nil {
 		if err := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneAttachments, attToken); err != nil {
 			log.Warn().Err(err).Msg("Failed to persist attachment sync token")
 		}
@@ -324,8 +404,10 @@ func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) 
 		_ = c.cloudStore.setSyncStateError(ctx, cloudZoneMessages, err.Error())
 		return total, err
 	}
-	if err = c.cloudStore.setSyncStateSuccess(ctx, cloudZoneMessages, msgToken); err != nil {
-		log.Warn().Err(err).Msg("Failed to persist message sync token")
+	if msgToken != nil {
+		if err = c.cloudStore.setSyncStateSuccess(ctx, cloudZoneMessages, msgToken); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist message sync token")
+		}
 	}
 	total.add(msgCounts)
 
@@ -348,6 +430,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 		return attMap, nil, err
 	}
 
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
@@ -379,6 +462,14 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 
 		prev := ptrStringOr(token, "")
 		token = resp.ContinuationToken
+
+		// Persist token after each page for crash-safe resume.
+		if token != nil {
+			if saveErr := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneAttachments, token); saveErr != nil {
+				log.Warn().Err(saveErr).Int("page", page).Msg("Failed to persist attachment sync token mid-page")
+			}
+		}
+
 		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
 			break
 		}
@@ -394,24 +485,48 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 		return counts, nil, err
 	}
 
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
+	totalPages := 0
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			return counts, token, syncErr
 		}
 
+		log.Info().
+			Int("page", page).
+			Int("chats_on_page", len(resp.Chats)).
+			Int32("status", resp.Status).
+			Bool("done", resp.Done).
+			Msg("CloudKit chat sync page")
+
 		ingestCounts, ingestErr := c.ingestCloudChats(ctx, resp.Chats)
 		if ingestErr != nil {
 			return counts, token, ingestErr
 		}
 		counts.add(ingestCounts)
+		totalPages = page + 1
 
 		prev := ptrStringOr(token, "")
 		token = resp.ContinuationToken
+
+		// Persist token after each page for crash-safe resume.
+		if token != nil {
+			if saveErr := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneChats, token); saveErr != nil {
+				log.Warn().Err(saveErr).Int("page", page).Msg("Failed to persist chat sync token mid-page")
+			}
+		}
+
 		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
+			log.Info().Int("page", page).Bool("api_done", resp.Done).Bool("token_unchanged", prev == ptrStringOr(token, "")).
+				Msg("CloudKit chat sync pagination stopped")
 			break
 		}
 	}
+
+	log.Info().Int("total_pages", totalPages).Int("imported", counts.Imported).Int("updated", counts.Updated).
+		Int("skipped", counts.Skipped).Int("deleted", counts.Deleted).
+		Msg("CloudKit chat sync finished")
 
 	return counts, token, nil
 }
@@ -488,6 +603,16 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 
 		prev := ptrStringOr(token, "")
 		token = resp.ContinuationToken
+
+		// Persist the continuation token after each page so a restart
+		// mid-sync resumes from the last completed page instead of
+		// re-downloading everything from scratch.
+		if token != nil {
+			if saveErr := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneMessages, token); saveErr != nil {
+				log.Warn().Err(saveErr).Int("page", page).Msg("Failed to persist message sync token mid-page")
+			}
+		}
+
 		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
 			break
 		}
@@ -557,7 +682,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		return counts, err
 	}
 
-	// Remove deleted chats from DB so they don't produce portals.
+	// Remove deleted chats AND their orphaned messages from DB so they don't
+	// produce portals. Without message cleanup, orphaned cloud_message rows
+	// keep portals alive in listPortalIDsWithNewestTimestamp() even after the
+	// parent cloud_chat is deleted.
+	if err := c.cloudStore.deleteMessagesByChatIDs(ctx, deletedChatIDs); err != nil {
+		return counts, fmt.Errorf("failed to delete messages for deleted chats: %w", err)
+	}
 	if err := c.cloudStore.deleteChatBatch(ctx, deletedChatIDs); err != nil {
 		return counts, fmt.Errorf("failed to delete chats: %w", err)
 	}
@@ -730,6 +861,7 @@ func (c *IMClient) ingestCloudMessages(
 
 		batch = append(batch, cloudMessageRow{
 			GUID:              msg.Guid,
+			RecordName:        msg.RecordName,
 			CloudChatID:       msg.CloudChatId,
 			PortalID:          portalID,
 			TimestampMS:       timestampMS,
@@ -816,87 +948,111 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 
 	// Get portal IDs sorted by newest message timestamp (most recent first).
-	// This lets us prioritize forward backfill for active conversations.
+	// This includes both portals that have messages AND chat-only portals
+	// from cloud_chat (with 0 messages). Chat-only portals are included so
+	// conversations synced from CloudKit without any resolved messages still
+	// get bridge portals created.
 	portalInfos, err := c.cloudStore.listPortalIDsWithNewestTimestamp(ctx)
 	if err != nil {
 		log.Err(err).Msg("Failed to list cloud portal IDs with timestamps")
 		return
 	}
 
-	// Also get portals that exist in cloud_chat but have zero messages.
-	// These still need rooms but won't have any forward backfill to do.
-	allPortalIDs, err := c.cloudStore.listAllPortalIDs(ctx)
+	if len(portalInfos) == 0 {
+		return
+	}
+
+	// Load deleted portals to filter out CloudKit records that should have
+	// been deleted but weren't (background deletion interrupted by restart).
+	// Portals with genuinely new messages (timestamped after the deletion)
+	// are allowed through — the conversation was re-initiated.
+	deletedPortals, err := c.cloudStore.getDeletedPortals(ctx)
 	if err != nil {
-		log.Err(err).Msg("Failed to list all cloud chat portal IDs")
-		return
+		log.Warn().Err(err).Msg("Failed to load deleted portals, skipping filter")
+		deletedPortals = nil
 	}
-	if len(allPortalIDs) == 0 && len(portalInfos) == 0 {
-		return
-	}
-
-	// Build set of portals that have messages (already in portalInfos).
-	hasMessages := make(map[string]bool, len(portalInfos))
-	for _, p := range portalInfos {
-		hasMessages[p.PortalID] = true
-	}
-
-	// Portals with no messages — create room but skip all backfill.
-	var noMessagePortals []string
-	for _, pid := range allPortalIDs {
-		if !hasMessages[pid] {
-			noMessagePortals = append(noMessagePortals, pid)
+	if len(deletedPortals) > 0 {
+		for pid, entry := range deletedPortals {
+			log.Info().Str("portal_id", pid).Int64("deleted_ts", entry.DeletedTS).Str("conv_hash", entry.ConvHash).Msg("Loaded deleted_portal entry")
 		}
 	}
+	skippedDeleted := 0
+	if len(deletedPortals) > 0 {
+		filtered := make([]portalWithNewestMessage, 0, len(portalInfos))
+		for _, p := range portalInfos {
+			if entry, ok := deletedPortals[p.PortalID]; ok && p.NewestTS <= entry.DeletedTS {
+				skippedDeleted++
+				continue
+			}
+			// Portal has messages newer than deletion — conversation
+			// was re-initiated. Clear the deleted_portal entry and purge
+			// pre-deletion messages so they don't backfill into the new portal.
+			if entry, ok := deletedPortals[p.PortalID]; ok && p.NewestTS > 0 {
+				purged, purgeErr := c.cloudStore.deleteMessagesBeforeTimestamp(ctx, p.PortalID, entry.DeletedTS)
+				if purgeErr != nil {
+					log.Warn().Err(purgeErr).Str("portal_id", p.PortalID).Msg("Failed to purge pre-deletion messages")
+				}
+				// Purge all remaining cloud_message records for this portal
+				// so old UUIDs don't block future genuinely new messages.
+				if purgeErr2 := c.cloudStore.purgeCloudMessagesByPortalID(ctx, p.PortalID); purgeErr2 != nil {
+					log.Warn().Err(purgeErr2).Str("portal_id", p.PortalID).Msg("Failed to purge cloud_message records")
+				}
+				_ = c.cloudStore.clearDeletedPortal(ctx, p.PortalID)
+				log.Info().
+					Str("portal_id", p.PortalID).
+					Int64("newest_ts", p.NewestTS).
+					Int64("deleted_ts", entry.DeletedTS).
+					Int64("purged_messages", purged).
+					Msg("Cleared deleted portal flag: newer messages detected, purged old messages")
+			}
+			filtered = append(filtered, p)
+		}
+		portalInfos = filtered
+	}
+	if skippedDeleted > 0 {
+		log.Info().Int("skipped_deleted", skippedDeleted).Msg("Filtered deleted portals from cloud sync")
+	}
+	if len(portalInfos) == 0 {
+		return
+	}
 
-	// Split portals with messages into priority (recent) vs deferred (old).
-	// Priority portals get immediate forward backfill (megolm session created
-	// inline). Deferred portals skip forward backfill — the backward backfill
-	// queue fills them gradually, spreading megolm cost over time.
-	const priorityCutoffDays = 14
-	cutoffTS := time.Now().Add(-priorityCutoffDays * 24 * time.Hour).UnixMilli()
-
-	var priorityPortals []string   // recent activity → forward backfill
-	var deferredPortals []string   // old activity → backward backfill only
-
+	// Count how many portals have messages vs chat-only (diagnostic).
+	chatOnlyPortals := 0
 	for _, p := range portalInfos {
-		if p.NewestTS >= cutoffTS {
-			priorityPortals = append(priorityPortals, p.PortalID)
-		} else {
-			deferredPortals = append(deferredPortals, p.PortalID)
+		if p.MessageCount == 0 {
+			chatOnlyPortals++
 		}
 	}
+	log.Info().
+		Int("total_portals", len(portalInfos)).
+		Int("with_messages", len(portalInfos)-chatOnlyPortals).
+		Int("chat_only", chatOnlyPortals).
+		Int("skipped_deleted", skippedDeleted).
+		Msg("Portal candidates from cloud sync (messages + chat-only)")
 
-	// Register the skip-set so FetchMessages returns 0 messages for
-	// deferred + no-message portals during forward backfill.
-	skipSet := make(map[string]bool, len(deferredPortals)+len(noMessagePortals))
-	for _, pid := range deferredPortals {
-		skipSet[pid] = true
+	// Skip portals already queued this session with the same newest timestamp.
+	// If CloudKit has newer messages, the timestamp changes and we re-queue.
+	if c.queuedPortals == nil {
+		c.queuedPortals = make(map[string]int64)
 	}
-	for _, pid := range noMessagePortals {
-		skipSet[pid] = true
+	ordered := make([]string, 0, len(portalInfos))
+	newestTSByPortal := make(map[string]int64, len(portalInfos))
+	alreadyQueued := 0
+	for _, p := range portalInfos {
+		newestTSByPortal[p.PortalID] = p.NewestTS
+		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= p.NewestTS {
+			alreadyQueued++
+			continue
+		}
+		ordered = append(ordered, p.PortalID)
 	}
-	c.initialSyncSkipMu.Lock()
-	c.initialSyncSkipForwardBackfill = skipSet
-	c.initialSyncSkipMu.Unlock()
 
-	totalPortals := len(priorityPortals) + len(deferredPortals) + len(noMessagePortals)
 	portalStart := time.Now()
 	log.Info().
-		Int("total", totalPortals).
-		Int("priority", len(priorityPortals)).
-		Int("deferred", len(deferredPortals)).
-		Int("no_messages", len(noMessagePortals)).
-		Int("cutoff_days", priorityCutoffDays).
-		Msg("Creating portals from cloud sync — priority portals get forward backfill first, deferred portals use backward backfill queue")
-
-	// Queue events: priority portals first (most recent activity first within
-	// that group), then deferred, then no-message portals.
-	// portalInfos is already sorted by newest_ts DESC, so priorityPortals
-	// and deferredPortals preserve that order.
-	ordered := make([]string, 0, totalPortals)
-	ordered = append(ordered, priorityPortals...)
-	ordered = append(ordered, deferredPortals...)
-	ordered = append(ordered, noMessagePortals...)
+		Int("total_candidates", len(portalInfos)).
+		Int("already_queued", alreadyQueued).
+		Int("to_process", len(ordered)).
+		Msg("Creating portals from cloud sync")
 
 	created := 0
 	for i, portalID := range ordered {
@@ -905,8 +1061,18 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			Receiver: c.UserLogin.ID,
 		}
 
-		isPriority := i < len(priorityPortals)
-		res := c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
+		newestTS := newestTSByPortal[portalID]
+		var latestMessageTS time.Time
+		if newestTS > 0 {
+			latestMessageTS = time.UnixMilli(newestTS)
+		}
+		log.Debug().
+			Str("portal_id", portalID).
+			Int("index", i).
+			Int("total", len(ordered)).
+			Int64("newest_ts", newestTS).
+			Msg("Queuing ChatResync for portal")
+		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
 			EventMeta: simplevent.EventMeta{
 				Type:         bridgev2.RemoteEventChatResync,
 				PortalKey:    portalKey,
@@ -914,37 +1080,31 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 				LogContext: func(lc zerolog.Context) zerolog.Context {
 					return lc.
 						Str("portal_id", portalID).
-						Str("source", "cloud_sync").
-						Bool("priority", isPriority)
+						Str("source", "cloud_sync")
 				},
 			},
 			GetChatInfoFunc: c.GetChatInfo,
+			LatestMessageTS: latestMessageTS,
 		})
-		if res.Success {
-			created++
-		}
-		// Progress log at phase transitions and every 100 portals.
-		if i+1 == len(priorityPortals) {
-			log.Info().
-				Int("priority_queued", len(priorityPortals)).
-				Dur("elapsed", time.Since(portalStart)).
-				Msg("All priority portals queued — now queuing deferred portals")
-		} else if (i+1)%100 == 0 {
+		c.queuedPortals[portalID] = newestTS
+		created++
+		if (i+1)%25 == 0 {
 			log.Info().
 				Int("progress", i+1).
-				Int("total", totalPortals).
-				Int("created_so_far", created).
+				Int("total", len(ordered)).
 				Dur("elapsed", time.Since(portalStart)).
-				Msg("Portal creation progress")
+				Msg("Portal queuing progress")
+		}
+		// Stagger portal processing to avoid overwhelming Matrix server
+		// with concurrent ghost updates and room state changes.
+		if (i+1)%5 == 0 {
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 
 	log.Info().
-		Int("created", created).
-		Int("total", totalPortals).
-		Int("priority_forward_backfill", len(priorityPortals)).
-		Int("deferred_backward_only", len(deferredPortals)).
-		Int("no_messages_skipped", len(noMessagePortals)).
+		Int("queued", created).
+		Int("total", len(ordered)).
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
 }

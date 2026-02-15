@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use backon::{ConstantBuilder, Retryable};
+use backon::{ConstantBuilder, ExponentialBuilder, Retryable};
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::request_operation::header::IsolationLevel;
 use cloudkit_proto::retrieve_changes_response::RecordChange;
@@ -640,20 +640,27 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     async fn delete_records(&self, zone: &str, records: &[String]) -> Result<(), PushError> {
+        log::info!("CloudKit delete: zone={} records={}", zone, records.len());
         let container = self.get_container().await?;
 
-        let zone = container.private_zone(zone.to_string());
+        let zone_id = container.private_zone(zone.to_string());
 
-        for batch in records.chunks(256) {
+        for (batch_idx, batch) in records.chunks(256).enumerate() {
             let mut operations = vec![];
             for record_id in batch {
-                operations.push(DeleteRecordOperation::new(record_identifier(zone.clone(), record_id)));
+                operations.push(DeleteRecordOperation::new(record_identifier(zone_id.clone(), record_id)));
             }
+            let attempt = std::sync::atomic::AtomicU32::new(0);
             (|| async {
+                let a = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if a > 1 {
+                    log::warn!("CloudKit delete retry: zone={} batch={} attempt={}", zone, batch_idx, a);
+                }
                 container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await
-            }).retry(&ConstantBuilder::default().with_delay(Duration::from_secs(5)).with_max_times(3)).await?;
+            }).retry(&ExponentialBuilder::default().with_min_delay(Duration::from_secs(2)).with_max_delay(Duration::from_secs(30)).with_max_times(5)).await?;
         }
 
+        log::info!("CloudKit delete complete: zone={} records={}", zone, records.len());
         Ok(())
     }
 
@@ -733,6 +740,43 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
     pub async fn delete_chats(&self, chats: &[String]) -> Result<(), PushError> {
         self.delete_records("chatManateeZone", chats).await
+    }
+
+    /// Sync all chat records from CloudKit, find ones matching the given
+    /// chat_identifier (e.g. "iMessage;-;user@example.com"), and delete them.
+    /// Returns the number of records deleted.
+    pub async fn find_and_delete_chats_by_identifier(&self, chat_identifier: &str) -> Result<usize, PushError> {
+        log::info!("CloudKit find-and-delete: searching for chat_identifier={}", chat_identifier);
+
+        // Full sync to get all chat records with their record_names.
+        let mut token: Option<Vec<u8>> = None;
+        let mut matching_record_names: Vec<String> = Vec::new();
+
+        loop {
+            let (next_token, chats, status) = self.sync_chats(token).await?;
+            for (record_name, chat_opt) in &chats {
+                if let Some(chat) = chat_opt {
+                    if chat.chat_identifier == chat_identifier {
+                        log::info!("CloudKit find-and-delete: found match record_name={} cid={}", record_name, chat_identifier);
+                        matching_record_names.push(record_name.clone());
+                    }
+                }
+            }
+            if status == 3 {
+                break; // done
+            }
+            token = Some(next_token);
+        }
+
+        if matching_record_names.is_empty() {
+            log::info!("CloudKit find-and-delete: no chat records found for cid={}", chat_identifier);
+            return Ok(0);
+        }
+
+        let count = matching_record_names.len();
+        self.delete_chats(&matching_record_names).await?;
+        log::info!("CloudKit find-and-delete: deleted {} chat records for cid={}", count, chat_identifier);
+        Ok(count)
     }
 
     pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {

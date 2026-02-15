@@ -12,12 +12,13 @@ use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore
 use log::{debug, error, info, warn};
 use rustpush::{
     authenticate_apple, login_apple_delegates, register, APSConnectionResource,
-    APSState, Attachment, AttachmentType, ConversationData, EditMessage, IDSNGMIdentity,
-    IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessagePart,
-    MessageParts, MessageType, NormalMessage, OSConfig, ReactMessage, ReactMessageType,
-    Reaction, UnsendMessage, IndexedMessagePart, LinkMeta,
-    LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL, TokenProvider,
-    util::{base64_decode, encode_hex},
+    APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
+    IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
+    MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
+    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, UnsendMessage,
+    IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
+    TokenProvider,
+    util::{base64_decode, encode_hex, ResourceState},
 };
 use omnisette::default_provider;
 use std::sync::RwLock;
@@ -880,6 +881,22 @@ pub struct WrappedMessage {
 
     // Group chat UUID (persistent identifier for the group conversation)
     pub sender_guid: Option<String>,
+
+    // Delete (MoveToRecycleBin / PermanentDelete)
+    pub is_move_to_recycle_bin: bool,
+    pub is_permanent_delete: bool,
+    pub delete_chat_participants: Vec<String>,
+    pub delete_chat_group_id: Option<String>,
+    pub delete_chat_guid: Option<String>,
+    pub delete_message_uuids: Vec<String>,
+
+    // Stored message detection: true if this message was queued by APNs
+    // while the client was offline and delivered on reconnect. Detected by
+    // checking if the message arrived (drain-time) within 10 seconds of an
+    // APNs reconnect (generated_signal). Drain-time is used instead of
+    // process-time so MMCS downloads and retries don't push messages past
+    // the window.
+    pub is_stored_message: bool,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1106,6 +1123,27 @@ fn convert_reaction(reaction: &Reaction, enable: bool) -> (Option<u32>, Option<S
     (tapback_type, emoji, !enable)
 }
 
+fn populate_delete_target(w: &mut WrappedMessage, target: &DeleteTarget) {
+    match target {
+        DeleteTarget::Chat(chat) => {
+            w.delete_chat_participants = chat.participants.clone();
+            w.delete_chat_group_id = if chat.group_id.is_empty() {
+                None
+            } else {
+                Some(chat.group_id.clone())
+            };
+            w.delete_chat_guid = if chat.guid.is_empty() {
+                None
+            } else {
+                Some(chat.guid.clone())
+            };
+        }
+        DeleteTarget::Messages(uuids) => {
+            w.delete_message_uuids = uuids.clone();
+        }
+    }
+}
+
 fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
     let conv = msg.conversation.as_ref();
 
@@ -1148,6 +1186,13 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         is_peer_cache_invalidate: false,
         send_delivered: msg.send_delivered,
         sender_guid: conv.and_then(|c| c.sender_guid.clone()),
+        is_move_to_recycle_bin: false,
+        is_permanent_delete: false,
+        delete_chat_participants: vec![],
+        delete_chat_group_id: None,
+        delete_chat_guid: None,
+        delete_message_uuids: vec![],
+        is_stored_message: false, // set by caller based on connection state
     };
 
     match &msg.message {
@@ -1282,6 +1327,14 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         }
         Message::PeerCacheInvalidate => {
             w.is_peer_cache_invalidate = true;
+        }
+        Message::MoveToRecycleBin(del) => {
+            w.is_move_to_recycle_bin = true;
+            populate_delete_target(&mut w, &del.target);
+        }
+        Message::PermanentDelete(del) => {
+            w.is_permanent_delete = true;
+            populate_delete_target(&mut w, &del.target);
         }
         _ => {}
     }
@@ -1928,44 +1981,100 @@ pub async fn new_client(
     let client_for_recv = client.clone();
     let callback = Arc::new(message_callback);
 
+    // Shared reconnect timestamp: set when APNs reconnects (generated_signal
+    // fires) or when the drain task starts listening (initial connection).
+    // Messages arriving within RECONNECT_WINDOW_MS of a (re)connect are
+    // marked as stored — they were cached by Apple's servers while offline.
+    const RECONNECT_WINDOW_MS: u64 = 30_000; // 30 seconds
+    // Initialize to 0 — the drain task sets it to now() right before
+    // entering the receive loop. This ensures the window starts when we're
+    // actually listening for messages, not when receive() is called (which
+    // can be 20-30s earlier during Go startup).
+    let reconnected_at = Arc::new(AtomicU64::new(0));
+
     let receive_handle = tokio::spawn({
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
+        let reconnected_at = reconnected_at.clone();
         async move {
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<rustpush::APSMessage>();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
 
-            // --- Drain task: broadcast → mpsc ---------------------------
+            // --- Drain task: broadcast → mpsc + reconnect detection ------
+            // Combines message draining AND reconnect detection in a SINGLE
+            // task using select!. This eliminates the scheduling race from
+            // the old two-task approach: resource_state changes are handled
+            // in the same task that receives messages, so reconnected_at is
+            // always updated before the next message is forwarded.
             let drain_pending = pending.clone();
             let drain_handle = tokio::spawn({
                 let conn = conn.clone();
+                let reconnected_at = reconnected_at.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
+                    let mut state = conn.resource_state.subscribe();
+                    // Mark the initial resource_state value as seen so we
+                    // only trigger on future transitions.
+                    state.borrow_and_update();
+                    // Set reconnected_at NOW — right when we start listening.
+                    // Covers stored messages delivered on first connect.
+                    let start_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    reconnected_at.store(start_ms, Ordering::Relaxed);
+                    info!("Drain task started, marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
                     loop {
-                        match recv.recv().await {
-                            Ok(msg) => {
-                                drain_pending.fetch_add(1, Ordering::Relaxed);
-                                if tx.send(msg).is_err() {
-                                    info!("Process task gone, stopping drain");
+                        tokio::select! {
+                            biased;
+                            // Reconnect detection: resource_state → Generating
+                            // fires BEFORE generate() establishes the new
+                            // connection, so reconnected_at is set before any
+                            // stored messages can arrive on messages_cont.
+                            result = state.changed() => {
+                                if result.is_err() {
+                                    info!("Resource state sender dropped, stopping drain task");
                                     break;
                                 }
+                                let current = state.borrow_and_update().clone();
+                                if matches!(current, ResourceState::Generating) {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64;
+                                    reconnected_at.store(now, Ordering::Relaxed);
+                                    info!("APNs reconnecting (Generating), marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
+                                }
                             }
-                            Err(broadcast::error::RecvError::Lagged(n)) => {
-                                error!(
-                                    "APS broadcast receiver lagged — {} messages were DROPPED by the \
-                                     broadcast channel before we could read them. Real-time messages \
-                                     may have been lost. Consider increasing broadcast capacity or \
-                                     investigating processing backlog (pending={}).",
-                                    n,
-                                    drain_pending.load(Ordering::Relaxed),
-                                );
-                                // Continue processing — we can't recover the
-                                // dropped broadcast messages, but we must keep
-                                // draining so we don't lose more.
-                            }
-                            Err(broadcast::error::RecvError::Closed) => {
-                                info!("Broadcast channel closed, stopping drain task");
-                                break;
+                            // Message drain: forward APNs messages to process task
+                            result = recv.recv() => {
+                                match result {
+                                    Ok(msg) => {
+                                        drain_pending.fetch_add(1, Ordering::Relaxed);
+                                        let drain_ts = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64;
+                                        if tx.send((msg, drain_ts)).is_err() {
+                                            info!("Process task gone, stopping drain");
+                                            break;
+                                        }
+                                    }
+                                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        error!(
+                                            "APS broadcast receiver lagged — {} messages were DROPPED by the \
+                                             broadcast channel before we could read them. Real-time messages \
+                                             may have been lost. Consider increasing broadcast capacity or \
+                                             investigating processing backlog (pending={}).",
+                                            n,
+                                            drain_pending.load(Ordering::Relaxed),
+                                        );
+                                    }
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        info!("Broadcast channel closed, stopping drain task");
+                                        break;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1976,7 +2085,7 @@ pub async fn new_client(
             const MAX_RETRIES: u32 = 5;
             const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
-            while let Some(msg) = rx.recv().await {
+            while let Some((msg, drain_ts)) = rx.recv().await {
                 let mut retries = 0u32;
                 let mut backoff = INITIAL_BACKOFF;
 
@@ -1985,6 +2094,20 @@ pub async fn new_client(
                         Ok(Some(msg_inst)) => {
                             if msg_inst.has_payload() || matches!(msg_inst.message, Message::Typing(_, _) | Message::Read | Message::Delivered | Message::Error(_) | Message::PeerCacheInvalidate) {
                                 let mut wrapped = message_inst_to_wrapped(&msg_inst);
+
+                                // Mark as stored if within the post-reconnect window.
+                                // Uses the drain timestamp (when the message was received
+                                // from APNs) instead of now, so MMCS download time and
+                                // retry backoff don't push messages past the window.
+                                let reconn = reconnected_at.load(Ordering::Relaxed);
+                                if reconn > 0 {
+                                    let delta = drain_ts.saturating_sub(reconn);
+                                    wrapped.is_stored_message = delta < RECONNECT_WINDOW_MS;
+                                    if wrapped.is_stored_message {
+                                        info!("Stored message detected: uuid={} delta={}ms (window={}ms)", wrapped.uuid, delta, RECONNECT_WINDOW_MS);
+                                    }
+                                }
+
                                 // Download MMCS attachments so Go receives inline data
                                 download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
                                 callback.on_message(wrapped);
@@ -2146,6 +2269,14 @@ impl Client {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
+    /// Reset the cached CloudKit client so the next CloudKit operation
+    /// re-initializes it with fresh auth tokens.  Call this after a sync
+    /// failure (e.g. TokenMissing) before retrying.
+    pub async fn reset_cloud_client(&self) {
+        *self.cloud_messages_client.lock().await = None;
+        *self.cloud_keychain_client.lock().await = None;
+    }
+
     pub async fn get_handles(&self) -> Vec<String> {
         self.client.identity.get_handles().await
     }
@@ -2416,6 +2547,77 @@ impl Client {
         self.client.send(&mut msg).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send unsend: {}", e) })?;
         Ok(msg.id.clone())
+    }
+
+    /// Send a MoveToRecycleBin message to notify other Apple devices that a chat was deleted.
+    pub async fn send_move_to_recycle_bin(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+        chat_guid: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        // Strip mailto:/tel: prefixes and exclude the sender's own handle.
+        // Apple's OperatedChat.ptcpts contains only the OTHER party's handles,
+        // not the user's own handle. Including it causes the Mac to not
+        // recognise the chat being deleted.
+        let bare_handle = handle.replace("mailto:", "").replace("tel:", "");
+        let bare_participants: Vec<String> = conv.participants.iter()
+            .map(|p| p.replace("mailto:", "").replace("tel:", ""))
+            .filter(|p| p != &bare_handle)
+            .collect();
+        let operated_chat = OperatedChat {
+            participants: bare_participants,
+            group_id: conv.sender_guid.clone().unwrap_or_default(),
+            guid: chat_guid,
+            delete_incoming_messages: None,
+            was_reported_as_junk: None,
+        };
+        let delete_msg = MoveToRecycleBinMessage {
+            target: DeleteTarget::Chat(operated_chat.clone()),
+            recoverable_delete_date: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        let mut msg = MessageInst::new(conv.clone(), &handle, Message::MoveToRecycleBin(delete_msg));
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send MoveToRecycleBin: {}", e) })?;
+
+        // Follow up with PermanentDelete to actually remove from CloudKit.
+        // MoveToRecycleBin only moves to "Recently Deleted" (30-day retention).
+        // Without PermanentDelete, records stay in CloudKit and get re-downloaded
+        // on every sync, resurrecting the portal.
+        let perm_msg = PermanentDeleteMessage {
+            target: DeleteTarget::Chat(operated_chat),
+            is_scheduled: false,
+        };
+        let mut perm = MessageInst::new(conv, &handle, Message::PermanentDelete(perm_msg));
+        self.client.send(&mut perm).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send PermanentDelete: {}", e) })?;
+        Ok(())
+    }
+
+    /// Delete chat records from CloudKit so they don't reappear during future syncs.
+    pub async fn delete_cloud_chats(
+        &self,
+        chat_ids: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        cloud_messages.delete_chats(&chat_ids).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit chats: {}", e) })?;
+        Ok(())
+    }
+
+    /// Delete message records from CloudKit so they don't reappear during future syncs.
+    pub async fn delete_cloud_messages(
+        &self,
+        message_ids: Vec<String>,
+    ) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        cloud_messages.delete_messages(&message_ids).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit messages: {}", e) })?;
+        Ok(())
     }
 
     pub async fn send_attachment(

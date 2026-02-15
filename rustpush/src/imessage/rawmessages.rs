@@ -513,7 +513,9 @@ pub struct OperatedChat {
     #[serde(rename = "groupID")]
     pub group_id: String,
     pub guid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_incoming_messages: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was_reported_as_junk: Option<bool>
 }
 
@@ -526,8 +528,10 @@ struct RawMoveToTrash {
     message: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     permanent_delete_chat_metadata_array: Vec<OperatedChat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     recoverable_delete_date: Option<Date>,
     is_permanent_delete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     is_scheduled_message: Option<bool>,
 }
 

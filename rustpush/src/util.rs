@@ -108,7 +108,9 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .default_headers(headers.clone())
-        .http1_title_case_headers();
+        .http1_title_case_headers()
+        .timeout(std::time::Duration::from_secs(30))
+        .connect_timeout(std::time::Duration::from_secs(10));
 
     for certificate in certificates.into_iter() {
         builder = builder.add_root_certificate(certificate);

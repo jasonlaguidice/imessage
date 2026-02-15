@@ -274,7 +274,8 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		smsPortals:         make(map[string]bool),
 		imGroupNames:       make(map[string]string),
 		imGroupGuids:       make(map[string]string),
-		lastGroupForMember: make(map[string]networkid.PortalKey),
+		lastGroupForMember:  make(map[string]networkid.PortalKey),
+		forwardBackfillSem: make(chan struct{}, 3),
 	}
 
 	login.Client = client
