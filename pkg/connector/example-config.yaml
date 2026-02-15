@@ -12,3 +12,17 @@ initial_sync_days: 365
 # Leave empty to use the handle chosen during login.
 # Available handles are logged on startup.
 preferred_handle: ""
+
+# External CardDAV server for contact name resolution.
+# Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
+# When configured, this is used instead of iCloud contacts.
+# Set up during install or via: ./mautrix-imessage-v2 carddav-setup
+carddav:
+    # Email address — used for auto-discovery and as default username.
+    email: ""
+    # CardDAV server URL. Leave empty to auto-discover from email.
+    url: ""
+    # Username for authentication (defaults to email if empty).
+    username: ""
+    # Encrypted app password (set by carddav-setup command).
+    password_encrypted: ""

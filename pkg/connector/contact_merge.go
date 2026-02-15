@@ -113,8 +113,8 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 		return nil
 	}
 
-	if c.cloudContacts != nil {
-		contact, _ := c.cloudContacts.GetContactInfo(localID)
+	if c.contacts != nil {
+		contact, _ := c.contacts.GetContactInfo(localID)
 		return contact
 	}
 	return nil

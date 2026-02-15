@@ -23,6 +23,13 @@ import (
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
+// contactSource is the interface for contact name resolution.
+// Both iCloud CardDAV and external CardDAV servers implement this.
+type contactSource interface {
+	SyncContacts(log zerolog.Logger) error
+	GetContactInfo(identifier string) (*imessage.Contact, error)
+}
+
 // cloudContactsClient fetches contacts from iCloud via CardDAV and caches
 // them locally for fast phone/email lookups.
 type cloudContactsClient struct {
