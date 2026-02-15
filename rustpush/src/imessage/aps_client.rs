@@ -334,8 +334,8 @@ impl IMClient {
         drop(ident_cache);
 
         // if we have multiple people, but not a single target going to not us, we cannot "send" this message.
-        // Read receipts are allowed to go only to self-devices (cross-device read sync).
-        if targets.len() > 1 && !matches!(message.message, Message::Read) && !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
+        // Read receipts and delete messages are allowed to go only to self-devices (cross-device sync).
+        if targets.len() > 1 && !matches!(message.message, Message::Read | Message::MoveToRecycleBin(_) | Message::PermanentDelete(_)) && !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
             return Err(PushError::NoValidTargets);
         }
         

@@ -1979,6 +1979,12 @@ impl MessageInst {
         if self.message.is_sms() {
             target_participants = vec![self.sender.as_ref().unwrap().clone()];
         }
+        if let Message::MoveToRecycleBin(_) | Message::PermanentDelete(_) = self.message {
+            // Delete messages are self-addressed — they sync the deletion to the
+            // user's own Apple devices, not to the other party. Only target our
+            // own handles so IDS lookup doesn't fail for contacts without Apple IDs.
+            target_participants = my_handles.to_vec();
+        }
         if let Message::Read = self.message {
             // For read receipts, include ALL of the user's own handles so that
             // devices registered under any handle (e.g. tel: vs mailto:) receive
@@ -2435,8 +2441,6 @@ impl MessageInst {
                     cv_name: conversation.cv_name.clone()
                 };
 
-                warn!("sent {:?}", plist::Value::from_reader(Cursor::new(&plist_to_bin(&raw).unwrap())));
-
                 plist_to_bin(&raw).unwrap()
             },
             Message::MoveToRecycleBin(msg) => {
@@ -2448,7 +2452,8 @@ impl MessageInst {
                     is_permanent_delete: false,
                     is_scheduled_message: None,
                 };
-                plist_to_bin(&raw).unwrap()
+                let bin = plist_to_bin(&raw).unwrap();
+                bin
             },
             Message::PermanentDelete(msg) => {
                 let raw = RawMoveToTrash {
@@ -2577,8 +2582,8 @@ impl MessageInst {
             return match loaded {
                 RawMoveToTrash { chat, message, recoverable_delete_date: Some(recoverable_delete_date), is_permanent_delete: false, .. } => {
                     let system_time: SystemTime = recoverable_delete_date.into();
-                    wrapper.to_message(None, Message::MoveToRecycleBin(MoveToRecycleBinMessage { 
-                        target: if message.len() > 0 { DeleteTarget::Messages(message) } else { DeleteTarget::Chat(chat.into_iter().next().unwrap()) }, 
+                    wrapper.to_message(None, Message::MoveToRecycleBin(MoveToRecycleBinMessage {
+                        target: if chat.len() > 0 { DeleteTarget::Chat(chat.into_iter().next().unwrap()) } else { DeleteTarget::Messages(message) },
                         recoverable_delete_date: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
                     }))
                 },

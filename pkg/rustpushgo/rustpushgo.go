@@ -1615,6 +1615,81 @@ func (_self *Client) SendUnsend(conversation WrappedConversation, targetUuid str
 		})
 }
 
+func (_self *Client) SendMoveToRecycleBin(conversation WrappedConversation, handle string, chatGuid string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_send_move_to_recycle_bin(
+				_pointer, rustBufferToC(FfiConverterTypeWrappedConversationINSTANCE.Lower(conversation)), rustBufferToC(FfiConverterStringINSTANCE.Lower(handle)), rustBufferToC(FfiConverterStringINSTANCE.Lower(chatGuid)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) DeleteCloudChats(chatIds []string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_delete_cloud_chats(
+				_pointer, rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(chatIds)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) DeleteCloudMessages(messageIds []string) error {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithError(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_delete_cloud_messages(
+				_pointer, rustBufferToC(FfiConverterSequenceStringINSTANCE.Lower(messageIds)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_void(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) {
+			// completeFunc
+			C.ffi_rustpushgo_rust_future_complete_void(unsafe.Pointer(handle), status)
+		},
+		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
+		})
+}
+
 func (_self *Client) Stop() {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -3072,6 +3147,13 @@ type WrappedMessage struct {
 	IsPeerCacheInvalidate bool
 	SendDelivered         bool
 	SenderGuid            *string
+	IsMoveToRecycleBin    bool
+	IsPermanentDelete     bool
+	DeleteChatParticipants []string
+	DeleteChatGroupId     *string
+	DeleteChatGuid        *string
+	DeleteMessageUuids    []string
+	IsStoredMessage       bool
 }
 
 func (r *WrappedMessage) Destroy() {
@@ -3113,6 +3195,13 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerBool{}.Destroy(r.IsPeerCacheInvalidate)
 	FfiDestroyerBool{}.Destroy(r.SendDelivered)
 	FfiDestroyerOptionalString{}.Destroy(r.SenderGuid)
+	FfiDestroyerBool{}.Destroy(r.IsMoveToRecycleBin)
+	FfiDestroyerBool{}.Destroy(r.IsPermanentDelete)
+	FfiDestroyerSequenceString{}.Destroy(r.DeleteChatParticipants)
+	FfiDestroyerOptionalString{}.Destroy(r.DeleteChatGroupId)
+	FfiDestroyerOptionalString{}.Destroy(r.DeleteChatGuid)
+	FfiDestroyerSequenceString{}.Destroy(r.DeleteMessageUuids)
+	FfiDestroyerBool{}.Destroy(r.IsStoredMessage)
 }
 
 type FfiConverterTypeWrappedMessage struct{}
@@ -3163,6 +3252,13 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 	}
 }
 
@@ -3209,6 +3305,13 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterBoolINSTANCE.Write(writer, value.IsPeerCacheInvalidate)
 	FfiConverterBoolINSTANCE.Write(writer, value.SendDelivered)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.SenderGuid)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsMoveToRecycleBin)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsPermanentDelete)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.DeleteChatParticipants)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.DeleteChatGroupId)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.DeleteChatGuid)
+	FfiConverterSequenceStringINSTANCE.Write(writer, value.DeleteMessageUuids)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsStoredMessage)
 }
 
 type FfiDestroyerTypeWrappedMessage struct{}

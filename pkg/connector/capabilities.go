@@ -56,6 +56,7 @@ var caps = &event.RoomFeatures{
 	Reply:               event.CapLevelFullySupported,
 	Edit:                event.CapLevelFullySupported,
 	Delete:              event.CapLevelFullySupported,
+	DeleteChat:          true,
 	Reaction:            event.CapLevelFullySupported,
 	ReactionCount:       1,
 	ReadReceipts:        true,
