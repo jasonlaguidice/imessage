@@ -244,8 +244,8 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
 	// Retry any pending CloudKit deletions from previous sessions.
-	// These are deletions where the local DB was cleaned (deleted_portal recorded)
-	// but the full-scan CloudKit cleanup was interrupted by a restart.
+	// These are deletions where the local DB was cleaned but the full-scan
+	// CloudKit cleanup was interrupted by a restart.
 	// Must run BEFORE the main sync so CloudKit records are gone before we
 	// download fresh data — otherwise the sync re-imports what we're deleting.
 	c.retryPendingCloudDeletions(ctx, log)
@@ -767,6 +767,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 
 func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.WrappedCloudSyncChat) (cloudSyncCounters, error) {
 	var counts cloudSyncCounters
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 
 	// Batch existence check for all non-deleted chat IDs.
 	chatIDs := make([]string, 0, len(chats))
@@ -780,15 +781,18 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		return counts, fmt.Errorf("batch chat existence check failed: %w", err)
 	}
 
-	// Collect deleted chat IDs for batch deletion from DB.
-	var deletedChatIDs []string
+	// Collect deleted record_names for tombstone handling.
+	// Tombstones only carry the record_name (CloudChatId is set to
+	// record_name by the FFI layer since there's no data to extract
+	// the real chat identifier). We must look up by record_name.
+	var deletedRecordNames []string
 
 	// Build batch of rows.
 	batch := make([]cloudChatUpsertRow, 0, len(chats))
 	for _, chat := range chats {
 		if chat.Deleted {
 			counts.Deleted++
-			deletedChatIDs = append(deletedChatIDs, chat.CloudChatId)
+			deletedRecordNames = append(deletedRecordNames, chat.RecordName)
 			continue
 		}
 
@@ -826,15 +830,67 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 		return counts, err
 	}
 
-	// Remove deleted chats AND their orphaned messages from DB so they don't
-	// produce portals. Without message cleanup, orphaned cloud_message rows
-	// keep portals alive in listPortalIDsWithNewestTimestamp() even after the
-	// parent cloud_chat is deleted.
-	if err := c.cloudStore.deleteMessagesByChatIDs(ctx, deletedChatIDs); err != nil {
-		return counts, fmt.Errorf("failed to delete messages for deleted chats: %w", err)
-	}
-	if err := c.cloudStore.deleteChatBatch(ctx, deletedChatIDs); err != nil {
-		return counts, fmt.Errorf("failed to delete chats: %w", err)
+	// Handle tombstoned (deleted) chats. Tombstones only carry the
+	// record_name, so we look up portal_ids from the local cloud_chat
+	// table, then:
+	// 1. Delete cloud_chat + cloud_message entries from local DB
+	// 2. Queue bridge portal deletion for any existing portal
+	// 3. Mark in recentlyDeletedPortals to block APNs echo resurrection
+	//    (cloudSyncDone gate ensures tombstones are always processed
+	//    before APNs can create portals — no DB table needed)
+	if len(deletedRecordNames) > 0 {
+		// Resolve record_names → portal_ids before deleting the rows.
+		portalMap, lookupErr := c.cloudStore.lookupPortalIDsByRecordNames(ctx, deletedRecordNames)
+		if lookupErr != nil {
+			log.Warn().Err(lookupErr).Msg("Failed to look up portal IDs for tombstoned chats")
+		}
+
+		// Delete local DB entries by record_name (correct for tombstones).
+		if err := c.cloudStore.deleteChatsByRecordNames(ctx, deletedRecordNames); err != nil {
+			return counts, fmt.Errorf("failed to delete tombstoned chats by record_name: %w", err)
+		}
+
+		// Delete orphaned messages and bridge portals for resolved portal_ids.
+		for recordName, portalID := range portalMap {
+			// Purge cloud_message records for this portal.
+			if purgeErr := c.cloudStore.purgeCloudMessagesByPortalID(ctx, portalID); purgeErr != nil {
+				log.Warn().Err(purgeErr).Str("portal_id", portalID).Msg("Failed to purge messages for tombstoned chat")
+			}
+
+			// Mark as tombstoned in memory so APNs echoes arriving after
+			// cloudSyncDone are blocked. On restart, CloudKit sync re-runs
+			// and re-delivers tombstones, so no persistent table needed.
+			c.recentlyDeletedPortalsMu.Lock()
+			if c.recentlyDeletedPortals == nil {
+				c.recentlyDeletedPortals = make(map[string]time.Time)
+			}
+			c.recentlyDeletedPortals[portalID] = time.Now()
+			c.recentlyDeletedPortalsMu.Unlock()
+
+			// Queue bridge portal deletion if it exists.
+			portalKey := networkid.PortalKey{
+				ID:       networkid.PortalID(portalID),
+				Receiver: c.UserLogin.ID,
+			}
+			existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+			if existing != nil && existing.MXID != "" {
+				log.Info().
+					Str("portal_id", portalID).
+					Str("record_name", recordName).
+					Msg("CloudKit tombstone: deleting bridge portal for chat in recycle bin")
+				c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatDelete{
+					EventMeta: simplevent.EventMeta{
+						Type:      bridgev2.RemoteEventChatDelete,
+						PortalKey: portalKey,
+						Timestamp: time.Now(),
+						LogContext: func(lc zerolog.Context) zerolog.Context {
+							return lc.Str("source", "cloudkit_tombstone").Str("record_name", recordName)
+						},
+					},
+					OnlyForMe: true,
+				})
+			}
+		}
 	}
 
 	return counts, nil
@@ -1106,59 +1162,9 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		return
 	}
 
-	// Load deleted portals to filter out CloudKit records that should have
-	// been deleted but weren't (background deletion interrupted by restart).
-	// Portals with genuinely new messages (timestamped after the deletion)
-	// are allowed through — the conversation was re-initiated.
-	deletedPortals, err := c.cloudStore.getDeletedPortals(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to load deleted portals, skipping filter")
-		deletedPortals = nil
-	}
-	if len(deletedPortals) > 0 {
-		for pid, entry := range deletedPortals {
-			log.Info().Str("portal_id", pid).Int64("deleted_ts", entry.DeletedTS).Str("conv_hash", entry.ConvHash).Msg("Loaded deleted_portal entry")
-		}
-	}
-	skippedDeleted := 0
-	if len(deletedPortals) > 0 {
-		filtered := make([]portalWithNewestMessage, 0, len(portalInfos))
-		for _, p := range portalInfos {
-			if entry, ok := deletedPortals[p.PortalID]; ok && p.NewestTS <= entry.DeletedTS {
-				skippedDeleted++
-				continue
-			}
-			// Portal has messages newer than deletion — conversation
-			// was re-initiated. Clear the deleted_portal entry and purge
-			// pre-deletion messages so they don't backfill into the new portal.
-			if entry, ok := deletedPortals[p.PortalID]; ok && p.NewestTS > 0 {
-				purged, purgeErr := c.cloudStore.deleteMessagesBeforeTimestamp(ctx, p.PortalID, entry.DeletedTS)
-				if purgeErr != nil {
-					log.Warn().Err(purgeErr).Str("portal_id", p.PortalID).Msg("Failed to purge pre-deletion messages")
-				}
-				// Purge all remaining cloud_message records for this portal
-				// so old UUIDs don't block future genuinely new messages.
-				if purgeErr2 := c.cloudStore.purgeCloudMessagesByPortalID(ctx, p.PortalID); purgeErr2 != nil {
-					log.Warn().Err(purgeErr2).Str("portal_id", p.PortalID).Msg("Failed to purge cloud_message records")
-				}
-				_ = c.cloudStore.clearDeletedPortal(ctx, p.PortalID)
-				log.Info().
-					Str("portal_id", p.PortalID).
-					Int64("newest_ts", p.NewestTS).
-					Int64("deleted_ts", entry.DeletedTS).
-					Int64("purged_messages", purged).
-					Msg("Cleared deleted portal flag: newer messages detected, purged old messages")
-			}
-			filtered = append(filtered, p)
-		}
-		portalInfos = filtered
-	}
-	if skippedDeleted > 0 {
-		log.Info().Int("skipped_deleted", skippedDeleted).Msg("Filtered deleted portals from cloud sync")
-	}
-	if len(portalInfos) == 0 {
-		return
-	}
+	// Tombstoned (deleted) chats are already removed from cloud_chat/cloud_message
+	// during ingestCloudChats, so they won't appear in portalInfos. No separate
+	// deleted_portal filter needed — CloudKit tombstones are the authoritative signal.
 
 	// Count how many portals have messages vs chat-only (diagnostic).
 	chatOnlyPortals := 0
@@ -1171,7 +1177,6 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Int("total_portals", len(portalInfos)).
 		Int("with_messages", len(portalInfos)-chatOnlyPortals).
 		Int("chat_only", chatOnlyPortals).
-		Int("skipped_deleted", skippedDeleted).
 		Msg("Portal candidates from cloud sync (messages + chat-only)")
 
 	// Skip portals already queued this session with the same newest timestamp.

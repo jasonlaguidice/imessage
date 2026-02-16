@@ -303,11 +303,8 @@ func (s *cloudBackfillStore) setSyncVersion(ctx context.Context, version int) er
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
 //
-// IMPORTANT: deleted_portal and pending_cloud_deletion are intentionally
-// PRESERVED across resets. These are the safety nets that prevent resurrection
-// if CloudKit records weren't fully deleted. Without them, a fresh sync
-// re-downloads surviving CloudKit records and recreates deleted portals.
-// The only way to clear deleted_portal is a genuinely new message arriving.
+// IMPORTANT: pending_cloud_deletion is intentionally PRESERVED across resets.
+// It ensures interrupted CloudKit deletions are retried on next startup.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
 	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message"} {
 		if _, err := s.db.Exec(ctx,
@@ -495,6 +492,85 @@ func (s *cloudBackfillStore) deleteChatBatch(ctx context.Context, chatIDs []stri
 		)
 		if _, err := s.db.Exec(ctx, query, args...); err != nil {
 			return fmt.Errorf("failed to delete chat batch: %w", err)
+		}
+	}
+	return nil
+}
+
+// lookupPortalIDsByRecordNames finds portal_ids for cloud_chat records matching
+// the given CloudKit record_names. Used to resolve tombstoned (deleted) chats
+// whose only identifier is the record_name.
+func (s *cloudBackfillStore) lookupPortalIDsByRecordNames(ctx context.Context, recordNames []string) (map[string]string, error) {
+	result := make(map[string]string, len(recordNames))
+	if len(recordNames) == 0 {
+		return result, nil
+	}
+	const chunkSize = 500
+	for i := 0; i < len(recordNames); i += chunkSize {
+		end := i + chunkSize
+		if end > len(recordNames) {
+			end = len(recordNames)
+		}
+		chunk := recordNames[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.loginID)
+		for j, rn := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, rn)
+		}
+
+		query := fmt.Sprintf(
+			`SELECT record_name, portal_id FROM cloud_chat WHERE login_id=$1 AND record_name IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		rows, err := s.db.Query(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to lookup portal IDs by record names: %w", err)
+		}
+		for rows.Next() {
+			var rn, pid string
+			if err := rows.Scan(&rn, &pid); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			result[rn] = pid
+		}
+		rows.Close()
+	}
+	return result, nil
+}
+
+// deleteChatsByRecordNames removes cloud_chat entries by their CloudKit
+// record_name (not cloud_chat_id). Needed for tombstoned records where the
+// only identifier is the record_name.
+func (s *cloudBackfillStore) deleteChatsByRecordNames(ctx context.Context, recordNames []string) error {
+	if len(recordNames) == 0 {
+		return nil
+	}
+	const chunkSize = 500
+	for i := 0; i < len(recordNames); i += chunkSize {
+		end := i + chunkSize
+		if end > len(recordNames) {
+			end = len(recordNames)
+		}
+		chunk := recordNames[i:end]
+
+		placeholders := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, s.loginID)
+		for j, rn := range chunk {
+			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			args = append(args, rn)
+		}
+
+		query := fmt.Sprintf(
+			`DELETE FROM cloud_chat WHERE login_id=$1 AND record_name IN (%s)`,
+			strings.Join(placeholders, ","),
+		)
+		if _, err := s.db.Exec(ctx, query, args...); err != nil {
+			return fmt.Errorf("failed to delete chats by record name: %w", err)
 		}
 	}
 	return nil
