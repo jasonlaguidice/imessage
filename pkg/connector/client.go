@@ -50,11 +50,13 @@ import (
 // library for real-time messaging. Contact resolution uses iCloud CardDAV.
 
 // deletedPortalEntry tracks why a portal was marked as deleted.
-// Only CloudKit tombstones should block new portal creation —
-// manual deletes (Beeper/iDevice) are temporary echo protection.
+// CloudKit tombstones (isTombstone=true) block stale echoes using
+// hasMessageUUID — known UUIDs are dropped, fresh UUIDs are allowed
+// through so the user or their contact can re-start the conversation.
+// Non-tombstone deletes (Beeper/iDevice) use the same UUID check.
 type deletedPortalEntry struct {
 	deletedAt   time.Time
-	isTombstone bool // true = CloudKit tombstone (authoritative), false = manual delete
+	isTombstone bool
 }
 
 type IMClient struct {
@@ -137,23 +139,16 @@ type IMClient struct {
 	// has newer messages.
 	queuedPortals map[string]int64
 
-	// recentlyDeletedPortals tracks portal IDs that were deleted or
-	// tombstoned this session. Populated by:
+	// recentlyDeletedPortals tracks portal IDs that were deleted this
+	// session. Populated by:
+	// - pending_cloud_deletion on startup (loadPendingDeletionPortalIDs)
 	// - CloudKit tombstones (ingestCloudChats, during sync before cloudSyncDone)
 	// - APNs MoveToRecycleBin (handleChatDelete)
 	// - Beeper deletes (HandleMatrixDeleteChat)
-	// Only CloudKit tombstones (isTombstone=true) block portal creation in
-	// handleMessage — manual deletes must NOT permanently block new messages.
-	// On restart, CloudKit sync re-delivers tombstones and repopulates.
+	// All paths use hasMessageUUID for echo detection: known UUIDs are
+	// dropped, fresh UUIDs are allowed through for new conversations.
 	recentlyDeletedPortals   map[string]deletedPortalEntry
 	recentlyDeletedPortalsMu sync.RWMutex
-
-	// processedMsgUUIDs tracks message UUIDs processed this session.
-	// Used to detect APNs echoes: if a message UUID was already bridged
-	// and the portal was then deleted, the echo reuses the same UUID.
-	// Genuinely new messages have new UUIDs and pass through.
-	processedMsgUUIDs   map[string]time.Time
-	processedMsgUUIDsMu sync.RWMutex
 
 	// forwardBackfillSem limits concurrent forward backfills to avoid
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
@@ -519,48 +514,33 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		c.markPortalSMS(string(portalKey.ID))
 	}
 
-	// Suppress echoes for recently deleted portals. This covers BOTH
-	// portal-creation AND delivery to existing portals (the bridge may not
-	// have finished deleting the Matrix room yet when the echo arrives).
-	c.recentlyDeletedPortalsMu.RLock()
-	entry, isDeleted := c.recentlyDeletedPortals[string(portalKey.ID)]
-	c.recentlyDeletedPortalsMu.RUnlock()
-	if isDeleted {
-		if entry.isTombstone {
-			// CloudKit tombstone — authoritative "chat deleted in iCloud".
-			// Drop the message entirely.
-			log.Info().
-				Str("portal_id", string(portalKey.ID)).
-				Str("msg_uuid", msg.Uuid).
-				Msg("Dropped message: portal is tombstoned in CloudKit")
-			return
-		} else if c.cloudStore != nil {
-			// Non-tombstone delete (Apple/Beeper). Check if this message
-			// UUID already exists in cloud_message (trashed on Apple's side).
-			// Known UUIDs = echoes of deleted messages. Fresh UUIDs = genuinely
-			// new messages that should create a portal.
-			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+	// Only create new portals after CloudKit sync is done.
+	cloudSyncDone := c.isCloudSyncDone()
+	createPortal := cloudSyncDone
+
+	// Suppress stale echoes that would resurrect deleted portals.
+	// If this message would create a NEW portal (no existing bridge portal)
+	// but the UUID is already in cloud_message, CloudKit sync already knows
+	// about it and chose not to create a portal (tombstoned/deleted chat).
+	// Don't second-guess that decision from an APNs echo.
+	// Fresh UUIDs (genuinely new messages) pass through — the user or their
+	// contact can re-start a conversation after deletion.
+	if createPortal && c.cloudStore != nil {
+		if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+			// Only block if there's no existing bridge portal for this chat.
+			existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
+			if existing == nil || existing.MXID == "" {
 				log.Info().
 					Str("portal_id", string(portalKey.ID)).
 					Str("msg_uuid", msg.Uuid).
-					Msg("Dropped message: echo of trashed message after delete")
+					Msg("Dropped message: known UUID with no portal (stale echo of deleted chat)")
 				return
 			}
 		}
 	}
-
-	// Only create new portals after CloudKit sync is done.
-	cloudSyncDone := c.isCloudSyncDone()
-	createPortal := cloudSyncDone
-	// Track this message UUID so future echoes are detected.
-	// In-memory map covers within-session echoes; cloud_message DB covers
-	// cross-restart echoes (e.g., APNs re-delivers after bridge restart).
-	c.processedMsgUUIDsMu.Lock()
-	if c.processedMsgUUIDs == nil {
-		c.processedMsgUUIDs = make(map[string]time.Time)
-	}
-	c.processedMsgUUIDs[msg.Uuid] = time.Now()
-	c.processedMsgUUIDsMu.Unlock()
+	// Persist this message UUID so cross-restart echoes are detected.
+	// hasMessageUUID checks cloud_message regardless of the deleted flag,
+	// so soft-deleted UUIDs from prior portal deletions still match.
 	if c.cloudStore != nil {
 		_ = c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe)
 	}
@@ -911,8 +891,7 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
 	}
 	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
-		deletedAt:   time.Now(),
-		isTombstone: false,
+		deletedAt: time.Now(),
 	}
 	c.recentlyDeletedPortalsMu.Unlock()
 
@@ -991,10 +970,12 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 
 		// Persist deletion intent BEFORE background scan. If bridge restarts
 		// before the scan completes, the pending entry ensures retry on startup.
-		if chatIdentifier != "" {
-			if err := c.cloudStore.recordPendingCloudDeletion(ctx, portalID, chatIdentifier, groupID); err != nil {
-				log.Warn().Err(err).Msg("Failed to persist pending cloud deletion for incoming delete")
-			}
+		// Always record even with empty chatIdentifier — loadPendingDeletionPortalIDs
+		// uses portal_id to populate recentlyDeletedPortals, which is the primary
+		// restart-resilience mechanism. runFullCloudKitDeletion will skip the CloudKit
+		// scan if chatIdentifier is empty but still clear the pending entry.
+		if err := c.cloudStore.recordPendingCloudDeletion(ctx, portalID, chatIdentifier, groupID); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist pending cloud deletion for incoming delete")
 		}
 
 		// Background: full-scan CloudKit for records not in our local DB.
@@ -1322,6 +1303,11 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
+	// Persist UUID immediately so echo detection works even if the portal
+	// is deleted before the APNs echo arrives.
+	if c.cloudStore != nil {
+		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
+	}
 
 	// If the outbound message has a URL but no link previews from the client,
 	// edit the Matrix event to add com.beeper.linkpreviews so Beeper renders them.
@@ -1501,6 +1487,11 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
+	// Persist UUID immediately so echo detection works even if the portal
+	// is deleted before the APNs echo arrives.
+	if c.cloudStore != nil {
+		_ = c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true)
+	}
 
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
@@ -1621,8 +1612,7 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
 	}
 	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
-		deletedAt:   time.Now(),
-		isTombstone: false,
+		deletedAt: time.Now(),
 	}
 	c.recentlyDeletedPortalsMu.Unlock()
 
@@ -1711,11 +1701,11 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
-	// Delete from Apple — MoveToRecycleBin + known record deletes run inline
-	// (fast), then full CloudKit scan runs in background (slow — pages through
-	// all records). Safe to be async because pending_cloud_deletion ensures
-	// retry on restart, and recentlyDeletedPortals blocks echo resurrection.
-	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, false)
+	// Delete from Apple — MoveToRecycleBin + known record deletes + full
+	// CloudKit scan all run synchronously for Beeper-initiated deletes.
+	// We MUST finish before returning so a restart can't leave CloudKit
+	// records alive that would resurrect the portal on next sync.
+	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, true)
 
 	return nil
 }
@@ -1800,6 +1790,10 @@ func (c *IMClient) runFullCloudKitDeletion(log zerolog.Logger, portalID, chatIde
 // findAndDeleteCloudChatByIdentifier syncs all chat records from CloudKit,
 // finds ones matching the given chat_identifier (e.g. "iMessage;-;user@example.com"),
 // and deletes them. Used as a fallback when local DB doesn't have record_names.
+//
+// Note: This uses the same CloudSyncChats API starting from nil token (full scan).
+// CloudKit change tokens are client-side state — this does NOT advance the main
+// sync controller's server-side watermark or cause it to miss changes.
 func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatIdentifier string) {
 	log.Info().Str("chat_identifier", chatIdentifier).Msg("Querying CloudKit for chat records to delete")
 
@@ -1807,7 +1801,7 @@ func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatId
 	var token *string
 
 	for {
-		page, err := c.client.CloudSyncChats(token)
+		page, err := safeCloudSyncChats(c.client, token)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to sync chats from CloudKit for delete lookup")
 			return
@@ -1830,12 +1824,14 @@ func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatId
 	} else {
 		log.Info().Int("count", len(matchingRecordNames)).Str("chat_identifier", chatIdentifier).Msg("Deleted chat records found via CloudKit query")
 	}
-
 }
 
 // findAndDeleteCloudMessagesByChatIdentifier syncs all message records from CloudKit,
 // finds ones belonging to the given chat_identifier (matched via cloud_chat_id),
 // and deletes them. This prevents deleted chat portals from reappearing on fresh sync.
+//
+// Note: Same as findAndDeleteCloudChatByIdentifier — uses full scan from nil token.
+// Does not interfere with the main sync controller's change tokens.
 func (c *IMClient) findAndDeleteCloudMessagesByChatIdentifier(log zerolog.Logger, chatIdentifier string) {
 	log.Info().Str("chat_identifier", chatIdentifier).Msg("Querying CloudKit for message records to delete")
 
@@ -1843,7 +1839,7 @@ func (c *IMClient) findAndDeleteCloudMessagesByChatIdentifier(log zerolog.Logger
 	var token *string
 
 	for {
-		page, err := c.client.CloudSyncMessages(token)
+		page, err := safeCloudSyncMessages(c.client, token)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to sync messages from CloudKit for delete lookup")
 			return
@@ -2146,27 +2142,18 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
-	// Guard: if this portal is tombstoned or recently deleted, return empty.
-	// Prevents backfilling old messages into portals recreated by echoes.
+	// Guard: if this portal was recently deleted, only backfill if there are
+	// live (non-deleted) messages. Prevents backfilling old messages into
+	// portals recreated by a genuinely new message.
 	c.recentlyDeletedPortalsMu.RLock()
-	if entry, ok := c.recentlyDeletedPortals[portalID]; ok {
-		if entry.isTombstone {
-			c.recentlyDeletedPortalsMu.RUnlock()
-			log.Info().Str("portal_id", portalID).Msg("FetchMessages: portal is tombstoned, returning empty")
+	_, isDeletedPortal := c.recentlyDeletedPortals[portalID]
+	c.recentlyDeletedPortalsMu.RUnlock()
+	if isDeletedPortal && c.cloudStore != nil {
+		rows, err := c.cloudStore.listLatestMessages(context.Background(), portalID, 1)
+		if err == nil && len(rows) == 0 {
+			log.Info().Str("portal_id", portalID).Msg("FetchMessages: deleted portal with no live messages, returning empty")
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 		}
-		// Non-tombstone delete: check if cloud_message has any non-deleted rows.
-		// If all are deleted=TRUE, the portal was deleted and we shouldn't backfill.
-		c.recentlyDeletedPortalsMu.RUnlock()
-		if c.cloudStore != nil {
-			rows, err := c.cloudStore.listLatestMessages(context.Background(), portalID, 1)
-			if err == nil && len(rows) == 0 {
-				log.Info().Str("portal_id", portalID).Msg("FetchMessages: deleted portal with no live messages, returning empty")
-				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-			}
-		}
-	} else {
-		c.recentlyDeletedPortalsMu.RUnlock()
 	}
 
 	// Forward backfill: return the newest messages for this portal.
