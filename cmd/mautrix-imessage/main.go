@@ -61,6 +61,16 @@ func main() {
 				fmt.Fprintln(os.Stderr, "[-] No valid backup session state — login required")
 				os.Exit(1)
 			}
+		case "list-handles":
+			// Print available iMessage handles (phone/email) from session state.
+			handles := connector.ListHandles()
+			if len(handles) == 0 {
+				os.Exit(1)
+			}
+			for _, h := range handles {
+				fmt.Println(h)
+			}
+			return
 		case "carddav-setup":
 			// Discover CardDAV URL + encrypt password for install scripts.
 			runCardDAVSetup()
