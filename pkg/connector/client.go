@@ -1684,9 +1684,11 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
-	// Delete from Apple synchronously — MoveToRecycleBin + full CloudKit scan
-	// must complete before returning so records are gone if the bridge restarts.
-	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, true)
+	// Delete from Apple — MoveToRecycleBin + known record deletes run inline
+	// (fast), then full CloudKit scan runs in background (slow — pages through
+	// all records). Safe to be async because pending_cloud_deletion ensures
+	// retry on restart, and recentlyDeletedPortals blocks echo resurrection.
+	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, false)
 
 	return nil
 }
