@@ -243,12 +243,11 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
-	// Retry any pending CloudKit deletions from previous sessions.
-	// These are deletions where the local DB was cleaned but the full-scan
-	// CloudKit cleanup was interrupted by a restart.
-	// Must run BEFORE the main sync so CloudKit records are gone before we
-	// download fresh data — otherwise the sync re-imports what we're deleting.
-	c.retryPendingCloudDeletions(ctx, log)
+	// Load pending CloudKit deletions from previous sessions BEFORE syncing.
+	// These are portals where local DB was cleaned but CloudKit full-scan was
+	// interrupted. We skip these portals during createPortalsFromCloudSync to
+	// prevent zombie portals, then run the slow CloudKit cleanup in background.
+	pendingDeletePortals := c.loadPendingDeletionPortalIDs(ctx, log)
 
 	// Bootstrap: download CloudKit data with retries until successful.
 	for {
@@ -269,14 +268,21 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 
 	// Create portals and queue forward backfill for all of them.
+	// Skip portals with pending CloudKit deletions — their local DB was already
+	// cleaned, but the sync may have re-imported CloudKit records.
 	portalStart := time.Now()
-	c.createPortalsFromCloudSync(ctx, log)
+	c.createPortalsFromCloudSync(ctx, log, pendingDeletePortals)
 	c.setCloudSyncDone()
 
 	log.Info().
 		Dur("portal_creation_elapsed", time.Since(portalStart)).
 		Dur("total_elapsed", time.Since(controllerStart)).
 		Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+
+	// Run pending CloudKit deletions in the background AFTER cloudSyncDone is set.
+	// This is the slow full-scan that pages through all records — must not block
+	// the sync controller or APNs portal creation.
+	go c.retryPendingCloudDeletions(ctx, log)
 }
 
 // runCloudSyncOnce performs a single CloudKit sync pass. On the first run
@@ -1146,7 +1152,7 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	return string(portalKey.ID)
 }
 
-func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger) {
+func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {
 	if c.cloudStore == nil {
 		return
 	}
@@ -1191,13 +1197,23 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	ordered := make([]string, 0, len(portalInfos))
 	newestTSByPortal := make(map[string]int64, len(portalInfos))
 	alreadyQueued := 0
+	pendingDeleteSkipped := 0
 	for _, p := range portalInfos {
 		newestTSByPortal[p.PortalID] = p.NewestTS
+		// Skip portals with pending CloudKit deletions — the sync may have
+		// re-imported records for chats we're still deleting from CloudKit.
+		if pendingDeletePortals[p.PortalID] {
+			pendingDeleteSkipped++
+			continue
+		}
 		if lastTS, ok := c.queuedPortals[p.PortalID]; ok && lastTS >= p.NewestTS {
 			alreadyQueued++
 			continue
 		}
 		ordered = append(ordered, p.PortalID)
+	}
+	if pendingDeleteSkipped > 0 {
+		log.Info().Int("skipped", pendingDeleteSkipped).Msg("Skipped portals with pending CloudKit deletions")
 	}
 
 	portalStart := time.Now()
@@ -1312,10 +1328,33 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 }
 
+// loadPendingDeletionPortalIDs returns the set of portal IDs with pending
+// CloudKit deletions. Used to skip these portals during createPortalsFromCloudSync
+// so the sync doesn't resurrect portals that are being deleted.
+func (c *IMClient) loadPendingDeletionPortalIDs(ctx context.Context, log zerolog.Logger) map[string]bool {
+	if c.cloudStore == nil {
+		return nil
+	}
+	pending, err := c.cloudStore.getPendingCloudDeletions(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to load pending cloud deletions")
+		return nil
+	}
+	if len(pending) == 0 {
+		return nil
+	}
+	skip := make(map[string]bool, len(pending))
+	for _, d := range pending {
+		skip[d.PortalID] = true
+	}
+	log.Info().Int("count", len(skip)).Msg("Loaded pending deletion portal IDs (will skip during portal creation)")
+	return skip
+}
+
 // retryPendingCloudDeletions checks for any pending_cloud_deletion entries
 // (deletions where local DB was cleaned but CloudKit full-scan was interrupted)
-// and retries the CloudKit cleanup. Runs on startup before the main CloudKit
-// sync so that stale records are gone before fresh data is downloaded.
+// and retries the CloudKit cleanup. Runs in the background after cloudSyncDone
+// is set, so the slow full-scan doesn't block portal creation.
 func (c *IMClient) retryPendingCloudDeletions(ctx context.Context, log zerolog.Logger) {
 	if c.cloudStore == nil || c.client == nil {
 		return
