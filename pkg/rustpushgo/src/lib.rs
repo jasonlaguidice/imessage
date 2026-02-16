@@ -2889,6 +2889,11 @@ impl Client {
         continuation_token: Option<String>,
     ) -> Result<WrappedCloudSyncMessagesPage, WrappedError> {
         let token = decode_continuation_token(continuation_token)?;
+        info!(
+            "cloud_sync_messages: token={}, token_bytes={}",
+            if token.is_some() { "present" } else { "nil" },
+            token.as_ref().map_or(0, |t| t.len())
+        );
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
 
         const MAX_SYNC_ATTEMPTS: usize = 4;
@@ -2898,6 +2903,10 @@ impl Client {
         for attempt in 0..MAX_SYNC_ATTEMPTS {
             match cloud_messages.sync_messages(token.clone()).await {
                 Ok(result) => {
+                    info!(
+                        "cloud_sync_messages: sync_messages returned {} records, status={}",
+                        result.1.len(), result.2
+                    );
                     sync_result = Some(result);
                     break;
                 }
