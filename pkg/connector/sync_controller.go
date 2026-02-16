@@ -56,6 +56,33 @@ func (c *IMClient) isCloudSyncDone() bool {
 	return c.cloudSyncDone
 }
 
+// recentlyDeletedPortalsTTL is how long entries stay in recentlyDeletedPortals
+// before being pruned. 24 hours is generous — tombstones are re-delivered on
+// every CloudKit sync so short-lived entries are repopulated anyway.
+const recentlyDeletedPortalsTTL = 24 * time.Hour
+
+// pruneRecentlyDeletedPortals removes entries older than the TTL.
+// Called after bootstrap sync to prevent unbounded memory growth.
+func (c *IMClient) pruneRecentlyDeletedPortals(log zerolog.Logger) {
+	c.recentlyDeletedPortalsMu.Lock()
+	defer c.recentlyDeletedPortalsMu.Unlock()
+	if len(c.recentlyDeletedPortals) == 0 {
+		return
+	}
+	cutoff := time.Now().Add(-recentlyDeletedPortalsTTL)
+	pruned := 0
+	for portalID, entry := range c.recentlyDeletedPortals {
+		if entry.deletedAt.Before(cutoff) {
+			delete(c.recentlyDeletedPortals, portalID)
+			pruned++
+		}
+	}
+	if pruned > 0 {
+		log.Info().Int("pruned", pruned).Int("remaining", len(c.recentlyDeletedPortals)).
+			Msg("Pruned stale entries from recentlyDeletedPortals")
+	}
+}
+
 func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	firstTime := false
 	c.contactsReadyLock.Lock()
@@ -250,13 +277,18 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	pendingDeletePortals := c.loadPendingDeletionPortalIDs(ctx, log)
 
 	// Bootstrap: download CloudKit data with retries until successful.
+	// IMPORTANT: Do NOT set cloudSyncDone on failure. The APNs gate must
+	// stay closed until sync succeeds — otherwise APNs echoes can create
+	// portals for deleted chats because cloud_message has no UUID data
+	// and recentlyDeletedPortals has no tombstone entries.
+	// Messages for EXISTING portals are still delivered during this time
+	// (handleMessage only checks cloudSyncDone for NEW portal creation).
 	for {
 		err := c.runCloudSyncOnce(ctx, log, true)
 		if err != nil {
-			c.setCloudSyncDone() // unblock APNs even on failure
 			log.Error().Err(err).
 				Dur("retry_in", cloudSyncRetryInterval).
-				Msg("CloudKit sync failed, will retry")
+				Msg("CloudKit sync failed, will retry (APNs gate stays closed)")
 			select {
 			case <-time.After(cloudSyncRetryInterval):
 				continue
@@ -278,10 +310,8 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		skipPortals[portalID] = true
 	}
 	c.recentlyDeletedPortalsMu.RLock()
-	for portalID, entry := range c.recentlyDeletedPortals {
-		if entry.isTombstone {
-			skipPortals[portalID] = true
-		}
+	for portalID := range c.recentlyDeletedPortals {
+		skipPortals[portalID] = true
 	}
 	c.recentlyDeletedPortalsMu.RUnlock()
 	for portalID := range skipPortals {
@@ -290,8 +320,7 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		}
 	}
 	if len(skipPortals) > 0 {
-		log.Info().Int("pending", len(pendingDeletePortals)).
-			Int("tombstoned", len(skipPortals)-len(pendingDeletePortals)).
+		log.Info().Int("count", len(skipPortals)).
 			Msg("Soft-deleted re-imported records for dead portals")
 	}
 
@@ -305,6 +334,10 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		Dur("portal_creation_elapsed", time.Since(portalStart)).
 		Dur("total_elapsed", time.Since(controllerStart)).
 		Msg("CloudKit bootstrap complete — all portals queued, APNs portal creation enabled")
+
+	// Clean up stale entries in recentlyDeletedPortals to prevent unbounded
+	// memory growth over long-running sessions.
+	c.pruneRecentlyDeletedPortals(log)
 
 	// Run pending CloudKit deletions in the background AFTER cloudSyncDone is set.
 	// This is the slow full-scan that pages through all records — must not block
@@ -866,7 +899,8 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// Handle tombstoned (deleted) chats. Tombstones only carry the
 	// record_name, so we look up portal_ids from the local cloud_chat
 	// table, then:
-	// 1. Delete cloud_chat + cloud_message entries from local DB
+	// 1. Delete cloud_chat rows by record_name, soft-delete cloud_message
+	//    rows (deleted=TRUE) to preserve UUIDs for echo detection
 	// 2. Queue bridge portal deletion for any existing portal
 	// 3. Mark in recentlyDeletedPortals to block APNs echo resurrection
 	//    (cloudSyncDone gate ensures tombstones are always processed
@@ -878,22 +912,23 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			log.Warn().Err(lookupErr).Msg("Failed to look up portal IDs for tombstoned chats")
 		}
 
-		// Delete local DB entries by record_name (correct for tombstones).
+		// Delete cloud_chat entries by record_name (correct for tombstones).
 		if err := c.cloudStore.deleteChatsByRecordNames(ctx, deletedRecordNames); err != nil {
 			return counts, fmt.Errorf("failed to delete tombstoned chats by record_name: %w", err)
 		}
 
-		// Delete orphaned messages and bridge portals for resolved portal_ids.
+		// Soft-delete cloud_message rows and bridge portals for resolved portal_ids.
+		// IMPORTANT: Use soft-delete (deleted=TRUE), NOT hard-delete. Soft-deleted
+		// UUIDs are still found by hasMessageUUID, so APNs echoes arriving after
+		// cloudSyncDone are correctly detected and dropped. Hard-delete would
+		// destroy the echo detection data and allow stale echoes to resurrect portals.
 		for recordName, portalID := range portalMap {
-			// Purge cloud_message records for this portal.
-			if purgeErr := c.cloudStore.purgeCloudMessagesByPortalID(ctx, portalID); purgeErr != nil {
-				log.Warn().Err(purgeErr).Str("portal_id", portalID).Msg("Failed to purge messages for tombstoned chat")
+			if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete messages for tombstoned chat")
 			}
 
-			// Mark as tombstoned in memory so APNs echoes arriving after
-			// cloudSyncDone are blocked. isTombstone=true means this is an
-			// authoritative CloudKit signal — blocks portal creation until
-			// next restart/sync. On restart, tombstones are re-delivered.
+			// Mark as deleted in memory so createPortalsFromCloudSync skips
+			// this portal and FetchMessages returns empty.
 			c.recentlyDeletedPortalsMu.Lock()
 			if c.recentlyDeletedPortals == nil {
 				c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
@@ -1358,6 +1393,20 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 // loadPendingDeletionPortalIDs returns the set of portal IDs with pending
 // CloudKit deletions. Used to skip these portals during createPortalsFromCloudSync
 // so the sync doesn't resurrect portals that are being deleted.
+//
+// Also populates recentlyDeletedPortals (isTombstone=false) for each pending
+// deletion. This is critical: without it, the following sequence resurrects
+// deleted portals:
+//  1. User deletes chat → cloud_chat row hard-deleted, pending_cloud_deletion saved
+//  2. Bridge restarts → recentlyDeletedPortals empty (in-memory only)
+//  3. CloudKit tombstone arrives but lookupPortalIDsByRecordNames fails
+//     (cloud_chat row already gone) → no recentlyDeletedPortals entry
+//  4. retryPendingCloudDeletions clears pending entry → zero protection
+//  5. APNs echo with known UUID arrives → portal resurrected
+//
+// Using isTombstone=false (not true) so the hasMessageUUID check fires:
+// known UUIDs (stale echoes) are blocked, but fresh UUIDs (genuinely new
+// messages from either party) are allowed to create new portals.
 func (c *IMClient) loadPendingDeletionPortalIDs(ctx context.Context, log zerolog.Logger) map[string]bool {
 	if c.cloudStore == nil {
 		return nil
@@ -1371,10 +1420,18 @@ func (c *IMClient) loadPendingDeletionPortalIDs(ctx context.Context, log zerolog
 		return nil
 	}
 	skip := make(map[string]bool, len(pending))
+	c.recentlyDeletedPortalsMu.Lock()
+	if c.recentlyDeletedPortals == nil {
+		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
+	}
 	for _, d := range pending {
 		skip[d.PortalID] = true
+		c.recentlyDeletedPortals[d.PortalID] = deletedPortalEntry{
+			deletedAt: time.Now(),
+		}
 	}
-	log.Info().Int("count", len(skip)).Msg("Loaded pending deletion portal IDs (will skip during portal creation)")
+	c.recentlyDeletedPortalsMu.Unlock()
+	log.Info().Int("count", len(skip)).Msg("Loaded pending deletion portal IDs (will skip during portal creation + echo protection active)")
 	return skip
 }
 
