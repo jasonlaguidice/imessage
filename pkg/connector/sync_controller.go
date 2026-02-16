@@ -28,7 +28,7 @@ import (
 // requires a one-time full re-download from CloudKit (e.g. improved PCS
 // key handling that can now decrypt previously-skipped records).
 // Increment this to trigger a token clear on the next bootstrap.
-const cloudSyncVersion = 2
+const cloudSyncVersion = 3
 
 type cloudSyncCounters struct {
 	Imported int
