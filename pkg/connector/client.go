@@ -518,39 +518,39 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		c.markPortalSMS(string(portalKey.ID))
 	}
 
-	// Only create new portals after CloudKit sync is done. Echo detection
-	// is handled by recentlyDeletedPortals (populated from CloudKit tombstones
-	// during sync, and from APNs MoveToRecycleBin at runtime).
-	cloudSyncDone := c.isCloudSyncDone()
-	createPortal := cloudSyncDone
-	if createPortal {
-		c.recentlyDeletedPortalsMu.RLock()
-		entry, isDeleted := c.recentlyDeletedPortals[string(portalKey.ID)]
-		c.recentlyDeletedPortalsMu.RUnlock()
-		if isDeleted {
-			if entry.isTombstone {
-				// CloudKit tombstone — authoritative "chat deleted in iCloud".
-				createPortal = false
+	// Suppress echoes for recently deleted portals. This covers BOTH
+	// portal-creation AND delivery to existing portals (the bridge may not
+	// have finished deleting the Matrix room yet when the echo arrives).
+	c.recentlyDeletedPortalsMu.RLock()
+	entry, isDeleted := c.recentlyDeletedPortals[string(portalKey.ID)]
+	c.recentlyDeletedPortalsMu.RUnlock()
+	if isDeleted {
+		if entry.isTombstone {
+			// CloudKit tombstone — authoritative "chat deleted in iCloud".
+			// Drop the message entirely.
+			log.Info().
+				Str("portal_id", string(portalKey.ID)).
+				Str("msg_uuid", msg.Uuid).
+				Msg("Dropped message: portal is tombstoned in CloudKit")
+			return
+		} else if c.cloudStore != nil {
+			// Non-tombstone delete (Apple/Beeper). Check if this message
+			// UUID already exists in cloud_message (trashed on Apple's side).
+			// Known UUIDs = echoes of deleted messages. Fresh UUIDs = genuinely
+			// new messages that should create a portal.
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
 				log.Info().
 					Str("portal_id", string(portalKey.ID)).
 					Str("msg_uuid", msg.Uuid).
-					Msg("Suppressed portal creation: portal is tombstoned in CloudKit")
-			} else if c.cloudStore != nil {
-				// Non-tombstone delete (Apple/Beeper). Check if this message
-				// UUID already exists in cloud_message — if so, it's an echo
-				// of a previously-synced message, not a genuinely new one.
-				// (hasMessageUUID runs BEFORE persistMessageUUID, so new UUIDs
-				// won't be found yet.)
-				if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
-					createPortal = false
-					log.Info().
-						Str("portal_id", string(portalKey.ID)).
-						Str("msg_uuid", msg.Uuid).
-						Msg("Suppressed portal creation: echo of known message after delete")
-				}
+					Msg("Dropped message: echo of trashed message after delete")
+				return
 			}
 		}
 	}
+
+	// Only create new portals after CloudKit sync is done.
+	cloudSyncDone := c.isCloudSyncDone()
+	createPortal := cloudSyncDone
 	// Track this message UUID so future echoes are detected.
 	// In-memory map covers within-session echoes; cloud_message DB covers
 	// cross-restart echoes (e.g., APNs re-delivers after bridge restart).
