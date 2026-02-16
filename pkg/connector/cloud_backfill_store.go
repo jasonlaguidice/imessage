@@ -228,6 +228,52 @@ func (s *cloudBackfillStore) setSyncStateSuccess(ctx context.Context, zone strin
 	return err
 }
 
+// clearSyncTokens removes only the sync continuation tokens for this login,
+// forcing the next sync to re-download all records from CloudKit.
+// Preserves cloud_chat, cloud_message, deleted_portal, and the _version row.
+func (s *cloudBackfillStore) clearSyncTokens(ctx context.Context) error {
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM cloud_sync_state WHERE login_id=$1 AND zone != '_version'`,
+		s.loginID,
+	)
+	return err
+}
+
+// getSyncVersion returns the stored sync schema version (0 if never set).
+func (s *cloudBackfillStore) getSyncVersion(ctx context.Context) (int, error) {
+	var token sql.NullString
+	err := s.db.QueryRow(ctx,
+		`SELECT continuation_token FROM cloud_sync_state WHERE login_id=$1 AND zone='_version'`,
+		s.loginID,
+	).Scan(&token)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if !token.Valid {
+		return 0, nil
+	}
+	v := 0
+	fmt.Sscanf(token.String, "%d", &v)
+	return v, nil
+}
+
+// setSyncVersion stores the sync schema version.
+func (s *cloudBackfillStore) setSyncVersion(ctx context.Context, version int) error {
+	nowMS := time.Now().UnixMilli()
+	vStr := fmt.Sprintf("%d", version)
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO cloud_sync_state (login_id, zone, continuation_token, updated_ts)
+		VALUES ($1, '_version', $2, $3)
+		ON CONFLICT (login_id, zone) DO UPDATE SET
+			continuation_token=excluded.continuation_token,
+			updated_ts=excluded.updated_ts
+	`, s.loginID, vStr, nowMS)
+	return err
+}
+
 // clearAllData removes all cloud cache data for this login: sync tokens,
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
@@ -330,7 +376,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			text=excluded.text,
 			subject=excluded.subject,
 			service=excluded.service,
-			deleted=excluded.deleted,
+			deleted=CASE WHEN cloud_message.deleted THEN cloud_message.deleted ELSE excluded.deleted END,
 			tapback_type=excluded.tapback_type,
 			tapback_target_guid=excluded.tapback_target_guid,
 			tapback_emoji=excluded.tapback_emoji,
@@ -732,9 +778,11 @@ func (s *cloudBackfillStore) getCloudRecordNamesByPortalID(ctx context.Context, 
 
 // deleteLocalChatByPortalID removes cloud_chat records and marks cloud_message
 // records as deleted for a given portal_id. cloud_message records are KEPT
-// (not deleted) so their GUIDs serve as a persisted echo-detection set —
-// if Apple re-delivers these messages via APNs, we can check the UUID against
-// cloud_message to identify them as echoes. The records are purged when the
+// (not physically deleted) so their GUIDs serve as a persisted echo-detection
+// set — if Apple re-delivers these messages via APNs, we can check the UUID
+// against cloud_message to identify them as echoes. Setting deleted=TRUE
+// prevents backfill from pulling old messages into a recreated portal (backfill
+// queries filter deleted=FALSE). The records are fully purged when the
 // deleted_portal entry is cleared (genuinely new conversation detected).
 func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, portalID string) error {
 	if _, err := s.db.Exec(ctx,
@@ -742,6 +790,15 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 		s.loginID, portalID,
 	); err != nil {
 		return fmt.Errorf("failed to delete cloud_chat records for portal %s: %w", portalID, err)
+	}
+	// Mark cloud_message records as deleted so backfill won't return them.
+	// Records are kept (not physically deleted) for UUID-based echo detection
+	// (hasMessageUUID doesn't check the deleted flag).
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
+		s.loginID, portalID, time.Now().UnixMilli(),
+	); err != nil {
+		return fmt.Errorf("failed to mark cloud_message records as deleted for portal %s: %w", portalID, err)
 	}
 	return nil
 }
@@ -987,6 +1044,21 @@ func (s *cloudBackfillStore) deleteLocalChatByGroupID(ctx context.Context, group
 	return nil
 }
 
+// getOldestMessageTimestamp returns the oldest non-deleted message timestamp
+// for a portal, or 0 if no messages exist.
+func (s *cloudBackfillStore) getOldestMessageTimestamp(ctx context.Context, portalID string) (int64, error) {
+	var ts sql.NullInt64
+	err := s.db.QueryRow(ctx, `
+		SELECT MIN(timestamp_ms)
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+	`, s.loginID, portalID).Scan(&ts)
+	if err != nil || !ts.Valid {
+		return 0, err
+	}
+	return ts.Int64, nil
+}
+
 func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID string) (bool, error) {
 	var count int
 	err := s.db.QueryRow(ctx, `
@@ -1000,7 +1072,7 @@ func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID str
 	return count > 0, nil
 }
 
-const cloudMessageSelectCols = `guid, chat_id, portal_id, timestamp_ms, sender, is_from_me,
+const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestamp_ms, COALESCE(sender, ''), is_from_me,
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
 	COALESCE(attachments_json, '')`

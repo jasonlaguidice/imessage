@@ -149,6 +149,7 @@ var _ bridgev2.ReadReceiptHandlingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.TypingHandlingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.IdentifierResolvingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*IMClient)(nil)
+var _ bridgev2.BackfillingNetworkAPIWithLimits = (*IMClient)(nil)
 var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
@@ -941,40 +942,53 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 		ctx := context.Background()
 		portalID := string(portalKey.ID)
 
-		// Record this portal as deleted. The conv_hash uniquely fingerprints
-		// this deletion event (includes timestamp). Filtering uses timestamp comparison.
+		// Check if this portal was already deleted — if so, this is a
+		// duplicate APNs echo. Still update local DB (idempotent) but
+		// skip the expensive CloudKit full-table scans.
+		alreadyDeleted := false
+		if deletedPortals, err := c.cloudStore.getDeletedPortals(ctx); err == nil {
+			if _, ok := deletedPortals[portalID]; ok {
+				alreadyDeleted = true
+				log.Debug().Str("portal_id", portalID).Msg("Portal already in deleted_portal table, skipping redundant CloudKit cleanup")
+			}
+		}
+
+		// Record this portal as deleted (idempotent — updates timestamp).
 		nowMS := time.Now().UnixMilli()
 		convHash := conversationHash(portalID, msg.DeleteChatGroupId, participants, nowMS)
 		if err := c.cloudStore.recordDeletedPortal(ctx, portalID, convHash, nowMS); err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to record deleted portal")
-		} else {
-			log.Info().Str("portal_id", portalID).Str("conv_hash", convHash).Int64("deleted_ts", nowMS).Msg("Recorded portal in deleted_portal table")
 		}
 
-		chatRecordNames, _ := c.cloudStore.getCloudRecordNamesByPortalID(ctx, portalID)
-		msgRecordNames, _ := c.cloudStore.getMessageRecordNamesByPortalID(ctx, portalID)
-
-		// Fallback: look up by group_id if portal_id has no record_names.
+		// Mark local cloud_message records as deleted (idempotent).
+		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to delete local cloud records on incoming delete")
+		}
 		groupID := ""
 		if strings.HasPrefix(portalID, "gid:") {
 			groupID = strings.TrimPrefix(portalID, "gid:")
-		}
-		if len(chatRecordNames) == 0 && groupID != "" {
-			chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByGroupID(ctx, groupID)
-		}
-		if len(msgRecordNames) == 0 && groupID != "" {
-			msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByGroupID(ctx, groupID)
-		}
-
-		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to delete local cloud records on incoming delete")
-		} else {
-			log.Debug().Str("portal_id", portalID).Msg("Deleted local cloud records on incoming delete")
 		}
 		if groupID != "" {
 			if err := c.cloudStore.deleteLocalChatByGroupID(ctx, groupID); err != nil {
 				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to delete local cloud records by group_id on incoming delete")
 			}
+		}
+
+		// Skip CloudKit cleanup for duplicate delete echoes.
+		if alreadyDeleted {
+			return
+		}
+
+		log.Info().Str("portal_id", portalID).Str("conv_hash", convHash).Msg("Recorded portal in deleted_portal table")
+
+		chatRecordNames, _ := c.cloudStore.getCloudRecordNamesByPortalID(ctx, portalID)
+		msgRecordNames, _ := c.cloudStore.getMessageRecordNamesByPortalID(ctx, portalID)
+
+		if len(chatRecordNames) == 0 && groupID != "" {
+			chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByGroupID(ctx, groupID)
+		}
+		if len(msgRecordNames) == 0 && groupID != "" {
+			msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByGroupID(ctx, groupID)
 		}
 
 		// Resolve the chat identifier for CloudKit query fallback.
@@ -1006,10 +1020,6 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 
 		// Background: scan CloudKit for records not in our local DB.
 		// Slow (pages through all records) so we don't block the APNs loop.
-		// Local DB is already clean + deleted_portal recorded, so restarts
-		// are safe. We do NOT send PermanentDelete here — respect the user's
-		// "Recently Deleted" on their Apple device. The deleted_portal table
-		// prevents resurrection on the bridge side.
 		go func() {
 			if len(chatRecordNames) == 0 && chatIdentifier != "" {
 				c.findAndDeleteCloudChatByIdentifier(log, chatIdentifier)
@@ -2071,6 +2081,12 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 // ============================================================================
 // Backfill (CloudKit cache-backed)
 // ============================================================================
+
+// GetBackfillMaxBatchCount returns -1 (unlimited) so backward backfill
+// processes all available messages in cloud_message without a batch cap.
+func (c *IMClient) GetBackfillMaxBatchCount(_ context.Context, _ *bridgev2.Portal, _ *database.BackfillTask) int {
+	return -1
+}
 
 type cloudBackfillCursor struct {
 	TimestampMS int64  `json:"ts"`
