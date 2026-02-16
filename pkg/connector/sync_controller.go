@@ -858,13 +858,17 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			}
 
 			// Mark as tombstoned in memory so APNs echoes arriving after
-			// cloudSyncDone are blocked. On restart, CloudKit sync re-runs
-			// and re-delivers tombstones, so no persistent table needed.
+			// cloudSyncDone are blocked. isTombstone=true means this is an
+			// authoritative CloudKit signal — blocks portal creation until
+			// next restart/sync. On restart, tombstones are re-delivered.
 			c.recentlyDeletedPortalsMu.Lock()
 			if c.recentlyDeletedPortals == nil {
-				c.recentlyDeletedPortals = make(map[string]time.Time)
+				c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
 			}
-			c.recentlyDeletedPortals[portalID] = time.Now()
+			c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+				deletedAt:   time.Now(),
+				isTombstone: true,
+			}
 			c.recentlyDeletedPortalsMu.Unlock()
 
 			// Queue bridge portal deletion if it exists.
