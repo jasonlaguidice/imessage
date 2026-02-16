@@ -91,6 +91,11 @@ else
     sed -i "s|uri: file:mautrix-imessage.db|uri: file:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
     # Also catch sqlite:// URIs from newer bbctl versions
     sed -i "s|uri: sqlite:mautrix-imessage.db|uri: sqlite:$DATA_DIR/mautrix-imessage.db|" "$CONFIG"
+    # iMessage CloudKit chats can have tens of thousands of messages.
+    # Deliver all history in one forward batch to avoid DAG fragmentation.
+    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+    sed -i 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
+    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
     # Enable unlimited backward backfill (default is 0 which disables it)
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
     # Remove artificial delay between backfill batches (default 20s is way too slow)
@@ -98,10 +103,22 @@ else
     echo "✓ Config saved to $CONFIG"
 fi
 
-# Ensure backward backfill is enabled (default from bbctl is 0 which disables it)
+# Ensure backfill settings are sane for existing configs
+PATCHED_BACKFILL=false
 if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
-    echo "✓ Enabled backward backfill (max_batches: -1)"
+    PATCHED_BACKFILL=true
+fi
+if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+    PATCHED_BACKFILL=true
+fi
+if grep -q 'batch_size: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+    PATCHED_BACKFILL=true
+fi
+if [ "$PATCHED_BACKFILL" = true ]; then
+    echo "✓ Updated backfill settings (max_initial=50000, batch_size=10000, max_batches=-1)"
 fi
 
 if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then

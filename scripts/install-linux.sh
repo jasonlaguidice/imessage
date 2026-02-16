@@ -86,7 +86,32 @@ text = '\n'.join(lines)
 
 open('$CONFIG', 'w').write(text)
 "
+    # iMessage CloudKit chats can have tens of thousands of messages.
+    # Deliver all history in one forward batch to avoid DAG fragmentation.
+    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+    sed -i 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
+    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    sed -i 's/batch_delay: [0-9]*/batch_delay: 0/' "$CONFIG"
     echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
+fi
+
+# Ensure backfill settings are sane for existing configs
+PATCHED_BACKFILL=false
+if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+    PATCHED_BACKFILL=true
+fi
+if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+    PATCHED_BACKFILL=true
+fi
+if grep -q 'batch_size: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+    PATCHED_BACKFILL=true
+fi
+if [ "$PATCHED_BACKFILL" = true ]; then
+    echo "✓ Updated backfill settings (max_initial=50000, batch_size=10000, max_batches=-1)"
 fi
 
 # ── Generate registration ────────────────────────────────────
