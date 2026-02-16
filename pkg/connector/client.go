@@ -519,22 +519,39 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	createPortal := cloudSyncDone
 
 	// Suppress stale echoes that would resurrect deleted portals.
-	// If this message would create a NEW portal (no existing bridge portal)
-	// but the UUID is already in cloud_message, CloudKit sync already knows
-	// about it and chose not to create a portal (tombstoned/deleted chat).
-	// Don't second-guess that decision from an APNs echo.
-	// Fresh UUIDs (genuinely new messages) pass through — the user or their
-	// contact can re-start a conversation after deletion.
-	if createPortal && c.cloudStore != nil {
+	// Two cases:
+	// 1. Portal is mid-deletion (still has MXID, but in recentlyDeletedPortals):
+	//    Drop known UUIDs — they're echoes of messages we already bridged.
+	//    Fresh UUIDs pass through (genuinely new conversation).
+	// 2. Portal is fully gone (no MXID): Drop known UUIDs — CloudKit sync
+	//    knew about this message but chose not to create a portal.
+	portalID := string(portalKey.ID)
+	c.recentlyDeletedPortalsMu.RLock()
+	_, isDeletedPortal := c.recentlyDeletedPortals[portalID]
+	c.recentlyDeletedPortalsMu.RUnlock()
+
+	if c.cloudStore != nil {
 		if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
-			// Only block if there's no existing bridge portal for this chat.
-			existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
-			if existing == nil || existing.MXID == "" {
+			if isDeletedPortal {
+				// Case 1: Portal mid-deletion. The bridge portal may still
+				// have its MXID (HandleMatrixDeleteChat or handleChatDelete
+				// is still running), but the message is a stale echo.
 				log.Info().
-					Str("portal_id", string(portalKey.ID)).
+					Str("portal_id", portalID).
 					Str("msg_uuid", msg.Uuid).
-					Msg("Dropped message: known UUID with no portal (stale echo of deleted chat)")
+					Msg("Dropped message: known UUID for recently-deleted portal (mid-deletion echo)")
 				return
+			}
+			if createPortal {
+				// Case 2: Portal fully deleted. No bridge portal exists.
+				existing, _ := c.Main.Bridge.GetExistingPortalByKey(context.Background(), portalKey)
+				if existing == nil || existing.MXID == "" {
+					log.Info().
+						Str("portal_id", portalID).
+						Str("msg_uuid", msg.Uuid).
+						Msg("Dropped message: known UUID with no portal (stale echo of deleted chat)")
+					return
+				}
 			}
 		}
 	}
@@ -1701,11 +1718,14 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
-	// Delete from Apple — MoveToRecycleBin + known record deletes + full
-	// CloudKit scan all run synchronously for Beeper-initiated deletes.
-	// We MUST finish before returning so a restart can't leave CloudKit
-	// records alive that would resurrect the portal on next sync.
-	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, true)
+	// Delete from Apple — MoveToRecycleBin + known record deletes run inline
+	// (fast). Full CloudKit scan runs in background (slow — pages all records).
+	// Safe to be async because:
+	// 1. pending_cloud_deletion ensures CloudKit retry on restart
+	// 2. recentlyDeletedPortals + hasMessageUUID blocks echoes mid-deletion
+	// 3. Running synchronously would block HandleMatrixDeleteChat for 5-30s,
+	//    delaying portal cleanup and widening the mid-deletion echo window
+	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, false)
 
 	return nil
 }
