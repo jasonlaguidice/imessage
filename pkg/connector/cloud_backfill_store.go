@@ -299,11 +299,17 @@ func (s *cloudBackfillStore) setSyncVersion(ctx context.Context, version int) er
 	return err
 }
 
-// clearAllData removes all cloud cache data for this login: sync tokens,
+// clearAllData removes cloud cache data for this login: sync tokens,
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
+//
+// IMPORTANT: deleted_portal and pending_cloud_deletion are intentionally
+// PRESERVED across resets. These are the safety nets that prevent resurrection
+// if CloudKit records weren't fully deleted. Without them, a fresh sync
+// re-downloads surviving CloudKit records and recreates deleted portals.
+// The only way to clear deleted_portal is a genuinely new message arriving.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
-	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "deleted_portal"} {
+	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message"} {
 		if _, err := s.db.Exec(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE login_id=$1`, table),
 			s.loginID,

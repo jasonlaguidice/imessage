@@ -18,8 +18,10 @@ use rustpush::{
     OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, UnsendMessage,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
     TokenProvider,
+    cloudkit::{ZoneDeleteOperation, CloudKitSession},
     util::{base64_decode, encode_hex, ResourceState},
 };
+use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use omnisette::default_provider;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
@@ -2644,6 +2646,25 @@ impl Client {
         let cloud_messages = self.get_or_init_cloud_messages_client().await?;
         cloud_messages.delete_messages(&message_ids).await
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to delete CloudKit messages: {}", e) })?;
+        Ok(())
+    }
+
+    /// Purge the recoverable-delete zones from CloudKit to prevent deleted
+    /// messages from resurrecting. After MoveToRecycleBin, Apple parks records
+    /// in recoverableMessageDeleteZone; nuking that zone ensures they stay dead.
+    pub async fn purge_recoverable_zones(&self) -> Result<(), WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+        let container = cloud_messages.get_container().await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get CloudKit container: {}", e) })?;
+        container.perform_operations_checked(
+            &CloudKitSession::new(),
+            &[
+                ZoneDeleteOperation::new(container.private_zone("recoverableMessageDeleteZone".to_string())),
+                ZoneDeleteOperation::new(container.private_zone("chatBotRecoverableMessageDeleteZone".to_string())),
+            ],
+            IsolationLevel::Operation,
+        ).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to purge recoverable zones: {}", e) })?;
         Ok(())
     }
 

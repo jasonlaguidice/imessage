@@ -243,6 +243,13 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
+	// Retry any pending CloudKit deletions from previous sessions.
+	// These are deletions where the local DB was cleaned (deleted_portal recorded)
+	// but the full-scan CloudKit cleanup was interrupted by a restart.
+	// Must run BEFORE the main sync so CloudKit records are gone before we
+	// download fresh data — otherwise the sync re-imports what we're deleting.
+	c.retryPendingCloudDeletions(ctx, log)
+
 	// Bootstrap: download CloudKit data with retries until successful.
 	for {
 		err := c.runCloudSyncOnce(ctx, log, true)
@@ -1294,6 +1301,37 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			c.Main.Bridge.WakeupBackfillQueue()
 		}
 	}
+}
+
+// retryPendingCloudDeletions checks for any pending_cloud_deletion entries
+// (deletions where local DB was cleaned but CloudKit full-scan was interrupted)
+// and retries the CloudKit cleanup. Runs on startup before the main CloudKit
+// sync so that stale records are gone before fresh data is downloaded.
+func (c *IMClient) retryPendingCloudDeletions(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil || c.client == nil {
+		return
+	}
+	pending, err := c.cloudStore.getPendingCloudDeletions(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to load pending cloud deletions")
+		return
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	log.Info().Int("count", len(pending)).Msg("Retrying pending CloudKit deletions from previous session")
+	for _, d := range pending {
+		dlog := log.With().
+			Str("portal_id", d.PortalID).
+			Str("chat_identifier", d.ChatIdentifier).
+			Str("group_id", d.GroupID).
+			Int64("created_ts", d.CreatedTS).
+			Logger()
+		dlog.Info().Msg("Retrying pending CloudKit deletion")
+		c.runFullCloudKitDeletion(dlog, d.PortalID, d.ChatIdentifier, nil)
+	}
+	log.Info().Int("count", len(pending)).Msg("Finished retrying pending CloudKit deletions")
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {

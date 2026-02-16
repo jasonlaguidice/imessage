@@ -1826,6 +1826,17 @@ func (c *IMClient) runFullCloudKitDeletion(log zerolog.Logger, portalID, chatIde
 	// Always scan messages — there may be more in CloudKit than in local DB.
 	c.findAndDeleteCloudMessagesByChatIdentifier(log, chatIdentifier)
 
+	// Nuke the recoverable-delete zones. After MoveToRecycleBin, Apple parks
+	// records in recoverableMessageDeleteZone (a 30-day "Recently Deleted"
+	// staging area). If we don't purge it, a fresh sync on restart will see
+	// those records promoted back to the main zones → portal resurrection.
+	// This is safe because the bridge is the only iDevice on the account.
+	if err := c.client.PurgeRecoverableZones(); err != nil {
+		log.Warn().Err(err).Msg("Failed to purge recoverable zones from CloudKit")
+	} else {
+		log.Info().Msg("Purged recoverable-delete zones from CloudKit")
+	}
+
 	// Deletion complete — clear the pending entry so it's not retried.
 	if c.cloudStore != nil {
 		if err := c.cloudStore.clearPendingCloudDeletion(context.Background(), portalID); err != nil {
