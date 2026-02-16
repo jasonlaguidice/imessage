@@ -188,6 +188,27 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 	return state
 }
 
+// ListHandles returns the available iMessage handles (phone numbers and
+// email addresses) from the backup session state. Returns nil if no valid
+// session state is found. Intended for CLI use (list-handles subcommand).
+// Reads session.json directly to avoid any logger output.
+func ListHandles() []string {
+	path, err := sessionFilePath()
+	if err != nil {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	var state PersistedSessionState
+	if err := json.Unmarshal(data, &state); err != nil || state.IDSUsers == "" {
+		return nil
+	}
+	users := rustpushgo.NewWrappedIdsUsers(&state.IDSUsers)
+	return users.GetHandles()
+}
+
 // CheckSessionRestore validates that backup session state (session.json +
 // keystore) exists and the IDS user keys are present in the keystore.
 // Returns true if login can be auto-restored without re-authentication.
