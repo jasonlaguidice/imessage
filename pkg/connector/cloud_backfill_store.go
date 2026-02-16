@@ -956,13 +956,26 @@ func (s *cloudBackfillStore) hasMessageUUID(ctx context.Context, uuid string) (b
 	return count > 0, err
 }
 
-// purgeCloudMessagesByPortalID deletes all cloud_message records for a portal.
-// Called when a deleted_portal entry is cleared (genuinely new conversation),
-// so old message UUIDs don't block future messages.
+// purgeCloudMessagesByPortalID hard-deletes all cloud_message records for a portal.
+// Used during Beeper deletes and tombstone handling to ensure old messages can't
+// reappear if the portal is recreated.
 func (s *cloudBackfillStore) purgeCloudMessagesByPortalID(ctx context.Context, portalID string) error {
 	_, err := s.db.Exec(ctx,
 		`DELETE FROM cloud_message WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
+	)
+	return err
+}
+
+// purgeCloudMessagesByGroupID hard-deletes all cloud_message records matching
+// a group_id. Covers cases where CloudKit sync stored messages under a different
+// portal_id for the same logical group chat.
+func (s *cloudBackfillStore) purgeCloudMessagesByGroupID(ctx context.Context, groupID string) error {
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM cloud_message WHERE login_id=$1 AND portal_id IN (
+			SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND group_id=$2
+		)`,
+		s.loginID, groupID,
 	)
 	return err
 }

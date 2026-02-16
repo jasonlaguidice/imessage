@@ -1672,14 +1672,24 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 
 		// Delete local records for both the portal_id AND the group_id
 		// (covers cases where CloudKit sync used a different portal_id).
+		// For Beeper deletes, HARD delete cloud_message records (purge) so old
+		// messages can't reappear if the portal is recreated. The soft-delete
+		// approach (deleted=TRUE) is insufficient because the CloudKit sync
+		// may re-import records before the full-scan cleanup completes.
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
 			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to delete local cloud records")
+		}
+		if err := c.cloudStore.purgeCloudMessagesByPortalID(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to purge cloud_message records")
 		} else {
-			log.Info().Str("portal_id", portalID).Msg("Deleted local cloud_chat and cloud_message records")
+			log.Info().Str("portal_id", portalID).Msg("Purged local cloud_chat and cloud_message records")
 		}
 		if groupID != "" {
 			if err := c.cloudStore.deleteLocalChatByGroupID(ctx, groupID); err != nil {
 				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to delete local cloud records by group_id")
+			}
+			if err := c.cloudStore.purgeCloudMessagesByGroupID(ctx, groupID); err != nil {
+				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to purge cloud_message records by group_id")
 			}
 		}
 	}
