@@ -2259,6 +2259,17 @@ impl Client {
             warn!("Cloud client init: zone key warm-up failed (non-fatal): {}", e);
         }
 
+        // Step 4: Log server-side record counts for diagnostics.
+        match cloud_messages.count_records().await {
+            Ok(summary) => {
+                info!("CloudKit server record counts — messages: {}, chats: {}, attachments: {}",
+                    summary.messages_summary.len(), summary.chat_summary.len(), summary.attachment_summary.len());
+            }
+            Err(e) => {
+                warn!("Cloud client init: count_records failed (non-fatal): {}", e);
+            }
+        }
+
         *locked = Some(cloud_messages.clone());
         *self.cloud_keychain_client.lock().await = Some(keychain);
         Ok(cloud_messages)
