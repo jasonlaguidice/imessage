@@ -267,9 +267,21 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		break
 	}
 
+	// Purge any cloud records the sync re-imported for portals pending deletion.
+	// The sync doesn't know about pending deletions, so it re-imports messages
+	// from CloudKit that we already purged locally. Clean them out before
+	// creating portals so old messages can't leak into backfill.
+	for portalID := range pendingDeletePortals {
+		if err := c.cloudStore.purgeCloudMessagesByPortalID(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to purge re-imported messages for pending deletion")
+		}
+		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to delete re-imported chat for pending deletion")
+		}
+	}
+
 	// Create portals and queue forward backfill for all of them.
-	// Skip portals with pending CloudKit deletions — their local DB was already
-	// cleaned, but the sync may have re-imported CloudKit records.
+	// Skip portals with pending CloudKit deletions.
 	portalStart := time.Now()
 	c.createPortalsFromCloudSync(ctx, log, pendingDeletePortals)
 	c.setCloudSyncDone()
