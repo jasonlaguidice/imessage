@@ -179,6 +179,9 @@ func (c *IMClient) refreshGroupPortalNamesFromContacts(log zerolog.Logger) {
 			ChatInfoChange: &bridgev2.ChatInfoChange{
 				ChatInfo: &bridgev2.ChatInfo{
 					Name: &newName,
+					// Exclude from timeline so Beeper doesn't render
+					// contact-based name resolution as a bridge bot message.
+					ExcludeChangesFromTimeline: true,
 				},
 			},
 		})
@@ -300,7 +303,18 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 				}
 				isFresh = true
 			} else {
-				log.Info().Msg("Resuming interrupted CloudKit sync (sync state exists but no portals yet)")
+				// Sync state exists but no portals. Two sub-cases:
+				// (a) CloudKit data download was interrupted → resume from saved tokens
+				// (b) Data download completed but portal creation was interrupted
+				//     → backfill returns ~0 new records, portal creation re-runs
+				// Both cases are handled correctly: backfill resumes or no-ops,
+				// then createPortalsFromCloudSync reads from the DB tables.
+				chatTok, _ := c.cloudStore.getSyncState(ctx, cloudZoneChats)
+				msgTok, _ := c.cloudStore.getSyncState(ctx, cloudZoneMessages)
+				log.Info().
+					Bool("has_chat_token", chatTok != nil).
+					Bool("has_msg_token", msgTok != nil).
+					Msg("Resuming interrupted CloudKit sync (sync state exists but no portals yet)")
 			}
 		} else {
 			// Existing portals — check sync version. If the sync logic has
@@ -371,6 +385,24 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 func (c *IMClient) runCloudKitBackfill(ctx context.Context, log zerolog.Logger) (cloudSyncCounters, error) {
 	var total cloudSyncCounters
 	backfillStart := time.Now()
+
+	// Always restart attachment sync from scratch. The attachment map
+	// (attMap) is built in-memory during sync and used to enrich messages.
+	// On crash/restart the map is lost, so resuming from a saved token
+	// would produce an incomplete map — messages referencing pre-crash
+	// attachments would lose their metadata. Attachment zones are small
+	// relative to messages, so the overhead is minimal.
+	if err := c.cloudStore.clearZoneToken(ctx, cloudZoneAttachments); err != nil {
+		log.Warn().Err(err).Msg("Failed to clear attachment zone token for fresh sync")
+	}
+
+	// Check which zones have saved continuation tokens (for diagnostic logging).
+	savedChatTok, _ := c.cloudStore.getSyncState(ctx, cloudZoneChats)
+	savedMsgTok, _ := c.cloudStore.getSyncState(ctx, cloudZoneMessages)
+	log.Info().
+		Bool("chat_token_saved", savedChatTok != nil).
+		Bool("msg_token_saved", savedMsgTok != nil).
+		Msg("CloudKit backfill starting (attachment zone always fresh)")
 
 	// Phase 1: Sync chats and attachments in parallel — they are independent.
 	// Messages depend on both (chats for portal ID resolution, attachments for
@@ -1213,15 +1245,31 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
 
-	// Reset backward backfill tasks so the backfill queue re-processes each
-	// portal from scratch. Uses Upsert to create the task if it doesn't exist
-	// (MarkNotDone silently no-ops when there's no matching row).
-	// Portals with nothing new will complete quickly (one empty FetchMessages).
+	// Reset backward backfill tasks for portals that already have Matrix rooms.
+	// This handles the version-upgrade re-sync case where rooms exist but the
+	// backfill task may be marked done from a previous incomplete sync.
+	//
+	// For NEW portals (fresh DB, no rooms yet), we do NOT create tasks here.
+	// bridgev2 automatically creates backfill tasks when it creates the Matrix
+	// room during ChatResync processing (portal.go calls BackfillTask.Upsert
+	// when CanBackfill=true). Creating tasks before rooms exist causes a race:
+	// the backfill queue picks up the task, finds portal.MXID=="", and
+	// permanently deletes it via deleteBackfillQueueTaskIfRoomDoesNotExist.
 	resetCount := 0
+	skippedNoRoom := 0
 	for _, portalID := range ordered {
 		portalKey := networkid.PortalKey{
 			ID:       networkid.PortalID(portalID),
 			Receiver: c.UserLogin.ID,
+		}
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to look up portal for backfill task")
+			continue
+		}
+		if portal == nil || portal.MXID == "" {
+			skippedNoRoom++
+			continue
 		}
 		if err := c.Main.Bridge.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
 			PortalKey:         portalKey,
@@ -1237,9 +1285,14 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			resetCount++
 		}
 	}
-	if resetCount > 0 {
-		log.Info().Int("reset_count", resetCount).Msg("Reset backward backfill tasks for cloud-synced portals")
-		c.Main.Bridge.WakeupBackfillQueue()
+	if resetCount > 0 || skippedNoRoom > 0 {
+		log.Info().
+			Int("reset_count", resetCount).
+			Int("skipped_no_room", skippedNoRoom).
+			Msg("Backward backfill task setup (rooms without tasks reset, new portals deferred to ChatResync)")
+		if resetCount > 0 {
+			c.Main.Bridge.WakeupBackfillQueue()
+		}
 	}
 }
 
