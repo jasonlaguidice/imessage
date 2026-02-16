@@ -48,6 +48,15 @@ import (
 
 // IMClient implements bridgev2.NetworkAPI using the rustpush iMessage protocol
 // library for real-time messaging. Contact resolution uses iCloud CardDAV.
+
+// deletedPortalEntry tracks why a portal was marked as deleted.
+// Only CloudKit tombstones should block new portal creation —
+// manual deletes (Beeper/iDevice) are temporary echo protection.
+type deletedPortalEntry struct {
+	deletedAt   time.Time
+	isTombstone bool // true = CloudKit tombstone (authoritative), false = manual delete
+}
+
 type IMClient struct {
 	Main      *IMConnector
 	UserLogin *bridgev2.UserLogin
@@ -133,9 +142,10 @@ type IMClient struct {
 	// - CloudKit tombstones (ingestCloudChats, during sync before cloudSyncDone)
 	// - APNs MoveToRecycleBin (handleChatDelete)
 	// - Beeper deletes (HandleMatrixDeleteChat)
-	// Checked by handleMessage to suppress portal creation for echoes.
+	// Only CloudKit tombstones (isTombstone=true) block portal creation in
+	// handleMessage — manual deletes must NOT permanently block new messages.
 	// On restart, CloudKit sync re-delivers tombstones and repopulates.
-	recentlyDeletedPortals   map[string]time.Time
+	recentlyDeletedPortals   map[string]deletedPortalEntry
 	recentlyDeletedPortalsMu sync.RWMutex
 
 	// processedMsgUUIDs tracks message UUIDs processed this session.
@@ -514,18 +524,17 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	cloudSyncDone := c.isCloudSyncDone()
 	createPortal := cloudSyncDone
 	if createPortal {
-		// Tombstone check — CloudKit tombstones and APNs MoveToRecycleBin
-		// both populate recentlyDeletedPortals. Since cloudSyncDone gate
-		// ensures tombstones are processed before APNs can create portals,
-		// this blocks echoes for chats that are in the recycle bin.
-		// On restart, CloudKit sync re-delivers tombstones and repopulates.
+		// Only block portal creation for actual CloudKit tombstones —
+		// these are the authoritative "chat is deleted" signal from Apple.
+		// Manual deletes (Beeper/iDevice) populate recentlyDeletedPortals
+		// for duplicate-detection only, NOT for blocking new messages.
 		c.recentlyDeletedPortalsMu.RLock()
-		if _, ok := c.recentlyDeletedPortals[string(portalKey.ID)]; ok {
+		if entry, ok := c.recentlyDeletedPortals[string(portalKey.ID)]; ok && entry.isTombstone {
 			createPortal = false
 			log.Info().
 				Str("portal_id", string(portalKey.ID)).
 				Str("msg_uuid", msg.Uuid).
-				Msg("Suppressed portal creation: portal is tombstoned (in recycle bin)")
+				Msg("Suppressed portal creation: portal is tombstoned in CloudKit")
 		}
 		c.recentlyDeletedPortalsMu.RUnlock()
 	}
@@ -872,18 +881,32 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	// doesn't match any existing portal, fall back to cloud_chat lookups.
 	portalKey := c.resolveDeleteTargetPortal(log, participants, msg.GroupName, msg.Sender, msg.DeleteChatGroupId)
 
-	// Immediately mark as deleted in memory — protects against APNs echoes
-	// arriving in the same batch or before this delete finishes processing.
+	// Immediately mark as deleted in memory — protects against duplicate
+	// APNs echoes in the same batch. NOT a tombstone — new messages from
+	// this contact should still be allowed to create fresh portals.
 	c.recentlyDeletedPortalsMu.Lock()
 	if c.recentlyDeletedPortals == nil {
-		c.recentlyDeletedPortals = make(map[string]time.Time)
+		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
 	}
-	c.recentlyDeletedPortals[string(portalKey.ID)] = time.Now()
+	portalID := string(portalKey.ID)
+	_, alreadyDeleted := c.recentlyDeletedPortals[portalID]
+	if !alreadyDeleted {
+		c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+			deletedAt:   time.Now(),
+			isTombstone: false,
+		}
+	}
 	c.recentlyDeletedPortalsMu.Unlock()
+
+	// Skip duplicate APNs echoes for the same chat delete.
+	if alreadyDeleted {
+		log.Debug().Str("portal_id", portalID).Msg("Portal already marked deleted, skipping duplicate delete")
+		return
+	}
 
 	log.Info().
 		Str("delete_type", deleteType).
-		Str("portal_id", string(portalKey.ID)).
+		Str("portal_id", portalID).
 		Strs("participants", participants).
 		Msg("Queueing portal deletion for remote chat delete")
 
@@ -902,20 +925,6 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	// Clean up local DB FIRST (fast), then CloudKit in background (can hang).
 	if c.cloudStore != nil {
 		ctx := context.Background()
-		portalID := string(portalKey.ID)
-
-		// Check if this portal was already deleted this session — if so,
-		// this is a duplicate APNs echo. Skip the expensive CloudKit scans.
-		c.recentlyDeletedPortalsMu.RLock()
-		alreadyDeleted := false
-		if _, ok := c.recentlyDeletedPortals[portalID]; ok {
-			alreadyDeleted = true
-		}
-		c.recentlyDeletedPortalsMu.RUnlock()
-		if alreadyDeleted {
-			log.Debug().Str("portal_id", portalID).Msg("Portal already tombstoned, skipping redundant CloudKit cleanup")
-			return
-		}
 
 		// Mark local cloud_message records as deleted (idempotent).
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
@@ -1593,13 +1602,16 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 	log := zerolog.Ctx(ctx)
 	portalID := string(msg.Portal.ID)
 
-	// Immediately mark as deleted in memory — protects against APNs echoes
-	// arriving before the delete finishes processing.
+	// Mark as deleted in memory — NOT a tombstone, just echo protection.
+	// New messages from this contact should still create fresh portals.
 	c.recentlyDeletedPortalsMu.Lock()
 	if c.recentlyDeletedPortals == nil {
-		c.recentlyDeletedPortals = make(map[string]time.Time)
+		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
 	}
-	c.recentlyDeletedPortals[portalID] = time.Now()
+	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+		deletedAt:   time.Now(),
+		isTombstone: false,
+	}
 	c.recentlyDeletedPortalsMu.Unlock()
 
 	conv := c.portalToConversation(msg.Portal)
