@@ -524,19 +524,32 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	cloudSyncDone := c.isCloudSyncDone()
 	createPortal := cloudSyncDone
 	if createPortal {
-		// Only block portal creation for actual CloudKit tombstones —
-		// these are the authoritative "chat is deleted" signal from Apple.
-		// Manual deletes (Beeper/iDevice) populate recentlyDeletedPortals
-		// for duplicate-detection only, NOT for blocking new messages.
 		c.recentlyDeletedPortalsMu.RLock()
-		if entry, ok := c.recentlyDeletedPortals[string(portalKey.ID)]; ok && entry.isTombstone {
-			createPortal = false
-			log.Info().
-				Str("portal_id", string(portalKey.ID)).
-				Str("msg_uuid", msg.Uuid).
-				Msg("Suppressed portal creation: portal is tombstoned in CloudKit")
-		}
+		entry, isDeleted := c.recentlyDeletedPortals[string(portalKey.ID)]
 		c.recentlyDeletedPortalsMu.RUnlock()
+		if isDeleted {
+			if entry.isTombstone {
+				// CloudKit tombstone — authoritative "chat deleted in iCloud".
+				createPortal = false
+				log.Info().
+					Str("portal_id", string(portalKey.ID)).
+					Str("msg_uuid", msg.Uuid).
+					Msg("Suppressed portal creation: portal is tombstoned in CloudKit")
+			} else if c.cloudStore != nil {
+				// Non-tombstone delete (Apple/Beeper). Check if this message
+				// UUID already exists in cloud_message — if so, it's an echo
+				// of a previously-synced message, not a genuinely new one.
+				// (hasMessageUUID runs BEFORE persistMessageUUID, so new UUIDs
+				// won't be found yet.)
+				if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+					createPortal = false
+					log.Info().
+						Str("portal_id", string(portalKey.ID)).
+						Str("msg_uuid", msg.Uuid).
+						Msg("Suppressed portal creation: echo of known message after delete")
+				}
+			}
+		}
 	}
 	// Track this message UUID so future echoes are detected.
 	// In-memory map covers within-session echoes; cloud_message DB covers
