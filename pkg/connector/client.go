@@ -128,11 +128,13 @@ type IMClient struct {
 	// has newer messages.
 	queuedPortals map[string]int64
 
-	// recentlyDeletedPortals is an in-memory set of portal IDs that were
-	// deleted this session. Provides instant protection against APNs echoes
-	// that arrive in the same APNs batch as (or before) the MoveToRecycleBin.
-	// The DB-based deleted_portal table covers cross-restart persistence;
-	// this covers intra-session races.
+	// recentlyDeletedPortals tracks portal IDs that were deleted or
+	// tombstoned this session. Populated by:
+	// - CloudKit tombstones (ingestCloudChats, during sync before cloudSyncDone)
+	// - APNs MoveToRecycleBin (handleChatDelete)
+	// - Beeper deletes (HandleMatrixDeleteChat)
+	// Checked by handleMessage to suppress portal creation for echoes.
+	// On restart, CloudKit sync re-delivers tombstones and repopulates.
 	recentlyDeletedPortals   map[string]time.Time
 	recentlyDeletedPortalsMu sync.RWMutex
 
@@ -507,71 +509,25 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	// Only create new portals after CloudKit sync is done. Echo detection
-	// is handled by UUID tracking (processedMsgUUIDs) and the deleted_portal
-	// table — no need for the 30s IsStoredMessage window which blocks
-	// legitimate messages on reconnect.
+	// is handled by recentlyDeletedPortals (populated from CloudKit tombstones
+	// during sync, and from APNs MoveToRecycleBin at runtime).
 	cloudSyncDone := c.isCloudSyncDone()
 	createPortal := cloudSyncDone
 	if createPortal {
-		// Fast in-memory check — covers APNs echoes arriving in the same
-		// batch as or immediately after a MoveToRecycleBin. Only suppresses
-		// for 10 seconds after deletion to avoid permanently blocking new
-		// conversations with the same person (portal_id is reused).
+		// Tombstone check — CloudKit tombstones and APNs MoveToRecycleBin
+		// both populate recentlyDeletedPortals. Since cloudSyncDone gate
+		// ensures tombstones are processed before APNs can create portals,
+		// this blocks echoes for chats that are in the recycle bin.
+		// On restart, CloudKit sync re-delivers tombstones and repopulates.
 		c.recentlyDeletedPortalsMu.RLock()
-		if deletedAt, ok := c.recentlyDeletedPortals[string(portalKey.ID)]; ok && time.Since(deletedAt) < 10*time.Second {
+		if _, ok := c.recentlyDeletedPortals[string(portalKey.ID)]; ok {
 			createPortal = false
 			log.Info().
 				Str("portal_id", string(portalKey.ID)).
-				Time("deleted_at", deletedAt).
-				Dur("age", time.Since(deletedAt)).
-				Msg("Suppressed portal creation: portal recently deleted (in-memory, <10s)")
+				Str("msg_uuid", msg.Uuid).
+				Msg("Suppressed portal creation: portal is tombstoned (in recycle bin)")
 		}
 		c.recentlyDeletedPortalsMu.RUnlock()
-	}
-	if createPortal && c.cloudStore != nil {
-		// DB check — if portal is in deleted_portal, decide if this message
-		// is an echo or genuinely new:
-		// 1. UUID in processedMsgUUIDs (in-memory) → within-session echo → block.
-		// 2. UUID in cloud_message DB (persisted) → cross-restart echo → block.
-		// 3. UUID unknown + IsStoredMessage → reconnect dump, likely echo → block.
-		// 4. UUID unknown + live message → genuinely new → purge + clear + allow.
-		deletedPortals, _ := c.cloudStore.getDeletedPortals(context.Background())
-		if entry, ok := deletedPortals[string(portalKey.ID)]; ok {
-			c.processedMsgUUIDsMu.RLock()
-			_, inMemEcho := c.processedMsgUUIDs[msg.Uuid]
-			c.processedMsgUUIDsMu.RUnlock()
-			dbEcho, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid)
-			if inMemEcho || dbEcho {
-				createPortal = false
-				log.Info().
-					Str("portal_id", string(portalKey.ID)).
-					Str("msg_uuid", msg.Uuid).
-					Str("deleted_hash", entry.ConvHash).
-					Bool("in_mem", inMemEcho).
-					Bool("in_db", dbEcho).
-					Msg("Suppressed portal creation: UUID is echo of deleted chat")
-			} else if msg.IsStoredMessage {
-				// UUID unknown but message arrived in a reconnect dump (stored
-				// by APNs while offline). Likely an echo from before the UUID
-				// was persisted — block to be safe.
-				createPortal = false
-				log.Info().
-					Str("portal_id", string(portalKey.ID)).
-					Str("msg_uuid", msg.Uuid).
-					Str("deleted_hash", entry.ConvHash).
-					Msg("Suppressed portal creation: stored message for deleted portal (reconnect echo)")
-			} else {
-				// Live message with unknown UUID → genuinely new conversation.
-				// Purge old cloud_message records and clear deleted_portal.
-				_ = c.cloudStore.purgeCloudMessagesByPortalID(context.Background(), string(portalKey.ID))
-				_ = c.cloudStore.clearDeletedPortal(context.Background(), string(portalKey.ID))
-				log.Info().
-					Str("portal_id", string(portalKey.ID)).
-					Str("msg_uuid", msg.Uuid).
-					Str("deleted_hash", entry.ConvHash).
-					Msg("Cleared deleted_portal: live message with unknown UUID (genuinely new)")
-			}
-		}
 	}
 	// Track this message UUID so future echoes are detected.
 	// In-memory map covers within-session echoes; cloud_message DB covers
@@ -948,22 +904,17 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 		ctx := context.Background()
 		portalID := string(portalKey.ID)
 
-		// Check if this portal was already deleted — if so, this is a
-		// duplicate APNs echo. Still update local DB (idempotent) but
-		// skip the expensive CloudKit full-table scans.
+		// Check if this portal was already deleted this session — if so,
+		// this is a duplicate APNs echo. Skip the expensive CloudKit scans.
+		c.recentlyDeletedPortalsMu.RLock()
 		alreadyDeleted := false
-		if deletedPortals, err := c.cloudStore.getDeletedPortals(ctx); err == nil {
-			if _, ok := deletedPortals[portalID]; ok {
-				alreadyDeleted = true
-				log.Debug().Str("portal_id", portalID).Msg("Portal already in deleted_portal table, skipping redundant CloudKit cleanup")
-			}
+		if _, ok := c.recentlyDeletedPortals[portalID]; ok {
+			alreadyDeleted = true
 		}
-
-		// Record this portal as deleted (idempotent — updates timestamp).
-		nowMS := time.Now().UnixMilli()
-		convHash := conversationHash(portalID, msg.DeleteChatGroupId, participants, nowMS)
-		if err := c.cloudStore.recordDeletedPortal(ctx, portalID, convHash, nowMS); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to record deleted portal")
+		c.recentlyDeletedPortalsMu.RUnlock()
+		if alreadyDeleted {
+			log.Debug().Str("portal_id", portalID).Msg("Portal already tombstoned, skipping redundant CloudKit cleanup")
+			return
 		}
 
 		// Mark local cloud_message records as deleted (idempotent).
@@ -979,13 +930,6 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 				log.Warn().Err(err).Str("group_id", groupID).Msg("Failed to delete local cloud records by group_id on incoming delete")
 			}
 		}
-
-		// Skip CloudKit cleanup for duplicate delete echoes.
-		if alreadyDeleted {
-			return
-		}
-
-		log.Info().Str("portal_id", portalID).Str("conv_hash", convHash).Msg("Recorded portal in deleted_portal table")
 
 		chatRecordNames, _ := c.cloudStore.getCloudRecordNamesByPortalID(ctx, portalID)
 		msgRecordNames, _ := c.cloudStore.getMessageRecordNamesByPortalID(ctx, portalID)
@@ -1695,18 +1639,6 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 	// even if the CloudKit calls below hang or fail.
 	var chatRecordNames, msgRecordNames []string
 	if c.cloudStore != nil {
-		// Record deleted_portal to prevent APNs echo resurrection after restart.
-		// PermanentDelete wipes CloudKit (prevents CloudKit sync resurrection),
-		// but APNs can still echo messages that were queued before the delete.
-		nowMS := time.Now().UnixMilli()
-		participants, _ := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID)
-		convHash := conversationHash(portalID, nil, participants, nowMS)
-		if err := c.cloudStore.recordDeletedPortal(ctx, portalID, convHash, nowMS); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to record deleted portal")
-		} else {
-			log.Info().Str("portal_id", portalID).Str("conv_hash", convHash).Msg("Recorded portal in deleted_portal table (Beeper delete)")
-		}
-
 		chatRecordNames, _ = c.cloudStore.getCloudRecordNamesByPortalID(ctx, portalID)
 		msgRecordNames, _ = c.cloudStore.getMessageRecordNamesByPortalID(ctx, portalID)
 
@@ -1825,17 +1757,6 @@ func (c *IMClient) runFullCloudKitDeletion(log zerolog.Logger, portalID, chatIde
 	}
 	// Always scan messages — there may be more in CloudKit than in local DB.
 	c.findAndDeleteCloudMessagesByChatIdentifier(log, chatIdentifier)
-
-	// Nuke the recoverable-delete zones. After MoveToRecycleBin, Apple parks
-	// records in recoverableMessageDeleteZone (a 30-day "Recently Deleted"
-	// staging area). If we don't purge it, a fresh sync on restart will see
-	// those records promoted back to the main zones → portal resurrection.
-	// This is safe because the bridge is the only iDevice on the account.
-	if err := c.client.PurgeRecoverableZones(); err != nil {
-		log.Warn().Err(err).Msg("Failed to purge recoverable zones from CloudKit")
-	} else {
-		log.Info().Msg("Purged recoverable-delete zones from CloudKit")
-	}
 
 	// Deletion complete — clear the pending entry so it's not retried.
 	if c.cloudStore != nil {
@@ -4103,31 +4024,6 @@ func normalizeURL(u string) string {
 		return "https://" + u
 	}
 	return u
-}
-
-// conversationHash computes a short hex checksum that uniquely fingerprints
-// a deletion event: portal_id + sender_guid + sorted participants + timestamp.
-// The timestamp makes each deletion unique even for 1:1 chats with the same
-// person. Used for logging/diagnostics — actual filtering uses timestamp comparison.
-func conversationHash(portalID string, senderGuid *string, participants []string, timestampMs int64) string {
-	h := sha256.New()
-	h.Write([]byte(portalID))
-	h.Write([]byte{0})
-	if senderGuid != nil {
-		h.Write([]byte(*senderGuid))
-	}
-	h.Write([]byte{0})
-	sorted := make([]string, len(participants))
-	copy(sorted, participants)
-	sort.Strings(sorted)
-	for _, p := range sorted {
-		h.Write([]byte(p))
-		h.Write([]byte{0})
-	}
-	// Timestamp makes each deletion event unique
-	ts := fmt.Sprintf("%d", timestampMs)
-	h.Write([]byte(ts))
-	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func ptrStringOr(s *string, def string) string {
