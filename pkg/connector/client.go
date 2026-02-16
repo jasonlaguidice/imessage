@@ -197,12 +197,13 @@ func (c *IMClient) loadSenderGuidsFromDB(log zerolog.Logger) {
 				c.imGroupGuidsMu.Unlock()
 				loadedGuids++
 			}
-			if meta.GroupName != "" {
-				c.imGroupNamesMu.Lock()
-				c.imGroupNames[string(portal.ID)] = meta.GroupName
-				c.imGroupNamesMu.Unlock()
-				loadedNames++
-			}
+			// NOTE: Do NOT pre-populate imGroupNames from portal metadata.
+			// The metadata GroupName can be stale (polluted by previous CloudKit
+			// sync cycles). Loading it on startup would cause resolveGroupName
+			// and refreshGroupPortalNamesFromContacts to revert correct room
+			// names back to stale values. Instead, let imGroupNames be populated
+			// only by real-time APNs messages (makePortalKey / handleRename).
+			// Outbound routing (portalToConversation) has its own metadata fallback.
 		}
 	}
 	if loadedGuids > 0 {
@@ -724,6 +725,13 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 					meta.GroupName = newName
 					portal.Metadata = meta
 					_ = portal.Save(ctx)
+				}
+			}
+			// Also correct the stale CloudKit display_name in cloud_chat
+			// so resolveGroupName doesn't fall back to the old name.
+			if c.cloudStore != nil {
+				if err := c.cloudStore.updateDisplayNameByPortalID(ctx, portalID, newName); err != nil {
+					log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to update cloud_chat display_name after rename")
 				}
 			}
 		}()
@@ -1881,6 +1889,10 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 
 	chatInfo := &bridgev2.ChatInfo{
 		CanBackfill: canBackfill,
+		// Suppress bridge bot timeline messages for name/member changes
+		// during ChatResync. Real-time renames go through handleRename
+		// which sends its own ChatInfoChange event (with timeline visibility).
+		ExcludeChangesFromTimeline: true,
 	}
 
 	if isGroup {
@@ -1932,8 +1944,16 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			},
 		}
 
-		groupName := c.resolveGroupName(ctx, portalID)
-		chatInfo.Name = &groupName
+		// Only set the group name for NEW portals (no Matrix room yet).
+		// For existing portals, skip — the name is managed by handleRename
+		// (explicit renames) and makePortalKey's envelope-change detection.
+		// Setting the name here for existing portals would revert correct
+		// names to stale values from CloudKit or metadata, and produce
+		// unwanted bridge bot "name changed" events.
+		if portal.MXID == "" || portal.Name == "" {
+			groupName := c.resolveGroupName(ctx, portalID)
+			chatInfo.Name = &groupName
+		}
 
 		// Persist sender_guid to portal metadata for gid: portals.
 		// Only persist iMessage protocol-level group names (cv_name) to
@@ -2308,6 +2328,15 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow) []*bridgev2.BackfillMessage {
 	sender := c.makeCloudSender(row)
 	ts := time.UnixMilli(row.TimestampMS)
+
+	// Skip messages with no resolvable sender. These are typically iMessage
+	// system/notification records (group renames, participant changes, etc.)
+	// stored in CloudKit without a sender field. Without this check, bridgev2
+	// falls back to the bridge bot as the sender, producing spurious bot
+	// messages in the backfilled timeline.
+	if sender.Sender == "" && !sender.IsFromMe {
+		return nil
+	}
 
 	// Tapback/reaction: return as a reaction event, not a text message.
 	if row.TapbackType != nil && *row.TapbackType >= 2000 {
@@ -3197,11 +3226,43 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
 		}
 		// Cache the actual iMessage group name (cv_name) so outbound
-		// messages can route to the correct conversation.
+		// messages can route to the correct conversation. Also push a
+		// room name update when the envelope name differs from what's
+		// cached OR on the first message after restart (old is empty).
+		// After restart, imGroupNames is empty and the portal may have
+		// a stale name from CloudKit. Pushing on first message ensures
+		// the correct cv_name from APNs overrides any stale data.
+		// bridgev2's updateName deduplicates — no state event if the
+		// name is already correct.
 		if groupName != nil && *groupName != "" {
 			c.imGroupNamesMu.Lock()
+			old := c.imGroupNames[string(portalID)]
 			c.imGroupNames[string(portalID)] = *groupName
 			c.imGroupNamesMu.Unlock()
+			if old != *groupName {
+				newName := *groupName
+				pid := string(portalID)
+				go func() {
+					c.UserLogin.QueueRemoteEvent(&simplevent.ChatInfoChange{
+						EventMeta: simplevent.EventMeta{
+							Type: bridgev2.RemoteEventChatInfoChange,
+							PortalKey: networkid.PortalKey{
+								ID:       portalID,
+								Receiver: c.UserLogin.ID,
+							},
+							LogContext: func(lc zerolog.Context) zerolog.Context {
+								return lc.Str("portal_id", pid).Str("source", "envelope_name_change")
+							},
+						},
+						ChatInfoChange: &bridgev2.ChatInfoChange{
+							ChatInfo: &bridgev2.ChatInfo{
+								Name:                       &newName,
+								ExcludeChangesFromTimeline: true,
+							},
+						},
+					})
+				}()
+			}
 		}
 		// Cache normalized participants in memory so resolveGroupMembers
 		// can find them immediately. The cloud_chat DB write happens async
@@ -3495,15 +3556,8 @@ func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string
 	}
 
 	// 2) CloudKit display_name (user-set group name from iCloud).
-	// This is the "name" field on CKChatRecord which maps to cv_name in the
-	// iMessage protocol — it's only non-empty when the user explicitly named
-	// the group. Cache it in imGroupNames so it persists to portal metadata
-	// via GetChatInfo's ExtraUpdates.
 	if c.cloudStore != nil {
 		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
-			c.imGroupNamesMu.Lock()
-			c.imGroupNames[portalID] = dn
-			c.imGroupNamesMu.Unlock()
 			return dn
 		}
 	}
