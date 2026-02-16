@@ -267,21 +267,38 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		break
 	}
 
-	// Soft-delete any cloud records the sync re-imported for portals pending
-	// deletion. The sync doesn't know about pending deletions, so it re-imports
-	// messages from CloudKit. deleteLocalChatByPortalID marks cloud_message rows
-	// deleted=TRUE (preserving UUIDs for echo detection via hasMessageUUID) and
-	// removes cloud_chat rows so createPortalsFromCloudSync won't see them.
+	// Soft-delete cloud records for portals that should be dead:
+	// 1. Pending deletions — sync re-imported records we're still deleting
+	// 2. Tombstoned portals — chat tombstones processed before messages,
+	//    so message import creates cloud_message rows for deleted chats
+	// deleteLocalChatByPortalID marks cloud_message deleted=TRUE (preserving
+	// UUIDs for echo detection) and removes cloud_chat rows.
+	skipPortals := make(map[string]bool)
 	for portalID := range pendingDeletePortals {
-		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete re-imported records for pending deletion")
+		skipPortals[portalID] = true
+	}
+	c.recentlyDeletedPortalsMu.RLock()
+	for portalID, entry := range c.recentlyDeletedPortals {
+		if entry.isTombstone {
+			skipPortals[portalID] = true
 		}
+	}
+	c.recentlyDeletedPortalsMu.RUnlock()
+	for portalID := range skipPortals {
+		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete records for dead portal")
+		}
+	}
+	if len(skipPortals) > 0 {
+		log.Info().Int("pending", len(pendingDeletePortals)).
+			Int("tombstoned", len(skipPortals)-len(pendingDeletePortals)).
+			Msg("Soft-deleted re-imported records for dead portals")
 	}
 
 	// Create portals and queue forward backfill for all of them.
-	// Skip portals with pending CloudKit deletions.
+	// Skip portals that are pending deletion or tombstoned.
 	portalStart := time.Now()
-	c.createPortalsFromCloudSync(ctx, log, pendingDeletePortals)
+	c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
 	log.Info().
