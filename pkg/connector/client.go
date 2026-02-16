@@ -2135,6 +2135,29 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
+	// Guard: if this portal is tombstoned or recently deleted, return empty.
+	// Prevents backfilling old messages into portals recreated by echoes.
+	c.recentlyDeletedPortalsMu.RLock()
+	if entry, ok := c.recentlyDeletedPortals[portalID]; ok {
+		if entry.isTombstone {
+			c.recentlyDeletedPortalsMu.RUnlock()
+			log.Info().Str("portal_id", portalID).Msg("FetchMessages: portal is tombstoned, returning empty")
+			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+		}
+		// Non-tombstone delete: check if cloud_message has any non-deleted rows.
+		// If all are deleted=TRUE, the portal was deleted and we shouldn't backfill.
+		c.recentlyDeletedPortalsMu.RUnlock()
+		if c.cloudStore != nil {
+			rows, err := c.cloudStore.listLatestMessages(context.Background(), portalID, 1)
+			if err == nil && len(rows) == 0 {
+				log.Info().Str("portal_id", portalID).Msg("FetchMessages: deleted portal with no live messages, returning empty")
+				return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+			}
+		}
+	} else {
+		c.recentlyDeletedPortalsMu.RUnlock()
+	}
+
 	// Forward backfill: return the newest messages for this portal.
 	// Triggered by the mautrix bridgev2 framework when a portal is first
 	// created (ChatResync / CreatePortal). With a high max_initial_messages
