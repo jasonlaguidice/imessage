@@ -894,28 +894,19 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	// doesn't match any existing portal, fall back to cloud_chat lookups.
 	portalKey := c.resolveDeleteTargetPortal(log, participants, msg.GroupName, msg.Sender, msg.DeleteChatGroupId)
 
-	// Immediately mark as deleted in memory — protects against duplicate
-	// APNs echoes in the same batch. NOT a tombstone — new messages from
-	// this contact should still be allowed to create fresh portals.
+	portalID := string(portalKey.ID)
+
+	// Mark as deleted in memory. Always overwrite — a stale entry from a
+	// previous delete/recreate cycle must not block processing a fresh delete.
 	c.recentlyDeletedPortalsMu.Lock()
 	if c.recentlyDeletedPortals == nil {
 		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
 	}
-	portalID := string(portalKey.ID)
-	_, alreadyDeleted := c.recentlyDeletedPortals[portalID]
-	if !alreadyDeleted {
-		c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
-			deletedAt:   time.Now(),
-			isTombstone: false,
-		}
+	c.recentlyDeletedPortals[portalID] = deletedPortalEntry{
+		deletedAt:   time.Now(),
+		isTombstone: false,
 	}
 	c.recentlyDeletedPortalsMu.Unlock()
-
-	// Skip duplicate APNs echoes for the same chat delete.
-	if alreadyDeleted {
-		log.Debug().Str("portal_id", portalID).Msg("Portal already marked deleted, skipping duplicate delete")
-		return
-	}
 
 	log.Info().
 		Str("delete_type", deleteType).
