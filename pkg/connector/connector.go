@@ -301,8 +301,9 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		cloudStore:         newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
 		recentUnsends:      make(map[string]time.Time),
 		smsPortals:         make(map[string]bool),
-		imGroupNames:       make(map[string]string),
-		imGroupGuids:       make(map[string]string),
+		imGroupNames:        make(map[string]string),
+		imGroupGuids:        make(map[string]string),
+		imGroupParticipants: make(map[string][]string),
 		lastGroupForMember:  make(map[string]networkid.PortalKey),
 		forwardBackfillSem: make(chan struct{}, 3),
 	}

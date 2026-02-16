@@ -193,6 +193,21 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	// Migration: add conv_hash column if table already exists without it.
 	_, _ = s.db.Exec(ctx, `ALTER TABLE deleted_portal ADD COLUMN conv_hash TEXT NOT NULL DEFAULT ''`)
 
+	// Pending CloudKit deletions: persists deletion intent so interrupted
+	// background scans (findAndDeleteCloud*) are retried on next startup.
+	// Without this, a restart between local DB cleanup and CloudKit deletion
+	// leaves remote records alive → fresh sync resurrects the portal.
+	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS pending_cloud_deletion (
+		login_id TEXT NOT NULL,
+		portal_id TEXT NOT NULL,
+		chat_identifier TEXT NOT NULL DEFAULT '',
+		group_id TEXT NOT NULL DEFAULT '',
+		created_ts BIGINT NOT NULL,
+		PRIMARY KEY (login_id, portal_id)
+	)`); err != nil {
+		return fmt.Errorf("failed to create pending_cloud_deletion table: %w", err)
+	}
+
 	return nil
 }
 
@@ -727,6 +742,27 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 		}
 	}
 	return normalized, nil
+}
+
+// getDisplayNameByPortalID returns the CloudKit display_name for a given portal_id.
+// This is the user-set group name (cv_name from the iMessage protocol), NOT an
+// auto-generated label. Returns empty string if none found or if the group is unnamed.
+func (s *cloudBackfillStore) getDisplayNameByPortalID(ctx context.Context, portalID string) (string, error) {
+	var displayName sql.NullString
+	err := s.db.QueryRow(ctx,
+		`SELECT display_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND display_name IS NOT NULL AND display_name <> '' LIMIT 1`,
+		s.loginID, portalID,
+	).Scan(&displayName)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	if displayName.Valid {
+		return displayName.String, nil
+	}
+	return "", nil
 }
 
 // getCloudChatIDByPortalID returns the cloud_chat_id (Apple's chat GUID, e.g.
@@ -1296,4 +1332,60 @@ func (s *cloudBackfillStore) deleteMessagesBeforeTimestamp(ctx context.Context, 
 		return 0, err
 	}
 	return result.RowsAffected()
+}
+
+// pendingCloudDeletion holds the persisted intent to delete CloudKit records
+// for a portal. Used to retry interrupted background deletions on startup.
+type pendingCloudDeletion struct {
+	PortalID       string
+	ChatIdentifier string
+	GroupID        string
+	CreatedTS      int64
+}
+
+// recordPendingCloudDeletion persists the intent to delete CloudKit records
+// for a portal. Must be called BEFORE starting the actual CloudKit deletion
+// so that restarts can retry. Idempotent (upserts).
+func (s *cloudBackfillStore) recordPendingCloudDeletion(ctx context.Context, portalID, chatIdentifier, groupID string) error {
+	nowMS := time.Now().UnixMilli()
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO pending_cloud_deletion (login_id, portal_id, chat_identifier, group_id, created_ts)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (login_id, portal_id) DO UPDATE SET
+			chat_identifier=excluded.chat_identifier,
+			group_id=excluded.group_id,
+			created_ts=excluded.created_ts
+	`, s.loginID, portalID, chatIdentifier, groupID, nowMS)
+	return err
+}
+
+// getPendingCloudDeletions returns all pending CloudKit deletions for this login.
+func (s *cloudBackfillStore) getPendingCloudDeletions(ctx context.Context) ([]pendingCloudDeletion, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT portal_id, chat_identifier, group_id, created_ts FROM pending_cloud_deletion WHERE login_id=$1`,
+		s.loginID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []pendingCloudDeletion
+	for rows.Next() {
+		var d pendingCloudDeletion
+		if err = rows.Scan(&d.PortalID, &d.ChatIdentifier, &d.GroupID, &d.CreatedTS); err != nil {
+			return nil, err
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// clearPendingCloudDeletion removes a completed deletion from the pending list.
+func (s *cloudBackfillStore) clearPendingCloudDeletion(ctx context.Context, portalID string) error {
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM pending_cloud_deletion WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID,
+	)
+	return err
 }
