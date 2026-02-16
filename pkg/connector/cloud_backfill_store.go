@@ -239,6 +239,16 @@ func (s *cloudBackfillStore) clearSyncTokens(ctx context.Context) error {
 	return err
 }
 
+// clearZoneToken removes the continuation token for a specific zone,
+// forcing the next sync for that zone to start from scratch.
+func (s *cloudBackfillStore) clearZoneToken(ctx context.Context, zone string) error {
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM cloud_sync_state WHERE login_id=$1 AND zone=$2`,
+		s.loginID, zone,
+	)
+	return err
+}
+
 // getSyncVersion returns the stored sync schema version (0 if never set).
 func (s *cloudBackfillStore) getSyncVersion(ctx context.Context) (int, error) {
 	var token sql.NullString
