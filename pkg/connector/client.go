@@ -2119,8 +2119,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 
 	// Forward backfill: return the newest messages for this portal.
 	// Triggered by the mautrix bridgev2 framework when a portal is first
-	// created (ChatResync / CreatePortal). Populates the room immediately
-	// instead of waiting for the backward backfill queue.
+	// created (ChatResync / CreatePortal). With a high max_initial_messages
+	// config, this delivers ALL messages in one batch — producing a clean
+	// linear DAG with room creation at the top and messages below.
 	if params.Forward {
 		// Acquire semaphore to limit concurrent forward backfills.
 		// This prevents overwhelming CloudKit/Matrix with simultaneous
@@ -2138,7 +2139,6 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		var err error
 		if params.AnchorMessage != nil {
 			// Existing portal catch-up: only fetch messages NEWER than the anchor.
-			// This avoids wasting time downloading attachments for already-bridged messages.
 			anchorTS := params.AnchorMessage.Timestamp.UnixMilli()
 			anchorGUID := string(params.AnchorMessage.ID)
 			log.Debug().
@@ -2148,7 +2148,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				Msg("Forward backfill: using anchor — fetching only newer messages")
 			rows, err = c.cloudStore.listForwardMessages(ctx, portalID, anchorTS, anchorGUID, count)
 		} else {
-			// New portal: fetch the newest N messages.
+			// New portal: fetch the newest N messages (N = max_initial_messages).
+			// A high count delivers all history in one forward batch, keeping
+			// the DAG clean (no fragmented backward batch_send requests).
 			rows, err = c.cloudStore.listLatestMessages(ctx, portalID, count)
 		}
 		if err != nil {
@@ -2160,7 +2162,6 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			Str("portal_id", portalID).
 			Int("rows", len(rows)).
 			Dur("query_ms", queryElapsed).
-			Bool("has_anchor", params.AnchorMessage != nil).
 			Msg("Forward backfill: query returned")
 		if len(rows) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")

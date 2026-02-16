@@ -50,6 +50,35 @@ func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
+	// Override backfill defaults for iMessage CloudKit sync.
+	// Applied in Start() because Init() runs before config YAML is loaded.
+	// The mautrix defaults (max_initial_messages=50, batch_size=100) are too
+	// low — CloudKit chats can have tens of thousands of messages, and many
+	// small backward batch_send requests create fragmented DAG branches that
+	// clients can't paginate through. High max_initial_messages ensures all
+	// messages are delivered in one forward batch during room creation.
+	cfg := &c.Bridge.Config.Backfill
+	if !cfg.Enabled {
+		cfg.Enabled = true
+	}
+	if cfg.MaxInitialMessages <= 100 {
+		cfg.MaxInitialMessages = 50000
+	}
+	if cfg.MaxCatchupMessages <= 500 {
+		cfg.MaxCatchupMessages = 5000
+	}
+	if cfg.UnreadHoursThreshold <= 0 {
+		cfg.UnreadHoursThreshold = 720
+	}
+	if !cfg.Queue.Enabled {
+		cfg.Queue.Enabled = true
+	}
+	if cfg.Queue.BatchSize <= 100 {
+		cfg.Queue.BatchSize = 10000
+	}
+	if cfg.Queue.MaxBatches == 0 {
+		cfg.Queue.MaxBatches = -1
+	}
 
 	// Auto-restore: if the DB has no logins but we have valid backup session
 	// state (session.json + keystore), create a user_login from the backup
