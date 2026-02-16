@@ -363,9 +363,17 @@ func (s *cloudBackfillStore) upsertChat(
 			group_id=excluded.group_id,
 			portal_id=excluded.portal_id,
 			service=excluded.service,
-			display_name=excluded.display_name,
+			display_name=CASE
+				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
+				THEN excluded.display_name
+				ELSE cloud_chat.display_name
+			END,
 			participants_json=excluded.participants_json,
-			updated_ts=excluded.updated_ts
+			updated_ts=CASE
+				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
+				THEN excluded.updated_ts
+				ELSE cloud_chat.updated_ts
+			END
 	`, s.loginID, cloudChatID, recordName, groupID, portalID, service, nullableString(displayName), string(participantsJSON), updatedTS, nowMS)
 	return err
 }
@@ -631,9 +639,17 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 			group_id=excluded.group_id,
 			portal_id=excluded.portal_id,
 			service=excluded.service,
-			display_name=excluded.display_name,
+			display_name=CASE
+				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
+				THEN excluded.display_name
+				ELSE cloud_chat.display_name
+			END,
 			participants_json=excluded.participants_json,
-			updated_ts=excluded.updated_ts
+			updated_ts=CASE
+				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
+				THEN excluded.updated_ts
+				ELSE cloud_chat.updated_ts
+			END
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch statement: %w", err)
@@ -832,7 +848,7 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 func (s *cloudBackfillStore) getDisplayNameByPortalID(ctx context.Context, portalID string) (string, error) {
 	var displayName sql.NullString
 	err := s.db.QueryRow(ctx,
-		`SELECT display_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND display_name IS NOT NULL AND display_name <> '' LIMIT 1`,
+		`SELECT display_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND display_name IS NOT NULL AND display_name <> '' ORDER BY updated_ts DESC LIMIT 1`,
 		s.loginID, portalID,
 	).Scan(&displayName)
 	if err != nil {
@@ -845,6 +861,17 @@ func (s *cloudBackfillStore) getDisplayNameByPortalID(ctx context.Context, porta
 		return displayName.String, nil
 	}
 	return "", nil
+}
+
+// updateDisplayNameByPortalID updates the display_name for all cloud_chat
+// rows matching a portal_id. Used when a real-time rename event arrives to
+// correct stale CloudKit data in the local cache.
+func (s *cloudBackfillStore) updateDisplayNameByPortalID(ctx context.Context, portalID, displayName string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET display_name=$1 WHERE login_id=$2 AND portal_id=$3`,
+		displayName, s.loginID, portalID,
+	)
+	return err
 }
 
 // getCloudChatIDByPortalID returns the cloud_chat_id (Apple's chat GUID, e.g.
