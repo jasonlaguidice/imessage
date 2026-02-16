@@ -28,7 +28,7 @@ import (
 // requires a one-time full re-download from CloudKit (e.g. improved PCS
 // key handling that can now decrypt previously-skipped records).
 // Increment this to trigger a token clear on the next bootstrap.
-const cloudSyncVersion = 3
+const cloudSyncVersion = 4
 
 type cloudSyncCounters struct {
 	Imported int
@@ -340,12 +340,29 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		Dur("elapsed", time.Since(backfillStart)).
 		Msg("CloudKit sync pass complete")
 
-	// Persist sync version after successful sync so we don't re-clear
-	// tokens on subsequent restarts.
-	if isBootstrap {
+	// Only persist sync version if the sync actually received data.
+	// If the re-sync returned 0 records (e.g. CloudKit changes feed
+	// considers records already delivered), leave the version unsaved
+	// so the next restart will clear tokens and try again.
+	totalRecords := counts.Imported + counts.Updated + counts.Deleted
+	if isBootstrap && totalRecords > 0 {
 		if err := c.cloudStore.setSyncVersion(ctx, cloudSyncVersion); err != nil {
 			log.Warn().Err(err).Msg("Failed to persist sync version")
 		}
+	} else if isBootstrap && totalRecords == 0 {
+		log.Warn().
+			Int("sync_version", cloudSyncVersion).
+			Msg("CloudKit sync returned 0 records — NOT saving version (will retry on next restart)")
+		// Diagnostic: run a separate full-count sync to check if CloudKit
+		// actually has records. This paginates from scratch independently
+		// and helps identify whether the changes feed is empty vs. data exists.
+		go func() {
+			if diagResult, diagErr := c.client.CloudDiagFullCount(); diagErr != nil {
+				log.Warn().Err(diagErr).Msg("CloudKit diagnostic full count failed")
+			} else {
+				log.Info().Str("diag_result", diagResult).Msg("CloudKit diagnostic full count (post-sync check)")
+			}
+		}()
 	}
 
 	return nil
@@ -634,8 +651,13 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	}
 
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
+	log.Info().
+		Bool("token_nil", token == nil).
+		Msg("CloudKit message sync starting")
+
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 3
+	totalPages := 0
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
@@ -658,14 +680,13 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 		}
 		consecutiveErrors = 0
 
-		if len(resp.Messages) > 0 {
-			log.Info().
-				Int("page", page).
-				Int("messages", len(resp.Messages)).
-				Int32("status", resp.Status).
-				Bool("done", resp.Done).
-				Msg("CloudKit message sync page")
-		}
+		log.Info().
+			Int("page", page).
+			Int("messages", len(resp.Messages)).
+			Int32("status", resp.Status).
+			Bool("done", resp.Done).
+			Bool("has_token", resp.ContinuationToken != nil).
+			Msg("CloudKit message sync page")
 
 		if err = c.ingestCloudMessages(ctx, resp.Messages, "", &counts, attMap); err != nil {
 			return counts, token, err
@@ -673,20 +694,34 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 
 		prev := ptrStringOr(token, "")
 		token = resp.ContinuationToken
+		totalPages = page + 1
 
-		// Persist the continuation token after each page so a restart
-		// mid-sync resumes from the last completed page instead of
-		// re-downloading everything from scratch.
-		if token != nil {
+		// Only persist the continuation token if records were received.
+		// Persisting an empty-page token on a 0-record re-sync would
+		// prevent future retries from starting fresh.
+		if token != nil && len(resp.Messages) > 0 {
 			if saveErr := c.cloudStore.setSyncStateSuccess(ctx, cloudZoneMessages, token); saveErr != nil {
 				log.Warn().Err(saveErr).Int("page", page).Msg("Failed to persist message sync token mid-page")
 			}
 		}
 
 		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
+			log.Info().
+				Int("page", page).
+				Bool("api_done", resp.Done).
+				Bool("token_unchanged", prev == ptrStringOr(token, "")).
+				Msg("CloudKit message sync pagination stopped")
 			break
 		}
 	}
+
+	log.Info().
+		Int("total_pages", totalPages).
+		Int("imported", counts.Imported).
+		Int("updated", counts.Updated).
+		Int("skipped", counts.Skipped).
+		Int("deleted", counts.Deleted).
+		Msg("CloudKit message sync finished")
 
 	return counts, token, nil
 }
