@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 
@@ -22,6 +23,12 @@ import (
 // No periodic polling needed: real-time messages arrive via APNs push
 // on com.apple.madrid. CloudKit sync is only used for initial backfill
 // of historical messages (bootstrap).
+
+// cloudSyncVersion is bumped when sync logic changes in a way that
+// requires a one-time full re-download from CloudKit (e.g. improved PCS
+// key handling that can now decrypt previously-skipped records).
+// Increment this to trigger a token clear on the next bootstrap.
+const cloudSyncVersion = 2
 
 type cloudSyncCounters struct {
 	Imported int
@@ -268,15 +275,6 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 // continuation tokens mean CloudKit only returns changes since last sync.
 func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isBootstrap bool) error {
 	if isBootstrap {
-		// Detect a fresh start: if the bridge has no portals AND no cloud sync
-		// state for this login, the DB was never synced. Clear stale cloud cache
-		// tables and sync tokens so the bootstrap does a full sync from scratch.
-		//
-		// We check BOTH bridge portals AND cloud sync state because:
-		// - Portals only exist after createPortalsFromCloudSync completes
-		// - Sync state exists as soon as the first CloudKit page is downloaded
-		// - If we only checked portals, a restart mid-sync would look "fresh"
-		//   and wipe all progress, causing an infinite restart loop
 		isFresh := false
 		hasOwnPortal := false
 		if portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx); err == nil {
@@ -287,25 +285,44 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 				}
 			}
 		}
-		hasSyncState := false
-		if c.cloudStore != nil {
+
+		if !hasOwnPortal {
+			hasSyncState := false
 			if has, err := c.cloudStore.hasAnySyncState(ctx); err == nil {
 				hasSyncState = has
 			}
-		}
-		isFresh = !hasOwnPortal && !hasSyncState
-
-		if isFresh {
-			if err := c.cloudStore.clearAllData(ctx); err != nil {
-				log.Warn().Err(err).Msg("Failed to clear stale cloud data")
+			if !hasSyncState {
+				// No portals AND no sync state — truly fresh. Clear everything.
+				if err := c.cloudStore.clearAllData(ctx); err != nil {
+					log.Warn().Err(err).Msg("Failed to clear stale cloud data")
+				} else {
+					log.Info().Msg("Fresh database detected, cleared cloud cache for full bootstrap")
+				}
+				isFresh = true
 			} else {
-				log.Info().Msg("Fresh database detected, cleared cloud cache and sync tokens for full bootstrap")
+				log.Info().Msg("Resuming interrupted CloudKit sync (sync state exists but no portals yet)")
 			}
-		} else if !hasOwnPortal && hasSyncState {
-			log.Info().Msg("Resuming interrupted CloudKit sync (sync state exists but no portals yet)")
+		} else {
+			// Existing portals — check sync version. If the sync logic has
+			// been upgraded (e.g. better PCS key handling), do a one-time
+			// full re-sync to pick up previously-undecryptable records.
+			// Subsequent restarts use incremental sync (cheap).
+			savedVersion, _ := c.cloudStore.getSyncVersion(ctx)
+			if savedVersion < cloudSyncVersion {
+				if err := c.cloudStore.clearSyncTokens(ctx); err != nil {
+					log.Warn().Err(err).Msg("Failed to clear sync tokens for version upgrade re-sync")
+				} else {
+					log.Info().
+						Int("old_version", savedVersion).
+						Int("new_version", cloudSyncVersion).
+						Msg("Sync version upgraded — cleared tokens for one-time full re-sync")
+				}
+			} else {
+				log.Info().Int("sync_version", savedVersion).Msg("Sync version current — using incremental CloudKit sync")
+			}
 		}
 
-		log.Info().Bool("incremental", !isFresh).Msg("CloudKit sync start")
+		log.Info().Bool("fresh", isFresh).Msg("CloudKit sync start")
 	}
 
 	backfillStart := time.Now()
@@ -322,6 +339,15 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		Bool("bootstrap", isBootstrap).
 		Dur("elapsed", time.Since(backfillStart)).
 		Msg("CloudKit sync pass complete")
+
+	// Persist sync version after successful sync so we don't re-clear
+	// tokens on subsequent restarts.
+	if isBootstrap {
+		if err := c.cloudStore.setSyncVersion(ctx, cloudSyncVersion); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist sync version")
+		}
+	}
+
 	return nil
 }
 
@@ -431,11 +457,27 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 	}
 
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
+	consecutiveErrors := 0
+	const maxConsecutiveAttErrors = 3
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
-			return attMap, token, syncErr
+			consecutiveErrors++
+			log.Warn().Err(syncErr).
+				Int("page", page).
+				Int("imported_so_far", len(attMap)).
+				Int("consecutive_errors", consecutiveErrors).
+				Msg("CloudKit attachment sync page failed (FFI error)")
+			if consecutiveErrors >= maxConsecutiveAttErrors {
+				log.Error().
+					Int("page", page).
+					Int("imported_so_far", len(attMap)).
+					Msg("CloudKit attachment sync: too many consecutive FFI errors, stopping pagination")
+				break
+			}
+			continue
 		}
+		consecutiveErrors = 0
 
 		for _, att := range resp.Attachments {
 			mime := ""
@@ -487,11 +529,27 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	totalPages := 0
+	consecutiveErrors := 0
+	const maxConsecutiveChatErrors = 3
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
-			return counts, token, syncErr
+			consecutiveErrors++
+			log.Warn().Err(syncErr).
+				Int("page", page).
+				Int("imported_so_far", counts.Imported).
+				Int("consecutive_errors", consecutiveErrors).
+				Msg("CloudKit chat sync page failed (FFI error)")
+			if consecutiveErrors >= maxConsecutiveChatErrors {
+				log.Error().
+					Int("page", page).
+					Int("imported_so_far", counts.Imported).
+					Msg("CloudKit chat sync: too many consecutive FFI errors, stopping pagination")
+				break
+			}
+			continue
 		}
+		consecutiveErrors = 0
 
 		log.Info().
 			Int("page", page).
@@ -576,17 +634,29 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	}
 
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
+	consecutiveErrors := 0
+	const maxConsecutiveErrors = 3
 	for page := 0; page < 256; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
-			// FFI panic or deserialization error on this page.
-			// Log and stop pagination — keep messages from previous pages.
+			consecutiveErrors++
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", counts.Imported).
-				Msg("CloudKit message sync page failed (FFI error), stopping pagination with partial data")
-			break
+				Int("consecutive_errors", consecutiveErrors).
+				Msg("CloudKit message sync page failed (FFI error)")
+			if consecutiveErrors >= maxConsecutiveErrors {
+				log.Error().
+					Int("page", page).
+					Int("imported_so_far", counts.Imported).
+					Msg("CloudKit message sync: too many consecutive FFI errors, stopping pagination")
+				break
+			}
+			// Skip this page and retry with the same token on next iteration.
+			// The server may return different records on retry.
+			continue
 		}
+		consecutiveErrors = 0
 
 		if len(resp.Messages) > 0 {
 			log.Info().
@@ -1107,6 +1177,35 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Int("total", len(ordered)).
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
+
+	// Reset backward backfill tasks so the backfill queue re-processes each
+	// portal from scratch. Uses Upsert to create the task if it doesn't exist
+	// (MarkNotDone silently no-ops when there's no matching row).
+	// Portals with nothing new will complete quickly (one empty FetchMessages).
+	resetCount := 0
+	for _, portalID := range ordered {
+		portalKey := networkid.PortalKey{
+			ID:       networkid.PortalID(portalID),
+			Receiver: c.UserLogin.ID,
+		}
+		if err := c.Main.Bridge.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
+			PortalKey:         portalKey,
+			UserLoginID:       c.UserLogin.ID,
+			BatchCount:        -1,
+			IsDone:            false,
+			Cursor:            "",
+			OldestMessageID:   "",
+			NextDispatchMinTS: time.Now().Add(5 * time.Second),
+		}); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to reset backfill task")
+		} else {
+			resetCount++
+		}
+	}
+	if resetCount > 0 {
+		log.Info().Int("reset_count", resetCount).Msg("Reset backward backfill tasks for cloud-synced portals")
+		c.Main.Bridge.WakeupBackfillQueue()
+	}
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {

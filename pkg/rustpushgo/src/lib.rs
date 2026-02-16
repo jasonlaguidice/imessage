@@ -2238,11 +2238,27 @@ impl Client {
             client: cloudkit.clone(),
         });
 
-        sync_keychain_with_retries(&keychain, 3, "Cloud client init").await?;
+        // Aggressively load all PCS keys during init to prevent sync_records
+        // from silently skipping records encrypted with old/rotated keys.
+        // Step 1: Fetch recoverable TLK shares for our identity — this pulls
+        // in key shares that sync_keychain alone might not discover.
+        if let Err(e) = refresh_recoverable_tlk_shares(&keychain, "Cloud client init").await {
+            warn!("Cloud client init: TLK share refresh failed (non-fatal): {}", e);
+        }
+        // Step 2: Full keychain sync with retries.
+        sync_keychain_with_retries(&keychain, 6, "Cloud client init").await?;
 
         let cloud_messages = Arc::new(rustpush::cloud_messages::CloudMessagesClient::new(
             cloudkit, keychain.clone(),
         ));
+
+        // Step 3: Pre-fetch and cache zone encryption configs for all Manatee zones.
+        // This ensures the PCS zone keys derived from the keychain are cached
+        // before sync_records tries to decrypt individual records.
+        if let Err(e) = cloud_messages.warm_zone_keys().await {
+            warn!("Cloud client init: zone key warm-up failed (non-fatal): {}", e);
+        }
+
         *locked = Some(cloud_messages.clone());
         *self.cloud_keychain_client.lock().await = Some(keychain);
         Ok(cloud_messages)
