@@ -106,6 +106,12 @@ type IMClient struct {
 	imGroupNames   map[string]string
 	imGroupNamesMu sync.RWMutex
 
+	// In-memory group participants cache keyed by portal ID.
+	// Populated synchronously in makePortalKey so resolveGroupMembers
+	// can find participants before the async cloud_chat DB write completes.
+	imGroupParticipants   map[string][]string
+	imGroupParticipantsMu sync.RWMutex
+
 	// Persistent iMessage group UUIDs (sender_guid/gid) keyed by portal ID.
 	// Populated from incoming messages; used for outbound routing so that
 	// Apple Messages recipients match messages to the correct group thread.
@@ -1018,16 +1024,18 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 			}
 		}
 
-		// Background: scan CloudKit for records not in our local DB.
+		// Persist deletion intent BEFORE background scan. If bridge restarts
+		// before the scan completes, the pending entry ensures retry on startup.
+		if chatIdentifier != "" {
+			if err := c.cloudStore.recordPendingCloudDeletion(ctx, portalID, chatIdentifier, groupID); err != nil {
+				log.Warn().Err(err).Msg("Failed to persist pending cloud deletion for incoming delete")
+			}
+		}
+
+		// Background: full-scan CloudKit for records not in our local DB.
 		// Slow (pages through all records) so we don't block the APNs loop.
-		go func() {
-			if len(chatRecordNames) == 0 && chatIdentifier != "" {
-				c.findAndDeleteCloudChatByIdentifier(log, chatIdentifier)
-			}
-			if chatIdentifier != "" {
-				c.findAndDeleteCloudMessagesByChatIdentifier(log, chatIdentifier)
-			}
-		}()
+		// runFullCloudKitDeletion clears the pending entry on success.
+		go c.runFullCloudKitDeletion(log, portalID, chatIdentifier, chatRecordNames)
 	}
 }
 
@@ -1732,18 +1740,32 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
-	// Delete from Apple synchronously — MoveToRecycleBin + CloudKit cleanup
+	// Persist deletion intent BEFORE starting CloudKit cleanup. If the bridge
+	// restarts mid-deletion, the pending entry ensures retry on next startup.
+	if c.cloudStore != nil {
+		groupID := ""
+		if strings.HasPrefix(portalID, "gid:") {
+			groupID = strings.TrimPrefix(portalID, "gid:")
+		}
+		if err := c.cloudStore.recordPendingCloudDeletion(ctx, portalID, chatGuid, groupID); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist pending cloud deletion")
+		}
+	}
+
+	// Delete from Apple synchronously — MoveToRecycleBin + full CloudKit scan
 	// must complete before returning so records are gone if the bridge restarts.
-	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames)
+	c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames, true)
 
 	return nil
 }
 
-// deleteFromApple sends MoveToRecycleBin via APNs and deletes known CloudKit
-// records synchronously, then kicks off a background scan to catch any records
-// not in the local DB. Local DB is already cleaned before this is called, so
-// restarts are safe even if the background scan is interrupted.
-func (c *IMClient) deleteFromApple(portalID string, conv rustpushgo.WrappedConversation, chatGuid string, chatRecordNames, msgRecordNames []string) {
+// deleteFromApple sends MoveToRecycleBin via APNs and comprehensively deletes
+// all CloudKit records for the chat. The caller must persist a pending_cloud_deletion
+// entry BEFORE calling this, so interrupted deletions are retried on startup.
+// The synchronous flag controls whether the full-scan fallback blocks or runs
+// in the background (use true for Beeper-initiated deletes, false for incoming
+// APNs deletes to avoid blocking the message loop).
+func (c *IMClient) deleteFromApple(portalID string, conv rustpushgo.WrappedConversation, chatGuid string, chatRecordNames, msgRecordNames []string, synchronous bool) {
 	log := c.Main.Bridge.Log.With().Str("portal_id", portalID).Str("chat_guid", chatGuid).Logger()
 
 	if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatGuid); err != nil {
@@ -1768,16 +1790,50 @@ func (c *IMClient) deleteFromApple(portalID string, conv rustpushgo.WrappedConve
 		}
 	}
 
-	// Background: scan CloudKit for records not in our local DB (e.g. records
-	// synced after our last cloud sync, or APNs-created portals with no
-	// record_names). This is slow (pages through all records) so we don't
-	// block the event loop. Local DB is already clean, so restarts are safe.
-	go func() {
-		if len(chatRecordNames) == 0 {
-			c.findAndDeleteCloudChatByIdentifier(log, chatGuid)
+	// Full-scan CloudKit to catch records not in our local DB (records synced
+	// after our last cloud sync, or APNs-created portals with no record_names).
+	// For Beeper deletes this runs synchronously — we MUST finish before returning
+	// so a restart can't leave CloudKit records alive. For incoming APNs deletes
+	// this runs in background to avoid blocking the message loop (the pending
+	// deletion entry ensures retry on restart).
+	doFullScan := func() {
+		c.runFullCloudKitDeletion(log, portalID, chatGuid, chatRecordNames)
+	}
+	if synchronous {
+		doFullScan()
+	} else {
+		go doFullScan()
+	}
+}
+
+// runFullCloudKitDeletion performs the full-scan deletion of CloudKit records for
+// a chat and clears the pending_cloud_deletion entry on success. Can be called
+// from the delete path or from the startup retry path.
+func (c *IMClient) runFullCloudKitDeletion(log zerolog.Logger, portalID, chatIdentifier string, knownChatRecordNames []string) {
+	if chatIdentifier == "" {
+		log.Debug().Str("portal_id", portalID).Msg("No chat identifier for full CloudKit scan, skipping")
+		// Still clear pending — we can't do anything without an identifier.
+		if c.cloudStore != nil {
+			_ = c.cloudStore.clearPendingCloudDeletion(context.Background(), portalID)
 		}
-		c.findAndDeleteCloudMessagesByChatIdentifier(log, chatGuid)
-	}()
+		return
+	}
+
+	// Scan and delete chat records (if we didn't already have record_names).
+	if len(knownChatRecordNames) == 0 {
+		c.findAndDeleteCloudChatByIdentifier(log, chatIdentifier)
+	}
+	// Always scan messages — there may be more in CloudKit than in local DB.
+	c.findAndDeleteCloudMessagesByChatIdentifier(log, chatIdentifier)
+
+	// Deletion complete — clear the pending entry so it's not retried.
+	if c.cloudStore != nil {
+		if err := c.cloudStore.clearPendingCloudDeletion(context.Background(), portalID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to clear pending cloud deletion")
+		} else {
+			log.Info().Str("portal_id", portalID).Msg("Cleared pending cloud deletion after successful cleanup")
+		}
+	}
 }
 
 // findAndDeleteCloudChatByIdentifier syncs all chat records from CloudKit,
@@ -2971,10 +3027,12 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 
 	c.imGroupNamesMu.Lock()
 	c.imGroupGuidsMu.Lock()
+	c.imGroupParticipantsMu.Lock()
 	c.groupPortalMu.Lock()
 	c.lastGroupForMemberMu.Lock()
 	defer c.lastGroupForMemberMu.Unlock()
 	defer c.groupPortalMu.Unlock()
+	defer c.imGroupParticipantsMu.Unlock()
 	defer c.imGroupGuidsMu.Unlock()
 	defer c.imGroupNamesMu.Unlock()
 
@@ -2992,6 +3050,11 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	if guid, ok := c.imGroupGuids[oldID]; ok {
 		c.imGroupGuids[newID] = guid
 		delete(c.imGroupGuids, oldID)
+	}
+	// Move group participants cache
+	if parts, ok := c.imGroupParticipants[oldID]; ok {
+		c.imGroupParticipants[newID] = parts
+		delete(c.imGroupParticipants, oldID)
 	}
 	// Update group portal index: remove old members, add new
 	for _, member := range strings.Split(oldID, ",") {
@@ -3163,6 +3226,24 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 			c.imGroupNamesMu.Lock()
 			c.imGroupNames[string(portalID)] = *groupName
 			c.imGroupNamesMu.Unlock()
+		}
+		// Cache normalized participants in memory so resolveGroupMembers
+		// can find them immediately. The cloud_chat DB write happens async
+		// and may not complete before GetChatInfo is called during portal
+		// creation, which would cause the group name to resolve as "Group Chat".
+		if len(participants) > 0 {
+			normalized := make([]string, 0, len(participants))
+			for _, p := range participants {
+				n := normalizeIdentifierForPortalID(p)
+				if n != "" {
+					normalized = append(normalized, n)
+				}
+			}
+			if len(normalized) > 0 {
+				c.imGroupParticipantsMu.Lock()
+				c.imGroupParticipants[string(portalID)] = normalized
+				c.imGroupParticipantsMu.Unlock()
+			}
 		}
 		portalKey := networkid.PortalKey{ID: portalID, Receiver: c.UserLogin.ID}
 
@@ -3397,14 +3478,25 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 }
 
 // resolveGroupMembers returns the participant list for a group portal.
-// For gid: portals it queries the cloud store; for legacy comma-separated
+// For gid: portals it checks the in-memory cache first (populated synchronously
+// by makePortalKey), then the cloud store DB; for legacy comma-separated
 // portal IDs it splits the ID string.
 func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []string {
 	if strings.HasPrefix(portalID, "gid:") {
+		// 1) Check cloud store DB (persisted from CloudKit sync or previous messages)
 		if c.cloudStore != nil {
 			if participants, err := c.cloudStore.getChatParticipantsByPortalID(ctx, portalID); err == nil && len(participants) > 0 {
 				return participants
 			}
+		}
+		// 2) Fallback to in-memory cache (populated synchronously by makePortalKey).
+		// The cloud_chat DB write is async and may not have completed yet when
+		// GetChatInfo is called during portal creation from a real-time message.
+		c.imGroupParticipantsMu.RLock()
+		cached := c.imGroupParticipants[portalID]
+		c.imGroupParticipantsMu.RUnlock()
+		if len(cached) > 0 {
+			return cached
 		}
 		return nil
 	}
@@ -3414,12 +3506,9 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 // resolveGroupName determines the best display name for a group portal.
 // Priority: 1) in-memory cache (user-set iMessage group name from real-time
 //              protocol cv_name, e.g. when someone explicitly renames a group)
-//
-//	2) contact-resolved member names via buildGroupName
-//
-// Note: CloudKit's display_name field is NOT used — it contains Apple's
-// auto-generated label (raw emails/phone numbers) rather than user-set names.
-// The nice contact-resolved names shown in Messages.app are generated locally.
+//           2) CloudKit display_name (user-set group name persisted to iCloud,
+//              the "name" field on CKChatRecord = cv_name from chat.db)
+//           3) contact-resolved member names via buildGroupName
 func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
 	// 1) In-memory cache (populated from real-time iMessage rename messages)
 	c.imGroupNamesMu.RLock()
@@ -3429,7 +3518,21 @@ func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string
 		return name
 	}
 
-	// 2) Build from contact-resolved member names
+	// 2) CloudKit display_name (user-set group name from iCloud).
+	// This is the "name" field on CKChatRecord which maps to cv_name in the
+	// iMessage protocol — it's only non-empty when the user explicitly named
+	// the group. Cache it in imGroupNames so it persists to portal metadata
+	// via GetChatInfo's ExtraUpdates.
+	if c.cloudStore != nil {
+		if dn, err := c.cloudStore.getDisplayNameByPortalID(ctx, portalID); err == nil && dn != "" {
+			c.imGroupNamesMu.Lock()
+			c.imGroupNames[portalID] = dn
+			c.imGroupNamesMu.Unlock()
+			return dn
+		}
+	}
+
+	// 3) Build from contact-resolved member names
 	members := c.resolveGroupMembers(ctx, portalID)
 	if len(members) == 0 {
 		return "Group Chat"
