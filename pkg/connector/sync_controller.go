@@ -267,16 +267,14 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		break
 	}
 
-	// Purge any cloud records the sync re-imported for portals pending deletion.
-	// The sync doesn't know about pending deletions, so it re-imports messages
-	// from CloudKit that we already purged locally. Clean them out before
-	// creating portals so old messages can't leak into backfill.
+	// Soft-delete any cloud records the sync re-imported for portals pending
+	// deletion. The sync doesn't know about pending deletions, so it re-imports
+	// messages from CloudKit. deleteLocalChatByPortalID marks cloud_message rows
+	// deleted=TRUE (preserving UUIDs for echo detection via hasMessageUUID) and
+	// removes cloud_chat rows so createPortalsFromCloudSync won't see them.
 	for portalID := range pendingDeletePortals {
-		if err := c.cloudStore.purgeCloudMessagesByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to purge re-imported messages for pending deletion")
-		}
 		if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to delete re-imported chat for pending deletion")
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete re-imported records for pending deletion")
 		}
 	}
 
