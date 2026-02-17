@@ -129,6 +129,7 @@ type Contact struct {
 	LastName  string   `json:"last_name,omitempty"`
 	Nickname  string   `json:"nickname,omitempty"`
 	Avatar    []byte   `json:"avatar,omitempty"`
+	AvatarURL string   `json:"avatar_url,omitempty"` // URL reference for deferred download
 	Phones    []string `json:"phones,omitempty"`
 	Emails    []string `json:"emails,omitempty"`
 	UserGUID  string   `json:"user_guid,omitempty"`
