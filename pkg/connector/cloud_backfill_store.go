@@ -37,6 +37,9 @@ type cloudMessageRow struct {
 
 	// Attachment metadata JSON (serialized []cloudAttachmentRow)
 	AttachmentsJSON string
+
+	// When the recipient read this message (Unix ms). Only for is_from_me messages.
+	DateReadMS int64
 }
 
 // cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
@@ -154,6 +157,15 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_message ADD COLUMN %s %s`, col.name, col.def)); err != nil {
 				return fmt.Errorf("failed to add %s column: %w", col.name, err)
 			}
+		}
+	}
+
+	// Migration: add date_read_ms column to cloud_message if missing
+	var hasDateReadMS int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name='date_read_ms'`).Scan(&hasDateReadMS)
+	if hasDateReadMS == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_message ADD COLUMN date_read_ms BIGINT NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add date_read_ms column: %w", err)
 		}
 	}
 
@@ -399,9 +411,9 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			login_id, guid, record_name, chat_id, portal_id, timestamp_ms,
 			sender, is_from_me, text, subject, service, deleted,
 			tapback_type, tapback_target_guid, tapback_emoji,
-			attachments_json,
+			attachments_json, date_read_ms,
 			created_ts, updated_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -417,6 +429,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			tapback_target_guid=excluded.tapback_target_guid,
 			tapback_emoji=excluded.tapback_emoji,
 			attachments_json=excluded.attachments_json,
+			date_read_ms=CASE WHEN excluded.date_read_ms > cloud_message.date_read_ms THEN excluded.date_read_ms ELSE cloud_message.date_read_ms END,
 			updated_ts=excluded.updated_ts
 	`)
 	if err != nil {
@@ -430,7 +443,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			s.loginID, row.GUID, row.RecordName, row.CloudChatID, row.PortalID, row.TimestampMS,
 			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
 			row.TapbackType, row.TapbackTargetGUID, row.TapbackEmoji,
-			row.AttachmentsJSON,
+			row.AttachmentsJSON, row.DateReadMS,
 			nowMS, nowMS,
 		)
 		if err != nil {
@@ -1243,7 +1256,7 @@ func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID str
 const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestamp_ms, COALESCE(sender, ''), is_from_me,
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
-	COALESCE(attachments_json, '')`
+	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
@@ -1321,6 +1334,7 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.TapbackTargetGUID,
 			&row.TapbackEmoji,
 			&row.AttachmentsJSON,
+			&row.DateReadMS,
 		); err != nil {
 			return nil, err
 		}

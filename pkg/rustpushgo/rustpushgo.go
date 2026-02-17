@@ -2964,6 +2964,7 @@ type WrappedCloudSyncMessage struct {
 	TapbackTargetGuid *string
 	TapbackEmoji      *string
 	AttachmentGuids   []string
+	DateReadMs        int64
 }
 
 func (r *WrappedCloudSyncMessage) Destroy() {
@@ -2981,6 +2982,7 @@ func (r *WrappedCloudSyncMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.TapbackTargetGuid)
 	FfiDestroyerOptionalString{}.Destroy(r.TapbackEmoji)
 	FfiDestroyerSequenceString{}.Destroy(r.AttachmentGuids)
+	FfiDestroyerInt64{}.Destroy(r.DateReadMs)
 }
 
 type FfiConverterTypeWrappedCloudSyncMessage struct{}
@@ -3007,6 +3009,7 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Read(reader io.Reader) WrappedC
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterSequenceStringINSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
 	}
 }
 
@@ -3029,6 +3032,7 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Write(writer io.Writer, value W
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackTargetGuid)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackEmoji)
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.AttachmentGuids)
+	FfiConverterInt64INSTANCE.Write(writer, value.DateReadMs)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncMessage struct{}

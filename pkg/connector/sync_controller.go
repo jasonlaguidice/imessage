@@ -330,6 +330,25 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
+	// Delayed incremental re-sync: catch CloudKit messages that propagated
+	// after the bootstrap sync completed. APNs stored messages create partial
+	// cloud_message rows (UUID + timestamp only); this re-sync fills them
+	// with full CloudKit data (sender, text, attachments).
+	go func() {
+		select {
+		case <-time.After(15 * time.Second):
+		case <-c.stopChan:
+			return
+		}
+		resyncLog := log.With().Str("source", "delayed_resync").Logger()
+		resyncLog.Info().Msg("Running delayed incremental CloudKit re-sync")
+		if err := c.runCloudSyncOnce(ctx, resyncLog, false); err != nil {
+			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
+			return
+		}
+		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
+	}()
+
 	log.Info().
 		Dur("portal_creation_elapsed", time.Since(portalStart)).
 		Dur("total_elapsed", time.Since(controllerStart)).
@@ -1147,6 +1166,7 @@ func (c *IMClient) ingestCloudMessages(
 			TapbackTargetGUID: tapbackTargetGUID,
 			TapbackEmoji:      tapbackEmoji,
 			AttachmentsJSON:   attachmentsJSON,
+			DateReadMS:        msg.DateReadMs,
 		})
 
 		if existingSet[msg.Guid] {
