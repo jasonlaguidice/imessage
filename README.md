@@ -198,7 +198,7 @@ flowchart TB
 
 **Real-time messages** flow through Apple's push notification service (APNs) via rustpush and appear in Matrix immediately.
 
-**Backfill** runs once on first login: the bridge reads `chat.db` and creates portals for all chats with activity in the last `initial_sync_days` (default: 1 year, configurable). On macOS this reads the local database directly; on Linux with the NAC relay, it proxies queries over HTTP to the Mac. After initial sync, everything is real-time via rustpush.
+**CloudKit backfill** (optional, off by default) syncs your iMessage history from iCloud on first login. Enable it during `make install` or by setting `cloudkit_backfill: true` in config. When enabled, the login flow will ask for your device PIN to join the iCloud Keychain trust circle, which grants access to Messages in iCloud. The backfill window is controlled by `initial_sync_days` (default: 1 year).
 
 ## Management
 
@@ -256,10 +256,11 @@ Key options:
 
 | Field | Default | What it does |
 |-------|---------|-------------|
-| `network.initial_sync_days` | `365` | How far back to backfill on first login |
+| `network.cloudkit_backfill` | `false` | Enable CloudKit message history backfill (requires device PIN during login) |
+| `network.initial_sync_days` | `365` | How far back to backfill on first login (only when backfill is enabled) |
 | `network.displayname_template` | First/Last name | How bridged contacts appear in Matrix |
 | `network.preferred_handle` | *(from login)* | Outgoing identity (`tel:+15551234567` or `mailto:user@example.com`) |
-| `backfill.max_initial_messages` | `10000` | Max messages to backfill per chat |
+| `backfill.max_initial_messages` | `50000` | Max messages to backfill per chat (auto-tuned when backfill enabled) |
 | `encryption.allow` | `true` | Enable end-to-bridge encryption |
 | `database.type` | `sqlite3-fk-wal` | `sqlite3-fk-wal` or `postgres` |
 

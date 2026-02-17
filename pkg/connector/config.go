@@ -28,6 +28,12 @@ type IMConfig struct {
 	// Default is 365 (1 year).
 	InitialSyncDays int `yaml:"initial_sync_days"`
 
+	// CloudKitBackfill enables CloudKit message history backfill.
+	// When false, the bridge only handles real-time messages via APNs push
+	// and skips the device PIN / iCloud Keychain steps during login.
+	// Default is false.
+	CloudKitBackfill bool `yaml:"cloudkit_backfill"`
+
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 	// If empty, the handle chosen during login is used.
@@ -111,6 +117,7 @@ func (c *IMConfig) FormatDisplayname(params DisplaynameParams) string {
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
 	helper.Copy(up.Int, "initial_sync_days")
+	helper.Copy(up.Bool, "cloudkit_backfill")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")

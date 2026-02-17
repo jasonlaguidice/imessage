@@ -585,9 +585,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
-	if cloudStoreReady {
+	if cloudStoreReady && c.Main.Config.CloudKitBackfill {
 		c.startCloudSyncController(log)
 	} else {
+		if !c.Main.Config.CloudKitBackfill {
+			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
+		}
 		// No CloudKit — open the APNs portal-creation gate immediately
 		// so real-time messages can create portals without waiting.
 		c.setCloudSyncDone()
@@ -2380,8 +2383,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}()
 	}
 
-	if c.cloudStore == nil {
-		log.Debug().Bool("forward", params.Forward).Msg("FetchMessages: no cloud store, returning empty")
+	if !c.Main.Config.CloudKitBackfill || c.cloudStore == nil {
+		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
+			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
