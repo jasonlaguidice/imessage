@@ -1114,6 +1114,10 @@ func (c *IMClient) resolveDeleteTargetPortal(
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	if msg.IsStoredMessage {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored read receipt (CloudKit backfill provides correct timestamp)")
+		return
+	}
 	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	ctx := context.Background()
 
@@ -1196,6 +1200,10 @@ resolved:
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	if msg.IsStoredMessage {
+		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored delivery receipt")
+		return
+	}
 	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	ctx := context.Background()
 
@@ -2363,6 +2371,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		beforeTS = params.AnchorMessage.Timestamp.UnixMilli()
 		beforeGUID = string(params.AnchorMessage.ID)
 		cursorDesc = fmt.Sprintf("anchor ts=%d id=%s", beforeTS, beforeGUID)
+	}
+
+	if beforeTS == 0 && beforeGUID == "" {
+		log.Debug().Str("portal_id", portalID).Msg("Backward backfill: no anchor or cursor, nothing to paginate from")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
 	}
 
 	log.Info().

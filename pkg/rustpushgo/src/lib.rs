@@ -976,6 +976,10 @@ pub struct WrappedCloudSyncMessage {
     // Attachment GUIDs extracted from messageSummaryInfo / attributedBody.
     // These are matched against the attachment zone to download files.
     pub attachment_guids: Vec<String>,
+
+    // When the recipient read this message (Apple epoch ns → Unix ms).
+    // Only meaningful for is_from_me messages. 0 means unread.
+    pub date_read_ms: i64,
 }
 
 /// Metadata for an attachment referenced by a CloudKit message.
@@ -2967,6 +2971,13 @@ impl Client {
         let mut skipped_messages = 0usize;
         for (record_name, msg_opt) in messages {
             if let Some(msg) = msg_opt {
+                // Skip system messages (group renames, participant changes, etc.)
+                // These are not user-visible content and should not appear in
+                // the backfilled timeline.
+                if msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE) {
+                    skipped_messages += 1;
+                    continue;
+                }
                 // Wrap per-message normalization in catch_unwind so one bad
                 // CloudKit record doesn't fail the entire page.
                 let rn = record_name.clone();
@@ -2994,6 +3005,10 @@ impl Client {
                         .filter(|g| !g.is_empty() && g.len() <= 256 && g.is_ascii())
                         .collect();
 
+                    let date_read_ms = msg.msg_proto.date_read
+                        .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
+                        .unwrap_or(0);
+
                     WrappedCloudSyncMessage {
                         record_name: rn,
                         guid,
@@ -3011,6 +3026,7 @@ impl Client {
                         tapback_target_guid,
                         tapback_emoji,
                         attachment_guids,
+                        date_read_ms,
                     }
                 }));
 
@@ -3047,6 +3063,7 @@ impl Client {
                     tapback_target_guid: None,
                     tapback_emoji: None,
                     attachment_guids: vec![],
+                    date_read_ms: 0,
                 });
             }
         }
@@ -3253,6 +3270,11 @@ impl Client {
                     continue;
                 };
 
+                // Skip system messages (group renames, participant changes, etc.)
+                if msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE) {
+                    continue;
+                }
+
                 if let Some(ref wanted_chat) = chat_id {
                     if &msg.chat_id != wanted_chat {
                         continue;
@@ -3275,6 +3297,10 @@ impl Client {
                 let tapback_emoji = msg.msg_proto_4.as_ref()
                     .and_then(|p4| p4.associated_message_emoji.clone());
 
+                let date_read_ms = msg.msg_proto.date_read
+                    .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
+                    .unwrap_or(0);
+
                 deduped.insert(
                     guid.clone(),
                     WrappedCloudSyncMessage {
@@ -3294,6 +3320,7 @@ impl Client {
                         tapback_target_guid,
                         tapback_emoji,
                         attachment_guids: vec![],
+                        date_read_ms,
                     },
                 );
 
