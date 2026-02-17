@@ -2646,6 +2646,12 @@ func (c *IMClient) downloadAndUploadAttachment(
 		fileName = "attachment"
 	}
 
+	// Convert CAF Opus voice messages to OGG Opus for Matrix clients
+	var durationMs int
+	if att.UTIType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
+		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+	}
+
 	msgType := mimeToMsgType(mimeType)
 	content := &event.MessageEventContent{
 		MsgType: msgType,
@@ -2654,6 +2660,14 @@ func (c *IMClient) downloadAndUploadAttachment(
 			MimeType: mimeType,
 			Size:     len(data),
 		},
+	}
+
+	// Mark as voice message if this was a CAF voice recording
+	if durationMs > 0 {
+		content.MSC3245Voice = &event.MSC3245Voice{}
+		content.MSC1767Audio = &event.MSC1767Audio{
+			Duration: durationMs,
+		}
 	}
 
 	url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
