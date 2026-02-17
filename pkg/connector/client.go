@@ -100,6 +100,11 @@ type IMClient struct {
 	recentUnsends     map[string]time.Time
 	recentUnsendsLock sync.Mutex
 
+	// Outbound unsend echo suppression: tracks target UUIDs of unsends
+	// initiated from Matrix so the APNs echo doesn't get double-processed.
+	recentOutboundUnsends     map[string]time.Time
+	recentOutboundUnsendsLock sync.Mutex
+
 	// SMS portal tracking: portal IDs known to be SMS-only contacts
 	smsPortals     map[string]bool
 	smsPortalsLock sync.RWMutex
@@ -624,8 +629,15 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	targetGUID := ptrStringOr(msg.TapbackTargetUuid, "")
+
+	// Resolve portal by target message UUID first as a safety net.
+	// Tapbacks usually have correct participants from the payload, but
+	// self-reflections can still have participants=[self, self].
+	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
+	if portalKey.ID == "" {
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	}
 	emoji := tapbackTypeToEmoji(msg.TapbackType, msg.TapbackEmoji)
 
 	evtType := bridgev2.RemoteEventReaction
@@ -646,8 +658,15 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 }
 
 func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	targetGUID := ptrStringOr(msg.EditTargetUuid, "")
+
+	// Resolve portal by target message UUID first. Edit reflections from the
+	// user's own devices have participants=[self, self], so makePortalKey can't
+	// determine the correct DM portal.
+	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
+	if portalKey.ID == "" {
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	}
 	newText := ptrStringOr(msg.EditNewText, "")
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[string]{
@@ -680,10 +699,23 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 }
 
 func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	targetGUID := ptrStringOr(msg.UnsendTargetUuid, "")
 
+	// Suppress echo of unsends initiated from Matrix.
+	if c.wasOutboundUnsend(targetGUID) {
+		log.Debug().Str("target_uuid", targetGUID).Msg("Suppressing echo of outbound unsend")
+		return
+	}
+
 	c.trackUnsend(targetGUID)
+
+	// Resolve portal by target message UUID first. Unsend reflections from the
+	// user's own devices have participants=[self, self], so makePortalKey can't
+	// determine the correct DM portal.
+	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
+	if portalKey.ID == "" {
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	}
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
 		EventMeta: simplevent.EventMeta{
@@ -1565,6 +1597,9 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	if c.client == nil {
 		return bridgev2.ErrNotLoggedIn
 	}
+
+	// Track outbound unsend so we can suppress the APNs echo.
+	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
 
 	conv := c.portalToConversation(msg.Portal)
 	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
@@ -4123,6 +4158,52 @@ func (c *IMClient) wasUnsent(uuid string) bool {
 	defer c.recentUnsendsLock.Unlock()
 	if t, ok := c.recentUnsends[uuid]; ok {
 		return time.Since(t) < 5*time.Minute
+	}
+	return false
+}
+
+// resolvePortalByTargetMessage looks up a message by UUID in the bridge database
+// and returns the portal key it belongs to. This is critical for unsends and edits
+// that arrive as self-reflections from the user's other Apple devices: the APNs
+// envelope has participants=[self, self], so makePortalKey can't determine the
+// correct DM portal. Returns an empty PortalKey if not found.
+func (c *IMClient) resolvePortalByTargetMessage(log zerolog.Logger, targetUUID string) networkid.PortalKey {
+	if targetUUID == "" {
+		return networkid.PortalKey{}
+	}
+	msgID := makeMessageID(targetUUID)
+	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
+		context.Background(), c.UserLogin.ID, msgID)
+	if err != nil || len(dbMessages) == 0 {
+		return networkid.PortalKey{}
+	}
+	log.Debug().
+		Str("target_uuid", targetUUID).
+		Str("resolved_portal", string(dbMessages[0].Room.ID)).
+		Msg("Resolved portal via target message UUID lookup")
+	return dbMessages[0].Room
+}
+
+func (c *IMClient) trackOutboundUnsend(uuid string) {
+	c.recentOutboundUnsendsLock.Lock()
+	defer c.recentOutboundUnsendsLock.Unlock()
+	c.recentOutboundUnsends[uuid] = time.Now()
+	for k, t := range c.recentOutboundUnsends {
+		if time.Since(t) > 5*time.Minute {
+			delete(c.recentOutboundUnsends, k)
+		}
+	}
+}
+
+func (c *IMClient) wasOutboundUnsend(uuid string) bool {
+	c.recentOutboundUnsendsLock.Lock()
+	defer c.recentOutboundUnsendsLock.Unlock()
+	if t, ok := c.recentOutboundUnsends[uuid]; ok {
+		if time.Since(t) < 5*time.Minute {
+			delete(c.recentOutboundUnsends, uuid)
+			return true
+		}
+		delete(c.recentOutboundUnsends, uuid)
 	}
 	return false
 }
