@@ -2072,12 +2072,29 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			MemberMap:   memberMap,
 		}
 
-		// For self-chats, set an explicit name from contacts since the
-		// framework can't derive a ghost name when the "other user" is the
-		// logged-in user — it falls back to the Matrix display name instead.
+		// For self-chats, set an explicit name and avatar from contacts since
+		// the framework can't derive them from the ghost when the "other user"
+		// is the logged-in user. Setting Name causes NameIsCustom=true in the
+		// framework, which blocks UpdateInfoFromGhost (it returns early when
+		// NameIsCustom is set), so we must also set the avatar explicitly here.
 		if isSelfChat {
 			selfName := c.resolveContactDisplayname(portalID)
 			chatInfo.Name = &selfName
+
+			// Pull contact photo for self-chat room avatar.
+			localID := stripIdentifierPrefix(portalID)
+			if c.contacts != nil {
+				if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && len(contact.Avatar) > 0 {
+					avatarHash := sha256.Sum256(contact.Avatar)
+					avatarData := contact.Avatar
+					chatInfo.Avatar = &bridgev2.Avatar{
+						ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", portalID, hex.EncodeToString(avatarHash[:8]))),
+						Get: func(ctx context.Context) ([]byte, error) {
+							return avatarData, nil
+						},
+					}
+				}
+			}
 		}
 		// For regular DMs, don't set an explicit room name. With
 		// private_chat_portal_meta, the framework derives it from the ghost's
