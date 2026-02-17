@@ -158,7 +158,71 @@ if ! grep -q "beeper" "$CONFIG" 2>/dev/null; then
     exit 1
 fi
 
-# (initial_sync_days is unused — cloud sync fetches all available history)
+# ── Ensure cloudkit_backfill key exists in config ─────────────
+if ! grep -q 'cloudkit_backfill:' "$CONFIG" 2>/dev/null; then
+    # Insert after initial_sync_days if it exists, otherwise after displayname_template
+    if grep -q 'initial_sync_days:' "$CONFIG" 2>/dev/null; then
+        sed -i '' '/initial_sync_days:/a\
+    cloudkit_backfill: false' "$CONFIG"
+    else
+        echo "    cloudkit_backfill: false" >> "$CONFIG"
+    fi
+fi
+
+# ── CloudKit backfill toggle (runs every time) ────────────────
+CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ -t 0 ]; then
+    echo ""
+    echo "CloudKit Backfill:"
+    echo "  When enabled, the bridge will sync your iMessage history from iCloud."
+    echo "  This requires entering your device PIN during login to join the iCloud Keychain."
+    echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
+    echo ""
+    if [ "$CURRENT_BACKFILL" = "true" ]; then
+        read -p "Enable CloudKit message history backfill? [Y/n]: " ENABLE_BACKFILL
+        case "$ENABLE_BACKFILL" in
+            [nN]*) ENABLE_BACKFILL=false ;;
+            *)     ENABLE_BACKFILL=true ;;
+        esac
+    else
+        read -p "Enable CloudKit message history backfill? [y/N]: " ENABLE_BACKFILL
+        case "$ENABLE_BACKFILL" in
+            [yY]*) ENABLE_BACKFILL=true ;;
+            *)     ENABLE_BACKFILL=false ;;
+        esac
+    fi
+    sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
+    if [ "$ENABLE_BACKFILL" = "true" ]; then
+        echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+    else
+        echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
+    fi
+fi
+
+# Tune backfill settings when CloudKit backfill is enabled
+CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ "$CURRENT_BACKFILL" = "true" ]; then
+    PATCHED_BACKFILL=false
+    if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
+        sed -i '' 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+        sed -i '' 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'max_catchup_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+        sed -i '' 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'batch_size: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+        sed -i '' 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if [ "$PATCHED_BACKFILL" = true ]; then
+        echo "✓ Updated backfill settings (max_initial=50000, batch_size=10000, max_batches=-1)"
+    fi
+fi
 
 # ── Restore CardDAV config from backup ────────────────────────
 CARDDAV_BACKUP="$DATA_DIR/.carddav-config"

@@ -97,26 +97,63 @@ open('$CONFIG', 'w').write(text)
     echo "✓ Configured: $HS_ADDRESS, $HS_DOMAIN, $ADMIN_USER, $DB_TYPE"
 fi
 
-# Ensure backfill settings are sane for existing configs
-PATCHED_BACKFILL=false
-if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
-    sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
-    PATCHED_BACKFILL=true
+# ── CloudKit backfill toggle (runs every time) ────────────────
+CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ -t 0 ]; then
+    echo ""
+    echo "CloudKit Backfill:"
+    echo "  When enabled, the bridge will sync your iMessage history from iCloud."
+    echo "  This requires entering your device PIN during login to join the iCloud Keychain."
+    echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
+    echo ""
+    if [ "$CURRENT_BACKFILL" = "true" ]; then
+        read -p "Enable CloudKit message history backfill? [Y/n]: " ENABLE_BACKFILL
+        case "$ENABLE_BACKFILL" in
+            [nN]*) ENABLE_BACKFILL=false ;;
+            *)     ENABLE_BACKFILL=true ;;
+        esac
+    else
+        read -p "Enable CloudKit message history backfill? [y/N]: " ENABLE_BACKFILL
+        case "$ENABLE_BACKFILL" in
+            [yY]*) ENABLE_BACKFILL=true ;;
+            *)     ENABLE_BACKFILL=false ;;
+        esac
+    fi
+    sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
+    if [ "$ENABLE_BACKFILL" = "true" ]; then
+        echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+    else
+        echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
+    fi
 fi
-if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
-    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
-    PATCHED_BACKFILL=true
-fi
-if grep -q 'batch_size: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
-    sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
-    PATCHED_BACKFILL=true
-fi
-if grep -q 'batch_delay: 0$' "$CONFIG" 2>/dev/null; then
-    sed -i 's/batch_delay: 0$/batch_delay: 1/' "$CONFIG"
-    PATCHED_BACKFILL=true
-fi
-if [ "$PATCHED_BACKFILL" = true ]; then
-    echo "✓ Updated backfill settings (max_initial=50000, batch_size=10000, max_batches=-1)"
+
+# Tune backfill settings when CloudKit backfill is enabled
+CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ "$CURRENT_BACKFILL" = "true" ]; then
+    PATCHED_BACKFILL=false
+    if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
+        sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+        sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'max_catchup_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+        sed -i 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'batch_size: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
+        sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if grep -q 'batch_delay: 0$' "$CONFIG" 2>/dev/null; then
+        sed -i 's/batch_delay: 0$/batch_delay: 1/' "$CONFIG"
+        PATCHED_BACKFILL=true
+    fi
+    if [ "$PATCHED_BACKFILL" = true ]; then
+        echo "✓ Updated backfill settings (max_initial=50000, batch_size=10000, max_batches=-1)"
+    fi
 fi
 
 # ── Generate registration ────────────────────────────────────
@@ -144,17 +181,20 @@ if [ "$FIRST_RUN" = true ]; then
     read -p "Press Enter once your homeserver is restarted..."
 fi
 
-# ── Backfill window (first install only) ──────────────────────
-DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
-if [ -t 0 ] && { [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; }; then
-    CURRENT_DAYS=$(grep 'initial_sync_days:' "$CONFIG" | head -1 | sed 's/.*initial_sync_days: *//')
-    [ -z "$CURRENT_DAYS" ] && CURRENT_DAYS=365
-    printf "How many days of message history to backfill? [%s]: " "$CURRENT_DAYS"
-    read BACKFILL_DAYS
-    BACKFILL_DAYS=$(echo "$BACKFILL_DAYS" | tr -dc '0-9')
-    [ -z "$BACKFILL_DAYS" ] && BACKFILL_DAYS="$CURRENT_DAYS"
-    sed -i "s/initial_sync_days: .*/initial_sync_days: $BACKFILL_DAYS/" "$CONFIG"
-    echo "✓ Backfill window set to $BACKFILL_DAYS days"
+# ── Backfill window (first install only, only when backfill is enabled) ──
+CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ "$CURRENT_BACKFILL" = "true" ]; then
+    DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+    if [ -t 0 ] && { [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; }; then
+        CURRENT_DAYS=$(grep 'initial_sync_days:' "$CONFIG" | head -1 | sed 's/.*initial_sync_days: *//')
+        [ -z "$CURRENT_DAYS" ] && CURRENT_DAYS=365
+        printf "How many days of message history to backfill? [%s]: " "$CURRENT_DAYS"
+        read BACKFILL_DAYS
+        BACKFILL_DAYS=$(echo "$BACKFILL_DAYS" | tr -dc '0-9')
+        [ -z "$BACKFILL_DAYS" ] && BACKFILL_DAYS="$CURRENT_DAYS"
+        sed -i "s/initial_sync_days: .*/initial_sync_days: $BACKFILL_DAYS/" "$CONFIG"
+        echo "✓ Backfill window set to $BACKFILL_DAYS days"
+    fi
 fi
 
 # ── Restore CardDAV config from backup ────────────────────────
