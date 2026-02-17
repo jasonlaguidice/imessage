@@ -1268,6 +1268,12 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	pendingDeleteSkipped := 0
 	for _, p := range portalInfos {
 		newestTSByPortal[p.PortalID] = p.NewestTS
+		// Skip portals with no messages — these are cloud_chat records whose
+		// messages were all deleted. Creating empty portals is pointless; if
+		// new messages arrive later, APNs will create the portal on demand.
+		if p.MessageCount == 0 {
+			continue
+		}
 		// Skip portals with pending CloudKit deletions — the sync may have
 		// re-imported records for chats we're still deleting from CloudKit.
 		if pendingDeletePortals[p.PortalID] {
