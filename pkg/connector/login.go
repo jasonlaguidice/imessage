@@ -810,6 +810,7 @@ func completeLoginWithMeta(
 		imGroupNames:        make(map[string]string),
 		imGroupGuids:        make(map[string]string),
 		imGroupParticipants: make(map[string][]string),
+		gidAliases:          make(map[string]string),
 		lastGroupForMember:  make(map[string]networkid.PortalKey),
 	}
 

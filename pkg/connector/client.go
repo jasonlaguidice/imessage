@@ -134,6 +134,13 @@ type IMClient struct {
 	imGroupGuids   map[string]string
 	imGroupGuidsMu sync.RWMutex
 
+	// gidAliases maps unknown gid-based portal IDs (e.g. "gid:uuid-b") to the
+	// resolved existing portal ID (e.g. "gid:uuid-a"). Populated when another
+	// rustpush client (like OpenBubbles) uses a different gid for the same
+	// group conversation. Avoids repeated participant-matching on each message.
+	gidAliases   map[string]string
+	gidAliasesMu sync.RWMutex
+
 	// Last active group portal per member. Updated on every incoming group
 	// message so typing indicators route to the correct group.
 	lastGroupForMember   map[string]networkid.PortalKey
@@ -3124,6 +3131,8 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	c.imGroupParticipantsMu.Lock()
 	c.groupPortalMu.Lock()
 	c.lastGroupForMemberMu.Lock()
+	c.gidAliasesMu.Lock()
+	defer c.gidAliasesMu.Unlock()
 	defer c.lastGroupForMemberMu.Unlock()
 	defer c.groupPortalMu.Unlock()
 	defer c.imGroupParticipantsMu.Unlock()
@@ -3164,6 +3173,12 @@ func (c *IMClient) reIDPortalWithCacheUpdate(ctx context.Context, oldKey, newKey
 	for member, key := range c.lastGroupForMember {
 		if key == oldKey {
 			c.lastGroupForMember[member] = newKey
+		}
+	}
+	// Update gidAliases entries pointing to old portal
+	for alias, target := range c.gidAliases {
+		if target == oldID {
+			c.gidAliases[alias] = newID
 		}
 	}
 
@@ -3281,6 +3296,150 @@ func (c *IMClient) findGroupPortalForMember(member string) (networkid.PortalKey,
 	return networkid.PortalKey{}, false
 }
 
+// resolveExistingGroupByGid tries to find an existing group portal that matches
+// the incoming message when the gid (sender_guid) doesn't match any known portal.
+// This handles the case where another rustpush client (like OpenBubbles) uses a
+// different UUID for the same group conversation.
+//
+// Resolution order:
+//  1. imGroupGuids cache — any existing portal with a matching guid value
+//  2. imGroupParticipants cache — portals with overlapping participant sets
+//  3. groupPortalIndex — comma-based portals via fuzzy participant matching
+//  4. cloud_chat DB — participant matching against all persisted groups
+func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid string, participants []string) networkid.PortalID {
+	ctx := context.Background()
+	normalizedGuid := strings.ToLower(senderGuid)
+
+	// 1. Check imGroupGuids cache: does any existing portal already have
+	//    this guid cached? (covers comma-based portals that previously
+	//    received messages with this same guid)
+	c.imGroupGuidsMu.RLock()
+	for portalIDStr, guid := range c.imGroupGuids {
+		if strings.ToLower(guid) == normalizedGuid {
+			c.imGroupGuidsMu.RUnlock()
+			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+				c.UserLogin.Log.Info().
+					Str("gid_portal_id", gidPortalID).
+					Str("resolved_portal", portalIDStr).
+					Msg("Resolved unknown gid to existing portal via guid cache")
+				return networkid.PortalID(portalIDStr)
+			}
+			c.imGroupGuidsMu.RLock()
+		}
+	}
+	c.imGroupGuidsMu.RUnlock()
+
+	// Build normalized participant set for matching.
+	if len(participants) == 0 {
+		return networkid.PortalID(gidPortalID)
+	}
+	normalizedParts := make([]string, 0, len(participants))
+	for _, p := range participants {
+		n := normalizeIdentifierForPortalID(p)
+		if n != "" {
+			normalizedParts = append(normalizedParts, n)
+		}
+	}
+	if len(normalizedParts) == 0 {
+		return networkid.PortalID(gidPortalID)
+	}
+
+	// 2. Check imGroupParticipants cache: find portals (including other gid:
+	//    portals) with matching participant sets.
+	c.imGroupParticipantsMu.RLock()
+	for portalIDStr, parts := range c.imGroupParticipants {
+		if portalIDStr == gidPortalID {
+			continue
+		}
+		if participantSetsMatch(parts, normalizedParts) {
+			c.imGroupParticipantsMu.RUnlock()
+			key := networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+			if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+				c.UserLogin.Log.Info().
+					Str("gid_portal_id", gidPortalID).
+					Str("resolved_portal", portalIDStr).
+					Msg("Resolved unknown gid to existing portal via participant cache")
+				return networkid.PortalID(portalIDStr)
+			}
+			c.imGroupParticipantsMu.RLock()
+		}
+	}
+	c.imGroupParticipantsMu.RUnlock()
+
+	// 3. Check comma-based portals via groupPortalIndex fuzzy matching.
+	//    We intentionally skip the guid mismatch rejection here because the
+	//    whole point is to find portals where the guid differs (another client
+	//    using a different gid for the same group).
+	c.ensureGroupPortalIndex()
+	sorted := make([]string, 0, len(normalizedParts))
+	for _, p := range normalizedParts {
+		if !c.isMyHandle(p) {
+			sorted = append(sorted, p)
+		}
+	}
+	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+	sort.Strings(sorted)
+	deduped := sorted[:0]
+	for i, s := range sorted {
+		if i == 0 || s != sorted[i-1] {
+			deduped = append(deduped, s)
+		}
+	}
+
+	overlap := make(map[string]int)
+	c.groupPortalMu.RLock()
+	for _, member := range deduped {
+		for existingID := range c.groupPortalIndex[member] {
+			overlap[existingID]++
+		}
+	}
+	c.groupPortalMu.RUnlock()
+
+	candidateSize := len(deduped)
+	for existingID, sharedCount := range overlap {
+		existingSize := len(strings.Split(existingID, ","))
+		diff := (candidateSize - sharedCount) + (existingSize - sharedCount)
+		if diff > 1 {
+			continue
+		}
+		key := networkid.PortalKey{ID: networkid.PortalID(existingID), Receiver: c.UserLogin.ID}
+		if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+			c.UserLogin.Log.Info().
+				Str("gid_portal_id", gidPortalID).
+				Str("resolved_portal", existingID).
+				Int("participant_diff", diff).
+				Msg("Resolved unknown gid to existing comma-based portal via fuzzy match")
+			return networkid.PortalID(existingID)
+		}
+	}
+
+	// 4. Fall back to cloud_chat DB for portals not in memory caches
+	//    (e.g., gid: portals from CloudKit sync that haven't received
+	//    live messages yet, so imGroupParticipants is empty).
+	if c.cloudStore != nil {
+		matches, err := c.cloudStore.findPortalIDsByParticipants(ctx, normalizedParts)
+		if err == nil {
+			for _, matchPortalID := range matches {
+				if matchPortalID == gidPortalID {
+					continue
+				}
+				key := networkid.PortalKey{ID: networkid.PortalID(matchPortalID), Receiver: c.UserLogin.ID}
+				if p, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, key); p != nil && p.MXID != "" {
+					c.UserLogin.Log.Info().
+						Str("gid_portal_id", gidPortalID).
+						Str("resolved_portal", matchPortalID).
+						Msg("Resolved unknown gid to existing portal via cloud_chat DB")
+					return networkid.PortalID(matchPortalID)
+				}
+			}
+		}
+	}
+
+	// No existing portal found — this is genuinely a new group.
+	return networkid.PortalID(gidPortalID)
+}
+
 func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
 	isGroup := len(participants) > 2 || groupName != nil
 
@@ -3291,7 +3450,35 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 		// changes or participants normalize differently.
 		var portalID networkid.PortalID
 		if senderGuid != nil && *senderGuid != "" {
-			portalID = networkid.PortalID("gid:" + strings.ToLower(*senderGuid))
+			gidID := "gid:" + strings.ToLower(*senderGuid)
+
+			// Fast path: check if we've previously resolved this gid to
+			// a different portal (cached from a prior resolution).
+			c.gidAliasesMu.RLock()
+			aliasedID, hasAlias := c.gidAliases[gidID]
+			c.gidAliasesMu.RUnlock()
+			if hasAlias {
+				portalID = networkid.PortalID(aliasedID)
+			} else {
+				// Check if a portal with this exact gid already exists.
+				ctx := context.Background()
+				gidKey := networkid.PortalKey{ID: networkid.PortalID(gidID), Receiver: c.UserLogin.ID}
+				if existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, gidKey); existing != nil && existing.MXID != "" {
+					portalID = networkid.PortalID(gidID)
+				} else {
+					// This gid doesn't match any existing portal. Another
+					// rustpush client (like OpenBubbles) may use a different
+					// gid for the same group. Try to resolve by participants.
+					portalID = c.resolveExistingGroupByGid(gidID, *senderGuid, participants)
+					// Cache the alias so subsequent messages with this gid
+					// resolve instantly without repeated participant matching.
+					if string(portalID) != gidID {
+						c.gidAliasesMu.Lock()
+						c.gidAliases[gidID] = string(portalID)
+						c.gidAliasesMu.Unlock()
+					}
+				}
+			}
 		} else {
 			// Fallback: build a participant-based ID for groups without a UUID.
 			sorted := make([]string, 0, len(participants))
