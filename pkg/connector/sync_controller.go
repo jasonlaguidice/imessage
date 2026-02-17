@@ -1204,6 +1204,12 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 		return remoteParticipants[0]
 	}
 
+	// Self-chat (Notes to Self): all participants are our own handle.
+	// Use our handle as the portal ID directly.
+	if len(remoteParticipants) == 0 && len(normalizedParticipants) > 0 {
+		return normalizedParticipants[0]
+	}
+
 	// Fallback for edge cases (unknown style, multi-participant without group style)
 	groupName := displayName
 	var senderGuidPtr *string
