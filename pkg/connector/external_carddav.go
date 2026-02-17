@@ -296,6 +296,9 @@ func (c *externalCardDAVClient) fetchAllVCards(log zerolog.Logger, addressBookUR
     <d:getetag/>
     <card:address-data/>
   </d:prop>
+  <card:filter>
+    <card:prop-filter name="FN"/>
+  </card:filter>
 </card:addressbook-query>`
 
 	resp, err := c.doRequest("REPORT", addressBookURL, body, "1")

@@ -244,7 +244,7 @@ open('$CONFIG', 'w').write(text)
             case "$CONTACT_CHOICE" in
                 2)
                     CARDDAV_URL="https://www.googleapis.com/carddav/v1/principals/$CARDDAV_EMAIL/lists/default/"
-                    echo "  Note: Use a Google App Password (https://myaccount.google.com/apppasswords)"
+                    echo "  Note: Use a Google App Password, without spaces (https://myaccount.google.com/apppasswords)"
                     ;;
                 3)
                     CARDDAV_URL="https://carddav.fastmail.com/dav/addressbooks/user/$CARDDAV_EMAIL/Default/"
