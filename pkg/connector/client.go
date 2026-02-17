@@ -2065,13 +2065,38 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 			MemberMap:   memberMap,
 		}
 
-		// Don't set an explicit room name for DMs. With private_chat_portal_meta
-		// enabled, the framework derives the room name from the ghost's profile
-		// display name, which means it auto-updates when contacts are edited.
+		// For self-chats, set an explicit name from contacts since the
+		// framework can't derive a ghost name when the "other user" is the
+		// logged-in user — it falls back to the Matrix display name instead.
+		if isSelfChat {
+			selfName := c.resolveContactDisplayname(portalID)
+			chatInfo.Name = &selfName
+		}
+		// For regular DMs, don't set an explicit room name. With
+		// private_chat_portal_meta, the framework derives it from the ghost's
+		// display name, which auto-updates when contacts are edited.
 		chatInfo.Members = members
 	}
 
 	return chatInfo, nil
+}
+
+// resolveContactDisplayname returns a contact-resolved display name for the
+// given identifier (e.g. "tel:+1234567890"). Falls back to formatting the
+// raw identifier if no contact is found.
+func (c *IMClient) resolveContactDisplayname(identifier string) string {
+	localID := stripIdentifierPrefix(identifier)
+	if c.contacts != nil {
+		if contact, _ := c.contacts.GetContactInfo(localID); contact != nil && contact.HasName() {
+			return c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: contact.FirstName,
+				LastName:  contact.LastName,
+				Nickname:  contact.Nickname,
+				ID:        localID,
+			})
+		}
+	}
+	return c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 }
 
 func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bridgev2.UserInfo, error) {
