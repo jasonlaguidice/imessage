@@ -125,6 +125,9 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 		allContacts = append(allContacts, contacts...)
 	}
 
+	// Step 4.5: Download any photo URLs (e.g. Google uses URL-based PHOTO fields)
+	downloadContactPhotos(allContacts, log)
+
 	// Step 5: Build lookup caches
 	c.mu.Lock()
 	defer c.mu.Unlock()

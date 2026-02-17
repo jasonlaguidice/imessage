@@ -8,6 +8,7 @@
 package connector
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/xml"
 	"fmt"
@@ -144,6 +145,9 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		}
 		allContacts = append(allContacts, contacts...)
 	}
+
+	// Step 4.5: Download any photo URLs (e.g. Google uses URL-based PHOTO fields)
+	downloadContactPhotos(allContacts, log)
 
 	// Step 5: Build lookup caches
 	c.mu.Lock()
@@ -595,9 +599,12 @@ func parseVCard(vcardData string) *imessage.Contact {
 				contact.Emails = append(contact.Emails, email)
 			}
 		case "PHOTO":
-			// Try to extract inline base64 photo data
-			if photo := extractVCardPhoto(nameWithParams, value); photo != nil {
+			// Try to extract inline base64 photo data, or capture URL for deferred download
+			photo, photoURL := extractVCardPhoto(nameWithParams, value)
+			if photo != nil {
 				contact.Avatar = photo
+			} else if photoURL != "" {
+				contact.AvatarURL = photoURL
 			}
 		}
 	}
@@ -616,32 +623,93 @@ func decodeVCardValue(s string) string {
 }
 
 // extractVCardPhoto tries to decode a base64-encoded PHOTO value.
-func extractVCardPhoto(nameWithParams, value string) []byte {
+// Returns (photoBytes, photoURL). If the photo is a URL reference,
+// photoBytes is nil and photoURL is set for deferred download.
+func extractVCardPhoto(nameWithParams, value string) ([]byte, string) {
 	params := strings.ToUpper(nameWithParams)
 	// Check for base64 encoding (vCard 3.0: ENCODING=b or ENCODING=BASE64)
 	if !strings.Contains(params, "ENCODING=B") && !strings.Contains(params, "ENCODING=BASE64") {
-		// vCard 4.0 uses data: URIs — skip for now
+		// vCard 4.0 uses data: URIs
 		if strings.HasPrefix(value, "data:") {
 			// data:image/jpeg;base64,/9j/4AAQ...
 			if idx := strings.Index(value, ","); idx >= 0 {
 				value = value[idx+1:]
 			} else {
-				return nil
+				return nil, ""
 			}
 		} else if strings.HasPrefix(value, "http") {
-			// URL reference — skip (would need separate download)
-			return nil
+			// URL reference — return for deferred download
+			return nil, value
 		} else {
 			// Assume base64 if it looks like it
 			if len(value) < 100 {
-				return nil
+				return nil, ""
 			}
 		}
 	}
 
 	data, err := base64.StdEncoding.DecodeString(value)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
-	return data
+	return data, ""
+}
+
+// downloadContactPhotos downloads photo URLs for contacts that have AvatarURL
+// set but no Avatar bytes. Uses bounded concurrency to avoid overwhelming
+// the server. Errors are logged but don't block contact loading.
+func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger) {
+	var needsDownload []*imessage.Contact
+	for _, c := range contacts {
+		if c.AvatarURL != "" && c.Avatar == nil {
+			needsDownload = append(needsDownload, c)
+		}
+	}
+	if len(needsDownload) == 0 {
+		return
+	}
+
+	log.Info().Int("count", len(needsDownload)).Msg("Downloading contact photo URLs")
+
+	const maxConcurrency = 10
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	for _, contact := range needsDownload {
+		wg.Add(1)
+		go func(c *imessage.Contact) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			data, _, err := downloadURL(ctx, c.AvatarURL)
+			if err != nil {
+				log.Debug().Err(err).
+					Str("name", c.Name()).
+					Str("url", c.AvatarURL).
+					Msg("Failed to download contact photo URL")
+				return
+			}
+			if len(data) > 0 {
+				c.Avatar = data
+				c.AvatarURL = ""
+			}
+		}(contact)
+	}
+
+	wg.Wait()
+
+	downloaded := 0
+	for _, c := range needsDownload {
+		if c.Avatar != nil {
+			downloaded++
+		}
+	}
+	log.Info().
+		Int("attempted", len(needsDownload)).
+		Int("downloaded", downloaded).
+		Msg("Contact photo URL downloads complete")
 }
