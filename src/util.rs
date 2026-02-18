@@ -17,7 +17,7 @@ use log::{debug, info, warn};
 use num_bigint::{BigInt, Sign};
 use openssl::bn::{BigNum, BigNumContext};
 use openssl::derive::Deriver;
-use openssl::ec::{EcGroup, EcKey, EcPoint};
+use openssl::ec::{EcGroup, EcKey, EcPoint, PointConversionForm};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkey::{HasPublic, PKey, Private, Public};
@@ -25,7 +25,7 @@ use openssl::rsa::Rsa;
 use openssl::sha::sha256;
 use openssl::sign::{Signer, Verifier};
 use openssl::symm::{decrypt, encrypt, Cipher, Crypter, Mode};
-use plist::{Data, Dictionary, Error, Uid, Value};
+use plist::{Data, Date, Dictionary, Error, Uid, Value};
 use base64::Engine;
 use prost::Message;
 use rasn::{AsnType, Decode, Encode};
@@ -318,6 +318,51 @@ where
     x.clone().map(|i| Data::new(i)).serialize(s)
 }
 
+pub fn date_to_ms(date: Date) -> u64 {
+    let time: SystemTime = date.into();
+    time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+pub fn ms_to_date(ms: u64) -> Date {
+    (SystemTime::UNIX_EPOCH + Duration::from_millis(ms)).into()
+}
+
+pub fn date_serialize_opt<S>(x: &Option<u64>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let date: Option<Date> = x.map(|x| (SystemTime::UNIX_EPOCH + Duration::from_millis(x)).into());
+    date.serialize(s)
+}
+
+pub fn date_deserialize_opt<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Date> = Deserialize::deserialize(d)?;
+    Ok(s.map(|s| {
+        let time: SystemTime = s.into();
+        time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+    }))
+}
+
+pub fn date_serialize<S>(x: &u64, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let date: Date = (SystemTime::UNIX_EPOCH + Duration::from_millis(*x)).into();
+    date.serialize(s)
+}
+
+pub fn date_deserialize<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Date = Deserialize::deserialize(d)?;
+    let time: SystemTime = s.into();
+    Ok(time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64)
+}
+
 // both in der
 #[derive(Serialize, Deserialize, Clone)]
 pub struct KeyPair {
@@ -426,6 +471,22 @@ pub fn encode_uleb128(mut val: u64) -> Vec<u8> {
         }
         result.push(byte | 0x80)
     }
+}
+
+pub fn ec_key_from_apple(apple: &[u8], curve: &EcGroup) -> EcKey<Private> {
+    let field_len = ((curve.degree() as usize) + 7) / 8;
+    let expected_uncompressed_len = 1 + 2 * field_len;
+
+    let mut num_context_ref = BigNumContext::new().unwrap();
+    let main_point = EcPoint::from_bytes(curve, &apple[..expected_uncompressed_len], &mut num_context_ref).unwrap();
+    EcKey::from_private_components(curve, &BigNum::from_slice(&apple[expected_uncompressed_len..]).unwrap(), &main_point).unwrap()
+}
+
+pub fn ec_key_to_apple(key: &EcKey<Private>) -> Vec<u8> {
+    let mut num_context_ref = BigNumContext::new().unwrap();
+    let mut point = key.public_key().to_bytes(&key.group(), PointConversionForm::UNCOMPRESSED, &mut num_context_ref).unwrap();
+    point.extend(key.private_key().to_vec());
+    point
 }
 
 #[derive(Deserialize)]

@@ -198,4 +198,6 @@ pub enum PushError {
     CircleNotFound(String),
     #[error("Keystore error {0}!")]
     KeystoreError(#[from] KeystoreError),
+    #[error("Unknown TOTP algorithm {0}!")]
+    UnknownTotpAlgorithm(u32),
 }

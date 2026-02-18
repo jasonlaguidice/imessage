@@ -11,6 +11,7 @@ pub mod findmy;
 pub mod facetime;
 pub mod icloud;
 pub mod statuskit;
+pub mod passwords;
 pub use imessage::cloud_messages;
 pub use imessage::posterkit;
 pub use util::KeyedArchive;
@@ -34,7 +35,7 @@ pub mod mmcsp {
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-pub use icloud_auth::{DefaultAnisetteProvider, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
+pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
 
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};

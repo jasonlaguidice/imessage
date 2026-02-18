@@ -4,7 +4,7 @@ use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
 use deku::{DekuRead, DekuWrite};
 use hkdf::Hkdf;
-use icloud_auth::{AppleAccount, CircleSendMessage, LoginState};
+use icloud_auth::{AppleAccount, CircleSendMessage, GenerateVerificationTokenRequest, LoginState};
 use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
 use log::{debug, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
@@ -142,6 +142,10 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         
 
         Ok(plist::from_bytes(&data)?)
+    }
+
+    pub async fn generate_verification_token(&self, request: GenerateVerificationTokenRequest) -> Result<String, PushError> {
+        Ok(self.account.lock().await.generate_verification_token(request).await?)
     }
 
     pub async fn get_gsa_token(&self, token: &str) -> Option<String> {

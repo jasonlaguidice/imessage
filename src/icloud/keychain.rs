@@ -26,7 +26,7 @@ use aes_gcm::KeyInit;
 use aes_siv::{siv::CmacSiv, Aes256SivAead};
 
 use cloudkit_proto::CuttlefishEstablishResponse;
-use crate::{TokenProvider, cloudkit::{SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey};
+use crate::{TokenProvider, cloudkit::{DeleteRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey, util::{ec_key_from_apple, ec_key_to_apple}};
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
@@ -181,7 +181,6 @@ impl CuttlefishEncItem {
         self.parentkeyref.record_identifier.as_ref().unwrap().value.as_ref().unwrap().name()
     }
 
-    // TODO not secure for raw passwords length, padding is lazy. Only cryptographic keys for now
     fn encrypt(&mut self, uuid: &str, key: &SivKey, data: Dictionary) -> Result<(), PushError> {
         let record_key: [u8; 64] = rand::random();
         self.wrappedkey = base64_encode(&key.encrypt(&record_key));
@@ -195,8 +194,15 @@ impl CuttlefishEncItem {
         headers.extend(aad.into_values());
         
         let mut data = plist_to_bin(&data)?;
-        data.push(0x80); // lazy padding
-        data.push(0x00);
+        data.push(0x80);
+
+        const BLOCK_PAD_SIZE: usize = 20;
+        let mut blocks = (data.len() + (BLOCK_PAD_SIZE - 1)) / BLOCK_PAD_SIZE;
+        if blocks == 1 {
+            blocks += 1;
+        }
+
+        data.resize(blocks * BLOCK_PAD_SIZE, 0);
 
         let data = cipher.encrypt::<&[Vec<u8>], &Vec<u8>>(&headers, &data).unwrap();
         self.data = [&iv[..], &data].concat();
@@ -423,21 +429,6 @@ fn msg_from_bin(bin: &[u8], header_len: usize, section_count: usize) -> (Vec<u8>
         bin[start + 4..start + 4 + size].to_vec()
     });
     (header, offsets.collect())
-}
-
-fn ec_key_from_apple(apple: &[u8]) -> EcKey<Private> {
-    let curve = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
-    let mut num_context_ref = BigNumContext::new().unwrap();
-    let main_point = EcPoint::from_bytes(&curve, &apple[..97], &mut num_context_ref).unwrap();
-    EcKey::from_private_components(&curve, &BigNum::from_slice(&apple[97..]).unwrap(), &main_point).unwrap()
-}
-
-fn ec_key_to_apple(key: &EcKey<Private>) -> Vec<u8> {
-    let mut num_context_ref = BigNumContext::new().unwrap();
-    let mut point = key.public_key().to_bytes(&key.group(), PointConversionForm::UNCOMPRESSED, &mut num_context_ref).unwrap();
-    assert_eq!(point.len(), 97);
-    point.extend(key.private_key().to_vec());
-    point
 }
 
 struct KeyVaultMessage {
@@ -1256,6 +1247,21 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         Ok(())
     }
+
+    pub async fn delete_keychain(&self, uuid: &str, zone: &str) -> Result<(), PushError> {
+        let security_container = self.get_security_container().await?;
+        let record_zone = security_container.private_zone(zone.to_string());
+
+        security_container.perform(&CloudKitSession::new(), DeleteRecordOperation::new(record_identifier(record_zone, uuid))).await?;
+
+        let mut state = self.state.write().await;
+        let zone = state.items.entry(zone.to_string()).or_default();
+        zone.keys.remove(uuid);
+
+        (self.update_state)(&state);
+
+        Ok(())
+    }
     
     pub async fn insert_keychain(&self, uuid: &str, zone: &str, class: &str, mut dict: Dictionary, pcs: Option<&PCSMeta>, associated_tag: Option<&str>) -> Result<(), PushError> {
         let security_container = self.get_security_container().await?;
@@ -1287,7 +1293,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         item.encrypt(&uuid, &key.decode(&state.get_cloudkey_access_key()?), dict.clone())?;
 
         let mut ops = vec![SaveRecordOperation::new(
-                record_identifier(record_zone.clone(), &uuid), item, None, false)];
+                record_identifier(record_zone.clone(), &uuid), item, None, true)];
 
         if let Some(tag) = associated_tag {
             ops.push(SaveRecordOperation::new(record_identifier(record_zone.clone(), tag), CuttlefishCurrentItem {
@@ -1684,13 +1690,15 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             &*[&cipertext.ciphertext()[..], &cipertext.authentication_code()[..]].concat()).map_err(|_| PushError::AESGCMError)?;
 
         let decoded = OtInternalBottle::decode(Cursor::new(&result))?;
+
+        let key_group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
         
         // reconstruct a keychain identity for our other peer
         Ok(KeychainUserIdentity {
             identifier: outer_bottle.peer_id().to_string(),
             info: peer.0.permanent_info.clone().unwrap(),
-            signing_key: SoftEcKey(ec_key_from_apple(decoded.signing_key.as_ref().unwrap().key_data.as_ref().unwrap())),
-            encryption_key: SoftEcKey(ec_key_from_apple(decoded.encryption_key.as_ref().unwrap().key_data.as_ref().unwrap())),
+            signing_key: SoftEcKey(ec_key_from_apple(decoded.signing_key.as_ref().unwrap().key_data.as_ref().unwrap(), &key_group)),
+            encryption_key: SoftEcKey(ec_key_from_apple(decoded.encryption_key.as_ref().unwrap().key_data.as_ref().unwrap(), &key_group)),
             current_state: peer.get_dynamic_info()?,
         })
     }
