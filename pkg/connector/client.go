@@ -2597,17 +2597,23 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	}
 	hasText := strings.TrimSpace(body) != "" && strings.TrimRight(body, "\ufffc \n") != ""
 	if hasText {
+		textContent := &event.MessageEventContent{
+			MsgType: event.MsgText,
+			Body:    body,
+		}
+		if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
+			textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, detectedURL),
+			}
+		}
 		messages = append(messages, &bridgev2.BackfillMessage{
 			Sender:    sender,
 			ID:        makeMessageID(row.GUID),
 			Timestamp: ts,
 			ConvertedMessage: &bridgev2.ConvertedMessage{
 				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgText,
-						Body:    body,
-					},
+					Type:    event.EventMessage,
+					Content: textContent,
 				}},
 			},
 		})
