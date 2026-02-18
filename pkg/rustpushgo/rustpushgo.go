@@ -465,6 +465,15 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_client_cloud_download_group_photo(uniffiStatus)
+		})
+		if checksum != 31376 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_client_cloud_download_group_photo: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_client_cloud_dump_chats_json(uniffiStatus)
 		})
 		if checksum != 18960 {
@@ -846,6 +855,9 @@ func uniffiCheckChecksums() {
 			return C.uniffi_rustpushgo_checksum_method_messagecallback_on_message(uniffiStatus)
 		})
 		if checksum != 9227 {
+			// NOTE: This checksum changes when WrappedMessage fields change.
+			// After rebuilding the Rust lib, update 9227 to the new checksum
+			// from the panic message or `nm` output.
 			// If this happens try cleaning and rebuilding your project
 			panic("rustpushgo: uniffi_rustpushgo_checksum_method_messagecallback_on_message: UniFFI API checksum mismatch")
 		}
@@ -1173,6 +1185,31 @@ func (_self *Client) CloudDownloadAttachment(recordName string) ([]byte, error) 
 		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
 			// rustFutureFunc
 			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_download_attachment(
+				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(recordName)),
+				status,
+			))
+		},
+		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
+			// pollFunc
+			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
+		},
+		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
+			// completeFunc
+			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
+		},
+		FfiConverterBytesINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
+			// freeFunc
+			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
+		})
+}
+
+func (_self *Client) CloudDownloadGroupPhoto(recordName string) ([]byte, error) {
+	_pointer := _self.ffiObject.incrementPointer("*Client")
+	defer _self.ffiObject.decrementPointer()
+	return uniffiRustCallAsyncWithErrorAndResult(
+		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+			// rustFutureFunc
+			return (*C.void)(C.uniffi_rustpushgo_fn_method_client_cloud_download_group_photo(
 				_pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(recordName)),
 				status,
 			))
@@ -2843,6 +2880,7 @@ type WrappedCloudSyncChat struct {
 	Participants       []string
 	Deleted            bool
 	UpdatedTimestampMs uint64
+	GroupPhotoGuid     *string
 }
 
 func (r *WrappedCloudSyncChat) Destroy() {
@@ -2855,6 +2893,7 @@ func (r *WrappedCloudSyncChat) Destroy() {
 	FfiDestroyerSequenceString{}.Destroy(r.Participants)
 	FfiDestroyerBool{}.Destroy(r.Deleted)
 	FfiDestroyerUint64{}.Destroy(r.UpdatedTimestampMs)
+	FfiDestroyerOptionalString{}.Destroy(r.GroupPhotoGuid)
 }
 
 type FfiConverterTypeWrappedCloudSyncChat struct{}
@@ -2876,6 +2915,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Read(reader io.Reader) WrappedClou
 		FfiConverterSequenceStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -2893,6 +2933,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Write(writer io.Writer, value Wrap
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.Participants)
 	FfiConverterBoolINSTANCE.Write(writer, value.Deleted)
 	FfiConverterUint64INSTANCE.Write(writer, value.UpdatedTimestampMs)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.GroupPhotoGuid)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncChat struct{}
@@ -2965,6 +3006,8 @@ type WrappedCloudSyncMessage struct {
 	TapbackEmoji      *string
 	AttachmentGuids   []string
 	DateReadMs        int64
+	MsgType           int64
+	HasBody           bool
 }
 
 func (r *WrappedCloudSyncMessage) Destroy() {
@@ -2983,6 +3026,8 @@ func (r *WrappedCloudSyncMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.TapbackEmoji)
 	FfiDestroyerSequenceString{}.Destroy(r.AttachmentGuids)
 	FfiDestroyerInt64{}.Destroy(r.DateReadMs)
+	FfiDestroyerInt64{}.Destroy(r.MsgType)
+	FfiDestroyerBool{}.Destroy(r.HasBody)
 }
 
 type FfiConverterTypeWrappedCloudSyncMessage struct{}
@@ -3010,6 +3055,8 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Read(reader io.Reader) WrappedC
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterSequenceStringINSTANCE.Read(reader),
 		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 	}
 }
 
@@ -3033,6 +3080,8 @@ func (c FfiConverterTypeWrappedCloudSyncMessage) Write(writer io.Writer, value W
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.TapbackEmoji)
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.AttachmentGuids)
 	FfiConverterInt64INSTANCE.Write(writer, value.DateReadMs)
+	FfiConverterInt64INSTANCE.Write(writer, value.MsgType)
+	FfiConverterBoolINSTANCE.Write(writer, value.HasBody)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncMessage struct{}
@@ -3183,6 +3232,9 @@ type WrappedMessage struct {
 	DeleteChatGuid        *string
 	DeleteMessageUuids    []string
 	IsStoredMessage       bool
+	IsIconChange          bool
+	GroupPhotoCleared     bool
+	IconChangePhotoData   *[]byte
 }
 
 func (r *WrappedMessage) Destroy() {
@@ -3231,6 +3283,9 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.DeleteChatGuid)
 	FfiDestroyerSequenceString{}.Destroy(r.DeleteMessageUuids)
 	FfiDestroyerBool{}.Destroy(r.IsStoredMessage)
+	FfiDestroyerBool{}.Destroy(r.IsIconChange)
+	FfiDestroyerBool{}.Destroy(r.GroupPhotoCleared)
+	FfiDestroyerOptionalBytes{}.Destroy(r.IconChangePhotoData)
 }
 
 type FfiConverterTypeWrappedMessage struct{}
@@ -3288,6 +3343,9 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterSequenceStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalBytesINSTANCE.Read(reader),
 	}
 }
 
@@ -3341,6 +3399,9 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.DeleteChatGuid)
 	FfiConverterSequenceStringINSTANCE.Write(writer, value.DeleteMessageUuids)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsStoredMessage)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsIconChange)
+	FfiConverterBoolINSTANCE.Write(writer, value.GroupPhotoCleared)
+	FfiConverterOptionalBytesINSTANCE.Write(writer, value.IconChangePhotoData)
 }
 
 type FfiDestroyerTypeWrappedMessage struct{}

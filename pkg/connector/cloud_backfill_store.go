@@ -40,6 +40,11 @@ type cloudMessageRow struct {
 
 	// When the recipient read this message (Unix ms). Only for is_from_me messages.
 	DateReadMS int64
+
+	// Whether the CloudKit record has an attributedBody (rich text payload).
+	// Regular user messages always have this; system messages (group renames,
+	// participant changes) do not.
+	HasBody bool
 }
 
 // cloudAttachmentRow holds CloudKit attachment metadata for a single attachment.
@@ -81,6 +86,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			portal_id TEXT NOT NULL,
 			service TEXT,
 			display_name TEXT,
+			group_photo_guid TEXT,
 			participants_json TEXT,
 			updated_ts BIGINT,
 			created_ts BIGINT NOT NULL,
@@ -105,6 +111,13 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			created_ts BIGINT NOT NULL,
 			updated_ts BIGINT NOT NULL,
 			PRIMARY KEY (login_id, guid)
+		)`,
+		`CREATE TABLE IF NOT EXISTS group_photo_cache (
+			login_id TEXT NOT NULL,
+			portal_id TEXT NOT NULL,
+			ts BIGINT NOT NULL,
+			data BLOB NOT NULL,
+			PRIMARY KEY (login_id, portal_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
 			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
@@ -138,6 +151,16 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			return fmt.Errorf("failed to add group_id column: %w", err)
 		}
 	}
+
+	// Migration: add group_photo_guid column if missing
+	var hasGroupPhotoGuid int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='group_photo_guid'`).Scan(&hasGroupPhotoGuid)
+	if hasGroupPhotoGuid == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN group_photo_guid TEXT`); err != nil {
+			return fmt.Errorf("failed to add group_photo_guid column: %w", err)
+		}
+	}
+
 
 	// Migration: add rich content columns to cloud_message if missing
 	richCols := []struct {
@@ -178,6 +201,47 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
+	// Migration: add has_body column to cloud_message if missing
+	var hasHasBody int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name='has_body'`).Scan(&hasHasBody)
+	if hasHasBody == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_message ADD COLUMN has_body BOOLEAN NOT NULL DEFAULT TRUE`); err != nil {
+			return fmt.Errorf("failed to add has_body column: %w", err)
+		}
+	}
+
+	// Cleanup: permanently delete system/rename message rows that slipped into
+	// the DB before the MsgType==0 ingest filter was added.  Two conditions
+	// catch different eras of the DB:
+	//   1. has_body=FALSE + no attachments + no tapback — rows that were stored
+	//      after the has_body column was added but before the MsgType filter;
+	//      their has_body is correctly FALSE (no attributedBody).
+	//   2. text matches the portal's display_name + no attachments + no tapback
+	//      — older rows whose has_body defaulted to TRUE but whose content
+	//      reveals them as group-rename notifications.
+	// This runs every startup and is idempotent: after the first pass it
+	// matches zero rows.
+	if _, err := s.db.Exec(ctx, `
+		DELETE FROM cloud_message
+		WHERE login_id = $1
+		  AND COALESCE(attachments_json, '') = ''
+		  AND tapback_type IS NULL
+		  AND (
+		    has_body = FALSE
+		    OR (
+		      text IS NOT NULL AND text <> ''
+		      AND portal_id IN (
+		        SELECT portal_id FROM cloud_chat c
+		        WHERE c.login_id = $1
+		          AND c.display_name IS NOT NULL AND c.display_name <> ''
+		          AND c.display_name = cloud_message.text
+		      )
+		    )
+		  )
+	`, s.loginID); err != nil {
+		return fmt.Errorf("failed to delete system messages: %w", err)
+	}
+
 	// Create index that depends on record_name column (must be after migration)
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
 		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
@@ -188,36 +252,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_group_id_idx
 		ON cloud_chat (login_id, group_id) WHERE group_id <> ''`); err != nil {
 		return fmt.Errorf("failed to create group_id index: %w", err)
-	}
-
-	// Deleted portal tracking: remembers portals that were explicitly deleted
-	// (from Apple device or Beeper) so CloudKit re-import doesn't resurrect
-	// them if the background CloudKit deletion was interrupted by a restart.
-	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS deleted_portal (
-		login_id TEXT NOT NULL,
-		portal_id TEXT NOT NULL,
-		deleted_ts BIGINT NOT NULL,
-		conv_hash TEXT NOT NULL DEFAULT '',
-		PRIMARY KEY (login_id, portal_id)
-	)`); err != nil {
-		return fmt.Errorf("failed to create deleted_portal table: %w", err)
-	}
-	// Migration: add conv_hash column if table already exists without it.
-	_, _ = s.db.Exec(ctx, `ALTER TABLE deleted_portal ADD COLUMN conv_hash TEXT NOT NULL DEFAULT ''`)
-
-	// Pending CloudKit deletions: persists deletion intent so interrupted
-	// background scans (findAndDeleteCloud*) are retried on next startup.
-	// Without this, a restart between local DB cleanup and CloudKit deletion
-	// leaves remote records alive → fresh sync resurrects the portal.
-	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS pending_cloud_deletion (
-		login_id TEXT NOT NULL,
-		portal_id TEXT NOT NULL,
-		chat_identifier TEXT NOT NULL DEFAULT '',
-		group_id TEXT NOT NULL DEFAULT '',
-		created_ts BIGINT NOT NULL,
-		PRIMARY KEY (login_id, portal_id)
-	)`); err != nil {
-		return fmt.Errorf("failed to create pending_cloud_deletion table: %w", err)
 	}
 
 	return nil
@@ -257,7 +291,7 @@ func (s *cloudBackfillStore) setSyncStateSuccess(ctx context.Context, zone strin
 
 // clearSyncTokens removes only the sync continuation tokens for this login,
 // forcing the next sync to re-download all records from CloudKit.
-// Preserves cloud_chat, cloud_message, deleted_portal, and the _version row.
+// Preserves cloud_chat, cloud_message, and the _version row.
 func (s *cloudBackfillStore) clearSyncTokens(ctx context.Context) error {
 	_, err := s.db.Exec(ctx,
 		`DELETE FROM cloud_sync_state WHERE login_id=$1 AND zone != '_version'`,
@@ -311,12 +345,47 @@ func (s *cloudBackfillStore) setSyncVersion(ctx context.Context, version int) er
 	return err
 }
 
+// getChatSyncVersion returns the stored chat-specific sync version (0 if never set).
+// This tracks chat-zone-only re-syncs independently of the full cloudSyncVersion,
+// so we can force a targeted chat re-fetch (e.g. to populate group_photo_guid)
+// without also re-downloading all messages.
+func (s *cloudBackfillStore) getChatSyncVersion(ctx context.Context) (int, error) {
+	var token sql.NullString
+	err := s.db.QueryRow(ctx,
+		`SELECT continuation_token FROM cloud_sync_state WHERE login_id=$1 AND zone='_chat_version'`,
+		s.loginID,
+	).Scan(&token)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if !token.Valid {
+		return 0, nil
+	}
+	v := 0
+	fmt.Sscanf(token.String, "%d", &v)
+	return v, nil
+}
+
+// setChatSyncVersion stores the chat-specific sync schema version.
+func (s *cloudBackfillStore) setChatSyncVersion(ctx context.Context, version int) error {
+	nowMS := time.Now().UnixMilli()
+	vStr := fmt.Sprintf("%d", version)
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO cloud_sync_state (login_id, zone, continuation_token, updated_ts)
+		VALUES ($1, '_chat_version', $2, $3)
+		ON CONFLICT (login_id, zone) DO UPDATE SET
+			continuation_token=excluded.continuation_token,
+			updated_ts=excluded.updated_ts
+	`, s.loginID, vStr, nowMS)
+	return err
+}
+
 // clearAllData removes cloud cache data for this login: sync tokens,
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
-//
-// IMPORTANT: pending_cloud_deletion is intentionally PRESERVED across resets.
-// It ensures interrupted CloudKit deletions are retried on next startup.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
 	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message"} {
 		if _, err := s.db.Exec(ctx,
@@ -356,7 +425,7 @@ func (s *cloudBackfillStore) setSyncStateError(ctx context.Context, zone, errMsg
 func (s *cloudBackfillStore) upsertChat(
 	ctx context.Context,
 	cloudChatID, recordName, groupID, portalID, service string,
-	displayName *string,
+	displayName, groupPhotoGuid *string,
 	participants []string,
 	updatedTS int64,
 ) error {
@@ -368,8 +437,8 @@ func (s *cloudBackfillStore) upsertChat(
 	_, err = s.db.Exec(ctx, `
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
-			participants_json, updated_ts, created_ts
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			group_photo_guid, participants_json, updated_ts, created_ts
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -380,13 +449,18 @@ func (s *cloudBackfillStore) upsertChat(
 				THEN excluded.display_name
 				ELSE cloud_chat.display_name
 			END,
+			group_photo_guid=CASE
+				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
+				THEN excluded.group_photo_guid
+				ELSE cloud_chat.group_photo_guid
+			END,
 			participants_json=excluded.participants_json,
 			updated_ts=CASE
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
 				ELSE cloud_chat.updated_ts
 			END
-	`, s.loginID, cloudChatID, recordName, groupID, portalID, service, nullableString(displayName), string(participantsJSON), updatedTS, nowMS)
+	`, s.loginID, cloudChatID, recordName, groupID, portalID, service, nullableString(displayName), nullableString(groupPhotoGuid), string(participantsJSON), updatedTS, nowMS)
 	return err
 }
 
@@ -411,9 +485,9 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			login_id, guid, record_name, chat_id, portal_id, timestamp_ms,
 			sender, is_from_me, text, subject, service, deleted,
 			tapback_type, tapback_target_guid, tapback_emoji,
-			attachments_json, date_read_ms,
+			attachments_json, date_read_ms, has_body,
 			created_ts, updated_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -430,6 +504,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			tapback_emoji=excluded.tapback_emoji,
 			attachments_json=excluded.attachments_json,
 			date_read_ms=CASE WHEN excluded.date_read_ms > cloud_message.date_read_ms THEN excluded.date_read_ms ELSE cloud_message.date_read_ms END,
+			has_body=excluded.has_body,
 			updated_ts=excluded.updated_ts
 	`)
 	if err != nil {
@@ -443,7 +518,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			s.loginID, row.GUID, row.RecordName, row.CloudChatID, row.PortalID, row.TimestampMS,
 			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
 			row.TapbackType, row.TapbackTargetGUID, row.TapbackEmoji,
-			row.AttachmentsJSON, row.DateReadMS,
+			row.AttachmentsJSON, row.DateReadMS, row.HasBody,
 			nowMS, nowMS,
 		)
 		if err != nil {
@@ -454,11 +529,26 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 	return tx.Commit()
 }
 
-// deleteMessageBatch removes messages by GUID in a single transaction.
+// deleteMessageBatch soft-deletes individual messages by GUID (sets deleted=TRUE).
+// This is for messages that CloudKit itself marks as deleted (individual message
+// deletions), NOT for portal-level deletion (see deleteLocalChatByPortalID).
+//
+// Soft-delete is used here because:
+//  1. Echo detection: hasMessageUUID checks cloud_message without filtering
+//     by deleted. Keeping the row means re-delivered APNs echoes of the same
+//     UUID are still recognised as known and suppressed.
+//  2. Re-sync safety: a full CloudKit re-sync would re-import the message as
+//     live. With a hard delete, the upsert inserts it with deleted=FALSE.
+//     With a soft delete, the upsert conflict resolution preserves deleted=TRUE.
+//
+// The upsert conflict resolution (`deleted=CASE WHEN cloud_message.deleted
+// THEN cloud_message.deleted ELSE excluded.deleted END`) ensures that a live
+// re-delivery of the same GUID can never flip a soft-deleted row back to live.
 func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []string) error {
 	if len(guids) == 0 {
 		return nil
 	}
+	nowMS := time.Now().UnixMilli()
 	const chunkSize = 500
 	for i := 0; i < len(guids); i += chunkSize {
 		end := i + chunkSize
@@ -468,19 +558,19 @@ func (s *cloudBackfillStore) deleteMessageBatch(ctx context.Context, guids []str
 		chunk := guids[i:end]
 
 		placeholders := make([]string, len(chunk))
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, s.loginID)
+		args := make([]any, 0, len(chunk)+2)
+		args = append(args, s.loginID, nowMS)
 		for j, g := range chunk {
-			placeholders[j] = fmt.Sprintf("$%d", j+2)
+			placeholders[j] = fmt.Sprintf("$%d", j+3)
 			args = append(args, g)
 		}
 
 		query := fmt.Sprintf(
-			`DELETE FROM cloud_message WHERE login_id=$1 AND guid IN (%s)`,
+			`UPDATE cloud_message SET deleted=TRUE, updated_ts=$2 WHERE login_id=$1 AND guid IN (%s) AND deleted=FALSE`,
 			strings.Join(placeholders, ","),
 		)
 		if _, err := s.db.Exec(ctx, query, args...); err != nil {
-			return fmt.Errorf("failed to delete message batch: %w", err)
+			return fmt.Errorf("failed to soft-delete message batch: %w", err)
 		}
 	}
 	return nil
@@ -645,8 +735,8 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
-			participants_json, updated_ts, created_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			group_photo_guid, participants_json, updated_ts, created_ts
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -656,6 +746,11 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.display_name
 				ELSE cloud_chat.display_name
+			END,
+			group_photo_guid=CASE
+				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
+				THEN excluded.group_photo_guid
+				ELSE cloud_chat.group_photo_guid
 			END,
 			participants_json=excluded.participants_json,
 			updated_ts=CASE
@@ -674,7 +769,7 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 		_, err = stmt.ExecContext(ctx,
 			s.loginID, chat.CloudChatID, chat.RecordName, chat.GroupID,
 			chat.PortalID, chat.Service, chat.DisplayName,
-			chat.ParticipantsJSON, chat.UpdatedTS, nowMS,
+			chat.GroupPhotoGuid, chat.ParticipantsJSON, chat.UpdatedTS, nowMS,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert chat %s: %w", chat.CloudChatID, err)
@@ -740,6 +835,7 @@ type cloudChatUpsertRow struct {
 	PortalID         string
 	Service          string
 	DisplayName      any // nil or string
+	GroupPhotoGuid   any // nil or string
 	ParticipantsJSON string
 	UpdatedTS        int64
 }
@@ -876,6 +972,78 @@ func (s *cloudBackfillStore) getDisplayNameByPortalID(ctx context.Context, porta
 	return "", nil
 }
 
+// getGroupPhotoByPortalID returns the group_photo_guid and record_name for
+// the most recently updated cloud_chat row that has a group photo set.
+// Returns ("", "", nil) if no photo is set.
+func (s *cloudBackfillStore) getGroupPhotoByPortalID(ctx context.Context, portalID string) (guid, recordName string, err error) {
+	var g, r sql.NullString
+	err = s.db.QueryRow(ctx,
+		`SELECT group_photo_guid, record_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND group_photo_guid IS NOT NULL AND group_photo_guid <> '' ORDER BY updated_ts DESC LIMIT 1`,
+		s.loginID, portalID,
+	).Scan(&g, &r)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", "", nil
+		}
+		return "", "", err
+	}
+	if g.Valid {
+		rStr := ""
+		if r.Valid {
+			rStr = r.String
+		}
+		return g.String, rStr, nil
+	}
+	return "", "", nil
+}
+
+// clearGroupPhotoGuid sets group_photo_guid = NULL for all cloud_chat rows
+// matching a portal_id. Called when a real-time IconChange(cleared) arrives so
+// that subsequent GetChatInfo calls know there is no custom photo.
+func (s *cloudBackfillStore) clearGroupPhotoGuid(ctx context.Context, portalID string) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET group_photo_guid = NULL WHERE login_id = $1 AND portal_id = $2`,
+		s.loginID, portalID,
+	)
+	return err
+}
+
+// saveGroupPhoto persists MMCS-downloaded group photo bytes and the IconChange
+// timestamp (used as avatar ID) to the group_photo_cache table.
+// UPSERT so it works regardless of whether a cloud_chat row exists yet.
+func (s *cloudBackfillStore) saveGroupPhoto(ctx context.Context, portalID string, ts int64, data []byte) error {
+	_, err := s.db.Exec(ctx,
+		`INSERT INTO group_photo_cache (login_id, portal_id, ts, data) VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (login_id, portal_id) DO UPDATE SET ts=excluded.ts, data=excluded.data`,
+		s.loginID, portalID, ts, data,
+	)
+	return err
+}
+
+// getGroupPhoto returns the locally cached group photo bytes and timestamp for
+// the given portal. Returns (0, nil, nil) if no cached photo exists.
+func (s *cloudBackfillStore) getGroupPhoto(ctx context.Context, portalID string) (ts int64, data []byte, err error) {
+	err = s.db.QueryRow(ctx,
+		`SELECT ts, data FROM group_photo_cache WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID,
+	).Scan(&ts, &data)
+	if err == sql.ErrNoRows {
+		return 0, nil, nil
+	}
+	return ts, data, err
+}
+
+// clearGroupPhoto removes the cached group photo for a portal.
+// Called when an IconChange(cleared) arrives so GetChatInfo won't
+// re-apply a stale photo after restart.
+func (s *cloudBackfillStore) clearGroupPhoto(ctx context.Context, portalID string) error {
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM group_photo_cache WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID,
+	)
+	return err
+}
+
 // updateDisplayNameByPortalID updates the display_name for all cloud_chat
 // rows matching a portal_id. Used when a real-time rename event arrives to
 // correct stale CloudKit data in the local cache.
@@ -887,71 +1055,25 @@ func (s *cloudBackfillStore) updateDisplayNameByPortalID(ctx context.Context, po
 	return err
 }
 
-// getCloudChatIDByPortalID returns the cloud_chat_id (Apple's chat GUID, e.g.
-// "iMessage;-;user@example.com") for a given portal_id. Returns empty string if none found.
-func (s *cloudBackfillStore) getCloudChatIDByPortalID(ctx context.Context, portalID string) (string, error) {
-	var chatID string
-	err := s.db.QueryRow(ctx,
-		`SELECT cloud_chat_id FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 LIMIT 1`,
-		s.loginID, portalID,
-	).Scan(&chatID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return "", nil
-		}
-		return "", err
-	}
-	return chatID, nil
-}
-
-// getCloudChatIDByGroupID returns the cloud_chat_id for any chat matching a group_id.
-func (s *cloudBackfillStore) getCloudChatIDByGroupID(ctx context.Context, groupID string) (string, error) {
-	var chatID string
-	err := s.db.QueryRow(ctx,
-		`SELECT cloud_chat_id FROM cloud_chat WHERE login_id=$1 AND LOWER(group_id)=LOWER($2) LIMIT 1`,
-		s.loginID, groupID,
-	).Scan(&chatID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return "", nil
-		}
-		return "", err
-	}
-	return chatID, nil
-}
-
-// getCloudRecordNamesByPortalID returns ALL CloudKit record_names for chat records
-// belonging to a portal. Multiple cloud_chat rows can map to the same portal_id
-// (e.g., one from APNs with empty record_name, one from CloudKit with a real one).
-func (s *cloudBackfillStore) getCloudRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT record_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND record_name <> ''`,
-		s.loginID, portalID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var name string
-		if err = rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
-}
-
-// deleteLocalChatByPortalID removes cloud_chat records and marks cloud_message
-// records as deleted for a given portal_id. cloud_message records are KEPT
-// (not physically deleted) so their GUIDs serve as a persisted echo-detection
-// set — if Apple re-delivers these messages via APNs, we can check the UUID
-// against cloud_message to identify them as echoes. Setting deleted=TRUE
-// prevents backfill from pulling old messages into a recreated portal (backfill
-// queries filter deleted=FALSE). The records are fully purged when the
-// deleted_portal entry is cleared (genuinely new conversation detected).
+// deleteLocalChatByPortalID removes the cloud_chat records for a portal and
+// soft-deletes its cloud_message records (sets deleted=TRUE, preserves the rows).
+//
+// cloud_chat is hard-deleted: it maps CloudKit record_names to portal IDs and
+// is no longer needed once the portal is gone.
+//
+// cloud_message is soft-deleted, NOT hard-deleted. The rows' GUIDs must survive
+// so that hasMessageUUID can detect stale APNs echoes even after:
+//  - pending_cloud_deletion is cleared (CloudKit deletion finished)
+//  - Bridge restarts (recentlyDeletedPortals is repopulated from pending entries,
+//    but once cleared there is no in-memory protection)
+//
+// hasMessageUUID queries cloud_message without filtering on deleted, so
+// soft-deleted UUIDs still block echoes. Fresh UUIDs from genuinely new
+// messages are not in cloud_message → hasMessageUUID=false → portal allowed.
+//
+// All other cloud_message queries (listLatestMessages, hasPortalMessages,
+// getOldestMessageTimestamp, FetchMessages) filter WHERE deleted=FALSE, so
+// soft-deleted rows don't trigger backfill or portal resurrection.
 func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, portalID string) error {
 	if _, err := s.db.Exec(ctx,
 		`DELETE FROM cloud_chat WHERE login_id=$1 AND portal_id=$2`,
@@ -959,14 +1081,12 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 	); err != nil {
 		return fmt.Errorf("failed to delete cloud_chat records for portal %s: %w", portalID, err)
 	}
-	// Mark cloud_message records as deleted so backfill won't return them.
-	// Records are kept (not physically deleted) for UUID-based echo detection
-	// (hasMessageUUID doesn't check the deleted flag).
+	nowMS := time.Now().UnixMilli()
 	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
-		s.loginID, portalID, time.Now().UnixMilli(),
+		`UPDATE cloud_message SET deleted=TRUE, updated_ts=$3 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID, nowMS,
 	); err != nil {
-		return fmt.Errorf("failed to mark cloud_message records as deleted for portal %s: %w", portalID, err)
+		return fmt.Errorf("failed to soft-delete cloud_message records for portal %s: %w", portalID, err)
 	}
 	return nil
 }
@@ -996,46 +1116,37 @@ func (s *cloudBackfillStore) hasMessageUUID(ctx context.Context, uuid string) (b
 	return count > 0, err
 }
 
-// purgeCloudMessagesByPortalID hard-deletes all cloud_message records for a portal.
-// Used during Beeper deletes and tombstone handling to ensure old messages can't
-// reappear if the portal is recreated.
-func (s *cloudBackfillStore) purgeCloudMessagesByPortalID(ctx context.Context, portalID string) error {
-	_, err := s.db.Exec(ctx,
-		`DELETE FROM cloud_message WHERE login_id=$1 AND portal_id=$2`,
-		s.loginID, portalID,
-	)
-	return err
-}
-
-// purgeCloudMessagesByGroupID hard-deletes all cloud_message records matching
-// a group_id. Covers cases where CloudKit sync stored messages under a different
-// portal_id for the same logical group chat.
-func (s *cloudBackfillStore) purgeCloudMessagesByGroupID(ctx context.Context, groupID string) error {
-	_, err := s.db.Exec(ctx,
-		`DELETE FROM cloud_message WHERE login_id=$1 AND portal_id IN (
-			SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND group_id=$2
-		)`,
-		s.loginID, groupID,
-	)
-	return err
-}
-
-// getPortalIDByGroupID looks up the portal_id for a given group UUID in the
-// cloud_chat table. Used as a fallback when the delete target's group UUID
-// doesn't directly match a portal key.
-func (s *cloudBackfillStore) getPortalIDByGroupID(ctx context.Context, groupID string) (string, error) {
-	var portalID string
+// getMessageTimestampByGUID returns the Unix-millisecond send timestamp for a
+// message UUID, and whether the row was found. Used to enforce the pre-startup
+// receipt filter when the message is still being backfilled into the Matrix DB
+// (so the Matrix DB lookup returns nothing but CloudKit already has the record).
+func (s *cloudBackfillStore) getMessageTimestampByGUID(ctx context.Context, uuid string) (int64, bool, error) {
+	var ts int64
+	// UPPER() on both sides: APNs delivers UUIDs as uppercase while CloudKit
+	// GUIDs may be lowercase or mixed-case, so a case-sensitive = would miss them.
 	err := s.db.QueryRow(ctx,
-		`SELECT portal_id FROM cloud_chat WHERE login_id=$1 AND LOWER(group_id)=LOWER($2) AND portal_id <> '' LIMIT 1`,
-		s.loginID, groupID,
-	).Scan(&portalID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return "", nil
-		}
-		return "", err
+		`SELECT timestamp_ms FROM cloud_message WHERE login_id=$1 AND UPPER(guid)=UPPER($2) LIMIT 1`,
+		s.loginID, uuid,
+	).Scan(&ts)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
 	}
-	return portalID, nil
+	return ts, err == nil, err
+}
+
+// portalHasPreStartupOutgoingMessages returns true if the portal has any
+// is_from_me messages with timestamp_ms < beforeMS. Used to detect portals
+// that were backfilled this session: if the portal has outgoing messages
+// predating startup, a live APNs read receipt arriving near startup is
+// almost certainly a buffered re-delivery (APNs re-delivers them with
+// TimestampMs = now on reconnect) rather than a genuine new read event.
+func (s *cloudBackfillStore) portalHasPreStartupOutgoingMessages(ctx context.Context, portalID string, beforeMS int64) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_message WHERE login_id=$1 AND portal_id=$2 AND is_from_me=TRUE AND timestamp_ms < $3 LIMIT 1`,
+		s.loginID, portalID, beforeMS,
+	).Scan(&count)
+	return count > 0, err
 }
 
 // findPortalIDsByParticipants returns all distinct portal_ids from cloud_chat
@@ -1119,79 +1230,6 @@ func participantSetsMatch(a, b []string) bool {
 	return diff <= 1
 }
 
-// getMessageRecordNamesByPortalID returns all CloudKit record_names for messages
-// belonging to a portal. Used when deleting a chat to also delete its messages
-// from CloudKit so they don't reappear during future syncs.
-func (s *cloudBackfillStore) getMessageRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT record_name FROM cloud_message WHERE login_id=$1 AND portal_id=$2 AND record_name <> ''`,
-		s.loginID, portalID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var name string
-		if err = rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
-}
-
-// getCloudRecordNamesByGroupID returns all non-empty chat record_names for ANY
-// portal_id that shares the given group_id. Used as a fallback when the portal
-// being deleted was created from APNs (empty record_name) but CloudKit has
-// records under a different portal_id for the same logical group.
-func (s *cloudBackfillStore) getCloudRecordNamesByGroupID(ctx context.Context, groupID string) ([]string, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT record_name FROM cloud_chat WHERE login_id=$1 AND LOWER(group_id)=LOWER($2) AND record_name <> ''`,
-		s.loginID, groupID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var name string
-		if err = rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
-}
-
-// getMessageRecordNamesByGroupID returns all non-empty message record_names
-// for portals that share the given group_id.
-func (s *cloudBackfillStore) getMessageRecordNamesByGroupID(ctx context.Context, groupID string) ([]string, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT cm.record_name FROM cloud_message cm
-		INNER JOIN cloud_chat cc ON cc.login_id=cm.login_id AND cc.portal_id=cm.portal_id
-		WHERE cm.login_id=$1 AND LOWER(cc.group_id)=LOWER($2) AND cm.record_name <> ''
-	`, s.loginID, groupID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var names []string
-	for rows.Next() {
-		var name string
-		if err = rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		names = append(names, name)
-	}
-	return names, rows.Err()
-}
-
 // deleteLocalChatByGroupID removes all local cloud_chat and cloud_message records
 // for any portal_id that shares the given group_id.
 func (s *cloudBackfillStore) deleteLocalChatByGroupID(ctx context.Context, groupID string) error {
@@ -1256,7 +1294,7 @@ func (s *cloudBackfillStore) hasPortalMessages(ctx context.Context, portalID str
 const cloudMessageSelectCols = `guid, COALESCE(chat_id, ''), portal_id, timestamp_ms, COALESCE(sender, ''), is_from_me,
 	COALESCE(text, ''), COALESCE(subject, ''), COALESCE(service, ''), deleted,
 	tapback_type, COALESCE(tapback_target_guid, ''), COALESCE(tapback_emoji, ''),
-	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0)`
+	COALESCE(attachments_json, ''), COALESCE(date_read_ms, 0), COALESCE(has_body, TRUE)`
 
 func (s *cloudBackfillStore) listBackwardMessages(
 	ctx context.Context,
@@ -1335,6 +1373,7 @@ func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, ar
 			&row.TapbackEmoji,
 			&row.AttachmentsJSON,
 			&row.DateReadMS,
+			&row.HasBody,
 		); err != nil {
 			return nil, err
 		}
@@ -1402,59 +1441,55 @@ func nullableString(value *string) any {
 	return *value
 }
 
-
-// pendingCloudDeletion holds the persisted intent to delete CloudKit records
-// for a portal. Used to retry interrupted background deletions on startup.
-type pendingCloudDeletion struct {
-	PortalID       string
-	ChatIdentifier string
-	GroupID        string
-	CreatedTS      int64
+// softDeletedPortal describes a portal whose cloud_message rows are all
+// soft-deleted (deleted=TRUE), meaning it was deleted at the Beeper level.
+type softDeletedPortal struct {
+	PortalID string
+	NewestTS int64
+	Count    int
 }
 
-// recordPendingCloudDeletion persists the intent to delete CloudKit records
-// for a portal. Must be called BEFORE starting the actual CloudKit deletion
-// so that restarts can retry. Idempotent (upserts).
-func (s *cloudBackfillStore) recordPendingCloudDeletion(ctx context.Context, portalID, chatIdentifier, groupID string) error {
-	nowMS := time.Now().UnixMilli()
-	_, err := s.db.Exec(ctx, `
-		INSERT INTO pending_cloud_deletion (login_id, portal_id, chat_identifier, group_id, created_ts)
-		VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (login_id, portal_id) DO UPDATE SET
-			chat_identifier=excluded.chat_identifier,
-			group_id=excluded.group_id,
-			created_ts=excluded.created_ts
-	`, s.loginID, portalID, chatIdentifier, groupID, nowMS)
-	return err
-}
-
-// getPendingCloudDeletions returns all pending CloudKit deletions for this login.
-func (s *cloudBackfillStore) getPendingCloudDeletions(ctx context.Context) ([]pendingCloudDeletion, error) {
-	rows, err := s.db.Query(ctx,
-		`SELECT portal_id, chat_identifier, group_id, created_ts FROM pending_cloud_deletion WHERE login_id=$1`,
-		s.loginID,
-	)
+// listSoftDeletedPortals returns portals where every cloud_message row is
+// soft-deleted (no live messages remain). These are candidates for restore.
+// Results are sorted newest-first by the most recent message timestamp.
+func (s *cloudBackfillStore) listSoftDeletedPortals(ctx context.Context) ([]softDeletedPortal, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT portal_id, MAX(timestamp_ms), COUNT(*)
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> ''
+		GROUP BY portal_id
+		HAVING MAX(CASE WHEN deleted=FALSE THEN 1 ELSE 0 END) = 0
+		   AND MAX(CASE WHEN deleted=TRUE  THEN 1 ELSE 0 END) = 1
+		ORDER BY MAX(timestamp_ms) DESC
+	`, s.loginID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
-	var out []pendingCloudDeletion
+	var out []softDeletedPortal
 	for rows.Next() {
-		var d pendingCloudDeletion
-		if err = rows.Scan(&d.PortalID, &d.ChatIdentifier, &d.GroupID, &d.CreatedTS); err != nil {
+		var p softDeletedPortal
+		if err = rows.Scan(&p.PortalID, &p.NewestTS, &p.Count); err != nil {
 			return nil, err
 		}
-		out = append(out, d)
+		out = append(out, p)
 	}
 	return out, rows.Err()
 }
 
-// clearPendingCloudDeletion removes a completed deletion from the pending list.
-func (s *cloudBackfillStore) clearPendingCloudDeletion(ctx context.Context, portalID string) error {
-	_, err := s.db.Exec(ctx,
-		`DELETE FROM pending_cloud_deletion WHERE login_id=$1 AND portal_id=$2`,
-		s.loginID, portalID,
+// undeleteCloudMessagesByPortalID reverses a portal-level soft-delete by
+// setting deleted=FALSE on all cloud_message rows for the portal.
+// Returns the number of rows updated.
+func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context, portalID string) (int, error) {
+	result, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3
+		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
+		s.loginID, portalID, time.Now().UnixMilli(),
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return int(n), nil
 }
+

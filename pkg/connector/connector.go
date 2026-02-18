@@ -67,9 +67,6 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	if cfg.MaxCatchupMessages <= 500 {
 		cfg.MaxCatchupMessages = 5000
 	}
-	if cfg.UnreadHoursThreshold <= 0 {
-		cfg.UnreadHoursThreshold = 720
-	}
 	if !cfg.Queue.Enabled {
 		cfg.Queue.Enabled = true
 	}

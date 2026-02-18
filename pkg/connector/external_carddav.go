@@ -192,6 +192,15 @@ func (c *externalCardDAVClient) GetContactInfo(identifier string) (*imessage.Con
 	return nil, nil
 }
 
+// GetAllContacts returns a snapshot of the full contact list for bulk search.
+func (c *externalCardDAVClient) GetAllContacts() []*imessage.Contact {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]*imessage.Contact, len(c.contacts))
+	copy(result, c.contacts)
+	return result
+}
+
 // ============================================================================
 // CardDAV Protocol (same as cloud_contacts.go but with Basic auth)
 // ============================================================================
