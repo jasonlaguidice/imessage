@@ -84,6 +84,12 @@ void* uniffi_rustpushgo_fn_method_client_cloud_download_attachment(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_cloud_download_group_photo(
+	void* ptr,
+	RustBuffer record_name,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_dump_chats_json(
 	void* ptr,
 	RustCallStatus* out_status
@@ -819,6 +825,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_download_attachment(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_download_group_photo(
 	RustCallStatus* out_status
 );
 

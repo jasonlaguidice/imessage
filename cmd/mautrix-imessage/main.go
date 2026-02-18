@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 
+	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
 	"github.com/lrhodin/imessage/pkg/connector"
@@ -38,6 +39,15 @@ var m = mxmain.BridgeMain{
 	Version:     "0.1.0",
 
 	Connector: &connector.IMConnector{},
+}
+
+func init() {
+	m.PostInit = func() {
+		proc := m.Bridge.Commands.(*commands.Processor)
+		for _, h := range connector.BridgeCommands() {
+			proc.AddHandler(h)
+		}
+	}
 }
 
 func main() {

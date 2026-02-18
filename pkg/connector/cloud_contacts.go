@@ -29,6 +29,8 @@ import (
 type contactSource interface {
 	SyncContacts(log zerolog.Logger) error
 	GetContactInfo(identifier string) (*imessage.Contact, error)
+	// GetAllContacts returns a snapshot of all cached contacts for bulk search.
+	GetAllContacts() []*imessage.Contact
 }
 
 // cloudContactsClient fetches contacts from iCloud via CardDAV and caches
@@ -221,6 +223,19 @@ func (c *cloudContactsClient) GetContactInfo(identifier string) (*imessage.Conta
 	}
 
 	return nil, nil
+}
+
+// GetAllContacts returns a snapshot of the full contact list for bulk search.
+func (c *cloudContactsClient) GetAllContacts() []*imessage.Contact {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	// Return a copy of the slice header so callers can iterate safely.
+	result := make([]*imessage.Contact, len(c.contacts))
+	copy(result, c.contacts)
+	return result
 }
 
 // ============================================================================

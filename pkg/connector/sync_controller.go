@@ -8,6 +8,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -30,6 +31,13 @@ import (
 // Increment this to trigger a token clear on the next bootstrap.
 const cloudSyncVersion = 4
 
+// cloudChatSyncVersion is bumped when chat-specific sync logic changes in a
+// way that requires a one-time full re-download of the chatManateeZone only
+// (not messages). This avoids the expensive message re-download that
+// bumping cloudSyncVersion would cause.
+// Current bump: 2 — populate group_photo_guid for all group chats.
+const cloudChatSyncVersion = 2
+
 type cloudSyncCounters struct {
 	Imported int
 	Updated  int
@@ -48,6 +56,58 @@ func (c *IMClient) setCloudSyncDone() {
 	c.cloudSyncDoneLock.Lock()
 	c.cloudSyncDone = true
 	c.cloudSyncDoneLock.Unlock()
+
+	// Flush the APNs reorder buffer once all forward backfills are complete.
+	// Messages accumulated during CloudKit sync to avoid interleaving APNs
+	// messages before older CloudKit messages in Matrix.
+	//
+	// If there are pending initial backfills (portals queued by the bootstrap
+	// createPortalsFromCloudSync pass), we wait for each FetchMessages call
+	// to complete and deliver its batch to Matrix (via CompleteCallback) before
+	// flushing. This ensures APNs messages appear AFTER the CloudKit history,
+	// not interleaved with it.
+	//
+	// If no portals were queued (fresh sync with no history, or all portals
+	// already up-to-date), flush immediately.
+	pending := atomic.LoadInt64(&c.pendingInitialBackfills)
+	if pending <= 0 {
+		log.Info().Msg("No pending initial backfills — flushing APNs buffer immediately")
+		atomic.StoreInt64(&c.apnsBufferFlushedAt, time.Now().UnixMilli())
+		if c.msgBuffer != nil {
+			c.msgBuffer.flush()
+		}
+		c.flushPendingPortalMsgs()
+		return
+	}
+
+	log.Info().Int64("pending", pending).
+		Msg("Waiting for initial forward backfills before flushing APNs buffer")
+
+	// Safety-net goroutine: if some FetchMessages calls never complete (e.g.
+	// portal deleted before bridgev2 processes the ChatResync event, existing
+	// portals that don't trigger a forward backfill, or a crash/timeout),
+	// force-flush the buffer after 10 seconds so APNs messages are never
+	// permanently suppressed.
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if atomic.LoadInt64(&c.pendingInitialBackfills) <= 0 {
+				// onForwardBackfillDone already flushed the buffer.
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		remaining := atomic.LoadInt64(&c.pendingInitialBackfills)
+		log.Warn().Int64("remaining", remaining).
+			Msg("APNs buffer flush timeout: not all initial backfills completed, forcing flush")
+		// Mirror what onForwardBackfillDone does: stamp the flush time so the
+		// read-receipt grace window (handleReadReceipt) knows the burst is done.
+		atomic.StoreInt64(&c.apnsBufferFlushedAt, time.Now().UnixMilli())
+		if c.msgBuffer != nil {
+			c.msgBuffer.flush()
+		}
+		c.flushPendingPortalMsgs()
+	}()
 }
 
 func (c *IMClient) isCloudSyncDone() bool {
@@ -270,12 +330,6 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 	log.Info().Dur("contacts_wait", time.Since(controllerStart)).Msg("Contacts ready, proceeding with CloudKit sync")
 
-	// Load pending CloudKit deletions from previous sessions BEFORE syncing.
-	// These are portals where local DB was cleaned but CloudKit full-scan was
-	// interrupted. We skip these portals during createPortalsFromCloudSync to
-	// prevent zombie portals, then run the slow CloudKit cleanup in background.
-	pendingDeletePortals := c.loadPendingDeletionPortalIDs(ctx, log)
-
 	// Bootstrap: download CloudKit data with retries until successful.
 	// IMPORTANT: Do NOT set cloudSyncDone on failure. The APNs gate must
 	// stay closed until sync succeeds — otherwise APNs echoes can create
@@ -300,15 +354,11 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 
 	// Soft-delete cloud records for portals that should be dead:
-	// 1. Pending deletions — sync re-imported records we're still deleting
-	// 2. Tombstoned portals — chat tombstones processed before messages,
-	//    so message import creates cloud_message rows for deleted chats
+	// Tombstoned portals — chat tombstones processed before messages,
+	// so message import creates cloud_message rows for deleted chats.
 	// deleteLocalChatByPortalID marks cloud_message deleted=TRUE (preserving
 	// UUIDs for echo detection) and removes cloud_chat rows.
 	skipPortals := make(map[string]bool)
-	for portalID := range pendingDeletePortals {
-		skipPortals[portalID] = true
-	}
 	c.recentlyDeletedPortalsMu.RLock()
 	for portalID := range c.recentlyDeletedPortals {
 		skipPortals[portalID] = true
@@ -325,28 +375,55 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	}
 
 	// Create portals and queue forward backfill for all of them.
-	// Skip portals that are pending deletion or tombstoned.
+	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
 	c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
-	// Delayed incremental re-sync: catch CloudKit messages that propagated
-	// after the bootstrap sync completed. APNs stored messages create partial
-	// cloud_message rows (UUID + timestamp only); this re-sync fills them
-	// with full CloudKit data (sender, text, attachments).
+	// Delayed incremental re-syncs: catch CloudKit messages that propagated
+	// after the bootstrap sync completed. Messages sent in the last few minutes
+	// may not be in the CloudKit changes feed yet (propagation delay). APNs
+	// delivers them with CreatePortal=false (gate closed), so bridgev2 drops
+	// them for non-existent portals. Multiple re-sync passes at increasing
+	// intervals ensure we catch them as CloudKit propagates.
 	go func() {
-		select {
-		case <-time.After(15 * time.Second):
-		case <-c.stopChan:
-			return
+		delays := []time.Duration{15 * time.Second, 60 * time.Second, 3 * time.Minute}
+		for i, delay := range delays {
+			select {
+			case <-time.After(delay):
+			case <-c.stopChan:
+				return
+			}
+			resyncLog := log.With().
+				Str("source", "delayed_resync").
+				Int("pass", i+1).
+				Int("total_passes", len(delays)).
+				Logger()
+			resyncLog.Info().Msg("Running delayed incremental CloudKit re-sync")
+			if err := c.runCloudSyncOnce(ctx, resyncLog, false); err != nil {
+				resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
+				continue
+			}
+			// Extend skipPortals with any portals deleted since bootstrap.
+			// The delayed re-sync may have imported new cloud_message records
+			// for these portals (deleted=FALSE). Soft-delete them now so they
+			// don't persist in the DB and resurrect the portal on next restart.
+			c.recentlyDeletedPortalsMu.RLock()
+			for portalID := range c.recentlyDeletedPortals {
+				if !skipPortals[portalID] {
+					skipPortals[portalID] = true
+					if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+						resyncLog.Warn().Err(err).Str("portal_id", portalID).
+							Msg("Failed to soft-delete re-imported records for recently deleted portal")
+					} else {
+						resyncLog.Debug().Str("portal_id", portalID).
+							Msg("Soft-deleted re-imported records for portal deleted after bootstrap")
+					}
+				}
+			}
+			c.recentlyDeletedPortalsMu.RUnlock()
+			c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
 		}
-		resyncLog := log.With().Str("source", "delayed_resync").Logger()
-		resyncLog.Info().Msg("Running delayed incremental CloudKit re-sync")
-		if err := c.runCloudSyncOnce(ctx, resyncLog, false); err != nil {
-			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
-			return
-		}
-		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
 	}()
 
 	log.Info().
@@ -357,11 +434,6 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Clean up stale entries in recentlyDeletedPortals to prevent unbounded
 	// memory growth over long-running sessions.
 	c.pruneRecentlyDeletedPortals(log)
-
-	// Run pending CloudKit deletions in the background AFTER cloudSyncDone is set.
-	// This is the slow full-scan that pages through all records — must not block
-	// the sync controller or APNs portal creation.
-	go c.retryPendingCloudDeletions(ctx, log)
 }
 
 // runCloudSyncOnce performs a single CloudKit sync pass. On the first run
@@ -425,6 +497,22 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 				}
 			} else {
 				log.Info().Int("sync_version", savedVersion).Msg("Sync version current — using incremental CloudKit sync")
+
+				// Check chat-specific sync version. A bump here only clears
+				// the chatManateeZone token, leaving the (expensive) message
+				// token intact. Used for changes that only require re-fetching
+				// chat metadata (e.g. populating group_photo_guid).
+				savedChatVersion, _ := c.cloudStore.getChatSyncVersion(ctx)
+				if savedChatVersion < cloudChatSyncVersion {
+					if err := c.cloudStore.clearZoneToken(ctx, cloudZoneChats); err != nil {
+						log.Warn().Err(err).Msg("Failed to clear chat zone token for chat sync version upgrade")
+					} else {
+						log.Info().
+							Int("old_version", savedChatVersion).
+							Int("new_version", cloudChatSyncVersion).
+							Msg("Chat sync version upgraded — cleared chat zone token for one-time full chat re-sync")
+					}
+				}
 			}
 		}
 
@@ -454,6 +542,15 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 	if isBootstrap && totalRecords > 0 {
 		if err := c.cloudStore.setSyncVersion(ctx, cloudSyncVersion); err != nil {
 			log.Warn().Err(err).Msg("Failed to persist sync version")
+		}
+		if err := c.cloudStore.setChatSyncVersion(ctx, cloudChatSyncVersion); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist chat sync version")
+		}
+	} else if !isBootstrap {
+		// For existing portals, always persist the chat sync version so that
+		// a targeted chat re-sync (cloudChatSyncVersion bump) is only done once.
+		if err := c.cloudStore.setChatSyncVersion(ctx, cloudChatSyncVersion); err != nil {
+			log.Warn().Err(err).Msg("Failed to persist chat sync version")
 		}
 	} else if isBootstrap && totalRecords == 0 {
 		log.Warn().
@@ -892,6 +989,14 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			return counts, jsonErr
 		}
 
+		if chat.GroupPhotoGuid != nil && *chat.GroupPhotoGuid != "" {
+			log.Info().
+				Str("portal_id", portalID).
+				Str("record_name", chat.RecordName).
+				Str("group_photo_guid", *chat.GroupPhotoGuid).
+				Msg("CloudKit chat sync: group photo GUID found")
+		}
+
 		batch = append(batch, cloudChatUpsertRow{
 			CloudChatID:      chat.CloudChatId,
 			RecordName:       chat.RecordName,
@@ -899,6 +1004,7 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			PortalID:         portalID,
 			Service:          chat.Service,
 			DisplayName:      nullableString(chat.DisplayName),
+			GroupPhotoGuid:   nullableString(chat.GroupPhotoGuid),
 			ParticipantsJSON: string(participantsJSON),
 			UpdatedTS:        int64(chat.UpdatedTimestampMs),
 		})
@@ -918,12 +1024,12 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 	// Handle tombstoned (deleted) chats. Tombstones only carry the
 	// record_name, so we look up portal_ids from the local cloud_chat
 	// table, then:
-	// 1. Delete cloud_chat rows by record_name, soft-delete cloud_message
-	//    rows (deleted=TRUE) to preserve UUIDs for echo detection
+	// 1. Hard-delete cloud_chat and cloud_message rows for the portal
 	// 2. Queue bridge portal deletion for any existing portal
 	// 3. Mark in recentlyDeletedPortals to block APNs echo resurrection
-	//    (cloudSyncDone gate ensures tombstones are always processed
-	//    before APNs can create portals — no DB table needed)
+	//    and to ensure ingestCloudMessages marks any re-imported messages
+	//    as deleted=TRUE (cloudSyncDone gate ensures tombstones are always
+	//    processed before APNs can create portals — no DB table needed)
 	if len(deletedRecordNames) > 0 {
 		// Resolve record_names → portal_ids before deleting the rows.
 		portalMap, lookupErr := c.cloudStore.lookupPortalIDsByRecordNames(ctx, deletedRecordNames)
@@ -936,14 +1042,13 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			return counts, fmt.Errorf("failed to delete tombstoned chats by record_name: %w", err)
 		}
 
-		// Soft-delete cloud_message rows and bridge portals for resolved portal_ids.
-		// IMPORTANT: Use soft-delete (deleted=TRUE), NOT hard-delete. Soft-deleted
-		// UUIDs are still found by hasMessageUUID, so APNs echoes arriving after
-		// cloudSyncDone are correctly detected and dropped. Hard-delete would
-		// destroy the echo detection data and allow stale echoes to resurrect portals.
+		// Hard-delete cloud_chat and cloud_message rows for resolved portal_ids.
+		// Echo detection is handled by recentlyDeletedPortals (set below) and by
+		// ingestCloudMessages marking re-imported messages as deleted=TRUE for
+		// portals in recentlyDeletedPortals.
 		for recordName, portalID := range portalMap {
 			if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to soft-delete messages for tombstoned chat")
+				log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to hard-delete messages for tombstoned chat")
 			}
 
 			// Mark as deleted in memory so createPortalsFromCloudSync skips
@@ -1067,6 +1172,18 @@ func (c *IMClient) ingestCloudMessages(
 		return fmt.Errorf("failed to delete messages: %w", err)
 	}
 
+	// Snapshot recentlyDeletedPortals so we can mark re-imported messages for
+	// deleted portals as deleted=TRUE. This closes the race where a periodic
+	// re-sync downloads messages for a portal that was just deleted: without
+	// this check, those messages would be inserted with deleted=FALSE and could
+	// trigger portal resurrection or spurious backfill on a future restart.
+	c.recentlyDeletedPortalsMu.RLock()
+	deletedPortalsSnapshot := make(map[string]bool, len(c.recentlyDeletedPortals))
+	for id := range c.recentlyDeletedPortals {
+		deletedPortalsSnapshot[id] = true
+	}
+	c.recentlyDeletedPortalsMu.RUnlock()
+
 	// Phase 1: Resolve portal IDs and build rows for live messages (no DB writes yet).
 	guids := make([]string, 0, len(liveMessages))
 	for _, msg := range liveMessages {
@@ -1088,6 +1205,19 @@ func (c *IMClient) ingestCloudMessages(
 				Bool("is_from_me", msg.IsFromMe).
 				Int64("timestamp_ms", msg.TimestampMs).
 				Msg("Skipping message with empty GUID")
+			counts.Skipped++
+			continue
+		}
+
+		// Skip system/service records (group renames, participant changes, etc.)
+		// that slipped past the Rust-side IS_SYSTEM_MESSAGE / IS_SERVICE_MESSAGE
+		// flag filter. In CloudKit, regular user messages have msgType=1;
+		// msgType=0 indicates non-user-content system records.
+		if msg.MsgType == 0 {
+			log.Debug().
+				Str("guid", msg.Guid).
+				Str("cloud_chat_id", msg.CloudChatId).
+				Msg("Skipping system/service message (msgType=0)")
 			counts.Skipped++
 			continue
 		}
@@ -1150,6 +1280,10 @@ func (c *IMClient) ingestCloudMessages(
 			}
 		}
 
+		// Mark as deleted if the portal is currently being deleted, so
+		// concurrent or future re-syncs don't resurrect the portal.
+		isDeleted := deletedPortalsSnapshot[portalID]
+
 		batch = append(batch, cloudMessageRow{
 			GUID:              msg.Guid,
 			RecordName:        msg.RecordName,
@@ -1161,12 +1295,13 @@ func (c *IMClient) ingestCloudMessages(
 			Text:              text,
 			Subject:           subject,
 			Service:           msg.Service,
-			Deleted:           false,
+			Deleted:           isDeleted,
 			TapbackType:       msg.TapbackType,
 			TapbackTargetGUID: tapbackTargetGUID,
 			TapbackEmoji:      tapbackEmoji,
 			AttachmentsJSON:   attachmentsJSON,
 			DateReadMS:        msg.DateReadMs,
+			HasBody:           msg.HasBody,
 		})
 
 		if existingSet[msg.Guid] {
@@ -1264,6 +1399,16 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// during ingestCloudChats, so they won't appear in portalInfos. No separate
 	// deleted_portal filter needed — CloudKit tombstones are the authoritative signal.
 
+	// Snapshot recentlyDeletedPortals so we filter portals deleted in-session
+	// even if they were deleted after the static pendingDeletePortals map was built
+	// (e.g. deleted between bootstrap sync and a delayed 15s/60s/3min re-sync).
+	c.recentlyDeletedPortalsMu.RLock()
+	recentlyDeletedSnapshot := make(map[string]bool, len(c.recentlyDeletedPortals))
+	for id := range c.recentlyDeletedPortals {
+		recentlyDeletedSnapshot[id] = true
+	}
+	c.recentlyDeletedPortalsMu.RUnlock()
+
 	// Count how many portals have messages vs chat-only (diagnostic).
 	chatOnlyPortals := 0
 	for _, p := range portalInfos {
@@ -1294,9 +1439,10 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		if p.MessageCount == 0 {
 			continue
 		}
-		// Skip portals with pending CloudKit deletions — the sync may have
-		// re-imported records for chats we're still deleting from CloudKit.
-		if pendingDeletePortals[p.PortalID] {
+		// Skip portals that are tombstoned or recently deleted this session.
+		// pendingDeletePortals is the skip map passed by the caller;
+		// recentlyDeletedSnapshot catches portals deleted after that point.
+		if pendingDeletePortals[p.PortalID] || recentlyDeletedSnapshot[p.PortalID] {
 			pendingDeleteSkipped++
 			continue
 		}
@@ -1307,7 +1453,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		ordered = append(ordered, p.PortalID)
 	}
 	if pendingDeleteSkipped > 0 {
-		log.Info().Int("skipped", pendingDeleteSkipped).Msg("Skipped portals with pending CloudKit deletions")
+		log.Info().Int("skipped", pendingDeleteSkipped).Msg("Skipped tombstoned or recently deleted portals")
 	}
 
 	portalStart := time.Now()
@@ -1316,6 +1462,20 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Int("already_queued", alreadyQueued).
 		Int("to_process", len(ordered)).
 		Msg("Creating portals from cloud sync")
+
+	// Set pendingInitialBackfills BEFORE queuing any portals.
+	// bridgev2 processes ChatResync events concurrently (QueueRemoteEvent is
+	// async), so FetchMessages(Forward=true) calls — and their
+	// onForwardBackfillDone decrements — can fire during the queuing loop.
+	// If we set the counter AFTER the loop (StoreInt64 at the end), early
+	// decrements land on 0 (making it negative), then the Store overwrites
+	// those decrements with N, leaving the counter stuck at the number of
+	// early completions rather than reaching 0.  Setting it up-front to
+	// len(ordered) ensures every decrement is counted correctly.
+	if !c.isCloudSyncDone() {
+		atomic.StoreInt64(&c.pendingInitialBackfills, int64(len(ordered)))
+		log.Debug().Int("count", len(ordered)).Msg("Set pendingInitialBackfills for APNs buffer hold")
+	}
 
 	created := 0
 	for i, portalID := range ordered {
@@ -1371,6 +1531,10 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
 
+	// pendingInitialBackfills was already set to len(ordered) BEFORE the loop
+	// so that early-completing FetchMessages(Forward=true) calls are counted
+	// correctly (see comment above the loop).  Nothing more to do here.
+
 	// Reset backward backfill tasks for portals that already have Matrix rooms.
 	// This handles the version-upgrade re-sync case where rooms exist but the
 	// backfill task may be marked done from a previous incomplete sync.
@@ -1420,82 +1584,6 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			c.Main.Bridge.WakeupBackfillQueue()
 		}
 	}
-}
-
-// loadPendingDeletionPortalIDs returns the set of portal IDs with pending
-// CloudKit deletions. Used to skip these portals during createPortalsFromCloudSync
-// so the sync doesn't resurrect portals that are being deleted.
-//
-// Also populates recentlyDeletedPortals (isTombstone=false) for each pending
-// deletion. This is critical: without it, the following sequence resurrects
-// deleted portals:
-//  1. User deletes chat → cloud_chat row hard-deleted, pending_cloud_deletion saved
-//  2. Bridge restarts → recentlyDeletedPortals empty (in-memory only)
-//  3. CloudKit tombstone arrives but lookupPortalIDsByRecordNames fails
-//     (cloud_chat row already gone) → no recentlyDeletedPortals entry
-//  4. retryPendingCloudDeletions clears pending entry → zero protection
-//  5. APNs echo with known UUID arrives → portal resurrected
-//
-// Using isTombstone=false (not true) so the hasMessageUUID check fires:
-// known UUIDs (stale echoes) are blocked, but fresh UUIDs (genuinely new
-// messages from either party) are allowed to create new portals.
-func (c *IMClient) loadPendingDeletionPortalIDs(ctx context.Context, log zerolog.Logger) map[string]bool {
-	if c.cloudStore == nil {
-		return nil
-	}
-	pending, err := c.cloudStore.getPendingCloudDeletions(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to load pending cloud deletions")
-		return nil
-	}
-	if len(pending) == 0 {
-		return nil
-	}
-	skip := make(map[string]bool, len(pending))
-	c.recentlyDeletedPortalsMu.Lock()
-	if c.recentlyDeletedPortals == nil {
-		c.recentlyDeletedPortals = make(map[string]deletedPortalEntry)
-	}
-	for _, d := range pending {
-		skip[d.PortalID] = true
-		c.recentlyDeletedPortals[d.PortalID] = deletedPortalEntry{
-			deletedAt: time.Now(),
-		}
-	}
-	c.recentlyDeletedPortalsMu.Unlock()
-	log.Info().Int("count", len(skip)).Msg("Loaded pending deletion portal IDs (will skip during portal creation + echo protection active)")
-	return skip
-}
-
-// retryPendingCloudDeletions checks for any pending_cloud_deletion entries
-// (deletions where local DB was cleaned but CloudKit full-scan was interrupted)
-// and retries the CloudKit cleanup. Runs in the background after cloudSyncDone
-// is set, so the slow full-scan doesn't block portal creation.
-func (c *IMClient) retryPendingCloudDeletions(ctx context.Context, log zerolog.Logger) {
-	if c.cloudStore == nil || c.client == nil {
-		return
-	}
-	pending, err := c.cloudStore.getPendingCloudDeletions(ctx)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to load pending cloud deletions")
-		return
-	}
-	if len(pending) == 0 {
-		return
-	}
-
-	log.Info().Int("count", len(pending)).Msg("Retrying pending CloudKit deletions from previous session")
-	for _, d := range pending {
-		dlog := log.With().
-			Str("portal_id", d.PortalID).
-			Str("chat_identifier", d.ChatIdentifier).
-			Str("group_id", d.GroupID).
-			Int64("created_ts", d.CreatedTS).
-			Logger()
-		dlog.Info().Msg("Retrying pending CloudKit deletion")
-		c.runFullCloudKitDeletion(dlog, d.PortalID, d.ChatIdentifier, nil)
-	}
-	log.Info().Int("count", len(pending)).Msg("Finished retrying pending CloudKit deletions")
 }
 
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {

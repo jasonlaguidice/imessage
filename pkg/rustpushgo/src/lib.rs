@@ -899,6 +899,17 @@ pub struct WrappedMessage {
     // process-time so MMCS downloads and retries don't push messages past
     // the window.
     pub is_stored_message: bool,
+
+    // Group photo (icon) change. True when someone sets or clears the
+    // group chat photo from their iMessage client.
+    // group_photo_cleared: true = photo was removed ("ngp"), false = new photo set.
+    // When is_icon_change=true and group_photo_cleared=false, icon_change_photo_data
+    // contains the MMCS-downloaded photo bytes (None if download failed).
+    pub is_icon_change: bool,
+    pub group_photo_cleared: bool,
+    // Pre-downloaded photo bytes for IconChange messages.
+    // Some(bytes) only when is_icon_change=true, group_photo_cleared=false, and download succeeded.
+    pub icon_change_photo_data: Option<Vec<u8>>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -953,6 +964,8 @@ pub struct WrappedCloudSyncChat {
     pub participants: Vec<String>,
     pub deleted: bool,
     pub updated_timestamp_ms: u64,
+    /// CloudKit group photo GUID ("gpid" field). Non-null means a custom photo is set.
+    pub group_photo_guid: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -980,6 +993,17 @@ pub struct WrappedCloudSyncMessage {
     // When the recipient read this message (Apple epoch ns → Unix ms).
     // Only meaningful for is_from_me messages. 0 means unread.
     pub date_read_ms: i64,
+
+    // CloudKit msgType field. 0 = regular user message, non-zero = system/service
+    // record (group naming, participant changes, etc.). Used by Go to filter
+    // non-user-content that slips past IS_SYSTEM/IS_SERVICE_MESSAGE flags.
+    pub msg_type: i64,
+
+    // Whether the CloudKit record has an attributedBody (rich text payload).
+    // Regular user messages always have attributedBody; system/service messages
+    // (group renames, participant changes) never do. Used by Go to filter
+    // system messages that slip past flag-based filters.
+    pub has_body: bool,
 }
 
 /// Metadata for an attachment referenced by a CloudKit message.
@@ -1199,6 +1223,9 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         delete_chat_guid: None,
         delete_message_uuids: vec![],
         is_stored_message: false, // set by caller based on connection state
+        is_icon_change: false,
+        group_photo_cleared: false,
+        icon_change_photo_data: None,
     };
 
     match &msg.message {
@@ -1341,6 +1368,10 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         Message::PermanentDelete(del) => {
             w.is_permanent_delete = true;
             populate_delete_target(&mut w, &del.target);
+        }
+        Message::IconChange(change) => {
+            w.is_icon_change = true;
+            w.group_photo_cleared = change.file.is_none();
         }
         _ => {}
     }
@@ -1919,6 +1950,40 @@ async fn download_mmcs_attachments(
     }
 }
 
+/// Download the group photo for an IconChange message via MMCS.
+/// Apple delivers group photo changes as MMCS file transfers inside IconChange
+/// APNs messages — NOT via CloudKit. This downloads the photo inline so the
+/// Go side can use msg.icon_change_photo_data directly without any CloudKit
+/// round-trip (which would fail for Apple-set photos anyway).
+async fn download_icon_change_photo(
+    wrapped: &mut WrappedMessage,
+    msg_inst: &MessageInst,
+    conn: &rustpush::APSConnectionResource,
+) {
+    if let Message::IconChange(change) = &msg_inst.message {
+        if let Some(mmcs_file) = &change.file {
+            let att = Attachment {
+                a_type: AttachmentType::MMCS(mmcs_file.clone()),
+                part: 0,
+                uti_type: String::new(),
+                mime: String::from("image/jpeg"),
+                name: String::from("group_photo"),
+                iris: false,
+            };
+            let mut buf: Vec<u8> = Vec::new();
+            match att.get_attachment(conn, &mut buf, |_, _| {}).await {
+                Ok(()) => {
+                    info!("Downloaded group photo via MMCS ({} bytes)", buf.len());
+                    wrapped.icon_change_photo_data = Some(buf);
+                }
+                Err(e) => {
+                    error!("Failed to download group photo via MMCS: {}", e);
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Client
 // ============================================================================
@@ -2116,6 +2181,10 @@ pub async fn new_client(
 
                                 // Download MMCS attachments so Go receives inline data
                                 download_mmcs_attachments(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                // Download group photo for IconChange messages via MMCS
+                                if wrapped.is_icon_change && !wrapped.group_photo_cleared {
+                                    download_icon_change_photo(&mut wrapped, &msg_inst, &conn_for_download).await;
+                                }
                                 callback.on_message(wrapped);
                             }
                             break; // success
@@ -2846,6 +2915,7 @@ impl Client {
                     participants: chat.participants.into_iter().map(|p| p.uri).collect(),
                     deleted: false,
                     updated_timestamp_ms,
+                    group_photo_guid: chat.group_photo_guid,
                 });
             } else {
                 normalized.push(WrappedCloudSyncChat {
@@ -2858,6 +2928,7 @@ impl Client {
                     participants: vec![],
                     deleted: true,
                     updated_timestamp_ms,
+                    group_photo_guid: None,
                 });
             }
         }
@@ -2971,10 +3042,15 @@ impl Client {
         let mut skipped_messages = 0usize;
         for (record_name, msg_opt) in messages {
             if let Some(msg) = msg_opt {
-                // Skip system messages (group renames, participant changes, etc.)
-                // These are not user-visible content and should not appear in
-                // the backfilled timeline.
-                if msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE) {
+                // Skip system/service messages (group renames, participant changes,
+                // location sharing, etc.). IS_SYSTEM_MESSAGE covers explicit system
+                // notifications; IS_SERVICE_MESSAGE covers service-generated inline
+                // notifications (e.g. "You named the conversation"). Neither type
+                // is user-authored content.
+                if msg.flags.intersects(
+                    rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE
+                    | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE
+                ) {
                     skipped_messages += 1;
                     continue;
                 }
@@ -3009,6 +3085,8 @@ impl Client {
                         .map(|dr| apple_timestamp_ns_to_unix_ms(dr as i64))
                         .unwrap_or(0);
 
+                    let has_body = msg.msg_proto.attributed_body.is_some();
+
                     WrappedCloudSyncMessage {
                         record_name: rn,
                         guid,
@@ -3027,6 +3105,8 @@ impl Client {
                         tapback_emoji,
                         attachment_guids,
                         date_read_ms,
+                        msg_type: msg.r#type,
+                        has_body,
                     }
                 }));
 
@@ -3064,6 +3144,8 @@ impl Client {
                     tapback_emoji: None,
                     attachment_guids: vec![],
                     date_read_ms: 0,
+                    msg_type: 0,
+                    has_body: false,
                 });
             }
         }
@@ -3142,6 +3224,25 @@ impl Client {
         cloud_messages.download_attachment(files).await
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("Failed to download CloudKit attachment {}: {}", record_name, e),
+            })?;
+        Ok(shared.into_bytes())
+    }
+
+    /// Download a group photo from CloudKit by the chat's record name.
+    /// Returns the raw image bytes. The record_name is the CloudKit record
+    /// in chatManateeZone where the chat's "gp" asset is stored.
+    pub async fn cloud_download_group_photo(
+        &self,
+        record_name: String,
+    ) -> Result<Vec<u8>, WrappedError> {
+        let cloud_messages = self.get_or_init_cloud_messages_client().await?;
+
+        let shared = SharedWriter::new();
+        let mut files = HashMap::new();
+        files.insert(record_name.clone(), shared.clone());
+        cloud_messages.download_group_photo(files).await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("Failed to download CloudKit group photo {}: {}", record_name, e),
             })?;
         Ok(shared.into_bytes())
     }
@@ -3270,8 +3371,11 @@ impl Client {
                     continue;
                 };
 
-                // Skip system messages (group renames, participant changes, etc.)
-                if msg.flags.contains(rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE) {
+                // Skip system/service messages (group renames, participant changes, etc.)
+                if msg.flags.intersects(
+                    rustpush::cloud_messages::MessageFlags::IS_SYSTEM_MESSAGE
+                    | rustpush::cloud_messages::MessageFlags::IS_SERVICE_MESSAGE
+                ) {
                     continue;
                 }
 
@@ -3321,6 +3425,8 @@ impl Client {
                         tapback_emoji,
                         attachment_guids: vec![],
                         date_read_ms,
+                        msg_type: msg.r#type,
+                        has_body: msg.msg_proto.attributed_body.is_some(),
                     },
                 );
 
