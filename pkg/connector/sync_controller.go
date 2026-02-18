@@ -785,6 +785,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 					Msg("CloudKit chat sync: too many consecutive FFI errors, stopping pagination")
 				break
 			}
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		consecutiveErrors = 0
@@ -897,6 +898,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 			}
 			// Skip this page and retry with the same token on next iteration.
 			// The server may return different records on retry.
+			time.Sleep(500 * time.Millisecond)
 			continue
 		}
 		consecutiveErrors = 0

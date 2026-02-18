@@ -1929,21 +1929,22 @@ func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatId
 	var matchingRecordNames []string
 	var token *string
 
-	for {
-		page, err := safeCloudSyncChats(c.client, token)
+	for page := 0; page < 256; page++ {
+		resp, err := safeCloudSyncChats(c.client, token)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to sync chats from CloudKit for delete lookup")
 			return
 		}
-		for _, chat := range page.Chats {
+		for _, chat := range resp.Chats {
 			if chat.CloudChatId == chatIdentifier && chat.RecordName != "" {
 				matchingRecordNames = append(matchingRecordNames, chat.RecordName)
 			}
 		}
-		if page.Done {
+		prev := ptrStringOr(token, "")
+		token = resp.ContinuationToken
+		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
 			break
 		}
-		token = page.ContinuationToken
 	}
 
 	if len(matchingRecordNames) == 0 {
@@ -1967,21 +1968,22 @@ func (c *IMClient) findAndDeleteCloudMessagesByChatIdentifier(log zerolog.Logger
 	var matchingRecordNames []string
 	var token *string
 
-	for {
-		page, err := safeCloudSyncMessages(c.client, token)
+	for page := 0; page < 256; page++ {
+		resp, err := safeCloudSyncMessages(c.client, token)
 		if err != nil {
 			log.Warn().Err(err).Msg("Failed to sync messages from CloudKit for delete lookup")
 			return
 		}
-		for _, msg := range page.Messages {
+		for _, msg := range resp.Messages {
 			if msg.CloudChatId == chatIdentifier && msg.RecordName != "" {
 				matchingRecordNames = append(matchingRecordNames, msg.RecordName)
 			}
 		}
-		if page.Done {
+		prev := ptrStringOr(token, "")
+		token = resp.ContinuationToken
+		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
 			break
 		}
-		token = page.ContinuationToken
 	}
 
 	if len(matchingRecordNames) == 0 {
