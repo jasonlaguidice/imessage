@@ -98,8 +98,8 @@ else
     sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
     # Enable unlimited backward backfill (default is 0 which disables it)
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
-    # Remove artificial delay between backfill batches (default 20s is way too slow)
-    sed -i 's/batch_delay: [0-9]*/batch_delay: 0/' "$CONFIG"
+    # Use 1s between batches — fast enough for backfill, prevents idle hot-loop
+    sed -i 's/batch_delay: [0-9]*/batch_delay: 1/' "$CONFIG"
     echo "✓ Config saved to $CONFIG"
 fi
 
@@ -115,6 +115,10 @@ if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
 fi
 if grep -q 'batch_size: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
     sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
+    PATCHED_BACKFILL=true
+fi
+if grep -q 'batch_delay: 0$' "$CONFIG" 2>/dev/null; then
+    sed -i 's/batch_delay: 0$/batch_delay: 1/' "$CONFIG"
     PATCHED_BACKFILL=true
 fi
 if [ "$PATCHED_BACKFILL" = true ]; then
