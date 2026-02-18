@@ -2811,6 +2811,9 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	mimeType := att.MimeType
 	if mimeType == "" {
+		mimeType = utiToMIME(att.UTIType)
+	}
+	if mimeType == "" {
 		mimeType = "application/octet-stream"
 	}
 	fileName := att.Filename
@@ -2824,6 +2827,32 @@ func (c *IMClient) downloadAndUploadAttachment(
 		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
 	}
 
+	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
+	var imgWidth, imgHeight int
+	var thumbData []byte
+	var thumbW, thumbH int
+	if strings.HasPrefix(mimeType, "image/") || looksLikeImage(data) {
+		if mimeType == "image/gif" {
+			if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+				imgWidth, imgHeight = cfg.Width, cfg.Height
+			}
+		} else if img, _, isJPEG := decodeImageData(data); img != nil {
+			b := img.Bounds()
+			imgWidth, imgHeight = b.Dx(), b.Dy()
+			if !isJPEG {
+				var buf bytes.Buffer
+				if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 95}); err == nil {
+					data = buf.Bytes()
+					mimeType = "image/jpeg"
+					fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".jpg"
+				}
+			}
+			if imgWidth > 800 || imgHeight > 800 {
+				thumbData, thumbW, thumbH = scaleAndEncodeThumb(img, imgWidth, imgHeight)
+			}
+		}
+	}
+
 	msgType := mimeToMsgType(mimeType)
 	content := &event.MessageEventContent{
 		MsgType: msgType,
@@ -2831,6 +2860,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 		Info: &event.FileInfo{
 			MimeType: mimeType,
 			Size:     len(data),
+			Width:    imgWidth,
+			Height:   imgHeight,
 		},
 	}
 
@@ -2854,6 +2885,23 @@ func (c *IMClient) downloadAndUploadAttachment(
 		content.File = encFile
 	} else {
 		content.URL = url
+	}
+
+	if thumbData != nil {
+		thumbURL, thumbEnc, thumbErr := intent.UploadMedia(ctx, "", thumbData, "thumbnail.jpg", "image/jpeg")
+		if thumbErr == nil {
+			if thumbEnc != nil {
+				content.Info.ThumbnailFile = thumbEnc
+			} else {
+				content.Info.ThumbnailURL = thumbURL
+			}
+			content.Info.ThumbnailInfo = &event.FileInfo{
+				MimeType: "image/jpeg",
+				Size:     len(thumbData),
+				Width:    thumbW,
+				Height:   thumbH,
+			}
+		}
 	}
 
 	return []*bridgev2.BackfillMessage{{
@@ -4505,6 +4553,39 @@ func mimeToUTI(mime string) string {
 		return "public.audio"
 	default:
 		return "public.data"
+	}
+}
+
+// utiToMIME converts an Apple UTI type to its MIME equivalent.
+// Used as a fallback when CloudKit attachment records have a UTI but no MIME type.
+func utiToMIME(uti string) string {
+	switch uti {
+	case "public.jpeg":
+		return "image/jpeg"
+	case "public.png":
+		return "image/png"
+	case "com.compuserve.gif":
+		return "image/gif"
+	case "public.tiff":
+		return "image/tiff"
+	case "public.heic":
+		return "image/heic"
+	case "public.heif":
+		return "image/heif"
+	case "public.webp":
+		return "image/webp"
+	case "public.mpeg-4":
+		return "video/mp4"
+	case "com.apple.quicktime-movie":
+		return "video/quicktime"
+	case "public.mp3":
+		return "audio/mpeg"
+	case "public.aac-audio":
+		return "audio/aac"
+	case "com.apple.coreaudio-format":
+		return "audio/x-caf"
+	default:
+		return ""
 	}
 }
 
