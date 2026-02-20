@@ -378,6 +378,12 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 			Msg("Soft-deleted re-imported records for dead portals")
 	}
 
+	// Pre-upload all CloudKit attachments to Matrix before triggering portal
+	// creation. This populates attachmentContentCache so that FetchMessages
+	// (which runs inside the portal event loop goroutine) gets instant cache
+	// hits instead of blocking on CloudKit for 30+ minutes.
+	c.preUploadCloudAttachments(ctx)
+
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
 	portalStart := time.Now()
@@ -431,6 +437,9 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 				}
 			}
 			c.recentlyDeletedPortalsMu.RUnlock()
+			// Pre-upload any new attachments discovered by this re-sync;
+			// already-cached record_names are skipped instantly.
+			c.preUploadCloudAttachments(ctx)
 			c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
 		}
 	}()
