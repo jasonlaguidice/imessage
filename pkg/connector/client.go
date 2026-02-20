@@ -2597,6 +2597,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			body = row.Subject
 		}
 	}
+	body = strings.TrimLeft(body, "\ufffc \n")
 	hasText := strings.TrimSpace(body) != "" && strings.TrimRight(body, "\ufffc \n") != ""
 	if hasText {
 		textContent := &event.MessageEventContent{
@@ -2736,6 +2737,11 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		wg.Add(1)
 		go func(idx int, att cloudAttachmentRow) {
 			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Any("panic", r).Str("stack", string(debug.Stack())).Msg("Recovered panic in attachment download goroutine")
+				}
+			}()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 			msgs := c.downloadAndUploadAttachment(ctx, row, sender, ts, hasText, idx, att)
@@ -4205,7 +4211,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 }
 
 func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := ptrStringOr(msg.Text, "")
+	text := strings.TrimLeft(ptrStringOr(msg.Text, ""), "\ufffc \n")
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    text,
