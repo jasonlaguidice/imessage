@@ -2790,16 +2790,43 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 	return messages
 }
 
-// safeCloudDownloadAttachment wraps the FFI call with panic recovery.
-func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) (data []byte, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			stack := string(debug.Stack())
-			log.Error().Str("ffi_method", "CloudDownloadAttachment").Str("record_name", recordName).Str("stack", stack).Msgf("FFI panic recovered: %v", r)
-			err = fmt.Errorf("FFI panic in CloudDownloadAttachment: %v", r)
-		}
+// safeCloudDownloadAttachment wraps the FFI call with panic recovery and a
+// 90-second timeout. When Rust stalls on a network hang or an unrecognised
+// attachment format the goroutine would otherwise block forever; the timeout
+// frees the semaphore slot so other downloads can proceed. The inner goroutine
+// is leaked until Rust eventually unblocks, but that is bounded to at most 32
+// goroutines and is temporary.
+func safeCloudDownloadAttachment(client *rustpushgo.Client, recordName string) ([]byte, error) {
+	type dlResult struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan dlResult, 1)
+	go func() {
+		var res dlResult
+		defer func() {
+			if r := recover(); r != nil {
+				stack := string(debug.Stack())
+				log.Error().Str("ffi_method", "CloudDownloadAttachment").
+					Str("record_name", recordName).
+					Str("stack", stack).
+					Msgf("FFI panic recovered: %v", r)
+				res = dlResult{err: fmt.Errorf("FFI panic in CloudDownloadAttachment: %v", r)}
+			}
+			ch <- res
+		}()
+		d, e := client.CloudDownloadAttachment(recordName)
+		res = dlResult{data: d, err: e}
 	}()
-	return client.CloudDownloadAttachment(recordName)
+	select {
+	case res := <-ch:
+		return res.data, res.err
+	case <-time.After(90 * time.Second):
+		log.Error().Str("ffi_method", "CloudDownloadAttachment").
+			Str("record_name", recordName).
+			Msg("CloudDownloadAttachment timed out after 90s — inner goroutine leaked until FFI unblocks")
+		return nil, fmt.Errorf("CloudDownloadAttachment timed out after 90s")
+	}
 }
 
 // downloadAndUploadAttachment handles a single attachment: download from CloudKit,
@@ -3054,12 +3081,27 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		}(p)
 	}
 
-	wg.Wait()
-	log.Info().
-		Int64("uploaded", uploaded.Load()).
-		Int("total", len(pending)).
-		Dur("elapsed", time.Since(start)).
-		Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	const preUploadTimeout = 5 * time.Minute
+	select {
+	case <-done:
+		log.Info().
+			Int64("uploaded", uploaded.Load()).
+			Int("total", len(pending)).
+			Dur("elapsed", time.Since(start)).
+			Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
+	case <-time.After(preUploadTimeout):
+		log.Warn().
+			Int64("uploaded", uploaded.Load()).
+			Int("total", len(pending)).
+			Dur("elapsed", time.Since(start)).
+			Msg("Pre-upload: timed out, proceeding to portal creation with partial cache (remaining attachments download on-demand in FetchMessages)")
+	}
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {
