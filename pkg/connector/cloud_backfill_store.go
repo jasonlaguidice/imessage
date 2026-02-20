@@ -1373,6 +1373,19 @@ func (s *cloudBackfillStore) listLatestMessages(ctx context.Context, portalID st
 	return s.queryMessages(ctx, query, s.loginID, portalID, count)
 }
 
+// listOldestMessages returns the oldest `count` non-deleted messages for a
+// portal in chronological order (ASC). Used by forward backfill chunking to
+// deliver messages starting from the beginning of conversation history.
+func (s *cloudBackfillStore) listOldestMessages(ctx context.Context, portalID string, count int) ([]cloudMessageRow, error) {
+	query := `SELECT ` + cloudMessageSelectCols + `
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		ORDER BY timestamp_ms ASC, guid ASC
+		LIMIT $3
+	`
+	return s.queryMessages(ctx, query, s.loginID, portalID, count)
+}
+
 // listAllAttachmentMessages returns every non-deleted cloud_message row that
 // has at least one attachment. Used by preUploadCloudAttachments to drive the
 // pre-upload pass before portal creation.
