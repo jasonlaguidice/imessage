@@ -63,6 +63,28 @@ type deletedPortalEntry struct {
 	isTombstone bool
 }
 
+// failedAttachmentEntry tracks a CloudKit attachment download/upload failure
+// with a retry count. After maxAttachmentRetries attempts the attachment is
+// abandoned to avoid infinite retries on permanently corrupted records.
+type failedAttachmentEntry struct {
+	lastError string
+	retries   int
+}
+
+const maxAttachmentRetries = 3
+
+// recordAttachmentFailure increments the retry count for a failed attachment.
+// Returns the updated entry so callers can log the retry count.
+func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
+	entry := &failedAttachmentEntry{lastError: errMsg, retries: 1}
+	if prev, loaded := c.failedAttachments.Load(recordName); loaded {
+		old := prev.(*failedAttachmentEntry)
+		entry.retries = old.retries + 1
+	}
+	c.failedAttachments.Store(recordName, entry)
+	return entry
+}
+
 type IMClient struct {
 	Main      *IMConnector
 	UserLogin *bridgev2.UserLogin
@@ -174,6 +196,14 @@ type IMClient struct {
 	// downloadAndUploadAttachment so that FetchMessages (portal event loop)
 	// never blocks on a CloudKit download — it just reads the pre-built content.
 	attachmentContentCache sync.Map
+
+	// failedAttachments tracks CloudKit record_name → *failedAttachmentEntry
+	// for attachments that failed to download or upload. preUploadCloudAttachments
+	// retries these on delayed re-syncs (15s/60s/3min) even for portals with
+	// fwd_backfill_done=1, ensuring transient failures don't cause permanent
+	// attachment loss. Capped at maxAttachmentRetries to avoid infinite retries
+	// on permanently corrupted CloudKit records.
+	failedAttachments sync.Map
 
 	// startupTime records when this session connected. Used to suppress
 	// read receipts for messages that pre-date this session: re-delivered
@@ -2391,27 +2421,53 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		groupDisplayName, _ = c.cloudStore.getDisplayNameByPortalID(ctx, portalID)
 	}
 
-	// Forward backfill: return the newest messages for this portal.
-	// Triggered by the mautrix bridgev2 framework when a portal is first
-	// created (ChatResync / CreatePortal). With a high max_initial_messages
-	// config, this delivers ALL messages in one batch — producing a clean
-	// linear DAG with room creation at the top and messages below.
+	// Forward backfill: return messages for this portal in chronological
+	// order, chunked to avoid blocking the portal event loop for minutes on
+	// portals with tens of thousands of messages (W2 in TPP).
+	//
+	// Chunking strategy:
+	//   - Each call returns at most forwardChunkSize messages.
+	//   - If more remain, HasMore=true + a cursor to resume.
+	//   - bridgev2 calls FetchMessages again with the cursor.
+	//   - CompleteCallback only fires on the final chunk.
+	const forwardChunkSize = 5000
 	if params.Forward {
 		// Acquire semaphore to limit concurrent forward backfills.
 		// This prevents overwhelming CloudKit/Matrix with simultaneous
 		// attachment downloads and uploads across many portals.
 		c.forwardBackfillSem <- struct{}{}
 		defer func() { <-c.forwardBackfillSem }()
+
+		chunkSize := count
+		if chunkSize > forwardChunkSize {
+			chunkSize = forwardChunkSize
+		}
+		fetchLimit := chunkSize + 1 // +1 to detect HasMore
+
 		log.Info().
 			Str("portal_id", portalID).
 			Int("count", count).
+			Int("chunk_size", chunkSize).
 			Str("trigger", "portal_creation").
 			Bool("has_anchor", params.AnchorMessage != nil).
+			Bool("has_cursor", params.Cursor != "").
 			Msg("Forward backfill START")
 		queryStart := time.Now()
 		var rows []cloudMessageRow
-		var err error
-		if params.AnchorMessage != nil {
+		var queryErr error
+		if params.Cursor != "" {
+			// Continuation from a previous chunk.
+			fwdCursor, decErr := decodeCloudBackfillCursor(params.Cursor)
+			if decErr != nil {
+				return nil, fmt.Errorf("invalid forward backfill cursor: %w", decErr)
+			}
+			log.Debug().
+				Str("portal_id", portalID).
+				Int64("cursor_ts", fwdCursor.TimestampMS).
+				Str("cursor_guid", fwdCursor.GUID).
+				Msg("Forward backfill: resuming from cursor")
+			rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, fwdCursor.TimestampMS, fwdCursor.GUID, fetchLimit)
+		} else if params.AnchorMessage != nil {
 			// Existing portal catch-up: only fetch messages NEWER than the anchor.
 			anchorTS := params.AnchorMessage.Timestamp.UnixMilli()
 			anchorGUID := string(params.AnchorMessage.ID)
@@ -2420,21 +2476,30 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				Int64("anchor_ts", anchorTS).
 				Str("anchor_guid", anchorGUID).
 				Msg("Forward backfill: using anchor — fetching only newer messages")
-			rows, err = c.cloudStore.listForwardMessages(ctx, portalID, anchorTS, anchorGUID, count)
+			rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, anchorTS, anchorGUID, fetchLimit)
 		} else {
-			// New portal: fetch the newest N messages (N = max_initial_messages).
-			// A high count delivers all history in one forward batch, keeping
-			// the DAG clean (no fragmented backward batch_send requests).
-			rows, err = c.cloudStore.listLatestMessages(ctx, portalID, count)
+			// New portal: start from the oldest messages and paginate
+			// forward in chunks. Each chunk is small enough to process
+			// quickly, preventing the 2+ minute event loop stall that
+			// occurs with 27k+ messages delivered in a single batch.
+			rows, queryErr = c.cloudStore.listOldestMessages(ctx, portalID, fetchLimit)
 		}
-		if err != nil {
-			log.Err(err).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Forward backfill: query FAILED")
-			return nil, err
+		if queryErr != nil {
+			log.Err(queryErr).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Forward backfill: query FAILED")
+			return nil, queryErr
 		}
 		queryElapsed := time.Since(queryStart)
+
+		// Detect whether more messages remain beyond this chunk.
+		hasMore := len(rows) > chunkSize
+		if hasMore {
+			rows = rows[:chunkSize]
+		}
+
 		log.Debug().
 			Str("portal_id", portalID).
 			Int("rows", len(rows)).
+			Bool("has_more", hasMore).
 			Dur("query_ms", queryElapsed).
 			Msg("Forward backfill: query returned")
 		if len(rows) == 0 {
@@ -2444,11 +2509,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			c.cloudStore.markForwardBackfillDone(ctx, portalID)
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 		}
-		if params.AnchorMessage == nil {
-			// listLatestMessages returns newest-first; reverse to chronological order
-			reverseCloudMessageRows(rows)
-		}
-		// listForwardMessages already returns in chronological order
+		// All query paths return rows in chronological order (ASC).
 		convertStart := time.Now()
 		// attachmentContentCache is pre-populated by preUploadCloudAttachments
 		// (called before createPortalsFromCloudSync), so downloadAndUploadAttachment
@@ -2463,28 +2524,44 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			Str("portal_id", portalID).
 			Int("db_rows", len(rows)).
 			Int("backfill_msgs", len(messages)).
+			Bool("has_more", hasMore).
 			Dur("query_ms", queryElapsed).
 			Dur("convert_ms", convertElapsed).
 			Dur("total_ms", time.Since(fetchStart)).
-			Msg("Forward backfill COMPLETE — newest messages returned for portal creation")
+			Msg("Forward backfill chunk complete")
 
-		// Mark done so the outer defer doesn't double-decrement; the
-		// CompleteCallback will call onForwardBackfillDone after bridgev2
-		// delivers the messages to Matrix (preserving ordering: CloudKit
-		// backfill is fully in Matrix before APNs buffer is flushed).
+		// Suppress the outer defer's call to onForwardBackfillDone on ALL
+		// return paths — intermediate chunks must not decrement the pending
+		// counter, and the final chunk uses CompleteCallback instead.
 		forwardDone = true
-		cloudStoreDone := c.cloudStore // capture for closure (c is a pointer, safe)
-		return &bridgev2.FetchMessagesResponse{
+
+		resp := &bridgev2.FetchMessagesResponse{
 			Messages: messages,
-			HasMore:  false,
+			HasMore:  hasMore,
 			Forward:  true,
-			CompleteCallback: func() {
-				// Mark portal as forward-backfill-done so preUploadCloudAttachments
-				// skips it on restart (avoids re-uploading every attachment).
+		}
+		if hasMore {
+			// Encode cursor pointing to the last row so the next call
+			// resumes after it.
+			cursor, cursorErr := encodeCloudBackfillCursor(cloudBackfillCursor{
+				TimestampMS: rows[len(rows)-1].TimestampMS,
+				GUID:        rows[len(rows)-1].GUID,
+			})
+			if cursorErr != nil {
+				return nil, cursorErr
+			}
+			resp.Cursor = cursor
+		} else {
+			// Final chunk: mark portal as done after bridgev2 delivers
+			// the messages to Matrix (preserving ordering: CloudKit
+			// backfill is fully in Matrix before APNs buffer is flushed).
+			cloudStoreDone := c.cloudStore
+			resp.CompleteCallback = func() {
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
 				c.onForwardBackfillDone()
-			},
-		}, nil
+			}
+		}
+		return resp, nil
 	}
 
 	// Backward backfill: triggered by the mautrix bridgev2 backfill queue
@@ -2874,15 +2951,20 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
 	if err != nil {
+		fe := c.recordAttachmentFailure(att.RecordName, err.Error())
 		log.Warn().Err(err).
 			Str("guid", row.GUID).
 			Str("att_guid", att.GUID).
 			Str("record_name", att.RecordName).
+			Int("attempt", fe.retries).
 			Msg("Failed to download CloudKit attachment, skipping")
 		return nil
 	}
 	if len(data) == 0 {
-		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).Msg("CloudKit attachment returned empty data")
+		fe := c.recordAttachmentFailure(att.RecordName, "empty data")
+		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).
+			Int("attempt", fe.retries).
+			Msg("CloudKit attachment returned empty data")
 		return nil
 	}
 
@@ -2952,9 +3034,11 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	url, encFile, uploadErr := intent.UploadMedia(ctx, "", data, fileName, mimeType)
 	if uploadErr != nil {
+		fe := c.recordAttachmentFailure(att.RecordName, uploadErr.Error())
 		log.Warn().Err(uploadErr).
 			Str("guid", row.GUID).
 			Str("att_guid", att.GUID).
+			Int("attempt", fe.retries).
 			Msg("Failed to upload attachment to Matrix, skipping")
 		return nil
 	}
@@ -2984,6 +3068,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 	// Populate the in-memory cache so any future backfill call for the same
 	// attachment returns instantly without re-downloading from CloudKit.
 	c.attachmentContentCache.Store(att.RecordName, content)
+	// Clear any prior failure tracking — this attachment succeeded.
+	c.failedAttachments.Delete(att.RecordName)
 	// Persist the mxc URI to SQLite so the cache survives bridge restarts.
 	// Future pre-upload passes load this at startup and skip re-downloading.
 	if c.cloudStore != nil {
@@ -3051,7 +3137,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	// - Interrupted backfill: that portal is NOT in the done set → still pre-uploads
 	// Using fwd_backfill_done (set by FetchMessages via CompleteCallback) rather than
 	// MXID-existence avoids the interrupted-backfill edge case.
-	donePorals, err := c.cloudStore.getForwardBackfillDonePortals(ctx)
+	donePortals, err := c.cloudStore.getForwardBackfillDonePortals(ctx)
 	if err != nil {
 		log.Warn().Err(err).Msg("Pre-upload: failed to query fwd_backfill_done, skipping pre-upload entirely")
 		return
@@ -3068,10 +3154,7 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	}
 	var pending []pendingUpload
 	for _, row := range rows {
-		// Skip portals whose forward backfill completed — no re-upload needed.
-		if donePorals[row.PortalID] {
-			continue
-		}
+		portalDone := donePortals[row.PortalID]
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
 			continue
@@ -3085,6 +3168,36 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 			}
 			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
 				continue // already cached from a previous pass
+			}
+			// Check if this attachment has failed before and whether
+			// it has exceeded the retry limit.
+			prev, isFailed := c.failedAttachments.Load(att.RecordName)
+			if isFailed {
+				fe := prev.(*failedAttachmentEntry)
+				if fe.retries >= maxAttachmentRetries {
+					log.Warn().
+						Str("record_name", att.RecordName).
+						Str("portal_id", row.PortalID).
+						Str("last_error", fe.lastError).
+						Int("retries", fe.retries).
+						Msg("Pre-upload: abandoning attachment after max retries")
+					c.failedAttachments.Delete(att.RecordName)
+					continue
+				}
+			}
+			// For done portals, only retry attachments that previously
+			// failed (transient). New uncached attachments in done portals
+			// were already handled by FetchMessages — no re-upload needed.
+			if portalDone {
+				if !isFailed {
+					continue
+				}
+				fe := prev.(*failedAttachmentEntry)
+				log.Info().
+					Str("record_name", att.RecordName).
+					Str("portal_id", row.PortalID).
+					Int("attempt", fe.retries+1).
+					Msg("Pre-upload: retrying previously failed attachment for completed portal")
 			}
 			pending = append(pending, pendingUpload{
 				row: row, idx: i, att: att,
@@ -3124,8 +3237,10 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 			}()
 			// downloadAndUploadAttachment stores the result in attachmentContentCache
 			// as a side effect; we discard the returned BackfillMessage here.
-			c.downloadAndUploadAttachment(ctx, p.row, p.sender, p.ts, p.hasText, p.idx, p.att)
-			uploaded.Add(1)
+			result := c.downloadAndUploadAttachment(ctx, p.row, p.sender, p.ts, p.hasText, p.idx, p.att)
+			if result != nil {
+				uploaded.Add(1)
+			}
 		}(p)
 	}
 
@@ -3135,8 +3250,10 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	// genuinely new/uncached attachments — so it completes fully every time
 	// and FetchMessages always gets 100% cache hits.
 	wg.Wait()
+	failed := int64(len(pending)) - uploaded.Load()
 	log.Info().
 		Int64("uploaded", uploaded.Load()).
+		Int64("failed", failed).
 		Int("total", len(pending)).
 		Dur("elapsed", time.Since(start)).
 		Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
