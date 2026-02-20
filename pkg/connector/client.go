@@ -2981,10 +2981,16 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
-	// Populate the cache so any future backfill call for the same attachment
-	// (e.g., a second portal covering the same thread, or a retry after restart)
-	// returns instantly without re-downloading from CloudKit.
+	// Populate the in-memory cache so any future backfill call for the same
+	// attachment returns instantly without re-downloading from CloudKit.
 	c.attachmentContentCache.Store(att.RecordName, content)
+	// Persist the mxc URI to SQLite so the cache survives bridge restarts.
+	// Future pre-upload passes load this at startup and skip re-downloading.
+	if c.cloudStore != nil {
+		if jsonBytes, err := json.Marshal(content); err == nil {
+			c.cloudStore.saveAttachmentCacheEntry(ctx, att.RecordName, jsonBytes)
+		}
+	}
 
 	return []*bridgev2.BackfillMessage{{
 		Sender:    sender,
@@ -3018,6 +3024,25 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	if err != nil {
 		log.Warn().Err(err).Msg("Pre-upload: failed to list attachment messages, skipping")
 		return
+	}
+
+	// Load previously persisted mxc URIs into the in-memory cache.
+	// This means attachments uploaded in any prior run are instant cache hits
+	// in the pending-list filter below — zero CloudKit downloads needed.
+	if cachedJSON, err := c.cloudStore.loadAttachmentCacheJSON(ctx); err != nil {
+		log.Warn().Err(err).Msg("Pre-upload: failed to load persistent attachment cache, will re-download")
+	} else {
+		loaded := 0
+		for recordName, jsonBytes := range cachedJSON {
+			var content event.MessageEventContent
+			if err := json.Unmarshal(jsonBytes, &content); err == nil {
+				c.attachmentContentCache.Store(recordName, &content)
+				loaded++
+			}
+		}
+		if loaded > 0 {
+			log.Debug().Int("loaded", loaded).Msg("Pre-upload: restored attachment cache from SQLite")
+		}
 	}
 
 	// Build the set of portal IDs whose forward FetchMessages has already
@@ -3104,27 +3129,17 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		}(p)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
-	const preUploadTimeout = 5 * time.Minute
-	select {
-	case <-done:
-		log.Info().
-			Int64("uploaded", uploaded.Load()).
-			Int("total", len(pending)).
-			Dur("elapsed", time.Since(start)).
-			Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
-	case <-time.After(preUploadTimeout):
-		log.Warn().
-			Int64("uploaded", uploaded.Load()).
-			Int("total", len(pending)).
-			Dur("elapsed", time.Since(start)).
-			Msg("Pre-upload: timed out, proceeding to portal creation with partial cache (remaining attachments download on-demand in FetchMessages)")
-	}
+	// Wait for all uploads to finish. No overall timeout here: the 90s
+	// per-download cap in safeCloudDownloadAttachment already bounds the
+	// worst case, and the persistent SQLite cache means this only runs for
+	// genuinely new/uncached attachments — so it completes fully every time
+	// and FetchMessages always gets 100% cache hits.
+	wg.Wait()
+	log.Info().
+		Int64("uploaded", uploaded.Load()).
+		Int("total", len(pending)).
+		Dur("elapsed", time.Since(start)).
+		Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {

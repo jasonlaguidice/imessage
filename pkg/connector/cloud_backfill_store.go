@@ -254,6 +254,20 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to delete system messages: %w", err)
 	}
 
+	// Migration: add cloud_attachment_cache table if missing.
+	// Persists record_name → MessageEventContent JSON so mxc URIs survive
+	// bridge restarts. Pre-upload loads this at startup and skips already-cached
+	// attachments, so a 27k-message thread never re-downloads across restarts.
+	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_attachment_cache (
+		login_id    TEXT    NOT NULL,
+		record_name TEXT    NOT NULL,
+		content_json BLOB   NOT NULL,
+		created_ts  BIGINT  NOT NULL,
+		PRIMARY KEY (login_id, record_name)
+	)`); err != nil {
+		return fmt.Errorf("failed to create cloud_attachment_cache table: %w", err)
+	}
+
 	// Create index that depends on record_name column (must be after migration)
 	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
 		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
@@ -1518,6 +1532,42 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 	}
 	n, _ := result.RowsAffected()
 	return int(n), nil
+}
+
+// loadAttachmentCacheJSON returns every persisted record_name → content_json
+// pair for this login. The caller deserialises the JSON into
+// *event.MessageEventContent and populates the in-memory attachmentContentCache
+// so pre-upload skips already-uploaded attachments without touching CloudKit.
+func (s *cloudBackfillStore) loadAttachmentCacheJSON(ctx context.Context) (map[string][]byte, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name, content_json FROM cloud_attachment_cache WHERE login_id=$1`,
+		s.loginID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cache := make(map[string][]byte)
+	for rows.Next() {
+		var recordName string
+		var contentJSON []byte
+		if err := rows.Scan(&recordName, &contentJSON); err != nil {
+			return nil, err
+		}
+		cache[recordName] = contentJSON
+	}
+	return cache, rows.Err()
+}
+
+// saveAttachmentCacheEntry persists a record_name → MessageEventContent JSON
+// pair. Idempotent (upsert). Errors are silently ignored — the persistent cache
+// is a best-effort optimisation; missing entries fall back to re-download.
+func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recordName string, contentJSON []byte) {
+	_, _ = s.db.Exec(ctx, `
+		INSERT INTO cloud_attachment_cache (login_id, record_name, content_json, created_ts)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (login_id, record_name) DO UPDATE SET content_json=excluded.content_json
+	`, s.loginID, recordName, contentJSON, time.Now().UnixMilli())
 }
 
 // markForwardBackfillDone marks all cloud_chat rows for portalID as having
