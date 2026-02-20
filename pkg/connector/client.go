@@ -2421,15 +2421,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		groupDisplayName, _ = c.cloudStore.getDisplayNameByPortalID(ctx, portalID)
 	}
 
-	// Forward backfill: return messages for this portal in chronological
-	// order, chunked to avoid blocking the portal event loop for minutes on
-	// portals with tens of thousands of messages (W2 in TPP).
-	//
-	// Chunking strategy:
-	//   - Each call returns at most forwardChunkSize messages.
-	//   - If more remain, HasMore=true + a cursor to resume.
-	//   - bridgev2 calls FetchMessages again with the cursor.
-	//   - CompleteCallback only fires on the final chunk.
+	// Forward backfill: return messages for this portal in chronological order.
+	// bridgev2 doForwardBackfill calls FetchMessages exactly once (no external
+	// pagination), so we loop internally — fetching and converting in chunks of
+	// forwardChunkSize to bound per-iteration memory. All messages are
+	// accumulated and returned in a single response.
 	const forwardChunkSize = 5000
 	if params.Forward {
 		// Acquire semaphore to limit concurrent forward backfills.
@@ -2437,131 +2433,117 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// attachment downloads and uploads across many portals.
 		c.forwardBackfillSem <- struct{}{}
 		defer func() { <-c.forwardBackfillSem }()
-
-		chunkSize := count
-		if chunkSize > forwardChunkSize {
-			chunkSize = forwardChunkSize
-		}
-		fetchLimit := chunkSize + 1 // +1 to detect HasMore
-
 		log.Info().
 			Str("portal_id", portalID).
 			Int("count", count).
-			Int("chunk_size", chunkSize).
+			Int("chunk_size", forwardChunkSize).
 			Str("trigger", "portal_creation").
 			Bool("has_anchor", params.AnchorMessage != nil).
-			Bool("has_cursor", params.Cursor != "").
 			Msg("Forward backfill START")
-		queryStart := time.Now()
-		var rows []cloudMessageRow
-		var queryErr error
-		if params.Cursor != "" {
-			// Continuation from a previous chunk.
-			fwdCursor, decErr := decodeCloudBackfillCursor(params.Cursor)
-			if decErr != nil {
-				return nil, fmt.Errorf("invalid forward backfill cursor: %w", decErr)
-			}
+
+		// Determine the starting anchor for the internal pagination loop.
+		var cursorTS int64
+		var cursorGUID string
+		hasCursor := false
+		if params.AnchorMessage != nil {
+			cursorTS = params.AnchorMessage.Timestamp.UnixMilli()
+			cursorGUID = string(params.AnchorMessage.ID)
+			hasCursor = true
 			log.Debug().
 				Str("portal_id", portalID).
-				Int64("cursor_ts", fwdCursor.TimestampMS).
-				Str("cursor_guid", fwdCursor.GUID).
-				Msg("Forward backfill: resuming from cursor")
-			rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, fwdCursor.TimestampMS, fwdCursor.GUID, fetchLimit)
-		} else if params.AnchorMessage != nil {
-			// Existing portal catch-up: only fetch messages NEWER than the anchor.
-			anchorTS := params.AnchorMessage.Timestamp.UnixMilli()
-			anchorGUID := string(params.AnchorMessage.ID)
-			log.Debug().
-				Str("portal_id", portalID).
-				Int64("anchor_ts", anchorTS).
-				Str("anchor_guid", anchorGUID).
+				Int64("anchor_ts", cursorTS).
+				Str("anchor_guid", cursorGUID).
 				Msg("Forward backfill: using anchor — fetching only newer messages")
-			rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, anchorTS, anchorGUID, fetchLimit)
-		} else {
-			// New portal: start from the oldest messages and paginate
-			// forward in chunks. Each chunk is small enough to process
-			// quickly, preventing the 2+ minute event loop stall that
-			// occurs with 27k+ messages delivered in a single batch.
-			rows, queryErr = c.cloudStore.listOldestMessages(ctx, portalID, fetchLimit)
-		}
-		if queryErr != nil {
-			log.Err(queryErr).Str("portal_id", portalID).Dur("query_ms", time.Since(queryStart)).Msg("Forward backfill: query FAILED")
-			return nil, queryErr
-		}
-		queryElapsed := time.Since(queryStart)
-
-		// Detect whether more messages remain beyond this chunk.
-		hasMore := len(rows) > chunkSize
-		if hasMore {
-			rows = rows[:chunkSize]
 		}
 
-		log.Debug().
-			Str("portal_id", portalID).
-			Int("rows", len(rows)).
-			Bool("has_more", hasMore).
-			Dur("query_ms", queryElapsed).
-			Msg("Forward backfill: query returned")
-		if len(rows) == 0 {
+		var allMessages []*bridgev2.BackfillMessage
+		totalRows := 0
+		chunk := 0
+		remaining := count
+
+		for remaining > 0 {
+			chunkLimit := forwardChunkSize
+			if chunkLimit > remaining {
+				chunkLimit = remaining
+			}
+
+			queryStart := time.Now()
+			var rows []cloudMessageRow
+			var queryErr error
+			if hasCursor {
+				rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, cursorTS, cursorGUID, chunkLimit)
+			} else {
+				// First chunk for a new portal: start from oldest messages.
+				rows, queryErr = c.cloudStore.listOldestMessages(ctx, portalID, chunkLimit)
+			}
+			if queryErr != nil {
+				log.Err(queryErr).Str("portal_id", portalID).Int("chunk", chunk).Msg("Forward backfill: query FAILED")
+				return nil, queryErr
+			}
+			if len(rows) == 0 {
+				break
+			}
+
+			// Convert this chunk's rows to backfill messages.
+			// attachmentContentCache is pre-populated by preUploadCloudAttachments,
+			// so downloadAndUploadAttachment is an instant cache lookup here.
+			for _, row := range rows {
+				allMessages = append(allMessages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
+			}
+			totalRows += len(rows)
+			chunk++
+
+			log.Debug().
+				Str("portal_id", portalID).
+				Int("chunk", chunk).
+				Int("chunk_rows", len(rows)).
+				Int("total_rows", totalRows).
+				Int("total_msgs", len(allMessages)).
+				Dur("chunk_query_ms", time.Since(queryStart)).
+				Msg("Forward backfill: chunk processed")
+
+			// Advance cursor to the last row in this chunk for the next iteration.
+			lastRow := rows[len(rows)-1]
+			cursorTS = lastRow.TimestampMS
+			cursorGUID = lastRow.GUID
+			hasCursor = true
+			remaining -= len(rows)
+
+			// If we got fewer rows than requested, there are no more.
+			if len(rows) < chunkLimit {
+				break
+			}
+		}
+
+		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
-			// Mark done even when empty so preUploadCloudAttachments skips this
-			// portal on future restarts (nothing to upload anyway).
 			c.cloudStore.markForwardBackfillDone(ctx, portalID)
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 		}
-		// All query paths return rows in chronological order (ASC).
-		convertStart := time.Now()
-		// attachmentContentCache is pre-populated by preUploadCloudAttachments
-		// (called before createPortalsFromCloudSync), so downloadAndUploadAttachment
-		// returns instantly from cache here. The sequential loop is correct and
-		// simple; no parallelism needed when every call is a cache hit.
-		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
-		for _, row := range rows {
-			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
-		}
-		convertElapsed := time.Since(convertStart)
+
 		log.Info().
 			Str("portal_id", portalID).
-			Int("db_rows", len(rows)).
-			Int("backfill_msgs", len(messages)).
-			Bool("has_more", hasMore).
-			Dur("query_ms", queryElapsed).
-			Dur("convert_ms", convertElapsed).
+			Int("db_rows", totalRows).
+			Int("backfill_msgs", len(allMessages)).
+			Int("chunks", chunk).
 			Dur("total_ms", time.Since(fetchStart)).
-			Msg("Forward backfill chunk complete")
+			Msg("Forward backfill COMPLETE — all messages returned for portal creation")
 
-		// Suppress the outer defer's call to onForwardBackfillDone on ALL
-		// return paths — intermediate chunks must not decrement the pending
-		// counter, and the final chunk uses CompleteCallback instead.
+		// Mark done so the outer defer doesn't double-decrement; the
+		// CompleteCallback will call onForwardBackfillDone after bridgev2
+		// delivers the messages to Matrix (preserving ordering: CloudKit
+		// backfill is fully in Matrix before APNs buffer is flushed).
 		forwardDone = true
-
-		resp := &bridgev2.FetchMessagesResponse{
-			Messages: messages,
-			HasMore:  hasMore,
+		cloudStoreDone := c.cloudStore
+		return &bridgev2.FetchMessagesResponse{
+			Messages: allMessages,
+			HasMore:  false,
 			Forward:  true,
-		}
-		if hasMore {
-			// Encode cursor pointing to the last row so the next call
-			// resumes after it.
-			cursor, cursorErr := encodeCloudBackfillCursor(cloudBackfillCursor{
-				TimestampMS: rows[len(rows)-1].TimestampMS,
-				GUID:        rows[len(rows)-1].GUID,
-			})
-			if cursorErr != nil {
-				return nil, cursorErr
-			}
-			resp.Cursor = cursor
-		} else {
-			// Final chunk: mark portal as done after bridgev2 delivers
-			// the messages to Matrix (preserving ordering: CloudKit
-			// backfill is fully in Matrix before APNs buffer is flushed).
-			cloudStoreDone := c.cloudStore
-			resp.CompleteCallback = func() {
+			CompleteCallback: func() {
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
 				c.onForwardBackfillDone()
-			}
-		}
-		return resp, nil
+			},
+		}, nil
 	}
 
 	// Backward backfill: triggered by the mautrix bridgev2 backfill queue
