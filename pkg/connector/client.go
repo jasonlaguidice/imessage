@@ -73,6 +73,7 @@ type failedAttachmentEntry struct {
 
 const maxAttachmentRetries = 3
 
+
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
 func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
@@ -2484,9 +2485,14 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				break
 			}
 
+			// Pre-upload any uncached attachments in this chunk in parallel
+			// before conversion. This prevents the sequential conversion loop
+			// from doing live CloudKit downloads (90s timeout each), which
+			// would hang the portal event loop for hours on large portals.
+			c.preUploadChunkAttachments(ctx, rows, *log)
+
 			// Convert this chunk's rows to backfill messages.
-			// attachmentContentCache is pre-populated by preUploadCloudAttachments,
-			// so downloadAndUploadAttachment is an instant cache lookup here.
+			// All attachments should now be cache hits after pre-upload.
 			for _, row := range rows {
 				allMessages = append(allMessages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
 			}
@@ -3245,6 +3251,76 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		Int("total", len(pending)).
 		Dur("elapsed", time.Since(start)).
 		Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
+}
+
+// preUploadChunkAttachments downloads and uploads any uncached attachments in
+// the given rows in parallel (up to 32 concurrent). Called inline during
+// forward backfill before the sequential conversion loop, so that
+// downloadAndUploadAttachment gets instant cache hits instead of doing
+// sequential 90s CloudKit downloads that hang the portal event loop.
+func (c *IMClient) preUploadChunkAttachments(ctx context.Context, rows []cloudMessageRow, log zerolog.Logger) {
+	type pendingAtt struct {
+		row     cloudMessageRow
+		idx     int
+		att     cloudAttachmentRow
+		sender  bridgev2.EventSender
+		ts      time.Time
+		hasText bool
+	}
+	var pending []pendingAtt
+	for _, row := range rows {
+		if row.AttachmentsJSON == "" {
+			continue
+		}
+		var atts []cloudAttachmentRow
+		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+			continue
+		}
+		sender := c.makeCloudSender(row)
+		ts := time.UnixMilli(row.TimestampMS)
+		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
+		for i, att := range atts {
+			if att.RecordName == "" {
+				continue
+			}
+			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+				continue
+			}
+			pending = append(pending, pendingAtt{
+				row: row, idx: i, att: att,
+				sender: sender, ts: ts, hasText: hasText,
+			})
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+	log.Info().Int("uncached", len(pending)).Msg("Forward backfill: pre-uploading uncached attachments in parallel")
+	const maxParallel = 32
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	for _, p := range pending {
+		wg.Add(1)
+		go func(p pendingAtt) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Any("panic", r).
+						Str("record_name", p.att.RecordName).
+						Msg("Forward backfill pre-upload: recovered panic")
+				}
+			}()
+			c.downloadAndUploadAttachment(ctx, p.row, p.sender, p.ts, p.hasText, p.idx, p.att)
+		}(p)
+	}
+	wg.Wait()
+	log.Info().Int("processed", len(pending)).Msg("Forward backfill: pre-upload complete")
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {
