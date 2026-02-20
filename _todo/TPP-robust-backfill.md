@@ -2,7 +2,7 @@
 
 ## Status
 - **Phase**: Implementation — Phases 1-2 complete, Phase 3 (docs) remaining
-- **Last updated**: 2026-02-20 (Session 2)
+- **Last updated**: 2026-02-20 (Session 3)
 - **Branch**: `refactor` on `mackid1993/imessage-test`
 - **Next step**: Phase 3 (doc updates) or deploy & test Phases 1-2
 
@@ -19,6 +19,9 @@
 - `RECONNECT_WINDOW_MS` is already **30 seconds** (not 10). Docs that say 10s are stale.
 - The `isStaleForDeletedChat` compile error and `loginLog` unused variable documented in the deletion-resurrection report have **already been fixed**. The `skipPortals` check in `createPortalsFromCloudSync` replaced `isStaleForDeletedChat`.
 - **bridgev2 `doForwardBackfill` calls `FetchMessages` exactly once** — it does NOT loop on `HasMore: true` for forward backfill. Only backward backfill (`DoBackwardsBackfill`) paginates. Do not return `HasMore: true` with `Forward: true`.
+- **DM portals can have `cloud_message` rows without any `cloud_chat` entry.** DMs are resolved from message data via `resolveConversationID`. Never delete messages solely based on missing `cloud_chat` — it will destroy DM data.
+- **Forward backfill with uncached attachments hangs.** Each `compileBatchMessage` call for an uncached attachment triggers a sequential 90s CloudKit download. For large portals this creates multi-hour stalls. Solution: `preUploadChunkAttachments` parallel-downloads uncached attachments per chunk BEFORE the conversion loop.
+- **Failed forward chunking approaches** (don't repeat): returning `HasMore: true` on forward (bridgev2 ignores it, only 5k of 27k delivered); skipping uncached attachments (user rejected — missing data).
 
 ---
 
@@ -92,7 +95,7 @@ May consume server-side cursor. Accept and document.
 - [x] **Task 1**: Track failed attachment downloads. Added `failedAttachmentEntry` struct with retry count, `recordAttachmentFailure` helper, `failedAttachments sync.Map` on `IMClient`. Downloads/uploads record failures with attempt count. `preUploadCloudAttachments` retries failed attachments (even for done portals) up to `maxAttachmentRetries=3`, then abandons permanently corrupted records. Fixed `uploaded.Add(1)` to only count successes. Fixed `donePorals` → `donePortals`. Added `failed` count to completion log.
   - Files: `pkg/connector/client.go`
 
-- [ ] **Task 2**: Forward backfill chunking — **REVERTED**. bridgev2 `doForwardBackfill` calls `FetchMessages` exactly once (no pagination loop), so `HasMore: true` on forward is silently ignored. Restored original single-batch behavior. `listOldestMessages` DB method still exists but unused. Chunking requires either patching bridgev2 or implementing an internal batching strategy within the single FetchMessages call.
+- [x] **Task 2**: Forward backfill internal chunking. Since bridgev2 `doForwardBackfill` calls `FetchMessages` exactly once (no HasMore loop), implemented internal chunking: `FetchMessages` loops over `listOldestMessages` / `listForwardMessages` in 5,000-row chunks, advancing a cursor. Added `preUploadChunkAttachments` — parallel-downloads uncached attachments (up to 32 concurrent) per chunk BEFORE the sequential conversion loop, preventing 90s CloudKit download stalls.
   - Files: `pkg/connector/client.go`, `pkg/connector/cloud_backfill_store.go`
 
 ### Phase 2: Cleanup & Housekeeping (Low)
@@ -103,7 +106,7 @@ May consume server-side cursor. Accept and document.
 - [x] **Task 4**: Cancellable context for `preUploadCloudAttachments`. Replaced `context.Background()` with `context.WithCancel` derived from `stopChan` in `runCloudSyncController`. Added `ctx.Done()` select on semaphore acquire so goroutines waiting for slots exit immediately on shutdown.
   - Files: `pkg/connector/sync_controller.go`, `pkg/connector/client.go`
 
-- [x] **Task 5**: Orphaned `cloud_message` cleanup via `deleteOrphanedMessages`. Deletes rows whose `portal_id` has no matching `cloud_chat` entry. Called from `runPostSyncHousekeeping`.
+- [x] **Task 5**: Orphaned `cloud_message` cleanup via `deleteOrphanedMessages`. Deletes rows where `deleted=TRUE` AND `portal_id` has no matching `cloud_chat` entry. **Critical restriction**: DM portals legitimately have messages without `cloud_chat` rows, so only already-soft-deleted rows are cleaned up. Called from `runPostSyncHousekeeping`.
   - Files: `pkg/connector/cloud_backfill_store.go`, `pkg/connector/sync_controller.go`
 
 ### Phase 3: Documentation (Low)
@@ -134,8 +137,14 @@ May consume server-side cursor. Accept and document.
 
 ### Session 2 (2026-02-20) — Phases 1 + 2 Implementation
 - **Task 1 DONE**: Failed attachment retry with `failedAttachments sync.Map` + `maxAttachmentRetries=3` cap. Fixed `uploaded.Add(1)` counter + `donePorals` typo.
-- **Task 2 DONE**: Forward backfill chunking at 5,000 messages/call. Added `listOldestMessages` DB method. New portals paginate oldest→newest. Cursor-based continuation.
+- **Task 2 iteration 1**: External chunking with `HasMore: true` — BROKEN. bridgev2 only calls `FetchMessages` once for forward, so only first 5k of 27k messages delivered.
+- **Task 2 iteration 2**: Reverted to single-batch — rejected by user, still needs chunking.
+- **Task 2 iteration 3 (FINAL)**: Internal chunking loop within `FetchMessages`. Loops over `listOldestMessages`/`listForwardMessages` in 5k-row chunks, accumulates all messages into one response.
 - **Task 3 DONE**: `cloud_attachment_cache` pruning using `json_each`/`json_extract`. Added to `clearAllData`. Runs after bootstrap via `runPostSyncHousekeeping`.
 - **Task 4 DONE**: Cancellable context from `stopChan`. Semaphore acquire checks `ctx.Done()` for prompt shutdown.
-- **Task 5 DONE**: Orphaned `cloud_message` cleanup. Runs after bootstrap.
-- **What's next**: Phase 3 (doc updates) or deploy & test.
+- **Task 5 iteration 1**: `deleteOrphanedMessages` deleted ALL rows without `cloud_chat` — BROKE DM portals (they legitimately have no `cloud_chat`).
+- **Task 5 iteration 2 (FINAL)**: Restricted to `deleted=TRUE` rows only. Safe for DMs.
+
+### Session 3 (2026-02-20) — Bugfixes + parallel pre-upload
+- **Forward backfill hang fix**: Large portals hung because uncached attachments triggered sequential 90s CloudKit downloads during `compileBatchMessage`. Added `preUploadChunkAttachments` — parallel pre-downloads (up to 32 concurrent) per chunk BEFORE the conversion loop. All downloads become cache hits.
+- **What's next**: Phase 3 (doc updates) or continue monitoring deployment.

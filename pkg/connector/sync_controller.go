@@ -402,60 +402,6 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	c.createPortalsFromCloudSync(ctx, log, skipPortals)
 	c.setCloudSyncDone()
 
-	// Delayed incremental re-syncs: catch CloudKit messages that propagated
-	// after the bootstrap sync completed. Messages sent in the last few minutes
-	// may not be in the CloudKit changes feed yet (propagation delay). APNs
-	// delivers them with CreatePortal=false (gate closed), so bridgev2 drops
-	// them for non-existent portals. Multiple re-sync passes at increasing
-	// intervals ensure we catch them as CloudKit propagates.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Error().Any("panic", r).Str("stack", string(debug.Stack())).Msg("Recovered panic in delayed resync goroutine")
-			}
-		}()
-		delays := []time.Duration{15 * time.Second, 60 * time.Second, 3 * time.Minute}
-		for i, delay := range delays {
-			select {
-			case <-time.After(delay):
-			case <-c.stopChan:
-				return
-			}
-			resyncLog := log.With().
-				Str("source", "delayed_resync").
-				Int("pass", i+1).
-				Int("total_passes", len(delays)).
-				Logger()
-			resyncLog.Info().Msg("Running delayed incremental CloudKit re-sync")
-			if err := c.runCloudSyncOnce(ctx, resyncLog, false); err != nil {
-				resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
-				continue
-			}
-			// Extend skipPortals with any portals deleted since bootstrap.
-			// The delayed re-sync may have imported new cloud_message records
-			// for these portals (deleted=FALSE). Soft-delete them now so they
-			// don't persist in the DB and resurrect the portal on next restart.
-			c.recentlyDeletedPortalsMu.RLock()
-			for portalID := range c.recentlyDeletedPortals {
-				if !skipPortals[portalID] {
-					skipPortals[portalID] = true
-					if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
-						resyncLog.Warn().Err(err).Str("portal_id", portalID).
-							Msg("Failed to soft-delete re-imported records for recently deleted portal")
-					} else {
-						resyncLog.Debug().Str("portal_id", portalID).
-							Msg("Soft-deleted re-imported records for portal deleted after bootstrap")
-					}
-				}
-			}
-			c.recentlyDeletedPortalsMu.RUnlock()
-			// Pre-upload any new attachments discovered by this re-sync;
-			// already-cached record_names are skipped instantly.
-			c.preUploadCloudAttachments(ctx)
-			c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
-		}
-	}()
-
 	log.Info().
 		Dur("portal_creation_elapsed", time.Since(portalStart)).
 		Dur("total_elapsed", time.Since(controllerStart)).
@@ -468,6 +414,59 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Housekeeping: prune orphaned data that accumulates over time.
 	// Run after bootstrap so the cleanup doesn't delay portal creation.
 	c.runPostSyncHousekeeping(ctx, log)
+
+	// Delayed incremental re-syncs: catch CloudKit messages that propagated
+	// after the bootstrap sync completed. Messages sent in the last few minutes
+	// may not be in the CloudKit changes feed yet (propagation delay). APNs
+	// delivers them with CreatePortal=false (gate closed), so bridgev2 drops
+	// them for non-existent portals. Multiple re-sync passes at increasing
+	// intervals ensure we catch them as CloudKit propagates.
+	//
+	// IMPORTANT: These run inline (not in a goroutine) so that the defer
+	// cancel() on the parent context doesn't fire until all re-syncs are
+	// done. Previously these ran in a goroutine, but runCloudSyncController
+	// returned immediately after launching it — the defer cancel() killed
+	// the context, causing every re-sync to fail with "context canceled".
+	delays := []time.Duration{15 * time.Second, 60 * time.Second, 3 * time.Minute}
+	for i, delay := range delays {
+		select {
+		case <-time.After(delay):
+		case <-c.stopChan:
+			return
+		}
+		resyncLog := log.With().
+			Str("source", "delayed_resync").
+			Int("pass", i+1).
+			Int("total_passes", len(delays)).
+			Logger()
+		resyncLog.Info().Msg("Running delayed incremental CloudKit re-sync")
+		if err := c.runCloudSyncOnce(ctx, resyncLog, false); err != nil {
+			resyncLog.Warn().Err(err).Msg("Delayed incremental re-sync failed")
+			continue
+		}
+		// Extend skipPortals with any portals deleted since bootstrap.
+		// The delayed re-sync may have imported new cloud_message records
+		// for these portals (deleted=FALSE). Soft-delete them now so they
+		// don't persist in the DB and resurrect the portal on next restart.
+		c.recentlyDeletedPortalsMu.RLock()
+		for portalID := range c.recentlyDeletedPortals {
+			if !skipPortals[portalID] {
+				skipPortals[portalID] = true
+				if err := c.cloudStore.deleteLocalChatByPortalID(ctx, portalID); err != nil {
+					resyncLog.Warn().Err(err).Str("portal_id", portalID).
+						Msg("Failed to soft-delete re-imported records for recently deleted portal")
+				} else {
+					resyncLog.Debug().Str("portal_id", portalID).
+						Msg("Soft-deleted re-imported records for portal deleted after bootstrap")
+				}
+			}
+		}
+		c.recentlyDeletedPortalsMu.RUnlock()
+		// Pre-upload any new attachments discovered by this re-sync;
+		// already-cached record_names are skipped instantly.
+		c.preUploadCloudAttachments(ctx)
+		c.createPortalsFromCloudSync(ctx, resyncLog, skipPortals)
+	}
 }
 
 // runPostSyncHousekeeping cleans up accumulated dead data after a successful
