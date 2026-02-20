@@ -16,6 +16,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"image"
 	"image/jpeg"
 	"path/filepath"
@@ -2588,21 +2589,26 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 
 	var messages []*bridgev2.BackfillMessage
 
-	// Text message
-	body := row.Text
+	// Text message — trim OBJ placeholders before building body.
+	body := strings.Trim(row.Text, "\ufffc \n")
+	var formattedBody string
 	if row.Subject != "" {
 		if body != "" {
+			formattedBody = fmt.Sprintf("<strong>%s</strong><br>%s", html.EscapeString(row.Subject), html.EscapeString(body))
 			body = fmt.Sprintf("**%s**\n%s", row.Subject, body)
 		} else {
 			body = row.Subject
 		}
 	}
-	body = strings.Trim(body, "\ufffc \n")
-	hasText := strings.TrimSpace(body) != "" && strings.TrimRight(body, "\ufffc \n") != ""
+	hasText := strings.TrimSpace(body) != ""
 	if hasText {
 		textContent := &event.MessageEventContent{
 			MsgType: event.MsgText,
 			Body:    body,
+		}
+		if formattedBody != "" {
+			textContent.Format = event.FormatHTML
+			textContent.FormattedBody = formattedBody
 		}
 		if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
 			textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
