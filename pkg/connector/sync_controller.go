@@ -322,11 +322,10 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 const cloudSyncRetryInterval = 1 * time.Minute
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Error().Any("panic", r).Str("stack", string(debug.Stack())).Msg("Recovered panic in cloud sync controller")
-		}
-	}()
+	// NOTE: no defer recover() here intentionally. A panic in this goroutine
+	// must crash the process so the bridge restarts and re-runs CloudKit sync.
+	// Swallowing the panic would leave setCloudSyncDone() uncalled, permanently
+	// blocking the APNs message buffer and dropping all incoming messages.
 	ctx := context.Background()
 	controllerStart := time.Now()
 	if !c.waitForContactsReady(log) {
