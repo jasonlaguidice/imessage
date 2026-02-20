@@ -322,6 +322,11 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 const cloudSyncRetryInterval = 1 * time.Minute
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Any("panic", r).Str("stack", string(debug.Stack())).Msg("Recovered panic in cloud sync controller")
+		}
+	}()
 	ctx := context.Background()
 	controllerStart := time.Now()
 	if !c.waitForContactsReady(log) {
@@ -387,6 +392,11 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// them for non-existent portals. Multiple re-sync passes at increasing
 	// intervals ensure we catch them as CloudKit propagates.
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Error().Any("panic", r).Str("stack", string(debug.Stack())).Msg("Recovered panic in delayed resync goroutine")
+			}
+		}()
 		delays := []time.Duration{15 * time.Second, 60 * time.Second, 3 * time.Minute}
 		for i, delay := range delays {
 			select {

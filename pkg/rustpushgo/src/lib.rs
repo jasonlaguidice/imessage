@@ -2997,8 +2997,14 @@ impl Client {
         let mut last_pcs_err: Option<rustpush::PushError> = None;
 
         for attempt in 0..MAX_SYNC_ATTEMPTS {
-            match cloud_messages.sync_messages(token.clone()).await {
-                Ok(result) => {
+            let cm_spawn = Arc::clone(&cloud_messages);
+            let tok_spawn = token.clone();
+            let spawn_result = tokio::task::spawn(async move {
+                cm_spawn.sync_messages(tok_spawn).await
+            }).await;
+
+            match spawn_result {
+                Ok(Ok(result)) => {
                     info!(
                         "cloud_sync_messages: sync_messages returned {} records, status={}",
                         result.1.len(), result.2
@@ -3006,7 +3012,7 @@ impl Client {
                     sync_result = Some(result);
                     break;
                 }
-                Err(err) if is_pcs_recoverable_error(&err) => {
+                Ok(Err(err)) if is_pcs_recoverable_error(&err) => {
                     let attempt_no = attempt + 1;
                     warn!(
                         "CloudKit messages sync hit PCS key error on attempt {}/{}: {}",
@@ -3020,10 +3026,32 @@ impl Client {
                         continue;
                     }
                 }
-                Err(err) => {
+                Ok(Err(err)) => {
                     return Err(WrappedError::GenericError {
                         msg: format!("Failed to sync CloudKit messages: {}", err),
                     });
+                }
+                Err(join_err) => {
+                    warn!(
+                        "cloud_sync_messages: sync_messages panicked on attempt {}/{} \
+                         (malformed CloudKit record); trying per-record fallback. panic={}",
+                        attempt + 1, MAX_SYNC_ATTEMPTS, join_err
+                    );
+                    match sync_messages_fallback(&cloud_messages, token.clone()).await {
+                        Ok(result) => {
+                            sync_result = Some(result);
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("cloud_sync_messages: fallback also failed: {}; returning empty done page", e);
+                            return Ok(WrappedCloudSyncMessagesPage {
+                                continuation_token: None,
+                                status: 0,
+                                done: true,
+                                messages: vec![],
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -3608,6 +3636,101 @@ impl Drop for Client {
             }
         }
     }
+}
+
+/// Fallback for cloud_sync_messages when sync_messages panics on a malformed CloudKit record.
+/// Replicates sync_records logic for "messageManateeZone" but handles None proto fields
+/// gracefully (no .unwrap()) and wraps from_record_encrypted in catch_unwind per record.
+async fn sync_messages_fallback(
+    cloud_messages: &Arc<rustpush::cloud_messages::CloudMessagesClient<omnisette::DefaultAnisetteProvider>>,
+    token: Option<Vec<u8>>,
+) -> Result<(Vec<u8>, HashMap<String, Option<rustpush::cloud_messages::CloudMessage>>, i32), rustpush::PushError> {
+    use rustpush::cloudkit::{pcs_keys_for_record, FetchRecordChangesOperation, CloudKitSession, NO_ASSETS};
+    use rustpush::cloudkit_proto::CloudKitRecord;
+    use rustpush::cloud_messages::{MESSAGES_SERVICE, CloudMessage};
+
+    let container = cloud_messages.get_container().await?;
+    let zone_id = container.private_zone("messageManateeZone".to_string());
+    let key = container
+        .get_zone_encryption_config(&zone_id, &cloud_messages.keychain, &MESSAGES_SERVICE)
+        .await?;
+
+    let (_assets, response) = container
+        .perform(
+            &CloudKitSession::new(),
+            FetchRecordChangesOperation::new(zone_id, token, &NO_ASSETS),
+        )
+        .await?;
+
+    let mut results: HashMap<String, Option<CloudMessage>> = HashMap::new();
+    let mut skipped = 0usize;
+
+    for change in &response.change {
+        // Graceful identifier extraction — no .unwrap()
+        let id_proto = match change.identifier.as_ref() {
+            Some(p) => p,
+            None => { warn!("sync_messages_fallback: skipping change with missing identifier"); skipped += 1; continue; }
+        };
+        let id_value = match id_proto.value.as_ref() {
+            Some(v) => v,
+            None => { warn!("sync_messages_fallback: skipping change with missing identifier value"); skipped += 1; continue; }
+        };
+        let identifier = id_value.name().to_string();
+
+        let record = match &change.record {
+            Some(r) => r,
+            None => { results.insert(identifier, None); continue; } // deleted record
+        };
+
+        // Graceful type check — no .unwrap()
+        if record.r#type.as_ref().map_or(true, |t| t.name() != CloudMessage::record_type()) {
+            continue;
+        }
+
+        let pcskey = match pcs_keys_for_record(record, &key) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!("sync_messages_fallback: skipping record {}: PCS key error: {}", identifier, e);
+                skipped += 1;
+                continue;
+            }
+        };
+
+        let rec_id = match record.record_identifier.as_ref() {
+            Some(id) => id,
+            None => {
+                warn!("sync_messages_fallback: skipping record {}: missing record_identifier", identifier);
+                skipped += 1;
+                continue;
+            }
+        };
+
+        // from_record_encrypted may panic on corrupt field data — catch it
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+        }));
+
+        match result {
+            Ok(msg) => { results.insert(identifier, Some(msg)); }
+            Err(e) => {
+                let msg = if let Some(s) = e.downcast_ref::<String>() { s.clone() }
+                          else if let Some(s) = e.downcast_ref::<&str>() { s.to_string() }
+                          else { "unknown panic".to_string() };
+                warn!("sync_messages_fallback: skipping record {}: deserialization panic: {}", identifier, msg);
+                skipped += 1;
+            }
+        }
+    }
+
+    if skipped > 0 {
+        warn!("sync_messages_fallback: skipped {} malformed record(s)", skipped);
+    }
+
+    Ok((
+        response.sync_continuation_token().to_vec(),
+        results,
+        response.status(),
+    ))
 }
 
 uniffi::setup_scaffolding!();
