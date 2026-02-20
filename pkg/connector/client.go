@@ -2432,7 +2432,15 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// Acquire semaphore to limit concurrent forward backfills.
 		// This prevents overwhelming CloudKit/Matrix with simultaneous
 		// attachment downloads and uploads across many portals.
-		c.forwardBackfillSem <- struct{}{}
+		// Use a select with ctx.Done() so we don't block the portal event
+		// loop indefinitely when all slots are taken — that causes "Portal
+		// event channel is still full" errors and dropped events.
+		select {
+		case c.forwardBackfillSem <- struct{}{}:
+		case <-ctx.Done():
+			log.Warn().Str("portal_id", portalID).Msg("Forward backfill: context cancelled while waiting for semaphore")
+			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
+		}
 		defer func() { <-c.forwardBackfillSem }()
 		log.Info().
 			Str("portal_id", portalID).
