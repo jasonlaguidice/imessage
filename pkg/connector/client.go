@@ -3013,6 +3013,24 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		return
 	}
 
+	// Build the set of portal IDs whose portals already exist in the bridge.
+	// If a portal has an MXID it was previously created and backfilled —
+	// re-uploading its attachments on every restart is wasteful (and broken:
+	// it re-posts the same media files each time). Only pre-upload for new
+	// portals that are about to be created for the first time.
+	existingPortals := make(map[string]bool)
+	for _, row := range rows {
+		if row.PortalID == "" || existingPortals[row.PortalID] {
+			continue
+		}
+		portalKey := networkid.PortalKey{
+			ID:       networkid.PortalID(row.PortalID),
+			Receiver: c.UserLogin.ID,
+		}
+		existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		existingPortals[row.PortalID] = existing != nil && existing.MXID != ""
+	}
+
 	// Build the list of attachments that still need to be uploaded.
 	type pendingUpload struct {
 		row     cloudMessageRow
@@ -3024,6 +3042,10 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	}
 	var pending []pendingUpload
 	for _, row := range rows {
+		// Skip portals that already exist — their backfill is done.
+		if existingPortals[row.PortalID] {
+			continue
+		}
 		var atts []cloudAttachmentRow
 		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
 			continue
