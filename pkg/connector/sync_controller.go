@@ -326,7 +326,19 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// must crash the process so the bridge restarts and re-runs CloudKit sync.
 	// Swallowing the panic would leave setCloudSyncDone() uncalled, permanently
 	// blocking the APNs message buffer and dropping all incoming messages.
-	ctx := context.Background()
+
+	// Derive a cancellable context from stopChan so that preUploadCloudAttachments
+	// and other long-running operations can be interrupted promptly on shutdown
+	// instead of running to completion (worst case: 48 min of leaked downloads).
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-c.stopChan:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	defer cancel()
 	controllerStart := time.Now()
 	if !c.waitForContactsReady(log) {
 		c.setCloudSyncDone() // unblock APNs portal creation
@@ -452,6 +464,34 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 	// Clean up stale entries in recentlyDeletedPortals to prevent unbounded
 	// memory growth over long-running sessions.
 	c.pruneRecentlyDeletedPortals(log)
+
+	// Housekeeping: prune orphaned data that accumulates over time.
+	// Run after bootstrap so the cleanup doesn't delay portal creation.
+	c.runPostSyncHousekeeping(ctx, log)
+}
+
+// runPostSyncHousekeeping cleans up accumulated dead data after a successful
+// CloudKit sync. Each operation is independent and best-effort — failures are
+// logged but don't block the bridge.
+func (c *IMClient) runPostSyncHousekeeping(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	log = log.With().Str("component", "housekeeping").Logger()
+
+	// Prune cloud_attachment_cache entries not referenced by any live message.
+	if pruned, err := c.cloudStore.pruneOrphanedAttachmentCache(ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to prune orphaned attachment cache")
+	} else if pruned > 0 {
+		log.Info().Int64("pruned", pruned).Msg("Pruned orphaned attachment cache entries")
+	}
+
+	// Delete cloud_message rows whose portal_id has no cloud_chat entry.
+	if deleted, err := c.cloudStore.deleteOrphanedMessages(ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to delete orphaned cloud messages")
+	} else if deleted > 0 {
+		log.Info().Int64("deleted", deleted).Msg("Deleted orphaned cloud_message rows (no matching cloud_chat)")
+	}
 }
 
 // runCloudSyncOnce performs a single CloudKit sync pass. On the first run
