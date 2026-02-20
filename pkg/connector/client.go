@@ -2441,10 +2441,23 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// listForwardMessages already returns in chronological order
 		convertStart := time.Now()
 		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
+		// Collect rows that have attachments for async delivery after the portal event
+		// loop is free. Downloading 486 images inline would block doForwardBackfill
+		// (which runs in the portal event loop goroutine) for ~33 minutes.
+		var rowsWithAtts []cloudMessageRow
 		for _, row := range rows {
-			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
+			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName, true)...)
+			if row.AttachmentsJSON != "" {
+				rowsWithAtts = append(rowsWithAtts, row)
+			}
 		}
 		convertElapsed := time.Since(convertStart)
+		if len(rowsWithAtts) > 0 {
+			log.Info().
+				Str("portal_id", portalID).
+				Int("att_rows", len(rowsWithAtts)).
+				Msg("Forward backfill: attachments deferred to async delivery outside portal event loop")
+		}
 		log.Info().
 			Str("portal_id", portalID).
 			Int("db_rows", len(rows)).
@@ -2453,6 +2466,14 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			Dur("convert_ms", convertElapsed).
 			Dur("total_ms", time.Since(fetchStart)).
 			Msg("Forward backfill COMPLETE — newest messages returned for portal creation")
+
+		// Capture loop-local variables before the closure below so the goroutine
+		// sees the right values even after the enclosing function returns.
+		capturedPortalKey := networkid.PortalKey{
+			ID:       networkid.PortalID(portalID),
+			Receiver: c.UserLogin.ID,
+		}
+		capturedRows := rowsWithAtts
 
 		// Mark done so the outer defer doesn't double-decrement; the
 		// CompleteCallback will call onForwardBackfillDone after bridgev2
@@ -2465,6 +2486,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			Forward:  true,
 			CompleteCallback: func() {
 				c.onForwardBackfillDone()
+				if len(capturedRows) > 0 {
+					go c.deliverAttachmentsAsync(capturedPortalKey, capturedRows)
+				}
 			},
 		}, nil
 	}
@@ -2520,7 +2544,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	convertStart := time.Now()
 	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
 	for _, row := range rows {
-		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
+		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName, false)...)
 	}
 	convertElapsed := time.Since(convertStart)
 
@@ -2554,7 +2578,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}, nil
 }
 
-func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
+func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string, skipAttachments bool) []*bridgev2.BackfillMessage {
 	sender := c.makeCloudSender(row)
 	ts := time.UnixMilli(row.TimestampMS)
 
@@ -2628,9 +2652,13 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 		})
 	}
 
-	// Attachments
-	attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
-	messages = append(messages, attMessages...)
+	// Attachments — skipped in the forward backfill path so that the portal
+	// event loop goroutine is not blocked for 30+ minutes downloading images.
+	// The async path (deliverAttachmentsAsync) handles these after the loop.
+	if !skipAttachments {
+		attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
+		messages = append(messages, attMessages...)
+	}
 
 	// No text, no attachments, no tapback → likely a deleted/unsent message
 	// whose content was wiped from CloudKit.  Skip silently.
@@ -2776,6 +2804,67 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 		messages = append(messages, r.Message)
 	}
 	return messages
+}
+
+// deliverAttachmentsAsync downloads and delivers CloudKit attachments from forward
+// backfill rows OUTSIDE the portal event loop, avoiding 30+ minute event loop blocks
+// on image-heavy conversations. Called from a goroutine spawned in CompleteCallback.
+//
+// Uses QueueRemoteEvent with EventMeta.Timestamp = original message timestamp.
+// bridgev2 passes this as the Matrix appservice ?ts= query param, setting
+// origin_server_ts correctly so attachments appear at the right historical
+// position in the room's timeline.
+func (c *IMClient) deliverAttachmentsAsync(portalKey networkid.PortalKey, rows []cloudMessageRow) {
+	ctx := context.Background()
+	log := c.Main.Bridge.Log.With().
+		Str("component", "cloud_backfill_async").
+		Str("portal_id", string(portalKey.ID)).
+		Logger()
+	log.Info().Int("rows", len(rows)).Msg("Async attachment backfill starting")
+
+	delivered := 0
+	for _, row := range rows {
+		sender := c.makeCloudSender(row)
+		ts := time.UnixMilli(row.TimestampMS)
+		// hasText: did the forward pass already send a text message for this row?
+		// Controls whether attachment IDs are bare GUID or GUID_att0, GUID_att1, etc.
+		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
+
+		attMsgs := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
+		for _, msg := range attMsgs {
+			if msg == nil || msg.ConvertedMessage == nil {
+				continue
+			}
+			converted := msg.ConvertedMessage
+			msgID := msg.ID
+			msgSender := msg.Sender
+			msgTS := msg.Timestamp
+			c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*bridgev2.ConvertedMessage]{
+				EventMeta: simplevent.EventMeta{
+					Type:      bridgev2.RemoteEventMessage,
+					PortalKey: portalKey,
+					Sender:    msgSender,
+					Timestamp: msgTS, // sets origin_server_ts via ?ts= appservice param
+				},
+				Data: converted,
+				ID:   msgID,
+				ConvertMessageFunc: func(
+					_ context.Context,
+					_ *bridgev2.Portal,
+					_ bridgev2.MatrixAPI,
+					data *bridgev2.ConvertedMessage,
+				) (*bridgev2.ConvertedMessage, error) {
+					return data, nil
+				},
+			})
+			delivered++
+		}
+	}
+	log.Info().
+		Int("delivered", delivered).
+		Int("rows", len(rows)).
+		Str("portal_id", string(portalKey.ID)).
+		Msg("Async attachment backfill complete")
 }
 
 // safeCloudDownloadAttachment wraps the FFI call with panic recovery.
