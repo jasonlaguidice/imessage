@@ -168,6 +168,13 @@ type IMClient struct {
 	// overwhelming CloudKit/Matrix with simultaneous attachment downloads.
 	forwardBackfillSem chan struct{}
 
+	// attachmentContentCache maps CloudKit record_name → *event.MessageEventContent.
+	// Populated by preUploadCloudAttachments, which runs in the cloud sync
+	// goroutine BEFORE createPortalsFromCloudSync. Checked first by
+	// downloadAndUploadAttachment so that FetchMessages (portal event loop)
+	// never blocks on a CloudKit download — it just reads the pre-built content.
+	attachmentContentCache sync.Map
+
 	// startupTime records when this session connected. Used to suppress
 	// read receipts for messages that pre-date this session: re-delivered
 	// APNs receipts arrive with TimestampMs = delivery time (now), not the
@@ -2440,55 +2447,14 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}
 		// listForwardMessages already returns in chronological order
 		convertStart := time.Now()
-
-		// Pass 1 (fast): extract text/tapback messages for every row without
-		// touching CloudKit. skipAttachments=true skips the blocking download.
-		textMsgsByRow := make([][]*bridgev2.BackfillMessage, len(rows))
-		for i, row := range rows {
-			textMsgsByRow[i] = c.cloudRowToBackfillMessages(ctx, row, groupDisplayName, true)
-		}
-
-		// Pass 2 (slow): download attachments from CloudKit and upload to Matrix.
-		// Running all rows concurrently (bounded by maxConcurrentAttachments)
-		// turns 486 sequential 4s downloads (~33 min) into ~ceil(486/32)*4s ≈ 60s.
-		// Results are stored in attMsgsByRow[i] so row order is preserved.
-		const maxConcurrentAttachments = 32
-		attMsgsByRow := make([][]*bridgev2.BackfillMessage, len(rows))
-		var attWg sync.WaitGroup
-		attSem := make(chan struct{}, maxConcurrentAttachments)
-		attRowCount := 0
-		for i, row := range rows {
-			if row.AttachmentsJSON == "" {
-				continue
-			}
-			attRowCount++
-			attWg.Add(1)
-			go func(idx int, r cloudMessageRow) {
-				defer attWg.Done()
-				attSem <- struct{}{}
-				defer func() { <-attSem }()
-				sender := c.makeCloudSender(r)
-				ts := time.UnixMilli(r.TimestampMS)
-				hasText := strings.TrimSpace(strings.Trim(r.Text, "\ufffc \n")) != ""
-				attMsgsByRow[idx] = c.cloudAttachmentsToBackfill(ctx, r, sender, ts, hasText)
-			}(i, row)
-		}
-		if attRowCount > 0 {
-			log.Info().
-				Str("portal_id", portalID).
-				Int("att_rows", attRowCount).
-				Int("concurrency", maxConcurrentAttachments).
-				Msg("Forward backfill: downloading attachments concurrently")
-		}
-		attWg.Wait()
-
-		// Merge: for each row, text messages then attachments — preserves ordering.
+		// attachmentContentCache is pre-populated by preUploadCloudAttachments
+		// (called before createPortalsFromCloudSync), so downloadAndUploadAttachment
+		// returns instantly from cache here. The sequential loop is correct and
+		// simple; no parallelism needed when every call is a cache hit.
 		messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
-		for i := range rows {
-			messages = append(messages, textMsgsByRow[i]...)
-			messages = append(messages, attMsgsByRow[i]...)
+		for _, row := range rows {
+			messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
 		}
-
 		convertElapsed := time.Since(convertStart)
 		log.Info().
 			Str("portal_id", portalID).
@@ -2565,7 +2531,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	convertStart := time.Now()
 	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
 	for _, row := range rows {
-		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName, false)...)
+		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
 	}
 	convertElapsed := time.Since(convertStart)
 
@@ -2599,7 +2565,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}, nil
 }
 
-func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string, skipAttachments bool) []*bridgev2.BackfillMessage {
+func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
 	sender := c.makeCloudSender(row)
 	ts := time.UnixMilli(row.TimestampMS)
 
@@ -2673,13 +2639,10 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 		})
 	}
 
-	// Attachments — skipped in the forward backfill path so that the portal
-	// event loop goroutine is not blocked for 30+ minutes downloading images.
-	// The async path (deliverAttachmentsAsync) handles these after the loop.
-	if !skipAttachments {
-		attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
-		messages = append(messages, attMessages...)
-	}
+	// Attachments: downloadAndUploadAttachment checks attachmentContentCache first,
+	// so this is a cheap cache lookup when preUploadCloudAttachments has run.
+	attMessages := c.cloudAttachmentsToBackfill(ctx, row, sender, ts, hasText)
+	messages = append(messages, attMessages...)
 
 	// No text, no attachments, no tapback → likely a deleted/unsent message
 	// whose content was wiped from CloudKit.  Skip silently.
@@ -2853,6 +2816,28 @@ func (c *IMClient) downloadAndUploadAttachment(
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_backfill").Logger()
 	intent := c.Main.Bridge.Bot
 
+	attID := row.GUID
+	if i > 0 || hasText {
+		attID = fmt.Sprintf("%s_att%d", row.GUID, i)
+	}
+
+	// Cache hit: preUploadCloudAttachments already downloaded and uploaded this
+	// attachment in the cloud sync goroutine. Return immediately without touching
+	// CloudKit, keeping the portal event loop unblocked.
+	if cached, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+		return []*bridgev2.BackfillMessage{{
+			Sender:    sender,
+			ID:        makeMessageID(attID),
+			Timestamp: ts,
+			ConvertedMessage: &bridgev2.ConvertedMessage{
+				Parts: []*bridgev2.ConvertedMessagePart{{
+					Type:    event.EventMessage,
+					Content: cached.(*event.MessageEventContent),
+				}},
+			},
+		}}
+	}
+
 	data, err := safeCloudDownloadAttachment(c.client, att.RecordName)
 	if err != nil {
 		log.Warn().Err(err).
@@ -2865,11 +2850,6 @@ func (c *IMClient) downloadAndUploadAttachment(
 	if len(data) == 0 {
 		log.Debug().Str("guid", row.GUID).Str("record_name", att.RecordName).Msg("CloudKit attachment returned empty data")
 		return nil
-	}
-
-	attID := row.GUID
-	if i > 0 || hasText {
-		attID = fmt.Sprintf("%s_att%d", row.GUID, i)
 	}
 
 	mimeType := att.MimeType
@@ -2967,6 +2947,11 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
+	// Populate the cache so any future backfill call for the same attachment
+	// (e.g., a second portal covering the same thread, or a retry after restart)
+	// returns instantly without re-downloading from CloudKit.
+	c.attachmentContentCache.Store(att.RecordName, content)
+
 	return []*bridgev2.BackfillMessage{{
 		Sender:    sender,
 		ID:        makeMessageID(attID),
@@ -2978,6 +2963,103 @@ func (c *IMClient) downloadAndUploadAttachment(
 			}},
 		},
 	}}
+}
+
+// preUploadCloudAttachments downloads every CloudKit attachment recorded in the
+// cloud message store and uploads it to Matrix, caching the resulting
+// *event.MessageEventContent in attachmentContentCache keyed by record_name.
+//
+// Call this in the cloud sync goroutine BEFORE createPortalsFromCloudSync.
+// When bridgev2 subsequently calls FetchMessages inside the portal event loop,
+// every downloadAndUploadAttachment invocation becomes an instant cache lookup
+// instead of a multi-second CloudKit download — eliminating the 30+ minute
+// portal event loop stall caused by image-heavy conversations (e.g. 486 pics).
+func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
+	if c.cloudStore == nil {
+		return
+	}
+	log := c.Main.Bridge.Log.With().Str("component", "cloud_preupload").Logger()
+
+	rows, err := c.cloudStore.listAllAttachmentMessages(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Pre-upload: failed to list attachment messages, skipping")
+		return
+	}
+
+	// Build the list of attachments that still need to be uploaded.
+	type pendingUpload struct {
+		row     cloudMessageRow
+		idx     int
+		att     cloudAttachmentRow
+		sender  bridgev2.EventSender
+		ts      time.Time
+		hasText bool
+	}
+	var pending []pendingUpload
+	for _, row := range rows {
+		var atts []cloudAttachmentRow
+		if err := json.Unmarshal([]byte(row.AttachmentsJSON), &atts); err != nil {
+			continue
+		}
+		sender := c.makeCloudSender(row)
+		ts := time.UnixMilli(row.TimestampMS)
+		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
+		for i, att := range atts {
+			if att.RecordName == "" {
+				continue
+			}
+			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
+				continue // already cached from a previous pass
+			}
+			pending = append(pending, pendingUpload{
+				row: row, idx: i, att: att,
+				sender: sender, ts: ts, hasText: hasText,
+			})
+		}
+	}
+
+	if len(pending) == 0 {
+		log.Debug().Int("message_rows", len(rows)).Msg("Pre-upload: all attachments already cached")
+		return
+	}
+
+	log.Info().
+		Int("attachments", len(pending)).
+		Int("message_rows", len(rows)).
+		Msg("Pre-upload: starting CloudKit→Matrix attachment pre-upload before portal creation")
+
+	start := time.Now()
+	const maxParallel = 32
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	var uploaded atomic.Int64
+
+	for _, p := range pending {
+		wg.Add(1)
+		go func(p pendingUpload) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Any("panic", r).
+						Str("record_name", p.att.RecordName).
+						Msg("Pre-upload: recovered panic in attachment goroutine")
+				}
+			}()
+			// downloadAndUploadAttachment stores the result in attachmentContentCache
+			// as a side effect; we discard the returned BackfillMessage here.
+			c.downloadAndUploadAttachment(ctx, p.row, p.sender, p.ts, p.hasText, p.idx, p.att)
+			uploaded.Add(1)
+		}(p)
+	}
+
+	wg.Wait()
+	log.Info().
+		Int64("uploaded", uploaded.Load()).
+		Int("total", len(pending)).
+		Dur("elapsed", time.Since(start)).
+		Msg("Pre-upload: CloudKit→Matrix attachment pre-upload complete")
 }
 
 func reverseCloudMessageRows(rows []cloudMessageRow) {

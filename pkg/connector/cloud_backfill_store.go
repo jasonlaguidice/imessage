@@ -1347,6 +1347,21 @@ func (s *cloudBackfillStore) listLatestMessages(ctx context.Context, portalID st
 	return s.queryMessages(ctx, query, s.loginID, portalID, count)
 }
 
+// listAllAttachmentMessages returns every non-deleted cloud_message row that
+// has at least one attachment. Used by preUploadCloudAttachments to drive the
+// pre-upload pass before portal creation.
+func (s *cloudBackfillStore) listAllAttachmentMessages(ctx context.Context) ([]cloudMessageRow, error) {
+	query := `SELECT ` + cloudMessageSelectCols + `
+		FROM cloud_message
+		WHERE login_id=$1
+		  AND deleted=FALSE
+		  AND attachments_json IS NOT NULL
+		  AND attachments_json <> ''
+		ORDER BY timestamp_ms ASC, guid ASC
+	`
+	return s.queryMessages(ctx, query, s.loginID)
+}
+
 func (s *cloudBackfillStore) queryMessages(ctx context.Context, query string, args ...any) ([]cloudMessageRow, error) {
 	rows, err := s.db.Query(ctx, query, args...)
 	if err != nil {
