@@ -210,6 +210,18 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
+	// Migration: add fwd_backfill_done column to cloud_chat if missing.
+	// Set to 1 when FetchMessages(forward) completes for a portal so that
+	// preUploadCloudAttachments skips those portals on restart instead of
+	// re-uploading every attachment. Default 0 means "not yet done".
+	var hasFwdBackfillDone int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='fwd_backfill_done'`).Scan(&hasFwdBackfillDone)
+	if hasFwdBackfillDone == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN fwd_backfill_done BOOLEAN NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add fwd_backfill_done column: %w", err)
+		}
+	}
+
 	// Cleanup: permanently delete system/rename message rows that slipped into
 	// the DB before the MsgType==0 ingest filter was added.  Two conditions
 	// catch different eras of the DB:
@@ -1508,3 +1520,36 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 	return int(n), nil
 }
 
+// markForwardBackfillDone marks all cloud_chat rows for portalID as having
+// completed their initial forward FetchMessages call. Idempotent. Called from
+// FetchMessages when the forward pass completes so that preUploadCloudAttachments
+// skips this portal on the next restart instead of re-uploading every attachment.
+func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portalID string) {
+	_, _ = s.db.Exec(ctx,
+		`UPDATE cloud_chat SET fwd_backfill_done=1 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, portalID,
+	)
+}
+
+// getForwardBackfillDonePortals returns the set of portal IDs whose forward
+// FetchMessages has completed at least once. Used by preUploadCloudAttachments
+// to skip portals that don't need pre-upload on restart.
+func (s *cloudBackfillStore) getForwardBackfillDonePortals(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1 AND fwd_backfill_done=1`,
+		s.loginID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	done := make(map[string]bool)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		done[id] = true
+	}
+	return done, rows.Err()
+}
