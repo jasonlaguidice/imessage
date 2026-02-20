@@ -2597,7 +2597,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			body = row.Subject
 		}
 	}
-	body = strings.TrimLeft(body, "\ufffc \n")
+	body = strings.Trim(body, "\ufffc \n")
 	hasText := strings.TrimSpace(body) != "" && strings.TrimRight(body, "\ufffc \n") != ""
 	if hasText {
 		textContent := &event.MessageEventContent{
@@ -4211,7 +4211,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 }
 
 func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := strings.TrimLeft(ptrStringOr(msg.Text, ""), "\ufffc \n")
+	text := strings.Trim(ptrStringOr(msg.Text, ""), "\ufffc \n")
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    text,
