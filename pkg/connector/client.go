@@ -3226,7 +3226,13 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		wg.Add(1)
 		go func(p pendingUpload) {
 			defer wg.Done()
-			sem <- struct{}{}
+			// Check context before acquiring semaphore so shutdown doesn't
+			// queue up behind 32 in-flight downloads (each up to 90s).
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-sem }()
 			defer func() {
 				if r := recover(); r != nil {

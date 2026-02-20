@@ -413,7 +413,7 @@ func (s *cloudBackfillStore) setChatSyncVersion(ctx context.Context, version int
 // cached chats, and cached messages. Used on fresh bootstrap when the bridge
 // DB was reset but the cloud tables survived.
 func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
-	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message"} {
+	for _, table := range []string{"cloud_sync_state", "cloud_chat", "cloud_message", "cloud_attachment_cache"} {
 		if _, err := s.db.Exec(ctx,
 			fmt.Sprintf(`DELETE FROM %s WHERE login_id=$1`, table),
 			s.loginID,
@@ -1615,4 +1615,49 @@ func (s *cloudBackfillStore) getForwardBackfillDonePortals(ctx context.Context) 
 		done[id] = true
 	}
 	return done, rows.Err()
+}
+
+// pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
+// record_name is not referenced by any live (non-deleted) cloud_message row.
+// This prevents unbounded growth after portal deletions or message tombstones
+// remove the messages that originally needed those cached attachments.
+func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (int64, error) {
+	result, err := s.db.Exec(ctx, `
+		DELETE FROM cloud_attachment_cache
+		WHERE login_id=$1
+		  AND record_name NOT IN (
+			SELECT DISTINCT json_extract(je.value, '$.record_name')
+			FROM cloud_message, json_each(cloud_message.attachments_json) AS je
+			WHERE cloud_message.login_id=$1
+			  AND cloud_message.deleted=FALSE
+			  AND cloud_message.attachments_json IS NOT NULL
+			  AND cloud_message.attachments_json <> ''
+			  AND json_extract(je.value, '$.record_name') IS NOT NULL
+		  )
+	`, s.loginID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to prune orphaned attachment cache: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
+// deleteOrphanedMessages deletes cloud_message rows whose portal_id has no
+// matching cloud_chat entry. These are messages imported for chats where
+// the corresponding cloud_chat record was tombstoned or never existed locally.
+// They can't cause portal resurrection (that requires a cloud_chat entry),
+// but accumulate as dead storage over time.
+func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64, error) {
+	result, err := s.db.Exec(ctx, `
+		DELETE FROM cloud_message
+		WHERE login_id=$1
+		  AND portal_id NOT IN (
+			SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
+		  )
+	`, s.loginID)
+	if err != nil {
+		return 0, fmt.Errorf("failed to delete orphaned messages: %w", err)
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
 }
