@@ -30,6 +30,10 @@ func isRunningOnMacOS() bool {
 type IMConnector struct {
 	Bridge *bridgev2.Bridge
 	Config IMConfig
+
+	// BridgeSecret is the HMAC key used to derive per-user CardDAV encryption
+	// keys. Set from the AS token in main.go's PostInit hook.
+	BridgeSecret string
 }
 
 var _ bridgev2.NetworkConnector = (*IMConnector)(nil)

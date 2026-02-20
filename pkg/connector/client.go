@@ -549,11 +549,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
-	// Set up contact source: external CardDAV if configured, else iCloud
-	if c.Main.Config.CardDAV.IsConfigured() {
-		c.contacts = newExternalCardDAVClient(c.Main.Config.CardDAV, log)
+	// Set up contact source: per-user external CardDAV if configured, else iCloud
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if meta.CardDAVIsConfigured() {
+		key := DeriveCardDAVKey(c.Main.BridgeSecret, string(c.UserLogin.ID))
+		c.contacts = newExternalCardDAVClient(meta.GetCardDAVConfig(), key, log)
 		if c.contacts != nil {
-			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
+			log.Info().Str("email", meta.CardDAVEmail).Msg("Using external CardDAV for contacts")
 			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
 			} else {

@@ -54,6 +54,29 @@ type UserLoginMetadata struct {
 	// Cached MobileMe delegate JSON — seeded on restore so contacts work
 	// without needing to refresh (which requires a still-valid PET).
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// External CardDAV contact sync — set via the !im carddav command.
+	// When configured, this overrides iCloud contacts for this user.
+	CardDAVEmail             string `json:"carddav_email,omitempty"`
+	CardDAVURL               string `json:"carddav_url,omitempty"`
+	CardDAVUsername          string `json:"carddav_username,omitempty"`
+	CardDAVPasswordEncrypted string `json:"carddav_password_encrypted,omitempty"`
+}
+
+// CardDAVIsConfigured returns true if external CardDAV credentials are stored
+// for this user login.
+func (m *UserLoginMetadata) CardDAVIsConfigured() bool {
+	return m.CardDAVEmail != "" && m.CardDAVPasswordEncrypted != ""
+}
+
+// GetCardDAVConfig builds a CardDAVConfig from the stored login metadata.
+func (m *UserLoginMetadata) GetCardDAVConfig() CardDAVConfig {
+	return CardDAVConfig{
+		Email:             m.CardDAVEmail,
+		URL:               m.CardDAVURL,
+		Username:          m.CardDAVUsername,
+		PasswordEncrypted: m.CardDAVPasswordEncrypted,
+	}
 }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {
