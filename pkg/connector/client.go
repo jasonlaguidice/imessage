@@ -2439,6 +2439,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			Msg("Forward backfill: query returned")
 		if len(rows) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
+			// Mark done even when empty so preUploadCloudAttachments skips this
+			// portal on future restarts (nothing to upload anyway).
+			c.cloudStore.markForwardBackfillDone(ctx, portalID)
 			return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: true}, nil
 		}
 		if params.AnchorMessage == nil {
@@ -2470,11 +2473,15 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// delivers the messages to Matrix (preserving ordering: CloudKit
 		// backfill is fully in Matrix before APNs buffer is flushed).
 		forwardDone = true
+		cloudStoreDone := c.cloudStore // capture for closure (c is a pointer, safe)
 		return &bridgev2.FetchMessagesResponse{
 			Messages: messages,
 			HasMore:  false,
 			Forward:  true,
 			CompleteCallback: func() {
+				// Mark portal as forward-backfill-done so preUploadCloudAttachments
+				// skips it on restart (avoids re-uploading every attachment).
+				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
 				c.onForwardBackfillDone()
 			},
 		}, nil
@@ -3013,22 +3020,16 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		return
 	}
 
-	// Build the set of portal IDs whose portals already exist in the bridge.
-	// If a portal has an MXID it was previously created and backfilled —
-	// re-uploading its attachments on every restart is wasteful (and broken:
-	// it re-posts the same media files each time). Only pre-upload for new
-	// portals that are about to be created for the first time.
-	existingPortals := make(map[string]bool)
-	for _, row := range rows {
-		if row.PortalID == "" || existingPortals[row.PortalID] {
-			continue
-		}
-		portalKey := networkid.PortalKey{
-			ID:       networkid.PortalID(row.PortalID),
-			Receiver: c.UserLogin.ID,
-		}
-		existing, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-		existingPortals[row.PortalID] = existing != nil && existing.MXID != ""
+	// Build the set of portal IDs whose forward FetchMessages has already
+	// completed successfully. These portals don't need pre-upload on restart:
+	// - Normal restart: all portals are done → skip everything (no re-upload storm)
+	// - Interrupted backfill: that portal is NOT in the done set → still pre-uploads
+	// Using fwd_backfill_done (set by FetchMessages via CompleteCallback) rather than
+	// MXID-existence avoids the interrupted-backfill edge case.
+	donePorals, err := c.cloudStore.getForwardBackfillDonePortals(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Pre-upload: failed to query fwd_backfill_done, skipping pre-upload entirely")
+		return
 	}
 
 	// Build the list of attachments that still need to be uploaded.
@@ -3042,8 +3043,8 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	}
 	var pending []pendingUpload
 	for _, row := range rows {
-		// Skip portals that already exist — their backfill is done.
-		if existingPortals[row.PortalID] {
+		// Skip portals whose forward backfill completed — no re-upload needed.
+		if donePorals[row.PortalID] {
 			continue
 		}
 		var atts []cloudAttachmentRow
