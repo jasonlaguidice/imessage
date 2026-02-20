@@ -1642,15 +1642,16 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	return n, nil
 }
 
-// deleteOrphanedMessages deletes cloud_message rows whose portal_id has no
-// matching cloud_chat entry. These are messages imported for chats where
-// the corresponding cloud_chat record was tombstoned or never existed locally.
-// They can't cause portal resurrection (that requires a cloud_chat entry),
-// but accumulate as dead storage over time.
+// deleteOrphanedMessages hard-deletes cloud_message rows that are already
+// soft-deleted (deleted=TRUE) AND whose portal_id has no matching cloud_chat
+// entry. This is conservative: DM portals legitimately have messages without
+// cloud_chat rows, so we only clean up rows that are BOTH orphaned AND already
+// marked deleted (from tombstone processing or portal deletion).
 func (s *cloudBackfillStore) deleteOrphanedMessages(ctx context.Context) (int64, error) {
 	result, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_message
 		WHERE login_id=$1
+		  AND deleted=TRUE
 		  AND portal_id NOT IN (
 			SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1
 		  )
