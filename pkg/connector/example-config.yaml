@@ -18,3 +18,9 @@ cloudkit_backfill: false
 # Leave empty to use the handle chosen during login.
 # Available handles are logged on startup.
 preferred_handle: ""
+
+# Server-wide hardware key for cross-platform (non-macOS) operation.
+# When set, users can choose to use this shared key during login instead of providing their own.
+# Leave empty to require each user to supply their own hardware key (extracted from a real Mac).
+# Warning: sharing a hardware key among multiple users may cause Apple to restrict those Apple IDs.
+default_hardware_key: ""

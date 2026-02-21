@@ -36,7 +36,13 @@ type UserLoginMetadata struct {
 
 	// Hardware key for cross-platform (non-macOS) operation.
 	// Base64-encoded JSON HardwareConfig extracted from a real Mac.
+	// Copied at login time and paired to user's login — must not be changed after setup.
 	HardwareKey string `json:"hardware_key,omitempty"`
+
+	// CloudKitBackfill records whether this user opted in to CloudKit message
+	// history backfill during login. Requires the server to have cloudkit_backfill
+	// enabled. Set once at login time and not changed afterwards.
+	CloudKitBackfill bool `json:"cloudkit_backfill,omitempty"`
 
 	// PreferredHandle is the user-chosen handle for outgoing messages
 	// (e.g. "tel:+15551234567" or "mailto:user@example.com").
