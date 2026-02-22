@@ -2623,7 +2623,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				Msg("Forward backfill: using anchor — fetching only newer messages")
 		}
 
-		var allMessages []*bridgev2.BackfillMessage
+		var allRows []cloudMessageRow
 		totalRows := 0
 		chunk := 0
 		remaining := count
@@ -2657,11 +2657,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			// would hang the portal event loop for hours on large portals.
 			c.preUploadChunkAttachments(ctx, rows, *log)
 
-			// Convert this chunk's rows to backfill messages.
-			// All attachments should now be cache hits after pre-upload.
-			for _, row := range rows {
-				allMessages = append(allMessages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
-			}
+			allRows = append(allRows, rows...)
 			totalRows += len(rows)
 			chunk++
 
@@ -2670,9 +2666,8 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				Int("chunk", chunk).
 				Int("chunk_rows", len(rows)).
 				Int("total_rows", totalRows).
-				Int("total_msgs", len(allMessages)).
 				Dur("chunk_query_ms", time.Since(queryStart)).
-				Msg("Forward backfill: chunk processed")
+				Msg("Forward backfill: chunk fetched")
 
 			// Advance cursor to the last row in this chunk for the next iteration.
 			lastRow := rows[len(rows)-1]
@@ -2686,6 +2681,11 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 				break
 			}
 		}
+
+		// Convert all rows with two-pass tapback resolution: reactions
+		// targeting messages in this batch go into BackfillMessage.Reactions
+		// (correct DAG ordering) instead of QueueRemoteEvent (end of DAG).
+		allMessages := c.cloudRowsToBackfillMessages(ctx, allRows, groupDisplayName)
 
 		if len(allMessages) == 0 {
 			log.Debug().Str("portal_id", portalID).Msg("Forward backfill: no rows to process")
@@ -2819,10 +2819,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	reverseCloudMessageRows(rows)
 
 	convertStart := time.Now()
-	messages := make([]*bridgev2.BackfillMessage, 0, len(rows))
-	for _, row := range rows {
-		messages = append(messages, c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)...)
-	}
+	messages := c.cloudRowsToBackfillMessages(ctx, rows, groupDisplayName)
 	convertElapsed := time.Since(convertStart)
 
 	var nextCursor networkid.PaginationCursor
@@ -2853,6 +2850,75 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		HasMore:  hasMore,
 		Forward:  false,
 	}, nil
+}
+
+// cloudRowsToBackfillMessages converts a batch of CloudKit rows into backfill
+// messages, attaching tapback reactions to their target messages when possible.
+// This two-pass approach ensures reactions appear in BackfillMessage.Reactions
+// (correct DAG ordering) instead of being queued via QueueRemoteEvent (which
+// places them at the end of the DAG, making the sidebar show old reactions).
+// Tapback removes and tapbacks targeting messages outside this batch still
+// fall back to QueueRemoteEvent.
+func (c *IMClient) cloudRowsToBackfillMessages(ctx context.Context, rows []cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
+	// Pass 1: convert regular messages, defer tapback rows.
+	var messages []*bridgev2.BackfillMessage
+	var tapbackRows []cloudMessageRow
+	messageByGUID := make(map[string]*bridgev2.BackfillMessage)
+
+	for _, row := range rows {
+		if row.TapbackType != nil && *row.TapbackType >= 2000 {
+			tapbackRows = append(tapbackRows, row)
+			continue
+		}
+		converted := c.cloudRowToBackfillMessages(ctx, row, groupDisplayName)
+		messages = append(messages, converted...)
+		// Key by row GUID so tapbacks can find their target. A row may
+		// produce multiple BackfillMessages (text + attachments); attach
+		// the reaction to the first one (text, or first attachment).
+		if len(converted) > 0 {
+			messageByGUID[row.GUID] = converted[0]
+		}
+	}
+
+	// Pass 2: resolve tapbacks — attach to target if in this batch,
+	// otherwise fall back to QueueRemoteEvent.
+	for _, row := range tapbackRows {
+		sender := c.makeCloudSender(row)
+		if sender.Sender == "" && !sender.IsFromMe {
+			continue
+		}
+
+		tapbackType := *row.TapbackType
+		isRemove := tapbackType >= 3000
+
+		// Parse target GUID from "p:0/GUID" format.
+		targetGUID := row.TapbackTargetGUID
+		if parts := strings.SplitN(targetGUID, "/", 2); len(parts) == 2 {
+			targetGUID = parts[1]
+		}
+		if targetGUID == "" {
+			continue
+		}
+
+		// Removes can't use BackfillReaction (framework only supports add).
+		// Tapbacks targeting messages outside this batch also fall back.
+		targetMsg, inBatch := messageByGUID[targetGUID]
+		if !isRemove && inBatch {
+			ts := time.UnixMilli(row.TimestampMS)
+			idx := tapbackType - 2000
+			emoji := tapbackTypeToEmoji(&idx, &row.TapbackEmoji)
+			targetMsg.Reactions = append(targetMsg.Reactions, &bridgev2.BackfillReaction{
+				Sender:    sender,
+				Emoji:     emoji,
+				Timestamp: ts,
+			})
+		} else {
+			// Fall back to QueueRemoteEvent for removes and out-of-batch targets.
+			c.cloudTapbackToBackfill(row, sender, time.UnixMilli(row.TimestampMS))
+		}
+	}
+
+	return messages
 }
 
 func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMessageRow, groupDisplayName string) []*bridgev2.BackfillMessage {
