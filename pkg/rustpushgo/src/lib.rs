@@ -966,6 +966,8 @@ pub struct WrappedCloudSyncChat {
     pub updated_timestamp_ms: u64,
     /// CloudKit group photo GUID ("gpid" field). Non-null means a custom photo is set.
     pub group_photo_guid: Option<String>,
+    /// CloudKit `filt` field: 0 = normal, 1 = filtered (spam/junk/unknown sender)
+    pub is_filtered: i64,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -2916,6 +2918,7 @@ impl Client {
                     deleted: false,
                     updated_timestamp_ms,
                     group_photo_guid: chat.group_photo_guid,
+                    is_filtered: chat.is_filtered,
                 });
             } else {
                 normalized.push(WrappedCloudSyncChat {
@@ -2929,6 +2932,7 @@ impl Client {
                     deleted: true,
                     updated_timestamp_ms,
                     group_photo_guid: None,
+                    is_filtered: 0,
                 });
             }
         }

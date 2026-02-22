@@ -43,6 +43,7 @@ type cloudSyncCounters struct {
 	Updated  int
 	Skipped  int
 	Deleted  int
+	Filtered int
 }
 
 func (c *cloudSyncCounters) add(other cloudSyncCounters) {
@@ -50,6 +51,7 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 	c.Updated += other.Updated
 	c.Skipped += other.Skipped
 	c.Deleted += other.Deleted
+	c.Filtered += other.Filtered
 }
 
 func (c *IMClient) setCloudSyncDone() {
@@ -879,7 +881,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	}
 
 	log.Info().Int("total_pages", totalPages).Int("imported", counts.Imported).Int("updated", counts.Updated).
-		Int("skipped", counts.Skipped).Int("deleted", counts.Deleted).
+		Int("skipped", counts.Skipped).Int("deleted", counts.Deleted).Int("filtered", counts.Filtered).
 		Msg("CloudKit chat sync finished")
 
 	return counts, token, nil
@@ -1001,6 +1003,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 		Int("updated", counts.Updated).
 		Int("skipped", counts.Skipped).
 		Int("deleted", counts.Deleted).
+		Int("filtered", counts.Filtered).
 		Msg("CloudKit message sync finished")
 
 	return counts, token, nil
@@ -1066,9 +1069,17 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			GroupPhotoGuid:   nullableString(chat.GroupPhotoGuid),
 			ParticipantsJSON: string(participantsJSON),
 			UpdatedTS:        int64(chat.UpdatedTimestampMs),
+			IsFiltered:       chat.IsFiltered,
 		})
 
-		if existingSet[chat.CloudChatId] {
+		if chat.IsFiltered != 0 {
+			counts.Filtered++
+			log.Debug().
+				Str("cloud_chat_id", chat.CloudChatId).
+				Str("portal_id", portalID).
+				Int64("is_filtered", chat.IsFiltered).
+				Msg("Stored filtered/junk chat from CloudKit (will skip messages)")
+		} else if existingSet[chat.CloudChatId] {
 			counts.Updated++
 		} else {
 			counts.Imported++
@@ -1296,6 +1307,22 @@ func (c *IMClient) ingestCloudMessages(
 				Msg("Skipping message: could not resolve portal ID")
 			counts.Skipped++
 			continue
+		}
+
+		// Skip orphaned messages: no chat_id AND no cloud_chat record for the
+		// resolved portal. Apple omits filtered/junk chats from the chat zone
+		// entirely, so these messages have no chat association and represent
+		// spam or unknown-sender conversations the user never sees in iMessage.
+		if msg.CloudChatId == "" && c.cloudStore != nil {
+			if hasChat, err := c.cloudStore.portalHasChat(ctx, portalID); err == nil && !hasChat {
+				log.Debug().
+					Str("guid", msg.Guid).
+					Str("portal_id", portalID).
+					Str("sender", msg.Sender).
+					Msg("Skipping orphaned message (no chat_id, no chat record)")
+				counts.Filtered++
+				continue
+			}
 		}
 
 		text := ""
