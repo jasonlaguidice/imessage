@@ -162,6 +162,17 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	}
 
 
+	// Migration: add deleted column to cloud_chat if missing.
+	// Soft-deletes cloud_chat rows alongside cloud_message rows so that
+	// restore-chat can recover group name and participants.
+	var hasChatDeleted int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='deleted'`).Scan(&hasChatDeleted)
+	if hasChatDeleted == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
+			return fmt.Errorf("failed to add deleted column to cloud_chat: %w", err)
+		}
+	}
+
 	// Migration: add is_filtered column to cloud_chat if missing
 	var hasIsFiltered int
 	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='is_filtered'`).Scan(&hasIsFiltered)
@@ -1108,17 +1119,18 @@ func (s *cloudBackfillStore) updateDisplayNameByPortalID(ctx context.Context, po
 	return err
 }
 
-// deleteLocalChatByPortalID removes the cloud_chat records for a portal and
-// soft-deletes its cloud_message records (sets deleted=TRUE, preserves the rows).
+// deleteLocalChatByPortalID soft-deletes the cloud_chat and cloud_message
+// records for a portal (sets deleted=TRUE, preserves the rows).
 //
-// cloud_chat is hard-deleted: it maps CloudKit record_names to portal IDs and
-// is no longer needed once the portal is gone.
+// cloud_chat is soft-deleted so that restore-chat can recover group name and
+// participant data. Queries that drive portal creation (listPortalIDsWithNewestTimestamp,
+// portalHasChat) filter on deleted=FALSE so soft-deleted rows don't resurrect portals.
 //
 // cloud_message is soft-deleted, NOT hard-deleted. The rows' GUIDs must survive
 // so that hasMessageUUID can detect stale APNs echoes even after:
-//  - pending_cloud_deletion is cleared (CloudKit deletion finished)
-//  - Bridge restarts (recentlyDeletedPortals is repopulated from pending entries,
-//    but once cleared there is no in-memory protection)
+//   - pending_cloud_deletion is cleared (CloudKit deletion finished)
+//   - Bridge restarts (recentlyDeletedPortals is repopulated from pending entries,
+//     but once cleared there is no in-memory protection)
 //
 // hasMessageUUID queries cloud_message without filtering on deleted, so
 // soft-deleted UUIDs still block echoes. Fresh UUIDs from genuinely new
@@ -1129,10 +1141,10 @@ func (s *cloudBackfillStore) updateDisplayNameByPortalID(ctx context.Context, po
 // soft-deleted rows don't trigger backfill or portal resurrection.
 func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, portalID string) error {
 	if _, err := s.db.Exec(ctx,
-		`DELETE FROM cloud_chat WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET deleted=TRUE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	); err != nil {
-		return fmt.Errorf("failed to delete cloud_chat records for portal %s: %w", portalID, err)
+		return fmt.Errorf("failed to soft-delete cloud_chat records for portal %s: %w", portalID, err)
 	}
 	nowMS := time.Now().UnixMilli()
 	if _, err := s.db.Exec(ctx,
@@ -1208,7 +1220,7 @@ func (s *cloudBackfillStore) portalHasPreStartupOutgoingMessages(ctx context.Con
 // group UUIDs. Participants are compared after normalization (tel:/mailto: prefix).
 func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string) ([]string, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> ''`,
+		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> '' AND deleted=FALSE`,
 		s.loginID,
 	)
 	if err != nil {
@@ -1568,6 +1580,15 @@ func (s *cloudBackfillStore) listSoftDeletedPortals(ctx context.Context) ([]soft
 // setting deleted=FALSE on all cloud_message rows for the portal.
 // Returns the number of rows updated.
 func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context, portalID string) (int, error) {
+	// Un-soft-delete cloud_chat rows so GetChatInfo can resolve group name
+	// and participants during the ChatResync that follows restore.
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET deleted=FALSE WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
+		s.loginID, portalID,
+	); err != nil {
+		return 0, fmt.Errorf("failed to undelete cloud_chat for portal %s: %w", portalID, err)
+	}
+
 	result, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3
 		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
