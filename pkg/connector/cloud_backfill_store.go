@@ -1671,6 +1671,75 @@ func (s *cloudBackfillStore) getForwardBackfillDonePortals(ctx context.Context) 
 	return done, rows.Err()
 }
 
+// hasCloudReadReceipt checks whether a message UUID in cloud_message already
+// has a valid date_read_ms (i.e., CloudKit recorded that it was read). Used to
+// suppress duplicate APNs read receipts that arrive after backfill — the
+// synthetic receipt already used the correct CloudKit timestamp, so the stale
+// APNs receipt (with delivery-time instead of read-time) should be dropped.
+// Uses case-insensitive GUID matching (APNs delivers uppercase, CloudKit may be mixed).
+func (s *cloudBackfillStore) hasCloudReadReceipt(ctx context.Context, uuid string) (bool, error) {
+	var dateReadMS int64
+	err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(date_read_ms, 0)
+		FROM cloud_message
+		WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND is_from_me=TRUE
+		LIMIT 1
+	`, s.loginID, uuid).Scan(&dateReadMS)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return dateReadMS > 978307200000, nil
+}
+
+// isCloudBackfilledMessage checks whether a message UUID exists in the
+// cloud_message table as a CloudKit-synced message. CloudKit entries (from
+// upsertMessageBatch) have record_name populated, while real-time entries
+// (from persistMessageUUID) have record_name=''. This distinguishes
+// backfilled messages whose ghost receipts should be suppressed from
+// real-time messages whose ghost receipts should go through.
+func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM cloud_message
+			WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND record_name != ''
+		)
+	`, s.loginID, uuid).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// getConversationReadByMe returns true if the portal has no unread incoming
+// messages — i.e., the user has read the entire conversation on the iMessage
+// side. This is approximated by checking if any incoming messages exist that
+// are newer than the latest outgoing message (if we sent a reply, we must have
+// read everything before it). Returns false if there are no incoming messages.
+func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
+	// Strategy: if the newest message in the portal is from_me, the user has
+	// seen the conversation. If the newest is NOT from_me, they might not have.
+	// This is a heuristic — CloudKit doesn't store "I read their message".
+	var isFromMe bool
+	err := s.db.QueryRow(ctx, `
+		SELECT is_from_me
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		ORDER BY timestamp_ms DESC, guid DESC
+		LIMIT 1
+	`, s.loginID, portalID).Scan(&isFromMe)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return isFromMe, nil
+}
+
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
 // record_name is not referenced by any live (non-deleted) cloud_message row.
 // This prevents unbounded growth after portal deletions or message tombstones

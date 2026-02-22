@@ -36,8 +36,10 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"go.mau.fi/util/ptr"
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
+	matrixfmt "maunium.net/go/mautrix/bridgev2/matrix"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
@@ -366,6 +368,113 @@ func (b *messageBuffer) stop() {
 	}
 	b.entries = nil
 	b.mu.Unlock()
+}
+
+// sendGhostReadReceipt sends a "they read my message" receipt from the ghost
+// user with the correct timestamp. The standard framework path
+// (QueueRemoteEvent → MarkRead → SetReadMarkers) doesn't work because the
+// ghost isn't double-puppeted, so the homeserver ignores BeeperReadExtra["ts"]
+// and uses server time instead. This method bypasses the framework by calling
+// SetBeeperInboxState directly on the ghost's underlying Matrix client, which
+// the homeserver honors for BeeperReadExtra["ts"] regardless of puppet status.
+// Falls back to QueueRemoteEvent if the direct path fails.
+func (c *IMClient) sendGhostReadReceipt(
+	log *zerolog.Logger,
+	ghostUserID networkid.UserID,
+	portalKey networkid.PortalKey,
+	guid string,
+	readTime time.Time,
+) {
+	ctx := context.Background()
+
+	// Step 1: Get the ghost user.
+	ghost, err := c.Main.Bridge.GetGhostByID(ctx, ghostUserID)
+	if err != nil || ghost == nil || ghost.Intent == nil {
+		log.Warn().Err(err).Str("ghost_user_id", string(ghostUserID)).
+			Msg("Ghost not found for read receipt, falling back to QueueRemoteEvent")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+
+	// Step 2: Look up the portal to get its Matrix room ID.
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().Err(err).Str("portal_id", string(portalKey.ID)).
+			Msg("Portal not found for ghost read receipt, falling back to QueueRemoteEvent")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+
+	// Step 3: Look up the target message's Matrix event ID in the bridge DB.
+	msg, err := c.Main.Bridge.DB.Message.GetLastPartByID(ctx, portalKey.Receiver, makeMessageID(guid))
+	if err != nil || msg == nil || msg.HasFakeMXID() {
+		log.Debug().Err(err).Str("portal_id", string(portalKey.ID)).Str("guid", guid).
+			Msg("Target message not in bridge DB, falling back to QueueRemoteEvent with ReadUpTo")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+
+	// Step 4: Type-assert to access the ghost's underlying Matrix client
+	// and call SetBeeperInboxState directly (bypasses IsCustomPuppet check).
+	asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent)
+	if !ok {
+		log.Warn().Str("portal_id", string(portalKey.ID)).
+			Msg("Ghost intent is not *matrix.ASIntent, falling back to QueueRemoteEvent")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+
+	extraData := map[string]any{
+		"ts": readTime.UnixMilli(),
+	}
+	req := &mautrix.ReqSetReadMarkers{
+		Read:            msg.MXID,
+		FullyRead:       msg.MXID,
+		BeeperReadExtra: extraData,
+		BeeperFullyReadExtra: extraData,
+	}
+	err = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
+		ReadMarkers: req,
+	})
+	if err != nil {
+		log.Warn().Err(err).Str("portal_id", string(portalKey.ID)).
+			Stringer("event_id", msg.MXID).
+			Msg("SetBeeperInboxState failed for ghost, falling back to QueueRemoteEvent")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+
+	log.Info().
+		Str("portal_id", string(portalKey.ID)).
+		Str("guid", guid).
+		Stringer("event_id", msg.MXID).
+		Int64("read_time_ms", readTime.UnixMilli()).
+		Str("read_time", readTime.UTC().Format(time.RFC3339)).
+		Msg("Set ghost read receipt via SetBeeperInboxState with correct timestamp")
+}
+
+// queueGhostReceiptFallback sends a ghost read receipt via the standard
+// QueueRemoteEvent path. The homeserver may ignore BeeperReadExtra["ts"]
+// (showing server time instead), but the receipt itself will still be created.
+func (c *IMClient) queueGhostReceiptFallback(
+	ghostUserID networkid.UserID,
+	portalKey networkid.PortalKey,
+	guid string,
+	readTime time.Time,
+) {
+	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
+		EventMeta: simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventReadReceipt,
+			PortalKey: portalKey,
+			Sender: bridgev2.EventSender{
+				IsFromMe: false,
+				Sender:   ghostUserID,
+			},
+			Timestamp: readTime,
+		},
+		LastTarget: makeMessageID(guid),
+		ReadUpTo:   readTime,
+	})
 }
 
 // onForwardBackfillDone is called when a single forward FetchMessages call
@@ -1380,6 +1489,22 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		return
 	}
 
+	// Suppress duplicate receipts in the post-backfill grace window (60s).
+	// After the APNs buffer flushes, stale receipts that arrived between the
+	// 30s IsStoredMessage window and backfill completion can leak through.
+	// If CloudKit already has a valid date_read_ms for this message, a
+	// synthetic receipt with the correct historical timestamp was already
+	// queued — drop the duplicate to prevent overwriting with time.Now().
+	const postBackfillGraceMS = 60_000
+	if c.cloudStore != nil && (time.Now().UnixMilli()-flushedAt) < postBackfillGraceMS {
+		if hasReceipt, err := c.cloudStore.hasCloudReadReceipt(context.Background(), msg.Uuid); err == nil && hasReceipt {
+			log.Debug().
+				Str("uuid", msg.Uuid).
+				Msg("Skipping duplicate read receipt — CloudKit already has date_read_ms (post-backfill grace)")
+			return
+		}
+	}
+
 	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	ctx := context.Background()
 
@@ -1430,15 +1555,44 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 	}
 resolved:
 
-	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
-		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventReadReceipt,
-			PortalKey: portalKey,
-			Sender:    c.makeEventSender(msg.Sender),
-			Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
-		},
-		LastTarget: makeMessageID(msg.Uuid),
-	})
+	readTime := time.UnixMilli(int64(msg.TimestampMs))
+	sender := c.makeEventSender(msg.Sender)
+
+	if !sender.IsFromMe {
+		// Skip ghost receipts for messages that were backfilled from CloudKit.
+		// APNs read receipts for group chats lack participants/senderGuid, so
+		// the portal key often resolves to a DM rather than a gid: portal.
+		// Check cloud_message regardless of portal type — any message that was
+		// synced from CloudKit is a backfilled message whose ghost receipt
+		// would incorrectly show "Seen by [person]" on outgoing messages.
+		// Real-time messages (not in cloud_message) are unaffected.
+		if c.cloudStore != nil {
+			if backfilled, err := c.cloudStore.isCloudBackfilledMessage(context.Background(), msg.Uuid); err == nil && backfilled {
+				log.Debug().
+					Str("uuid", msg.Uuid).
+					Str("portal_id", string(portalKey.ID)).
+					Msg("Skipping ghost read receipt for backfilled message")
+				return
+			}
+		}
+		// Ghost receipt ("they read my message"): bypass the framework and call
+		// SetBeeperInboxState directly. The standard framework path (QueueRemoteEvent
+		// → MarkRead → SetReadMarkers) ignores BeeperReadExtra["ts"] for ghost
+		// users, causing the homeserver to use server time instead of the actual
+		// read time from the APNs receipt.
+		c.sendGhostReadReceipt(&log, sender.Sender, portalKey, msg.Uuid, readTime)
+	} else {
+		// Self-receipt (unlikely for APNs read receipts, but handle gracefully).
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventReadReceipt,
+				PortalKey: portalKey,
+				Sender:    sender,
+				Timestamp: readTime,
+			},
+			LastTarget: makeMessageID(msg.Uuid),
+		})
+	}
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -2553,12 +2707,64 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		// backfill is fully in Matrix before APNs buffer is flushed).
 		forwardDone = true
 		cloudStoreDone := c.cloudStore
+		portalKey := params.Portal.PortalKey
+
+		// Capture latest backfilled message for Receipt 2 target.
+		// This ensures we mark the conversation as read up to the very
+		// latest message, not just the most recently read outgoing message.
+		lastMsg := allMessages[len(allMessages)-1]
+		lastMsgID := lastMsg.ID
+		lastMsgTS := lastMsg.Timestamp
+
 		return &bridgev2.FetchMessagesResponse{
 			Messages: allMessages,
 			HasMore:  false,
 			Forward:  true,
+			// Don't set MarkRead here — MarkReadBy on the batch send creates
+			// a homeserver-side read receipt with server time (≈now), which
+			// Beeper clients display as "Read at [now]". Instead, rely on
+			// the synthetic receipts below for correct timestamps.
 			CompleteCallback: func() {
 				cloudStoreDone.markForwardBackfillDone(context.Background(), portalID)
+
+				// NOTE: Receipt 1 (ghost "they read my message") is intentionally
+				// NOT sent during backfill. CloudKit's date_read_ms is unreliable:
+				// real iPhone users have no data (shows "Sent" correctly), but
+				// bridge users get wrong timestamps (shows "Seen at [wrong time]").
+				// Real-time read receipts via APNs still work after backfill.
+
+				// --- Receipt 2: Double puppet receipt ("I read their message") ---
+				// Works for both DMs and group chats. Uses getConversationReadByMe
+				// heuristic (last message is from_me → user has read everything).
+				// Independent of date_read_ms — covers conversations where the
+				// recipient hasn't sent read receipts (SMS, disabled receipts, etc.).
+				// Targets the latest backfilled message to mark the entire
+				// conversation as read, overwriting forceMarkRead's server-time
+				// receipt via SetBeeperInboxState with correct BeeperReadExtra["ts"].
+				if readByMe, err := cloudStoreDone.getConversationReadByMe(context.Background(), portalID); err == nil && readByMe {
+					c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Receipt{
+						EventMeta: simplevent.EventMeta{
+							Type:      bridgev2.RemoteEventReadReceipt,
+							PortalKey: portalKey,
+							Sender: bridgev2.EventSender{
+								IsFromMe:    true,
+								SenderLogin: c.UserLogin.ID,
+								Sender:      makeUserID(c.handle),
+							},
+							Timestamp: lastMsgTS,
+						},
+						LastTarget: lastMsgID,
+						ReadUpTo:   lastMsgTS,
+					})
+					log.Info().
+						Str("portal_id", portalID).
+						Str("last_msg_id", string(lastMsgID)).
+						Str("last_msg_ts", lastMsgTS.UTC().Format(time.RFC3339)).
+						Msg("Queued double puppet read receipt (I read their message)")
+				} else if err != nil {
+					log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to check if conversation is read by me")
+				}
+
 				c.onForwardBackfillDone()
 			},
 		}, nil
