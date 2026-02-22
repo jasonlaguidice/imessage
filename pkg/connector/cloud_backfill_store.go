@@ -162,6 +162,15 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	}
 
 
+	// Migration: add is_filtered column to cloud_chat if missing
+	var hasIsFiltered int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='is_filtered'`).Scan(&hasIsFiltered)
+	if hasIsFiltered == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN is_filtered INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add is_filtered column: %w", err)
+		}
+	}
+
 	// Migration: add rich content columns to cloud_message if missing
 	richCols := []struct {
 		name string
@@ -761,8 +770,8 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
-			group_photo_guid, participants_json, updated_ts, created_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			group_photo_guid, participants_json, updated_ts, created_ts, is_filtered
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -783,7 +792,8 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
 				ELSE cloud_chat.updated_ts
-			END
+			END,
+			is_filtered=excluded.is_filtered
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch statement: %w", err)
@@ -795,7 +805,7 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 		_, err = stmt.ExecContext(ctx,
 			s.loginID, chat.CloudChatID, chat.RecordName, chat.GroupID,
 			chat.PortalID, chat.Service, chat.DisplayName,
-			chat.GroupPhotoGuid, chat.ParticipantsJSON, chat.UpdatedTS, nowMS,
+			chat.GroupPhotoGuid, chat.ParticipantsJSON, chat.UpdatedTS, nowMS, chat.IsFiltered,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert chat %s: %w", chat.CloudChatID, err)
@@ -864,6 +874,7 @@ type cloudChatUpsertRow struct {
 	GroupPhotoGuid   any // nil or string
 	ParticipantsJSON string
 	UpdatedTS        int64
+	IsFiltered       int64
 }
 
 func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID string) (string, error) {
@@ -889,6 +900,22 @@ func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID st
 		return "", err
 	}
 	return portalID, nil
+}
+
+// portalHasChat returns true if the given portal_id has at least one
+// cloud_chat record (i.e., the conversation was included in CloudKit chat
+// sync). Portals with no chat record are orphaned — typically junk/spam
+// that Apple filters from the chat zone.
+func (s *cloudBackfillStore) portalHasChat(ctx context.Context, portalID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
+		s.loginID, portalID,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (s *cloudBackfillStore) hasChat(ctx context.Context, cloudChatID string) (bool, error) {
@@ -1453,7 +1480,7 @@ type portalWithNewestMessage struct {
 // their updated_ts from the cloud_chat table so they still get portals created.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context) ([]portalWithNewestMessage, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT portal_id, MAX(newest_ts) AS newest_ts, SUM(msg_count) AS msg_count FROM (
+		SELECT sub.portal_id, MAX(sub.newest_ts) AS newest_ts, SUM(sub.msg_count) AS msg_count FROM (
 			SELECT portal_id, MAX(timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
 			FROM cloud_message
 			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE
@@ -1464,12 +1491,18 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			SELECT cc.portal_id, COALESCE(cc.updated_ts, 0) AS newest_ts, 0 AS msg_count
 			FROM cloud_chat cc
 			WHERE cc.login_id=$1 AND cc.portal_id IS NOT NULL AND cc.portal_id <> ''
+			AND COALESCE(cc.is_filtered, 0) = 0
+			AND cc.deleted = FALSE
 			AND cc.portal_id NOT IN (
 				SELECT DISTINCT cm.portal_id FROM cloud_message cm
 				WHERE cm.login_id=$1 AND cm.portal_id IS NOT NULL AND cm.portal_id <> '' AND cm.deleted=FALSE
 			)
+		) sub
+		WHERE NOT EXISTS (
+			SELECT 1 FROM cloud_chat fc
+			WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) != 0
 		)
-		GROUP BY portal_id
+		GROUP BY sub.portal_id
 		ORDER BY newest_ts DESC
 	`, s.loginID)
 	if err != nil {
