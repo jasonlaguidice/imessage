@@ -756,7 +756,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	consecutiveErrors := 0
 	const maxConsecutiveAttErrors = 3
-	for page := 0; page < 256; page++ {
+	for page := 0; page < 10000; page++ {
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -828,7 +828,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	totalPages := 0
 	consecutiveErrors := 0
 	const maxConsecutiveChatErrors = 3
-	for page := 0; page < 256; page++ {
+	for page := 0; page < 10000; page++ {
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -939,7 +939,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 3
 	totalPages := 0
-	for page := 0; page < 256; page++ {
+	for page := 0; page < 10000; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
