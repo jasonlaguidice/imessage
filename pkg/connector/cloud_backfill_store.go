@@ -1648,6 +1648,21 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 	)
 }
 
+// isForwardBackfillDone returns true if forward backfill has completed for the
+// given portal. Used by backward backfill to avoid permanently marking
+// is_done=true before forward backfill has inserted the anchor message.
+func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID string) bool {
+	var done bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=1)`,
+		s.loginID, portalID,
+	).Scan(&done)
+	if err != nil {
+		return false
+	}
+	return done
+}
+
 // getForwardBackfillDonePortals returns the set of portal IDs whose forward
 // FetchMessages has completed at least once. Used by preUploadCloudAttachments
 // to skip portals that don't need pre-upload on restart.

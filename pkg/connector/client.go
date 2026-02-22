@@ -2792,7 +2792,15 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 	}
 
 	if beforeTS == 0 && beforeGUID == "" {
-		log.Debug().Str("portal_id", portalID).Msg("Backward backfill: no anchor or cursor, nothing to paginate from")
+		// If forward backfill hasn't completed yet, don't permanently mark backward
+		// as done — the anchor will appear once sendBatch finishes.
+		if !c.cloudStore.isForwardBackfillDone(ctx, portalID) {
+			log.Info().Str("portal_id", portalID).
+				Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
+			return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
+		}
+		log.Debug().Str("portal_id", portalID).
+			Msg("Backward backfill: no anchor or cursor, nothing to paginate from")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
 	}
 
