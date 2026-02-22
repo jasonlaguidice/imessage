@@ -167,6 +167,16 @@ if [ -t 0 ]; then
     sed -i "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
     if [ "$ENABLE_BACKFILL" = "true" ]; then
         echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+        echo ""
+        echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
+        echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
+        echo "are available for backfill."
+        echo ""
+        read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
+        case "$ICLOUD_SYNCED" in
+            [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
+            *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
+        esac
     else
         echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
     fi
