@@ -3,10 +3,6 @@
 # {{.Phone}}, {{.Email}}, {{.ID}}
 displayname_template: "{{if .FirstName}}{{.FirstName}}{{if .LastName}} {{.LastName}}{{end}}{{else if .Nickname}}{{.Nickname}}{{else if .Phone}}{{.Phone}}{{else if .Email}}{{.Email}}{{else}}{{.ID}}{{end}}"
 
-# How many days back to look for chats during initial sync.
-# Default is 365 (1 year). Set to 0 to use the default.
-initial_sync_days: 365
-
 # Enable CloudKit message history backfill.
 # When true, the bridge will sync past messages from iCloud during setup.
 # Requires entering your device PIN during login to join the iCloud Keychain.

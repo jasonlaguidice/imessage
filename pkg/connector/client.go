@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"html"
 	"image"
+	"math"
 	"image/jpeg"
 	"path/filepath"
 	"regexp"
@@ -2510,6 +2511,8 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 
 // GetBackfillMaxBatchCount returns -1 (unlimited) so backward backfill
 // processes all available messages in cloud_message without a batch cap.
+// When the user caps max_initial_messages, FetchMessages short-circuits
+// backward requests to return empty immediately.
 func (c *IMClient) GetBackfillMaxBatchCount(_ context.Context, _ *bridgev2.Portal, _ *database.BackfillTask) int {
 	return -1
 }
@@ -2541,6 +2544,13 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
 			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+
+	// When the user has capped max_initial_messages, skip backward backfill
+	// entirely. Forward backfill already delivered the capped N messages;
+	// returning empty here marks the backward task as done immediately.
+	if !params.Forward && c.Main.Bridge.Config.Backfill.MaxInitialMessages < math.MaxInt32 {
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
 	}
 
 	count := params.Count
@@ -2628,57 +2638,77 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		chunk := 0
 		remaining := count
 
-		for remaining > 0 {
-			chunkLimit := forwardChunkSize
-			if chunkLimit > remaining {
-				chunkLimit = remaining
-			}
-
+		if !hasCursor {
+			// No anchor: fetch the N most recent messages. listLatestMessages
+			// selects the newest N (crash resilience — if interrupted, the
+			// delivered messages are recent, not ancient). We reverse to
+			// chronological (ASC) order before sending so the Matrix timeline
+			// displays correctly.
 			queryStart := time.Now()
-			var rows []cloudMessageRow
-			var queryErr error
-			if hasCursor {
-				rows, queryErr = c.cloudStore.listForwardMessages(ctx, portalID, cursorTS, cursorGUID, chunkLimit)
-			} else {
-				// First chunk for a new portal: start from oldest messages.
-				rows, queryErr = c.cloudStore.listOldestMessages(ctx, portalID, chunkLimit)
-			}
+			rows, queryErr := c.cloudStore.listLatestMessages(ctx, portalID, count)
 			if queryErr != nil {
-				log.Err(queryErr).Str("portal_id", portalID).Int("chunk", chunk).Msg("Forward backfill: query FAILED")
+				log.Err(queryErr).Str("portal_id", portalID).Msg("Forward backfill: listLatestMessages FAILED")
 				return nil, queryErr
 			}
-			if len(rows) == 0 {
-				break
+			for i, j := 0, len(rows)-1; i < j; i, j = i+1, j-1 {
+				rows[i], rows[j] = rows[j], rows[i]
 			}
-
-			// Pre-upload any uncached attachments in this chunk in parallel
-			// before conversion. This prevents the sequential conversion loop
-			// from doing live CloudKit downloads (90s timeout each), which
-			// would hang the portal event loop for hours on large portals.
 			c.preUploadChunkAttachments(ctx, rows, *log)
-
-			allRows = append(allRows, rows...)
-			totalRows += len(rows)
-			chunk++
-
+			allRows = rows
+			totalRows = len(rows)
+			chunk = 1
 			log.Debug().
 				Str("portal_id", portalID).
-				Int("chunk", chunk).
-				Int("chunk_rows", len(rows)).
-				Int("total_rows", totalRows).
-				Dur("chunk_query_ms", time.Since(queryStart)).
-				Msg("Forward backfill: chunk fetched")
+				Int("rows", totalRows).
+				Dur("query_ms", time.Since(queryStart)).
+				Msg("Forward backfill: fetched most recent messages")
+		} else {
+			// Anchor path (catchup): page forward from the anchor message.
+			for remaining > 0 {
+				chunkLimit := forwardChunkSize
+				if chunkLimit > remaining {
+					chunkLimit = remaining
+				}
 
-			// Advance cursor to the last row in this chunk for the next iteration.
-			lastRow := rows[len(rows)-1]
-			cursorTS = lastRow.TimestampMS
-			cursorGUID = lastRow.GUID
-			hasCursor = true
-			remaining -= len(rows)
+				queryStart := time.Now()
+				rows, queryErr := c.cloudStore.listForwardMessages(ctx, portalID, cursorTS, cursorGUID, chunkLimit)
+				if queryErr != nil {
+					log.Err(queryErr).Str("portal_id", portalID).Int("chunk", chunk).Msg("Forward backfill: query FAILED")
+					return nil, queryErr
+				}
+				if len(rows) == 0 {
+					break
+				}
 
-			// If we got fewer rows than requested, there are no more.
-			if len(rows) < chunkLimit {
-				break
+				// Pre-upload any uncached attachments in this chunk in parallel
+				// before conversion. This prevents the sequential conversion loop
+				// from doing live CloudKit downloads (90s timeout each), which
+				// would hang the portal event loop for hours on large portals.
+				c.preUploadChunkAttachments(ctx, rows, *log)
+
+				allRows = append(allRows, rows...)
+				totalRows += len(rows)
+				chunk++
+
+				log.Debug().
+					Str("portal_id", portalID).
+					Int("chunk", chunk).
+					Int("chunk_rows", len(rows)).
+					Int("total_rows", totalRows).
+					Dur("chunk_query_ms", time.Since(queryStart)).
+					Msg("Forward backfill: chunk fetched")
+
+				// Advance cursor to the last row in this chunk for the next iteration.
+				lastRow := rows[len(rows)-1]
+				cursorTS = lastRow.TimestampMS
+				cursorGUID = lastRow.GUID
+				hasCursor = true
+				remaining -= len(rows)
+
+				// If we got fewer rows than requested, there are no more.
+				if len(rows) < chunkLimit {
+					break
+				}
 			}
 		}
 
@@ -3382,6 +3412,14 @@ func (c *IMClient) downloadAndUploadAttachment(
 // portal event loop stall caused by image-heavy conversations (e.g. 486 pics).
 func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 	if c.cloudStore == nil {
+		return
+	}
+	// When the user has capped max_initial_messages, skip the bulk startup
+	// pre-upload. The per-chunk preUploadChunkAttachments in FetchMessages
+	// already handles attachments for the rows actually being backfilled.
+	// The startup pre-upload is an optimization for the unlimited case where
+	// thousands of attachments need warming before portal creation.
+	if c.Main.Bridge.Config.Backfill.MaxInitialMessages < math.MaxInt32 {
 		return
 	}
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_preupload").Logger()

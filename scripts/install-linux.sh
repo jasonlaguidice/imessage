@@ -88,7 +88,7 @@ open('$CONFIG', 'w').write(text)
 "
     # iMessage CloudKit chats can have tens of thousands of messages.
     # Deliver all history in one forward batch to avoid DAG fragmentation.
-    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+    sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
     sed -i 's/max_catchup_messages: [0-9]*/max_catchup_messages: 5000/' "$CONFIG"
     sed -i 's/batch_size: [0-9]*/batch_size: 10000/' "$CONFIG"
     sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
@@ -137,16 +137,52 @@ if [ -t 0 ]; then
     fi
 fi
 
+# ── Max initial messages (new database + CloudKit backfill + interactive) ──
+CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+if [ "$CURRENT_BACKFILL" = "true" ] && [ -t 0 ]; then
+    DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+    if [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; then
+        echo ""
+        echo "By default, all messages per chat will be backfilled."
+        echo "If you choose to limit, the minimum is 100 messages per chat."
+        read -p "Would you like to limit the number of messages? [y/N]: " LIMIT_MSGS
+        case "$LIMIT_MSGS" in
+            [yY]*)
+                while true; do
+                    read -p "Max messages per chat (minimum 100): " MAX_MSGS
+                    MAX_MSGS=$(echo "$MAX_MSGS" | tr -dc '0-9')
+                    if [ -n "$MAX_MSGS" ] && [ "$MAX_MSGS" -ge 100 ] 2>/dev/null; then
+                        break
+                    fi
+                    echo "Minimum is 100. Please enter a value of 100 or more."
+                done
+                sed -i "s/max_initial_messages: [0-9]*/max_initial_messages: $MAX_MSGS/" "$CONFIG"
+                # Disable backward backfill so the cap is the final word on message count
+                sed -i 's/max_batches: -1$/max_batches: 0/' "$CONFIG"
+                echo "✓ Max initial messages set to $MAX_MSGS per chat"
+                ;;
+            *)
+                echo "✓ Backfilling all messages"
+                ;;
+        esac
+    fi
+fi
+
 # Tune backfill settings when CloudKit backfill is enabled
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
 if [ "$CURRENT_BACKFILL" = "true" ]; then
     PATCHED_BACKFILL=false
-    if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
-        sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
-        PATCHED_BACKFILL=true
+    # Only enable unlimited backward backfill when max_initial is uncapped.
+    # When the user caps max_initial_messages, max_batches stays at 0 so the
+    # bridge won't backfill beyond the cap.
+    if grep -q 'max_initial_messages: 2147483647' "$CONFIG" 2>/dev/null; then
+        if grep -q 'max_batches: 0$' "$CONFIG" 2>/dev/null; then
+            sed -i 's/max_batches: 0$/max_batches: -1/' "$CONFIG"
+            PATCHED_BACKFILL=true
+        fi
     fi
-    if grep -q 'max_initial_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
-        sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 50000/' "$CONFIG"
+    if grep -q 'max_initial_messages: [0-9]\{1,2\}$' "$CONFIG" 2>/dev/null; then
+        sed -i 's/max_initial_messages: [0-9]*/max_initial_messages: 2147483647/' "$CONFIG"
         PATCHED_BACKFILL=true
     fi
     if grep -q 'max_catchup_messages: [0-9]\{1,3\}$' "$CONFIG" 2>/dev/null; then
@@ -162,7 +198,7 @@ if [ "$CURRENT_BACKFILL" = "true" ]; then
         PATCHED_BACKFILL=true
     fi
     if [ "$PATCHED_BACKFILL" = true ]; then
-        echo "✓ Updated backfill settings (max_initial=50000, batch_size=10000, max_batches=-1)"
+        echo "✓ Updated backfill settings (max_initial=unlimited, batch_size=10000, max_batches=-1)"
     fi
 fi
 
@@ -189,22 +225,6 @@ if [ "$FIRST_RUN" = true ]; then
     echo "└─────────────────────────────────────────────────┘"
     echo ""
     read -p "Press Enter once your homeserver is restarted..."
-fi
-
-# ── Backfill window (first install only, only when backfill is enabled) ──
-CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
-if [ "$CURRENT_BACKFILL" = "true" ]; then
-    DB_PATH=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
-    if [ -t 0 ] && { [ -z "$DB_PATH" ] || [ ! -f "$DB_PATH" ]; }; then
-        CURRENT_DAYS=$(grep 'initial_sync_days:' "$CONFIG" | head -1 | sed 's/.*initial_sync_days: *//')
-        [ -z "$CURRENT_DAYS" ] && CURRENT_DAYS=365
-        printf "How many days of message history to backfill? [%s]: " "$CURRENT_DAYS"
-        read BACKFILL_DAYS
-        BACKFILL_DAYS=$(echo "$BACKFILL_DAYS" | tr -dc '0-9')
-        [ -z "$BACKFILL_DAYS" ] && BACKFILL_DAYS="$CURRENT_DAYS"
-        sed -i "s/initial_sync_days: .*/initial_sync_days: $BACKFILL_DAYS/" "$CONFIG"
-        echo "✓ Backfill window set to $BACKFILL_DAYS days"
-    fi
 fi
 
 # ── Restore CardDAV config from backup ────────────────────────
