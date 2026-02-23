@@ -86,22 +86,34 @@ func (c *IMClient) setCloudSyncDone() {
 		Msg("Waiting for initial forward backfills before flushing APNs buffer")
 
 	// Safety-net goroutine: if some FetchMessages calls never complete (e.g.
-	// portal deleted before bridgev2 processes the ChatResync event, existing
-	// portals that don't trigger a forward backfill, or a crash/timeout),
-	// force-flush the buffer after 10 seconds so APNs messages are never
-	// permanently suppressed.
+	// portal deleted before bridgev2 processes the ChatResync event, or a
+	// crash/panic inside FetchMessages), force-flush the buffer so APNs
+	// messages are never permanently suppressed.
+	//
+	// Uses an activity-based deadline rather than a fixed one: the timer
+	// resets every time any forward backfill completes. This lets slow
+	// hardware (or large accounts) take as long as needed, while still
+	// eventually force-flushing if nothing makes progress for 5 minutes
+	// (i.e. a portal is genuinely stuck and will never finish).
 	go func() {
-		deadline := time.Now().Add(10 * time.Second)
+		const noProgressTimeout = 5 * time.Minute
+		lastCount := atomic.LoadInt64(&c.pendingInitialBackfills)
+		deadline := time.Now().Add(noProgressTimeout)
 		for time.Now().Before(deadline) {
 			if atomic.LoadInt64(&c.pendingInitialBackfills) <= 0 {
 				// onForwardBackfillDone already flushed the buffer.
 				return
 			}
 			time.Sleep(250 * time.Millisecond)
+			if current := atomic.LoadInt64(&c.pendingInitialBackfills); current < lastCount {
+				// Progress was made — reset the no-progress deadline.
+				lastCount = current
+				deadline = time.Now().Add(noProgressTimeout)
+			}
 		}
 		remaining := atomic.LoadInt64(&c.pendingInitialBackfills)
 		log.Warn().Int64("remaining", remaining).
-			Msg("APNs buffer flush timeout: not all initial backfills completed, forcing flush")
+			Msg("APNs buffer flush timeout: no forward backfill progress in 5 minutes, forcing flush")
 		// Mirror what onForwardBackfillDone does: stamp the flush time so the
 		// read-receipt grace window (handleReadReceipt) knows the burst is done.
 		atomic.StoreInt64(&c.apnsBufferFlushedAt, time.Now().UnixMilli())
