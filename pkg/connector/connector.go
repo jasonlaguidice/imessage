@@ -11,6 +11,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"math"
 	"runtime"
 	"time"
 
@@ -65,19 +66,23 @@ func (c *IMConnector) Start(ctx context.Context) error {
 		if !cfg.Enabled {
 			cfg.Enabled = true
 		}
-		if cfg.MaxInitialMessages <= 100 {
-			cfg.MaxInitialMessages = 50000
+		if cfg.MaxInitialMessages < 100 {
+			cfg.MaxInitialMessages = math.MaxInt32 // uncapped — backfill everything CloudKit downloaded
 		}
-		if cfg.MaxCatchupMessages <= 500 {
-			cfg.MaxCatchupMessages = 5000
-		}
+		// Catchup should match the initial cap — unlimited when uncapped,
+		// capped when the user caps max_initial_messages.
+		cfg.MaxCatchupMessages = cfg.MaxInitialMessages
 		if !cfg.Queue.Enabled {
 			cfg.Queue.Enabled = true
 		}
 		if cfg.Queue.BatchSize <= 100 {
 			cfg.Queue.BatchSize = 10000
 		}
-		if cfg.Queue.MaxBatches == 0 {
+		if cfg.MaxInitialMessages < math.MaxInt32 {
+			// User explicitly capped initial messages — disable backward
+			// backfill so the cap is the final word on message count.
+			cfg.Queue.MaxBatches = 0
+		} else if cfg.Queue.MaxBatches == 0 {
 			cfg.Queue.MaxBatches = -1
 		}
 	}

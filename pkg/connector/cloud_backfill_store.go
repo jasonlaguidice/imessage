@@ -162,6 +162,26 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	}
 
 
+	// Migration: add deleted column to cloud_chat if missing.
+	// Soft-deletes cloud_chat rows alongside cloud_message rows so that
+	// restore-chat can recover group name and participants.
+	var hasChatDeleted int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='deleted'`).Scan(&hasChatDeleted)
+	if hasChatDeleted == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN deleted BOOLEAN NOT NULL DEFAULT FALSE`); err != nil {
+			return fmt.Errorf("failed to add deleted column to cloud_chat: %w", err)
+		}
+	}
+
+	// Migration: add is_filtered column to cloud_chat if missing
+	var hasIsFiltered int
+	_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name='is_filtered'`).Scan(&hasIsFiltered)
+	if hasIsFiltered == 0 {
+		if _, err := s.db.Exec(ctx, `ALTER TABLE cloud_chat ADD COLUMN is_filtered INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return fmt.Errorf("failed to add is_filtered column: %w", err)
+		}
+	}
+
 	// Migration: add rich content columns to cloud_message if missing
 	richCols := []struct {
 		name string
@@ -761,8 +781,8 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
-			group_photo_guid, participants_json, updated_ts, created_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			group_photo_guid, participants_json, updated_ts, created_ts, is_filtered
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -783,7 +803,8 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 				WHEN excluded.updated_ts >= COALESCE(cloud_chat.updated_ts, 0)
 				THEN excluded.updated_ts
 				ELSE cloud_chat.updated_ts
-			END
+			END,
+			is_filtered=excluded.is_filtered
 	`)
 	if err != nil {
 		return fmt.Errorf("failed to prepare batch statement: %w", err)
@@ -795,7 +816,7 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 		_, err = stmt.ExecContext(ctx,
 			s.loginID, chat.CloudChatID, chat.RecordName, chat.GroupID,
 			chat.PortalID, chat.Service, chat.DisplayName,
-			chat.GroupPhotoGuid, chat.ParticipantsJSON, chat.UpdatedTS, nowMS,
+			chat.GroupPhotoGuid, chat.ParticipantsJSON, chat.UpdatedTS, nowMS, chat.IsFiltered,
 		)
 		if err != nil {
 			return fmt.Errorf("failed to insert chat %s: %w", chat.CloudChatID, err)
@@ -864,6 +885,7 @@ type cloudChatUpsertRow struct {
 	GroupPhotoGuid   any // nil or string
 	ParticipantsJSON string
 	UpdatedTS        int64
+	IsFiltered       int64
 }
 
 func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID string) (string, error) {
@@ -889,6 +911,22 @@ func (s *cloudBackfillStore) getChatPortalID(ctx context.Context, cloudChatID st
 		return "", err
 	}
 	return portalID, nil
+}
+
+// portalHasChat returns true if the given portal_id has at least one
+// cloud_chat record (i.e., the conversation was included in CloudKit chat
+// sync). Portals with no chat record are orphaned — typically junk/spam
+// that Apple filters from the chat zone.
+func (s *cloudBackfillStore) portalHasChat(ctx context.Context, portalID string) (bool, error) {
+	var count int
+	err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE`,
+		s.loginID, portalID,
+	).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
 }
 
 func (s *cloudBackfillStore) hasChat(ctx context.Context, cloudChatID string) (bool, error) {
@@ -1081,17 +1119,18 @@ func (s *cloudBackfillStore) updateDisplayNameByPortalID(ctx context.Context, po
 	return err
 }
 
-// deleteLocalChatByPortalID removes the cloud_chat records for a portal and
-// soft-deletes its cloud_message records (sets deleted=TRUE, preserves the rows).
+// deleteLocalChatByPortalID soft-deletes the cloud_chat and cloud_message
+// records for a portal (sets deleted=TRUE, preserves the rows).
 //
-// cloud_chat is hard-deleted: it maps CloudKit record_names to portal IDs and
-// is no longer needed once the portal is gone.
+// cloud_chat is soft-deleted so that restore-chat can recover group name and
+// participant data. Queries that drive portal creation (listPortalIDsWithNewestTimestamp,
+// portalHasChat) filter on deleted=FALSE so soft-deleted rows don't resurrect portals.
 //
 // cloud_message is soft-deleted, NOT hard-deleted. The rows' GUIDs must survive
 // so that hasMessageUUID can detect stale APNs echoes even after:
-//  - pending_cloud_deletion is cleared (CloudKit deletion finished)
-//  - Bridge restarts (recentlyDeletedPortals is repopulated from pending entries,
-//    but once cleared there is no in-memory protection)
+//   - pending_cloud_deletion is cleared (CloudKit deletion finished)
+//   - Bridge restarts (recentlyDeletedPortals is repopulated from pending entries,
+//     but once cleared there is no in-memory protection)
 //
 // hasMessageUUID queries cloud_message without filtering on deleted, so
 // soft-deleted UUIDs still block echoes. Fresh UUIDs from genuinely new
@@ -1102,10 +1141,10 @@ func (s *cloudBackfillStore) updateDisplayNameByPortalID(ctx context.Context, po
 // soft-deleted rows don't trigger backfill or portal resurrection.
 func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, portalID string) error {
 	if _, err := s.db.Exec(ctx,
-		`DELETE FROM cloud_chat WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET deleted=TRUE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	); err != nil {
-		return fmt.Errorf("failed to delete cloud_chat records for portal %s: %w", portalID, err)
+		return fmt.Errorf("failed to soft-delete cloud_chat records for portal %s: %w", portalID, err)
 	}
 	nowMS := time.Now().UnixMilli()
 	if _, err := s.db.Exec(ctx,
@@ -1181,7 +1220,7 @@ func (s *cloudBackfillStore) portalHasPreStartupOutgoingMessages(ctx context.Con
 // group UUIDs. Participants are compared after normalization (tel:/mailto: prefix).
 func (s *cloudBackfillStore) findPortalIDsByParticipants(ctx context.Context, normalizedTarget []string) ([]string, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> ''`,
+		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat WHERE login_id=$1 AND portal_id <> '' AND deleted=FALSE`,
 		s.loginID,
 	)
 	if err != nil {
@@ -1453,7 +1492,7 @@ type portalWithNewestMessage struct {
 // their updated_ts from the cloud_chat table so they still get portals created.
 func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Context) ([]portalWithNewestMessage, error) {
 	rows, err := s.db.Query(ctx, `
-		SELECT portal_id, MAX(newest_ts) AS newest_ts, SUM(msg_count) AS msg_count FROM (
+		SELECT sub.portal_id, MAX(sub.newest_ts) AS newest_ts, SUM(sub.msg_count) AS msg_count FROM (
 			SELECT portal_id, MAX(timestamp_ms) AS newest_ts, COUNT(*) AS msg_count
 			FROM cloud_message
 			WHERE login_id=$1 AND portal_id IS NOT NULL AND portal_id <> '' AND deleted=FALSE
@@ -1464,12 +1503,18 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 			SELECT cc.portal_id, COALESCE(cc.updated_ts, 0) AS newest_ts, 0 AS msg_count
 			FROM cloud_chat cc
 			WHERE cc.login_id=$1 AND cc.portal_id IS NOT NULL AND cc.portal_id <> ''
+			AND COALESCE(cc.is_filtered, 0) = 0
+			AND cc.deleted = FALSE
 			AND cc.portal_id NOT IN (
 				SELECT DISTINCT cm.portal_id FROM cloud_message cm
 				WHERE cm.login_id=$1 AND cm.portal_id IS NOT NULL AND cm.portal_id <> '' AND cm.deleted=FALSE
 			)
+		) sub
+		WHERE NOT EXISTS (
+			SELECT 1 FROM cloud_chat fc
+			WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) != 0
 		)
-		GROUP BY portal_id
+		GROUP BY sub.portal_id
 		ORDER BY newest_ts DESC
 	`, s.loginID)
 	if err != nil {
@@ -1535,6 +1580,15 @@ func (s *cloudBackfillStore) listSoftDeletedPortals(ctx context.Context) ([]soft
 // setting deleted=FALSE on all cloud_message rows for the portal.
 // Returns the number of rows updated.
 func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context, portalID string) (int, error) {
+	// Un-soft-delete cloud_chat rows so GetChatInfo can resolve group name
+	// and participants during the ChatResync that follows restore.
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET deleted=FALSE WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
+		s.loginID, portalID,
+	); err != nil {
+		return 0, fmt.Errorf("failed to undelete cloud_chat for portal %s: %w", portalID, err)
+	}
+
 	result, err := s.db.Exec(ctx,
 		`UPDATE cloud_message SET deleted=FALSE, updated_ts=$3
 		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
@@ -1594,6 +1648,21 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 	)
 }
 
+// isForwardBackfillDone returns true if forward backfill has completed for the
+// given portal. Used by backward backfill to avoid permanently marking
+// is_done=true before forward backfill has inserted the anchor message.
+func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID string) bool {
+	var done bool
+	err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=1)`,
+		s.loginID, portalID,
+	).Scan(&done)
+	if err != nil {
+		return false
+	}
+	return done
+}
+
 // getForwardBackfillDonePortals returns the set of portal IDs whose forward
 // FetchMessages has completed at least once. Used by preUploadCloudAttachments
 // to skip portals that don't need pre-upload on restart.
@@ -1615,6 +1684,75 @@ func (s *cloudBackfillStore) getForwardBackfillDonePortals(ctx context.Context) 
 		done[id] = true
 	}
 	return done, rows.Err()
+}
+
+// hasCloudReadReceipt checks whether a message UUID in cloud_message already
+// has a valid date_read_ms (i.e., CloudKit recorded that it was read). Used to
+// suppress duplicate APNs read receipts that arrive after backfill — the
+// synthetic receipt already used the correct CloudKit timestamp, so the stale
+// APNs receipt (with delivery-time instead of read-time) should be dropped.
+// Uses case-insensitive GUID matching (APNs delivers uppercase, CloudKit may be mixed).
+func (s *cloudBackfillStore) hasCloudReadReceipt(ctx context.Context, uuid string) (bool, error) {
+	var dateReadMS int64
+	err := s.db.QueryRow(ctx, `
+		SELECT COALESCE(date_read_ms, 0)
+		FROM cloud_message
+		WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND is_from_me=TRUE
+		LIMIT 1
+	`, s.loginID, uuid).Scan(&dateReadMS)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return dateReadMS > 978307200000, nil
+}
+
+// isCloudBackfilledMessage checks whether a message UUID exists in the
+// cloud_message table as a CloudKit-synced message. CloudKit entries (from
+// upsertMessageBatch) have record_name populated, while real-time entries
+// (from persistMessageUUID) have record_name=''. This distinguishes
+// backfilled messages whose ghost receipts should be suppressed from
+// real-time messages whose ghost receipts should go through.
+func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid string) (bool, error) {
+	var exists bool
+	err := s.db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM cloud_message
+			WHERE login_id=$1 AND UPPER(guid)=UPPER($2) AND record_name != ''
+		)
+	`, s.loginID, uuid).Scan(&exists)
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// getConversationReadByMe returns true if the portal has no unread incoming
+// messages — i.e., the user has read the entire conversation on the iMessage
+// side. This is approximated by checking if any incoming messages exist that
+// are newer than the latest outgoing message (if we sent a reply, we must have
+// read everything before it). Returns false if there are no incoming messages.
+func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portalID string) (bool, error) {
+	// Strategy: if the newest message in the portal is from_me, the user has
+	// seen the conversation. If the newest is NOT from_me, they might not have.
+	// This is a heuristic — CloudKit doesn't store "I read their message".
+	var isFromMe bool
+	err := s.db.QueryRow(ctx, `
+		SELECT is_from_me
+		FROM cloud_message
+		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
+		ORDER BY timestamp_ms DESC, guid DESC
+		LIMIT 1
+	`, s.loginID, portalID).Scan(&isFromMe)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return isFromMe, nil
 }
 
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose

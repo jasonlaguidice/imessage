@@ -98,7 +98,7 @@ func fnRestoreChat(ce *commands.Event) {
 	var sb strings.Builder
 	sb.WriteString("**Deleted iMessage rooms:**\n\n")
 	for i, p := range active {
-		name := friendlyPortalName(ce.Ctx, ce.Bridge, networkid.PortalKey{
+		name := friendlyPortalName(ce.Ctx, ce.Bridge, client, networkid.PortalKey{
 			ID:       networkid.PortalID(p.PortalID),
 			Receiver: login.ID,
 		}, p.PortalID)
@@ -126,7 +126,7 @@ func fnRestoreChat(ce *commands.Event) {
 			chosen := active[n-1]
 			portalID := chosen.PortalID
 			portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: login.ID}
-			name := friendlyPortalName(ce.Ctx, ce.Bridge, portalKey, portalID)
+			name := friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
 
 			restored, err := client.cloudStore.undeleteCloudMessagesByPortalID(ce.Ctx, portalID)
 			if err != nil {
@@ -160,15 +160,22 @@ func fnRestoreChat(ce *commands.Event) {
 }
 
 // friendlyPortalName returns a human-readable name for a portal.
-// Tries the bridgev2 portal DB first, then falls back to formatting the
-// portal_id (stripping tel:/mailto: prefixes).
-func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, key networkid.PortalKey, portalID string) string {
+// Tries the bridgev2 portal DB first, then the IMClient's resolveGroupName
+// (which checks cloud_chat for display_name and participant contacts),
+// then falls back to formatting the portal_id.
+func friendlyPortalName(ctx context.Context, bridge *bridgev2.Bridge, client *IMClient, key networkid.PortalKey, portalID string) string {
 	if portal, _ := bridge.GetExistingPortalByKey(ctx, key); portal != nil && portal.Name != "" {
 		return portal.Name
 	}
+	// For group chats, resolve from cloud store (display_name / contact names).
+	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
+	if isGroup && client != nil {
+		if name := client.resolveGroupName(ctx, portalID); name != "" && name != "Group Chat" {
+			return name
+		}
+	}
 	// Strip URI prefix for a cleaner display.
 	id := strings.TrimPrefix(strings.TrimPrefix(portalID, "mailto:"), "tel:")
-	// Capitalize group IDs slightly.
 	if strings.HasPrefix(portalID, "gid:") {
 		return "Group " + strings.TrimPrefix(portalID, "gid:")[:8] + "…"
 	}

@@ -2881,6 +2881,7 @@ type WrappedCloudSyncChat struct {
 	Deleted            bool
 	UpdatedTimestampMs uint64
 	GroupPhotoGuid     *string
+	IsFiltered         int64
 }
 
 func (r *WrappedCloudSyncChat) Destroy() {
@@ -2894,6 +2895,7 @@ func (r *WrappedCloudSyncChat) Destroy() {
 	FfiDestroyerBool{}.Destroy(r.Deleted)
 	FfiDestroyerUint64{}.Destroy(r.UpdatedTimestampMs)
 	FfiDestroyerOptionalString{}.Destroy(r.GroupPhotoGuid)
+	FfiDestroyerInt64{}.Destroy(r.IsFiltered)
 }
 
 type FfiConverterTypeWrappedCloudSyncChat struct{}
@@ -2916,6 +2918,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Read(reader io.Reader) WrappedClou
 		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterUint64INSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterInt64INSTANCE.Read(reader),
 	}
 }
 
@@ -2934,6 +2937,7 @@ func (c FfiConverterTypeWrappedCloudSyncChat) Write(writer io.Writer, value Wrap
 	FfiConverterBoolINSTANCE.Write(writer, value.Deleted)
 	FfiConverterUint64INSTANCE.Write(writer, value.UpdatedTimestampMs)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.GroupPhotoGuid)
+	FfiConverterInt64INSTANCE.Write(writer, value.IsFiltered)
 }
 
 type FfiDestroyerTypeWrappedCloudSyncChat struct{}

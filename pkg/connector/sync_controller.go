@@ -43,6 +43,7 @@ type cloudSyncCounters struct {
 	Updated  int
 	Skipped  int
 	Deleted  int
+	Filtered int
 }
 
 func (c *cloudSyncCounters) add(other cloudSyncCounters) {
@@ -50,6 +51,7 @@ func (c *cloudSyncCounters) add(other cloudSyncCounters) {
 	c.Updated += other.Updated
 	c.Skipped += other.Skipped
 	c.Deleted += other.Deleted
+	c.Filtered += other.Filtered
 }
 
 func (c *IMClient) setCloudSyncDone() {
@@ -84,22 +86,34 @@ func (c *IMClient) setCloudSyncDone() {
 		Msg("Waiting for initial forward backfills before flushing APNs buffer")
 
 	// Safety-net goroutine: if some FetchMessages calls never complete (e.g.
-	// portal deleted before bridgev2 processes the ChatResync event, existing
-	// portals that don't trigger a forward backfill, or a crash/timeout),
-	// force-flush the buffer after 10 seconds so APNs messages are never
-	// permanently suppressed.
+	// portal deleted before bridgev2 processes the ChatResync event, or a
+	// crash/panic inside FetchMessages), force-flush the buffer so APNs
+	// messages are never permanently suppressed.
+	//
+	// Uses an activity-based deadline rather than a fixed one: the timer
+	// resets every time any forward backfill completes. This lets slow
+	// hardware (or large accounts) take as long as needed, while still
+	// eventually force-flushing if nothing makes progress for 5 minutes
+	// (i.e. a portal is genuinely stuck and will never finish).
 	go func() {
-		deadline := time.Now().Add(10 * time.Second)
+		const noProgressTimeout = 5 * time.Minute
+		lastCount := atomic.LoadInt64(&c.pendingInitialBackfills)
+		deadline := time.Now().Add(noProgressTimeout)
 		for time.Now().Before(deadline) {
 			if atomic.LoadInt64(&c.pendingInitialBackfills) <= 0 {
 				// onForwardBackfillDone already flushed the buffer.
 				return
 			}
 			time.Sleep(250 * time.Millisecond)
+			if current := atomic.LoadInt64(&c.pendingInitialBackfills); current < lastCount {
+				// Progress was made — reset the no-progress deadline.
+				lastCount = current
+				deadline = time.Now().Add(noProgressTimeout)
+			}
 		}
 		remaining := atomic.LoadInt64(&c.pendingInitialBackfills)
 		log.Warn().Int64("remaining", remaining).
-			Msg("APNs buffer flush timeout: not all initial backfills completed, forcing flush")
+			Msg("APNs buffer flush timeout: no forward backfill progress in 5 minutes, forcing flush")
 		// Mirror what onForwardBackfillDone does: stamp the flush time so the
 		// read-receipt grace window (handleReadReceipt) knows the burst is done.
 		atomic.StoreInt64(&c.apnsBufferFlushedAt, time.Now().UnixMilli())
@@ -754,7 +768,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 	log := c.Main.Bridge.Log.With().Str("component", "cloud_sync").Logger()
 	consecutiveErrors := 0
 	const maxConsecutiveAttErrors = 3
-	for page := 0; page < 256; page++ {
+	for page := 0; page < 10000; page++ {
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -826,7 +840,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	totalPages := 0
 	consecutiveErrors := 0
 	const maxConsecutiveChatErrors = 3
-	for page := 0; page < 256; page++ {
+	for page := 0; page < 10000; page++ {
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -879,7 +893,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 	}
 
 	log.Info().Int("total_pages", totalPages).Int("imported", counts.Imported).Int("updated", counts.Updated).
-		Int("skipped", counts.Skipped).Int("deleted", counts.Deleted).
+		Int("skipped", counts.Skipped).Int("deleted", counts.Deleted).Int("filtered", counts.Filtered).
 		Msg("CloudKit chat sync finished")
 
 	return counts, token, nil
@@ -937,7 +951,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 	consecutiveErrors := 0
 	const maxConsecutiveErrors = 3
 	totalPages := 0
-	for page := 0; page < 256; page++ {
+	for page := 0; page < 10000; page++ {
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
@@ -1001,6 +1015,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 		Int("updated", counts.Updated).
 		Int("skipped", counts.Skipped).
 		Int("deleted", counts.Deleted).
+		Int("filtered", counts.Filtered).
 		Msg("CloudKit message sync finished")
 
 	return counts, token, nil
@@ -1066,9 +1081,17 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			GroupPhotoGuid:   nullableString(chat.GroupPhotoGuid),
 			ParticipantsJSON: string(participantsJSON),
 			UpdatedTS:        int64(chat.UpdatedTimestampMs),
+			IsFiltered:       chat.IsFiltered,
 		})
 
-		if existingSet[chat.CloudChatId] {
+		if chat.IsFiltered != 0 {
+			counts.Filtered++
+			log.Debug().
+				Str("cloud_chat_id", chat.CloudChatId).
+				Str("portal_id", portalID).
+				Int64("is_filtered", chat.IsFiltered).
+				Msg("Stored filtered/junk chat from CloudKit (will skip messages)")
+		} else if existingSet[chat.CloudChatId] {
 			counts.Updated++
 		} else {
 			counts.Imported++
@@ -1296,6 +1319,22 @@ func (c *IMClient) ingestCloudMessages(
 				Msg("Skipping message: could not resolve portal ID")
 			counts.Skipped++
 			continue
+		}
+
+		// Skip orphaned messages: no chat_id AND no cloud_chat record for the
+		// resolved portal. Apple omits filtered/junk chats from the chat zone
+		// entirely, so these messages have no chat association and represent
+		// spam or unknown-sender conversations the user never sees in iMessage.
+		if msg.CloudChatId == "" && c.cloudStore != nil {
+			if hasChat, err := c.cloudStore.portalHasChat(ctx, portalID); err == nil && !hasChat {
+				log.Debug().
+					Str("guid", msg.Guid).
+					Str("portal_id", portalID).
+					Str("sender", msg.Sender).
+					Msg("Skipping orphaned message (no chat_id, no chat record)")
+				counts.Filtered++
+				continue
+			}
 		}
 
 		text := ""
