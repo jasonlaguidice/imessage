@@ -1641,11 +1641,24 @@ func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recor
 // completed their initial forward FetchMessages call. Idempotent. Called from
 // FetchMessages when the forward pass completes so that preUploadCloudAttachments
 // skips this portal on the next restart instead of re-uploading every attachment.
+//
+// Self-healing: if the UPDATE hits 0 rows (no cloud_chat row matches this
+// portal_id), a synthetic row is inserted so the flag persists. This covers
+// APNs-created portals, CloudKit portal_id mismatches between cloud_message
+// and cloud_chat, and any other case where a portal exists without a
+// corresponding cloud_chat row.
 func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portalID string) {
-	_, _ = s.db.Exec(ctx,
+	res, _ := s.db.Exec(ctx,
 		`UPDATE cloud_chat SET fwd_backfill_done=1 WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	)
+	if rows, _ := res.RowsAffected(); rows == 0 {
+		_, _ = s.db.Exec(ctx, `
+			INSERT OR IGNORE INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
+			VALUES ($1, $2, $3, $4, 1)`,
+			s.loginID, "synthetic:"+portalID, portalID, time.Now().UnixMilli(),
+		)
+	}
 }
 
 // isForwardBackfillDone returns true if forward backfill has completed for the
