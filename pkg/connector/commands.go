@@ -19,6 +19,7 @@ package connector
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +28,8 @@ import (
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/bridgev2/simplevent"
+
+	"github.com/lrhodin/imessage/imessage"
 )
 
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
@@ -66,8 +69,20 @@ func fnRestoreChat(ce *commands.Event) {
 		return
 	}
 	client, ok := login.Client.(*IMClient)
-	if !ok || client == nil || client.cloudStore == nil {
+	if !ok || client == nil {
 		ce.Reply("Bridge client not available.")
+		return
+	}
+
+	// Chat.db path: list all chats from chat.db that don't have active rooms.
+	if client.Main.Config.UseChatDBBackfill() && client.chatDB != nil {
+		fnRestoreChatFromChatDB(ce, login, client)
+		return
+	}
+
+	// CloudKit path: list soft-deleted portals from the cloud store.
+	if client.cloudStore == nil {
+		ce.Reply("No backfill source available.")
 		return
 	}
 
@@ -155,6 +170,101 @@ func fnRestoreChat(ce *commands.Event) {
 			}
 		}),
 		Cancel: func() {}, // nothing to clean up
+	})
+}
+
+// fnRestoreChatFromChatDB handles restore-chat using the local macOS chat.db.
+// Lists all chats in chat.db that don't have an active Matrix room.
+func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, client *IMClient) {
+	chats, err := client.chatDB.api.GetChatsWithMessagesAfter(time.Time{})
+	if err != nil {
+		ce.Reply("Failed to query chat.db: %v", err)
+		return
+	}
+
+	type chatDBEntry struct {
+		portalID string
+		name     string
+	}
+	var candidates []chatDBEntry
+
+	for _, chat := range chats {
+		parsed := imessage.ParseIdentifier(chat.ChatGUID)
+		if parsed.LocalID == "" {
+			continue
+		}
+
+		var portalID string
+		if parsed.IsGroup {
+			info, err := client.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+			if err != nil || info == nil {
+				continue
+			}
+			members := []string{client.handle}
+			for _, m := range info.Members {
+				members = append(members, addIdentifierPrefix(m))
+			}
+			sort.Strings(members)
+			portalID = strings.Join(members, ",")
+		} else {
+			portalID = string(identifierToPortalID(parsed))
+		}
+
+		portalKey := networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: login.ID}
+		existing, _ := ce.Bridge.GetExistingPortalByKey(ce.Ctx, portalKey)
+		if existing != nil && existing.MXID != "" {
+			continue // room already exists
+		}
+
+		name := friendlyPortalName(ce.Ctx, ce.Bridge, client, portalKey, portalID)
+		candidates = append(candidates, chatDBEntry{portalID: portalID, name: name})
+	}
+
+	if len(candidates) == 0 {
+		ce.Reply("No chats found in chat.db that can be restored.")
+		return
+	}
+
+	var sb strings.Builder
+	sb.WriteString("**Chats available to restore from chat.db:**\n\n")
+	for i, c := range candidates {
+		sb.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, c.name))
+	}
+	sb.WriteString("\nReply with a number to restore, or `$cmdprefix cancel` to cancel.")
+	ce.Reply(sb.String())
+
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "restore chat",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			n, err := strconv.Atoi(strings.TrimSpace(ce.RawArgs))
+			if err != nil || n < 1 || n > len(candidates) {
+				ce.Reply("Please reply with a number between 1 and %d, or `$cmdprefix cancel` to cancel.", len(candidates))
+				return
+			}
+
+			commands.StoreCommandState(ce.User, nil)
+
+			chosen := candidates[n-1]
+			portalKey := networkid.PortalKey{ID: networkid.PortalID(chosen.portalID), Receiver: login.ID}
+
+			// Remove from recentlyDeletedPortals so recreation isn't blocked.
+			client.recentlyDeletedPortalsMu.Lock()
+			delete(client.recentlyDeletedPortals, chosen.portalID)
+			client.recentlyDeletedPortalsMu.Unlock()
+
+			client.Main.Bridge.QueueRemoteEvent(login, &simplevent.ChatResync{
+				EventMeta: simplevent.EventMeta{
+					Type:         bridgev2.RemoteEventChatResync,
+					PortalKey:    portalKey,
+					CreatePortal: true,
+					Timestamp:    time.Now(),
+				},
+				GetChatInfoFunc: client.GetChatInfo,
+			})
+
+			ce.Reply("Restoring **%s** — the room will appear shortly with history from chat.db.", chosen.name)
+		}),
+		Cancel: func() {},
 	})
 }
 

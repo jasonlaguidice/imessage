@@ -1,0 +1,377 @@
+// mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// Copyright (C) 2024 Ludvig Rhodin
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+package connector
+
+import (
+	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
+
+	"github.com/lrhodin/imessage/imessage"
+)
+
+// chatDB wraps the macOS chat.db iMessage API for backfill and contact
+// resolution. It does NOT listen for incoming messages (rustpush handles that).
+type chatDB struct {
+	api imessage.API
+}
+
+// openChatDB attempts to open the local iMessage chat.db database.
+// Returns nil if chat.db is not accessible (e.g., no Full Disk Access).
+func openChatDB(log zerolog.Logger) *chatDB {
+	if !canReadChatDB(log) {
+		showDialogAndOpenFDA(log)
+		waitForFDA(log)
+	}
+
+	adapter := newBridgeAdapter(&log)
+	api, err := imessage.NewAPI(adapter)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to initialize chat.db API via imessage.NewAPI")
+		return nil
+	}
+
+	return &chatDB{api: api}
+}
+
+// Close stops the chat.db API.
+func (db *chatDB) Close() {
+	if db.api != nil {
+		db.api.Stop()
+	}
+}
+
+// findGroupChatGUID finds a group chat GUID by matching the portal's members.
+// The portalID is comma-separated members like "tel:+1555...,tel:+1555...".
+func (db *chatDB) findGroupChatGUID(portalID string, c *IMClient) string {
+	// Parse members from portal ID (lowercase for case-insensitive matching)
+	portalMembers := strings.Split(portalID, ",")
+	portalMemberSet := make(map[string]struct{})
+	for _, m := range portalMembers {
+		portalMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+	}
+
+	// Search all group chats
+	chats, err := db.api.GetChatsWithMessagesAfter(time.Time{})
+	if err != nil {
+		return ""
+	}
+
+	for _, chat := range chats {
+		parsed := imessage.ParseIdentifier(chat.ChatGUID)
+		if !parsed.IsGroup {
+			continue
+		}
+		info, err := db.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+		if err != nil || info == nil {
+			continue
+		}
+
+		// Build member set from chat.db (add self, lowercase for case-insensitive matching)
+		chatMemberSet := make(map[string]struct{})
+		chatMemberSet[strings.ToLower(stripIdentifierPrefix(c.handle))] = struct{}{}
+		for _, m := range info.Members {
+			chatMemberSet[strings.ToLower(stripIdentifierPrefix(m))] = struct{}{}
+		}
+
+		// Check if members match
+		if len(chatMemberSet) == len(portalMemberSet) {
+			match := true
+			for m := range portalMemberSet {
+				if _, ok := chatMemberSet[m]; !ok {
+					match = false
+					break
+				}
+			}
+			if match {
+				return chat.ChatGUID
+			}
+		}
+	}
+	return ""
+}
+
+// FetchMessages retrieves historical messages from chat.db for backfill.
+func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessagesParams, c *IMClient) (*bridgev2.FetchMessagesResponse, error) {
+	portalID := string(params.Portal.ID)
+	log := zerolog.Ctx(ctx)
+
+	var chatGUIDs []string
+	if strings.Contains(portalID, ",") {
+		// Group portal: find chat GUID by matching members
+		chatGUID := db.findGroupChatGUID(portalID, c)
+		if chatGUID != "" {
+			chatGUIDs = []string{chatGUID}
+		}
+	} else {
+		// Use contact-aware lookup: includes chat GUIDs for all of the
+		// contact's phone numbers, so merged DM portals get complete history.
+		chatGUIDs = c.getContactChatGUIDs(portalID)
+	}
+
+	log.Info().Str("portal_id", portalID).Strs("chat_guids", chatGUIDs).Bool("forward", params.Forward).Msg("FetchMessages called")
+
+	if len(chatGUIDs) == 0 {
+		log.Warn().Str("portal_id", portalID).Msg("Could not find chat GUID for portal")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
+	}
+
+	count := params.Count
+	if count <= 0 {
+		count = 50
+	}
+
+	// Fetch messages from ALL chat GUIDs and merge. For contacts with multiple
+	// phone numbers, this combines messages from all numbers into one timeline.
+	// Also tries multiple GUID formats (any/iMessage/SMS) per phone number.
+	var messages []*imessage.Message
+	var lastErr error
+
+	// Respect the configured message cap. params.Count comes from the
+	// framework's MaxInitialMessages setting.
+	maxMessages := c.Main.Bridge.Config.Backfill.MaxInitialMessages
+
+	for _, chatGUID := range chatGUIDs {
+		var msgs []*imessage.Message
+		if params.AnchorMessage != nil {
+			if params.Forward {
+				msgs, lastErr = db.api.GetMessagesSinceDate(chatGUID, params.AnchorMessage.Timestamp, "")
+			} else {
+				msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, params.AnchorMessage.Timestamp, count)
+			}
+		} else {
+			// Fetch the most recent N messages (uncapped = MaxInt32, effectively all).
+			msgs, lastErr = db.api.GetMessagesBeforeWithLimit(chatGUID, time.Now().Add(time.Minute), maxMessages)
+		}
+		if lastErr == nil {
+			messages = append(messages, msgs...)
+		}
+	}
+
+	if len(messages) == 0 && lastErr != nil {
+		log.Error().Err(lastErr).Strs("chat_guids", chatGUIDs).Msg("Failed to fetch messages from chat.db")
+		return nil, fmt.Errorf("failed to fetch messages from chat.db: %w", lastErr)
+	}
+
+	// Sort chronologically — messages may come from multiple chat GUIDs
+	sort.Slice(messages, func(i, j int) bool {
+		return messages[i].Time.Before(messages[j].Time)
+	})
+
+	log.Info().Strs("chat_guids", chatGUIDs).Int("raw_message_count", len(messages)).Msg("Got messages from chat.db")
+
+	// Get an intent for uploading media. The bot intent works for all uploads.
+	intent := c.Main.Bridge.Bot
+
+	backfillMessages := make([]*bridgev2.BackfillMessage, 0, len(messages))
+	for _, msg := range messages {
+		if msg.ItemType != imessage.ItemTypeMessage || msg.Tapback != nil {
+			continue
+		}
+		sender := chatDBMakeEventSender(msg, c)
+
+		// Strip U+FFFC (object replacement character) — inline attachment
+		// placeholders from NSAttributedString that render as blank
+		msg.Text = strings.ReplaceAll(msg.Text, "\uFFFC", "")
+		msg.Text = strings.TrimSpace(msg.Text)
+
+		// Only create a text part if there's actual text content
+		if msg.Text != "" || msg.Subject != "" {
+			cm, err := convertChatDBMessage(ctx, params.Portal, intent, msg)
+			if err == nil {
+				backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
+					ConvertedMessage: cm,
+					Sender:           sender,
+					ID:               makeMessageID(msg.GUID),
+					TxnID:            networkid.TransactionID(msg.GUID),
+					Timestamp:        msg.Time,
+					StreamOrder:      msg.Time.UnixMilli(),
+				})
+			}
+		}
+
+		for i, att := range msg.Attachments {
+			if att == nil {
+				continue
+			}
+			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att)
+			if err != nil {
+				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
+				continue
+			}
+			partID := fmt.Sprintf("%s_att%d", msg.GUID, i)
+			backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
+				ConvertedMessage: attCm,
+				Sender:           sender,
+				ID:               makeMessageID(partID),
+				TxnID:            networkid.TransactionID(partID),
+				Timestamp:        msg.Time.Add(time.Duration(i+1) * time.Millisecond),
+				StreamOrder:      msg.Time.UnixMilli() + int64(i+1),
+			})
+		}
+	}
+
+	return &bridgev2.FetchMessagesResponse{
+		Messages:                backfillMessages,
+		HasMore:                 len(messages) >= count,
+		Forward:                 params.Forward,
+		AggressiveDeduplication: params.Forward,
+	}, nil
+}
+
+// ============================================================================
+// chat.db ↔ portal ID conversion
+// ============================================================================
+
+// portalIDToChatGUIDs converts a DM portal ID to possible chat.db GUIDs.
+// Returns multiple possible GUIDs to try, since macOS versions differ:
+// Tahoe+ uses "any;-;" while older uses "iMessage;-;" or "SMS;-;".
+//
+// Note: Group portal IDs (comma-separated) are handled by findGroupChatGUID instead.
+func portalIDToChatGUIDs(portalID string) []string {
+	// DMs: strip tel:/mailto: prefix and try multiple service prefixes
+	localID := stripIdentifierPrefix(portalID)
+	if localID == "" {
+		return nil
+	}
+	return []string{
+		"any;-;" + localID,
+		"iMessage;-;" + localID,
+		"SMS;-;" + localID,
+	}
+}
+
+// identifierToPortalID converts a chat.db Identifier to a clean portal ID.
+func identifierToPortalID(id imessage.Identifier) networkid.PortalID {
+	if id.IsGroup {
+		return networkid.PortalID(id.String())
+	}
+	if strings.HasPrefix(id.LocalID, "+") {
+		return networkid.PortalID("tel:" + id.LocalID)
+	}
+	if strings.Contains(id.LocalID, "@") {
+		return networkid.PortalID("mailto:" + id.LocalID)
+	}
+	// Short codes and numeric-only identifiers (e.g., "242733") are SMS-based.
+	// Rustpush creates these with "tel:" prefix, so we must match.
+	if isNumeric(id.LocalID) {
+		return networkid.PortalID("tel:" + id.LocalID)
+	}
+	return networkid.PortalID(id.LocalID)
+}
+
+// ============================================================================
+// chat.db message conversion
+// ============================================================================
+
+func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSender {
+	if msg.IsFromMe {
+		return bridgev2.EventSender{
+			IsFromMe:    true,
+			SenderLogin: c.UserLogin.ID,
+			Sender:      makeUserID(c.handle),
+		}
+	}
+	return bridgev2.EventSender{
+		IsFromMe: false,
+		Sender:   makeUserID(addIdentifierPrefix(msg.Sender.LocalID)),
+	}
+}
+
+func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message) (*bridgev2.ConvertedMessage, error) {
+	content := &event.MessageEventContent{
+		MsgType: event.MsgText,
+		Body:    msg.Text,
+	}
+	if msg.Subject != "" {
+		if msg.Text != "" {
+			content.Body = fmt.Sprintf("**%s**\n%s", msg.Subject, msg.Text)
+			content.Format = event.FormatHTML
+			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", msg.Subject, msg.Text)
+		} else {
+			content.Body = msg.Subject
+		}
+	}
+	if msg.IsEmote {
+		content.MsgType = event.MsgEmote
+	}
+
+	// URL preview: detect URL and fetch og: metadata + image
+	if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
+		content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+			fetchURLPreview(ctx, portal.Bridge, intent, detectedURL),
+		}
+	}
+
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{{
+			Type:    event.EventMessage,
+			Content: content,
+		}},
+	}, nil
+}
+
+func convertChatDBAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message, att *imessage.Attachment) (*bridgev2.ConvertedMessage, error) {
+	mimeType := att.GetMimeType()
+	fileName := att.GetFileName()
+
+	data, err := att.Read()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read attachment %s: %w", att.PathOnDisk, err)
+	}
+
+	// Convert CAF Opus voice messages to OGG Opus for Matrix/Beeper clients
+	var durationMs int
+	if mimeType == "audio/x-caf" || strings.HasSuffix(strings.ToLower(fileName), ".caf") {
+		data, mimeType, fileName, durationMs = convertAudioForMatrix(data, mimeType, fileName)
+	}
+
+	content := &event.MessageEventContent{
+		MsgType: mimeToMsgType(mimeType),
+		Body:    fileName,
+		Info: &event.FileInfo{
+			MimeType: mimeType,
+			Size:     len(data),
+		},
+	}
+
+	// Mark as voice message if this was a CAF voice recording
+	if durationMs > 0 {
+		content.MSC3245Voice = &event.MSC3245Voice{}
+		content.MSC1767Audio = &event.MSC1767Audio{
+			Duration: durationMs,
+		}
+	}
+
+	if intent != nil {
+		url, encFile, err := intent.UploadMedia(ctx, "", data, fileName, mimeType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload attachment: %w", err)
+		}
+		if encFile != nil {
+			content.File = encFile
+		} else {
+			content.URL = url
+		}
+	}
+
+	return &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{{
+			Type:    event.EventMessage,
+			Content: content,
+		}},
+	}, nil
+}

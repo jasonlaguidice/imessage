@@ -24,11 +24,16 @@ type IMConfig struct {
 	DisplaynameTemplate string `yaml:"displayname_template"`
 	displaynameTemplate *template.Template
 
-	// CloudKitBackfill enables CloudKit message history backfill.
+	// CloudKitBackfill enables message history backfill (master on/off switch).
 	// When false, the bridge only handles real-time messages via APNs push
 	// and skips the device PIN / iCloud Keychain steps during login.
 	// Default is false.
 	CloudKitBackfill bool `yaml:"cloudkit_backfill"`
+
+	// BackfillSource selects the backfill engine when CloudKitBackfill is true.
+	// "cloudkit" (default) syncs from iCloud; "chatdb" reads the local macOS
+	// chat.db (requires Full Disk Access).
+	BackfillSource string `yaml:"backfill_source"`
 
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
@@ -110,9 +115,20 @@ func (c *IMConfig) FormatDisplayname(params DisplaynameParams) string {
 	return name
 }
 
+// UseChatDBBackfill returns true when backfill is enabled and sourced from chat.db.
+func (c *IMConfig) UseChatDBBackfill() bool {
+	return c.CloudKitBackfill && c.BackfillSource == "chatdb"
+}
+
+// UseCloudKitBackfill returns true when backfill is enabled and sourced from CloudKit.
+func (c *IMConfig) UseCloudKitBackfill() bool {
+	return c.CloudKitBackfill && c.BackfillSource != "chatdb"
+}
+
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
 	helper.Copy(up.Bool, "cloudkit_backfill")
+	helper.Copy(up.Str, "backfill_source")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")

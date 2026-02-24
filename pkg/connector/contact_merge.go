@@ -17,6 +17,7 @@ package connector
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -106,7 +107,7 @@ func (c *IMClient) resolveSendTarget(portalID string) string {
 }
 
 // lookupContact resolves a portal/identifier string to a Contact using
-// cloud contacts (iCloud CardDAV).
+// cloud contacts (iCloud CardDAV), falling back to chat.db contacts.
 func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 	localID := stripIdentifierPrefix(identifier)
 	if localID == "" {
@@ -115,9 +116,56 @@ func (c *IMClient) lookupContact(identifier string) *imessage.Contact {
 
 	if c.contacts != nil {
 		contact, _ := c.contacts.GetContactInfo(localID)
+		if contact != nil {
+			return contact
+		}
+	}
+	if c.chatDB != nil {
+		contact, _ := c.chatDB.api.GetContactInfo(localID)
 		return contact
 	}
 	return nil
+}
+
+// getContactChatGUIDs returns all possible chat.db GUIDs for a DM portal,
+// including GUIDs for alternate phone numbers/emails belonging to the same contact.
+func (c *IMClient) getContactChatGUIDs(portalID string) []string {
+	guids := portalIDToChatGUIDs(portalID)
+
+	contact := c.lookupContact(portalID)
+	if contact == nil {
+		return guids
+	}
+
+	for _, altID := range contactPortalIDs(contact) {
+		if altID == portalID {
+			continue
+		}
+		guids = append(guids, portalIDToChatGUIDs(altID)...)
+	}
+
+	return guids
+}
+
+// contactKeyFromContact returns a stable identity key for grouping a contact's
+// DM entries during initial sync deduplication. Returns "" if no merging is
+// needed (single phone, no name, etc.).
+func contactKeyFromContact(contact *imessage.Contact) string {
+	if contact == nil || !contact.HasName() {
+		return ""
+	}
+	phones := make([]string, 0, len(contact.Phones))
+	for _, p := range contact.Phones {
+		n := normalizePhoneForPortalID(p)
+		if n != "" {
+			phones = append(phones, n)
+		}
+	}
+	if len(phones) <= 1 {
+		return ""
+	}
+	sort.Strings(phones)
+	return strings.Join(phones, "|")
 }
 
 // contactPortalIDs returns all portal ID strings for a contact's phone numbers

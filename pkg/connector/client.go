@@ -123,6 +123,9 @@ type IMClient struct {
 	// Cloud backfill local cache store.
 	cloudStore *cloudBackfillStore
 
+	// Chat.db backfill (macOS with Full Disk Access only)
+	chatDB *chatDB
+
 	// Background goroutine lifecycle
 	stopChan chan struct{}
 
@@ -659,7 +662,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 
-	// Set up contact source: external CardDAV if configured, else iCloud
+	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
 		c.contacts = newExternalCardDAVClient(c.Main.Config.CardDAV, log)
 		if c.contacts != nil {
@@ -672,6 +675,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 			go c.periodicCloudContactSync(log)
 		} else {
 			log.Warn().Msg("External CardDAV configured but failed to initialize")
+		}
+	} else if c.Main.Config.UseChatDBBackfill() {
+		// Chat.db mode: use local macOS Contacts (no iCloud dependency).
+		c.contacts = newLocalContactSource(log)
+		if c.contacts != nil {
+			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
+				log.Warn().Err(syncErr).Msg("Initial local contacts sync failed")
+			} else {
+				c.setContactsReady(log)
+			}
+		} else {
+			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
 	} else {
 		c.contacts = newCloudContactsClient(c.client, log)
@@ -695,7 +710,18 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
-	if cloudStoreReady && c.Main.Config.CloudKitBackfill {
+	if c.Main.Config.UseChatDBBackfill() {
+		// Chat.db backfill: read local macOS Messages database
+		c.chatDB = openChatDB(log)
+		if c.chatDB != nil {
+			log.Info().Msg("Chat.db available for backfill")
+			go c.runChatDBInitialSync(log)
+		} else {
+			log.Warn().Msg("Chat.db backfill configured but chat.db not accessible")
+		}
+		// No CloudKit gate needed — open immediately
+		c.setCloudSyncDone()
+	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
 		c.startCloudSyncController(log)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
@@ -720,6 +746,10 @@ func (c *IMClient) Disconnect() {
 		c.client.Stop()
 		c.client.Destroy()
 		c.client = nil
+	}
+	if c.chatDB != nil {
+		c.chatDB.Close()
+		c.chatDB = nil
 	}
 }
 
@@ -2205,7 +2235,9 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
 
 	canBackfill := false
-	if c.cloudStore != nil {
+	if c.Main.Config.UseChatDBBackfill() {
+		canBackfill = c.chatDB != nil
+	} else if c.cloudStore != nil {
 		if hasMessages, err := c.cloudStore.hasPortalMessages(ctx, portalID); err == nil {
 			canBackfill = hasMessages
 		}
@@ -2540,17 +2572,23 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		}()
 	}
 
-	if !c.Main.Config.CloudKitBackfill || c.cloudStore == nil {
-		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
-			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
-		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
-	}
-
 	// When the user has capped max_initial_messages, skip backward backfill
 	// entirely. Forward backfill already delivered the capped N messages;
 	// returning empty here marks the backward task as done immediately.
+	// Applies to both chat.db and CloudKit paths.
 	if !params.Forward && c.Main.Bridge.Config.Backfill.MaxInitialMessages < math.MaxInt32 {
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: false}, nil
+	}
+
+	// Chat.db backfill path
+	if c.Main.Config.UseChatDBBackfill() && c.chatDB != nil {
+		return c.chatDB.FetchMessages(ctx, params, c)
+	}
+
+	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
+		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
+			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
+		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
 	count := params.Count
@@ -5440,4 +5478,240 @@ func ptrUint64Or(v *uint64, def uint64) uint64 {
 		return *v
 	}
 	return def
+}
+
+// ============================================================================
+// Chat.db initial sync
+// ============================================================================
+
+// runChatDBInitialSync creates portals and backfills messages for all recent
+// chats found in chat.db. Runs once on first login, then marks ChatsSynced.
+func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
+	ctx := log.WithContext(context.Background())
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if meta.ChatsSynced {
+		log.Info().Msg("Initial sync already completed, skipping")
+		return
+	}
+
+	chats, err := c.chatDB.api.GetChatsWithMessagesAfter(time.Time{})
+	if err != nil {
+		log.Err(err).Msg("Failed to get chat list for initial sync")
+		return
+	}
+
+	type chatEntry struct {
+		chatGUID  string
+		portalKey networkid.PortalKey
+		info      *imessage.ChatInfo
+	}
+	var entries []chatEntry
+	for _, chat := range chats {
+		info, err := c.chatDB.api.GetChatInfo(chat.ChatGUID, chat.ThreadID)
+		if err != nil || info == nil {
+			continue
+		}
+		parsed := imessage.ParseIdentifier(chat.ChatGUID)
+		var portalKey networkid.PortalKey
+		if parsed.IsGroup {
+			members := make([]string, 0, len(info.Members)+1)
+			members = append(members, addIdentifierPrefix(c.handle))
+			for _, m := range info.Members {
+				members = append(members, addIdentifierPrefix(m))
+			}
+			sort.Strings(members)
+			portalKey = networkid.PortalKey{
+				ID:       networkid.PortalID(strings.Join(members, ",")),
+				Receiver: c.UserLogin.ID,
+			}
+		} else {
+			portalKey = networkid.PortalKey{
+				ID:       identifierToPortalID(parsed),
+				Receiver: c.UserLogin.ID,
+			}
+		}
+		entries = append(entries, chatEntry{
+			chatGUID:  chat.ChatGUID,
+			portalKey: portalKey,
+			info:      info,
+		})
+	}
+
+	// Deduplicate DM entries for contacts with multiple phone numbers.
+	{
+		type contactGroup struct {
+			indices []int
+		}
+		groups := make(map[string]*contactGroup)
+		for i, entry := range entries {
+			portalID := string(entry.portalKey.ID)
+			if strings.Contains(portalID, ",") {
+				continue
+			}
+			contact := c.lookupContact(portalID)
+			key := contactKeyFromContact(contact)
+			if key == "" {
+				continue
+			}
+			if g, ok := groups[key]; ok {
+				g.indices = append(g.indices, i)
+			} else {
+				groups[key] = &contactGroup{indices: []int{i}}
+			}
+		}
+
+		skip := make(map[int]bool)
+		for _, group := range groups {
+			if len(group.indices) <= 1 {
+				continue
+			}
+			primaryIdx := group.indices[0]
+			for _, idx := range group.indices[1:] {
+				skip[idx] = true
+				log.Info().
+					Str("skip_portal", string(entries[idx].portalKey.ID)).
+					Str("primary_portal", string(entries[primaryIdx].portalKey.ID)).
+					Msg("Merging DM portal for contact with multiple phone numbers")
+			}
+		}
+
+		if len(skip) > 0 {
+			var merged []chatEntry
+			for i, entry := range entries {
+				if !skip[i] {
+					merged = append(merged, entry)
+				}
+			}
+			log.Info().Int("before", len(entries)).Int("after", len(merged)).Msg("Deduplicated DM entries by contact")
+			entries = merged
+		}
+	}
+
+	// Reverse to process oldest-activity first, so the most recent chat
+	// gets the highest stream_ordering.
+	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
+		entries[i], entries[j] = entries[j], entries[i]
+	}
+
+	log.Info().
+		Int("chat_count", len(entries)).
+		Msg("Initial sync: processing chats sequentially (oldest activity first)")
+
+	synced := 0
+	for _, entry := range entries {
+		done := make(chan struct{})
+		chatInfo := c.chatDBInfoToBridgev2(entry.info)
+		chatGUID := entry.chatGUID
+		c.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
+			EventMeta: simplevent.EventMeta{
+				Type:         bridgev2.RemoteEventChatResync,
+				PortalKey:    entry.portalKey,
+				CreatePortal: true,
+				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+					close(done)
+				},
+				LogContext: func(lc zerolog.Context) zerolog.Context {
+					return lc.Str("chat_guid", chatGUID).Str("source", "initial_sync")
+				},
+			},
+			ChatInfo:        chatInfo,
+			LatestMessageTS: time.Now(),
+		})
+
+		select {
+		case <-done:
+			synced++
+			if synced%10 == 0 || synced == len(entries) {
+				log.Info().
+					Int("progress", synced).
+					Int("total", len(entries)).
+					Msg("Initial sync progress")
+			}
+		case <-time.After(30 * time.Minute):
+			synced++
+			log.Warn().
+				Str("chat_guid", entry.chatGUID).
+				Msg("Initial sync: timeout waiting for chat, continuing")
+		case <-c.stopChan:
+			log.Info().Msg("Initial sync stopped")
+			return
+		}
+	}
+
+	meta.ChatsSynced = true
+	if err := c.UserLogin.Save(ctx); err != nil {
+		log.Err(err).Msg("Failed to save metadata after initial sync")
+	}
+	log.Info().
+		Int("synced_chats", synced).
+		Int("total_chats", len(entries)).
+		Msg("Initial sync complete")
+}
+
+// chatDBInfoToBridgev2 converts a chat.db ChatInfo to a bridgev2 ChatInfo.
+func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatInfo {
+	parsed := imessage.ParseIdentifier(info.JSONChatGUID)
+	if parsed.LocalID == "" {
+		parsed = info.Identifier
+	}
+
+	chatInfo := &bridgev2.ChatInfo{
+		CanBackfill: true,
+	}
+
+	if parsed.IsGroup {
+		displayName := info.DisplayName
+		if displayName == "" {
+			displayName = c.buildGroupName(info.Members)
+		}
+		chatInfo.Name = &displayName
+	}
+
+	if parsed.IsGroup {
+		chatInfo.Type = ptr.Ptr(database.RoomTypeDefault)
+		members := &bridgev2.ChatMemberList{
+			IsFull:    true,
+			MemberMap: make(map[networkid.UserID]bridgev2.ChatMember),
+		}
+		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
+			EventSender: bridgev2.EventSender{
+				IsFromMe:    true,
+				SenderLogin: c.UserLogin.ID,
+				Sender:      makeUserID(c.handle),
+			},
+			Membership: event.MembershipJoin,
+		}
+		for _, memberID := range info.Members {
+			userID := makeUserID(addIdentifierPrefix(memberID))
+			members.MemberMap[userID] = bridgev2.ChatMember{
+				EventSender: bridgev2.EventSender{Sender: userID},
+				Membership:  event.MembershipJoin,
+			}
+		}
+		chatInfo.Members = members
+	} else {
+		chatInfo.Type = ptr.Ptr(database.RoomTypeDM)
+		otherUser := makeUserID(addIdentifierPrefix(parsed.LocalID))
+		members := &bridgev2.ChatMemberList{
+			IsFull:      true,
+			OtherUserID: otherUser,
+			MemberMap: map[networkid.UserID]bridgev2.ChatMember{
+				makeUserID(c.handle): {
+					EventSender: bridgev2.EventSender{
+						IsFromMe:    true,
+						SenderLogin: c.UserLogin.ID,
+						Sender:      makeUserID(c.handle),
+					},
+					Membership: event.MembershipJoin,
+				},
+				otherUser: {
+					EventSender: bridgev2.EventSender{Sender: otherUser},
+					Membership:  event.MembershipJoin,
+				},
+			},
+		}
+		chatInfo.Members = members
+	}
+
+	return chatInfo
 }

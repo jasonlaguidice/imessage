@@ -148,6 +148,11 @@ if ! grep -q 'cloudkit_backfill:' "$CONFIG" 2>/dev/null; then
     fi
 fi
 
+# ── Ensure backfill_source key exists in config ───────────────
+if ! grep -q 'backfill_source:' "$CONFIG" 2>/dev/null; then
+    sed -i '/cloudkit_backfill:/a\    backfill_source: cloudkit' "$CONFIG"
+fi
+
 # ── CloudKit backfill toggle (runs every time) ────────────────
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
 if [ -t 0 ]; then

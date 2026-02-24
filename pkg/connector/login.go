@@ -202,7 +202,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 
 	// Skip device selection and passcode when CloudKit backfill is disabled —
 	// iCloud Keychain is only needed for decrypting CloudKit message records.
-	if !l.Main.Config.CloudKitBackfill {
+	if !l.Main.Config.UseCloudKitBackfill() {
 		log.Info().Msg("CloudKit backfill disabled, skipping device selection and passcode")
 		handles := l.result.Users.GetHandles()
 		if step := handleSelectionStep(handles); step != nil {
@@ -444,7 +444,7 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 
 	// Skip device selection and passcode when CloudKit backfill is disabled —
 	// iCloud Keychain is only needed for decrypting CloudKit message records.
-	if !l.Main.Config.CloudKitBackfill {
+	if !l.Main.Config.UseCloudKitBackfill() {
 		log.Info().Msg("CloudKit backfill disabled, skipping device selection and passcode")
 		handles := l.result.Users.GetHandles()
 		if step := handleSelectionStep(handles); step != nil {

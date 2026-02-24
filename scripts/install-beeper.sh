@@ -174,43 +174,93 @@ if ! grep -q 'cloudkit_backfill:' "$CONFIG" 2>/dev/null; then
     fi
 fi
 
-# ── CloudKit backfill toggle (runs every time) ────────────────
+# ── Ensure backfill_source key exists in config ───────────────
+if ! grep -q 'backfill_source:' "$CONFIG" 2>/dev/null; then
+    sed -i '' '/cloudkit_backfill:/a\
+    backfill_source: cloudkit' "$CONFIG"
+fi
+
+# ── Backfill source selection ─────────────────────────────────
+# On first run (fresh DB), show a 3-way prompt. On re-runs, preserve existing.
+DB_PATH_CHECK=$(grep 'uri:' "$CONFIG" | head -1 | sed 's/.*uri: file://' | sed 's/?.*//')
+IS_FRESH_DB=false
+if [ -z "$DB_PATH_CHECK" ] || [ ! -f "$DB_PATH_CHECK" ]; then
+    IS_FRESH_DB=true
+fi
+
 CURRENT_BACKFILL=$(grep 'cloudkit_backfill:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*cloudkit_backfill: *//' || true)
+CURRENT_SOURCE=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+
 if [ -t 0 ]; then
-    echo ""
-    echo "CloudKit Backfill:"
-    echo "  When enabled, the bridge will sync your iMessage history from iCloud."
-    echo "  This requires entering your device PIN during login to join the iCloud Keychain."
-    echo "  When disabled, only new real-time messages are bridged (no PIN needed)."
-    echo ""
-    if [ "$CURRENT_BACKFILL" = "true" ]; then
-        read -p "Enable CloudKit message history backfill? [Y/n]: " ENABLE_BACKFILL
-        case "$ENABLE_BACKFILL" in
-            [nN]*) ENABLE_BACKFILL=false ;;
-            *)     ENABLE_BACKFILL=true ;;
+    if [ "$IS_FRESH_DB" = "true" ]; then
+        echo ""
+        echo "Message History Backfill:"
+        echo "  1) iCloud (CloudKit) — sync from iCloud, requires device PIN"
+        echo "  2) Local chat.db — read macOS Messages database, requires Full Disk Access"
+        echo "  3) Disabled — real-time messages only"
+        echo ""
+        read -p "Choose [1/2/3]: " BACKFILL_CHOICE
+        case "$BACKFILL_CHOICE" in
+            2)
+                sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: true/" "$CONFIG"
+                sed -i '' "s/backfill_source: .*/backfill_source: chatdb/" "$CONFIG"
+                echo "✓ Chat.db backfill enabled — requires Full Disk Access for the bridge binary"
+                ;;
+            3)
+                sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: false/" "$CONFIG"
+                sed -i '' "s/backfill_source: .*/backfill_source: cloudkit/" "$CONFIG"
+                echo "✓ Backfill disabled — real-time messages only, no PIN needed"
+                ;;
+            *)
+                sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: true/" "$CONFIG"
+                sed -i '' "s/backfill_source: .*/backfill_source: cloudkit/" "$CONFIG"
+                echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
+                echo ""
+                echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
+                echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
+                echo "are available for backfill."
+                echo ""
+                read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
+                case "$ICLOUD_SYNCED" in
+                    [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
+                    *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
+                esac
+                ;;
         esac
     else
-        read -p "Enable CloudKit message history backfill? [y/N]: " ENABLE_BACKFILL
-        case "$ENABLE_BACKFILL" in
-            [yY]*) ENABLE_BACKFILL=true ;;
-            *)     ENABLE_BACKFILL=false ;;
-        esac
+        # Re-run: show current setting, allow changing CloudKit on/off
+        if [ "$CURRENT_BACKFILL" = "true" ] && [ "$CURRENT_SOURCE" = "chatdb" ]; then
+            echo "✓ Backfill source: chat.db (local macOS Messages database)"
+        elif [ "$CURRENT_BACKFILL" = "true" ]; then
+            echo "✓ Backfill source: CloudKit (iCloud sync)"
+        else
+            echo "✓ Backfill: disabled (real-time messages only)"
+        fi
     fi
-    sed -i '' "s/cloudkit_backfill: .*/cloudkit_backfill: $ENABLE_BACKFILL/" "$CONFIG"
-    if [ "$ENABLE_BACKFILL" = "true" ]; then
-        echo "✓ CloudKit backfill enabled — you'll be asked for your device PIN during login"
-        echo ""
-        echo "IMPORTANT: Before starting the bridge, sync your latest messages to iCloud"
-        echo "from an Apple device (iPhone, iPad, or Mac) to ensure all recent messages"
-        echo "are available for backfill."
-        echo ""
-        read -p "Have you synced your Apple device to iCloud? [y/N]: " ICLOUD_SYNCED
-        case "$ICLOUD_SYNCED" in
-            [yY]*) echo "✓ Great — backfill will include your latest messages" ;;
-            *)     echo "⚠ Please sync your Apple device to iCloud before starting the bridge" ;;
-        esac
+fi
+
+# ── Full Disk Access check for chat.db mode (macOS only) ──────
+CURRENT_SOURCE=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$CURRENT_SOURCE" = "chatdb" ] && [ "$(uname -s)" = "Darwin" ]; then
+    CHATDB_PATH="$HOME/Library/Messages/chat.db"
+    if [ -f "$CHATDB_PATH" ]; then
+        if ! sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+            echo ""
+            echo "⚠ Full Disk Access is required for chat.db backfill."
+            echo "  Opening System Settings → Privacy & Security → Full Disk Access..."
+            echo "  Grant access to the bridge binary, then press Enter to continue."
+            open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles" 2>/dev/null
+            read -p "Press Enter when Full Disk Access has been granted..."
+            if sqlite3 "$CHATDB_PATH" "SELECT 1 FROM message LIMIT 1" >/dev/null 2>&1; then
+                echo "✓ Full Disk Access confirmed"
+            else
+                echo "⚠ chat.db still not accessible — the bridge will prompt again on startup"
+            fi
+        else
+            echo "✓ Full Disk Access: granted"
+        fi
     else
-        echo "✓ CloudKit backfill disabled — real-time messages only, no PIN needed"
+        echo "⚠ chat.db not found at $CHATDB_PATH — is Messages set up on this Mac?"
     fi
 fi
 
@@ -276,8 +326,10 @@ if [ "$CURRENT_BACKFILL" = "true" ]; then
 fi
 
 # ── Restore CardDAV config from backup ────────────────────────
+# Skip when using chat.db — local macOS Contacts are used automatically.
 CARDDAV_BACKUP="$DATA_DIR/.carddav-config"
-if [ -f "$CARDDAV_BACKUP" ]; then
+CURRENT_SOURCE_CHECK=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$CURRENT_SOURCE_CHECK" != "chatdb" ] && [ -f "$CARDDAV_BACKUP" ]; then
     CHECK_EMAIL=$(grep 'email:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*email: *//;s/['\"]//g" | tr -d ' ' || true)
     if [ -z "$CHECK_EMAIL" ]; then
         source "$CARDDAV_BACKUP"
@@ -313,7 +365,11 @@ open('$CONFIG', 'w').write(text)
 fi
 
 # ── Contact source (runs every time, can reconfigure) ─────────
-if [ -t 0 ]; then
+# Skip when using chat.db — local macOS Contacts are used automatically.
+CURRENT_SOURCE=$(grep 'backfill_source:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*backfill_source: *//' || true)
+if [ "$CURRENT_SOURCE" = "chatdb" ]; then
+    echo "✓ Contact source: local macOS Contacts (via chat.db)"
+elif [ -t 0 ]; then
     CURRENT_CARDDAV_EMAIL=$(grep 'email:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*email: *//;s/['\"]//g" | tr -d ' ' || true)
     CONFIGURE_CARDDAV=false
 
