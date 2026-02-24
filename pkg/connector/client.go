@@ -599,16 +599,14 @@ func (c *IMClient) Connect(ctx context.Context) {
 	}
 	c.client = client
 
-	// Get our handle (precedence: config > login metadata > first handle)
+	// Get our handle (precedence: login metadata > first handle)
 	handles := client.GetHandles()
 	c.allHandles = handles
 	if len(handles) > 0 {
 		c.handle = handles[0]
-		preferred := c.Main.Config.PreferredHandle
-		if preferred == "" {
-			if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
-				preferred = meta.PreferredHandle
-			}
+		var preferred string
+		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+			preferred = meta.PreferredHandle
 		}
 		if preferred != "" {
 			found := false

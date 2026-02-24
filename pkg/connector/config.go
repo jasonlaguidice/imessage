@@ -30,11 +30,6 @@ type IMConfig struct {
 	// Default is false.
 	CloudKitBackfill bool `yaml:"cloudkit_backfill"`
 
-	// PreferredHandle overrides the outgoing iMessage identity.
-	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
-	// If empty, the handle chosen during login is used.
-	PreferredHandle string `yaml:"preferred_handle"`
-
 	// DefaultHardwareKey is a server-wide hardware key (base64-encoded JSON) that
 	// users can opt to use during login instead of supplying their own.
 	// Leave empty to require each user to provide their own hardware key.
@@ -113,7 +108,6 @@ func (c *IMConfig) FormatDisplayname(params DisplaynameParams) string {
 func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Str, "displayname_template")
 	helper.Copy(up.Bool, "cloudkit_backfill")
-	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "default_hardware_key")
 }
 
