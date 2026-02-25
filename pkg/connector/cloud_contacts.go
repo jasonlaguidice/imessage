@@ -148,8 +148,8 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 		allContacts = append(allContacts, contacts...)
 	}
 
-	// Step 4.5: Download any photo URLs (e.g. Google uses URL-based PHOTO fields)
-	downloadContactPhotos(allContacts, log)
+	// Step 4.5: Download any photo URLs — use authenticated fetcher for iCloud URLs
+	downloadContactPhotos(allContacts, log, c.downloadAuthURL)
 
 	// Step 5: Build lookup caches
 	c.mu.Lock()
@@ -670,10 +670,27 @@ func extractVCardPhoto(nameWithParams, value string) ([]byte, string) {
 	return data, ""
 }
 
+// downloadAuthURL fetches a URL using iCloud auth headers.
+func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL string) ([]byte, error) {
+	resp, err := c.doRequest("GET", targetURL, "", "")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d fetching %s", resp.StatusCode, targetURL)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024))
+}
+
+// photoFetcher downloads a URL with authentication. Nil means use generic unauthenticated fetch.
+type photoFetcher func(ctx context.Context, url string) ([]byte, error)
+
 // downloadContactPhotos downloads photo URLs for contacts that have AvatarURL
 // set but no Avatar bytes. Uses bounded concurrency to avoid overwhelming
-// the server. Errors are logged but don't block contact loading.
-func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger) {
+// the server. If an authenticated fetcher is provided, iCloud URLs use it;
+// all other URLs use the generic unauthenticated downloader.
+func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, authFetch ...photoFetcher) {
 	var needsDownload []*imessage.Contact
 	for _, c := range contacts {
 		if c.AvatarURL != "" && c.Avatar == nil {
@@ -685,6 +702,11 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger) {
 	}
 
 	log.Info().Int("count", len(needsDownload)).Msg("Downloading contact photo URLs")
+
+	var authDL photoFetcher
+	if len(authFetch) > 0 {
+		authDL = authFetch[0]
+	}
 
 	const maxConcurrency = 10
 	sem := make(chan struct{}, maxConcurrency)
@@ -700,7 +722,13 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			data, _, err := downloadURL(ctx, c.AvatarURL)
+			var data []byte
+			var err error
+			if authDL != nil && (strings.Contains(c.AvatarURL, ".icloud.com") || strings.Contains(c.AvatarURL, ".apple.com")) {
+				data, err = authDL(ctx, c.AvatarURL)
+			} else {
+				data, _, err = downloadURL(ctx, c.AvatarURL)
+			}
 			if err != nil {
 				log.Debug().Err(err).
 					Str("name", c.Name()).
