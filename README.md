@@ -1,5 +1,14 @@
 # mautrix-imessage (v2)
 
+**Important note for Beeper Users as of 2/25/2026**
+
+This update changes how bbctl is built and managed. If you have an existing installation, you must delete your bridge-manager directory before running make install-beeper again, otherwise the build will fail.
+                                                                                                                        
+ - macOS / Linux:                                                                                                        
+  `rm -rf ~/.local/share/mautrix-imessage/bridge-manager`                                                               
+  `make install-beeper`
+
+
 A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix client.
 
 This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustpush) and [bridgev2](https://mau.fi/blog/megabridge-twilio/) — it connects directly to Apple's iMessage servers without SIP bypass, Barcelona, or relay servers.
