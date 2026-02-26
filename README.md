@@ -7,7 +7,7 @@ This update changes how bbctl is built and managed. If you have an existing inst
  - macOS / Linux:                                                                                                        
   `rm -rf ~/.local/share/mautrix-imessage/bridge-manager`                                                               
   `make install-beeper`
-
+***
 
 A Matrix-iMessage puppeting bridge. Send and receive iMessages from any Matrix client.
 
