@@ -55,7 +55,17 @@ sudo apt install -y git make
 
 ### Step 1: Extract hardware key (one-time, on your Mac)
 
-**Option A: GUI app (macOS 10.15+ Catalina)**
+**Option A: CLI (macOS 13+ with Go)**
+
+```bash
+git clone https://github.com/lrhodin/imessage.git
+cd imessage
+go run tools/extract-key/main.go
+```
+
+**Option B: GUI app (macOS 10.15+ Catalina)**
+
+*Please consider this bleeding edge and minimally tested, use at your own risk for now.* It is suggested to compare output with option A until this method has been tested more.
 
 Build the SwiftUI extraction app on any Mac (Intel or Apple Silicon), then run it on the Intel Mac:
 
@@ -73,14 +83,6 @@ The app reads hardware identifiers, displays them, and lets you copy or save the
 > - **macOS 13+ (Ventura)**: Double-click the app. When the warning appears, go to **System Settings → Privacy & Security**, scroll down, and click **Open Anyway**.
 > - **macOS 10.15–12**: Right-click (or Control-click) the app and choose **Open** from the context menu. Click **Open** in the dialog that appears.
 > - **Terminal**: Run `xattr -cr ExtractKey.app` to strip the quarantine flag, then double-click normally.
-
-**Option B: CLI (macOS 13+ with Go)**
-
-```bash
-git clone https://github.com/lrhodin/imessage.git
-cd imessage
-go run tools/extract-key/main.go
-```
 
 **Option C: older Macs (macOS 10.13 High Sierra through 12) without Go**
 
