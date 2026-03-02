@@ -55,9 +55,9 @@ sudo apt install -y git make
 
 ### Step 1: Extract hardware key (one-time, on your Mac)
 
-**Option A: GUI app (macOS 11+ Big Sur)**
+**Option A: GUI app (macOS 10.15+ Catalina)**
 
-Build the SwiftUI extraction app on any Mac, then run it on the Intel Mac:
+Build the SwiftUI extraction app on any Mac (Intel or Apple Silicon), then run it on the Intel Mac:
 
 ```bash
 git clone https://github.com/lrhodin/imessage.git
@@ -66,7 +66,7 @@ cd imessage/tools/extract-key-app
 # Copy ExtractKey.app to the Intel Mac and double-click it.
 ```
 
-The app reads hardware identifiers, displays them, and lets you copy or save the base64 key.
+The app reads hardware identifiers, displays them, and lets you copy or save the base64 key. If the Mac is missing encrypted IOKit properties (`_enc` fields), the app offers an **Enrich Key** button to compute them on the spot — no extra steps needed.
 
 **Option B: CLI (macOS 13+ with Go)**
 
@@ -95,14 +95,14 @@ cd ~ && ./extract-key-intel
 
 This reads hardware identifiers (serial, MLB, ROM, etc.) and outputs a base64 key. The Mac is not modified and can continue to be used normally.
 
-**Enriching keys from older Macs**: Keys extracted from macOS High Sierra (10.13) may be missing encrypted IOKit properties (`_enc` fields). On your Linux bridge server, enrich them before login:
+**Enriching keys from older Macs**: Keys extracted from older Intel Macs may be missing encrypted IOKit properties (`_enc` fields). The GUI app (Option A) can compute these automatically with the **Enrich Key** button. If using the CLI instead, you can enrich on your Linux bridge server:
 
 ```bash
 cd rustpush/open-absinthe
 cargo run --bin enrich_hw_key -- --file ~/hwkey.b64 > ~/hwkey-enriched.b64
 ```
 
-This derives the missing `_enc` fields from plaintext values using the XNU encryption function (x86_64 Linux only).
+This derives the missing `_enc` fields from plaintext values using the XNU encryption function (x86_64 Linux only). The GUI app runs the same function directly on the Mac.
 
 **Apple Silicon Macs** lack the encrypted IOKit properties needed by the x86_64 NAC emulator. You must also run the NAC relay — a small HTTP server that generates Apple validation data using the Mac's native `AAAbsintheContext` framework.
 
@@ -321,9 +321,11 @@ rustpush/                    # OpenBubbles/rustpush (vendored)
   └── open-absinthe/         #   NAC emulator (unicorn-engine, cross-platform)
 nac-validation/              # Local NAC via AppleAccount.framework (macOS)
 tools/
-  ├── extract-key/           # Hardware key extraction CLI (run on Mac)
-  ├── extract-key-app/       # Hardware key extraction SwiftUI app (run on Mac)
+  ├── extract-key/           # Hardware key extraction CLI (Go, run on Mac)
+  ├── extract-key-app/       # Hardware key extraction GUI (SwiftUI, x86_64, run on Mac)
   └── nac-relay/             # NAC validation + contacts + backfill relay (run on Mac)
+rustpush/open-absinthe/
+  └── src/bin/enrich_hw_key  # Enrich keys missing _enc fields (x86_64 Linux CLI)
 imessage/                    # macOS chat.db + Contacts reader
 ```
 
