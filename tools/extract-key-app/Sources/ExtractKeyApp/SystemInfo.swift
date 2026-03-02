@@ -65,6 +65,25 @@ func getRootDiskUUID() -> String {
     return "unknown"
 }
 
+// MARK: - Architecture Detection
+
+/// Detect Apple Silicon at runtime. Works even when running an x86_64
+/// binary under Rosetta on Apple Silicon hardware.
+func isRunningOnAppleSilicon() -> Bool {
+    // sysctl "sysctl.proc_translated" returns 1 when running under Rosetta.
+    var ret: Int32 = 0
+    var size = MemoryLayout<Int32>.size
+    if sysctlbyname("sysctl.proc_translated", &ret, &size, nil, 0) == 0 && ret == 1 {
+        return true // x86_64 binary running under Rosetta on Apple Silicon
+    }
+    // Native arm64 binary on Apple Silicon
+    #if arch(arm64)
+    return true
+    #else
+    return false
+    #endif
+}
+
 // MARK: - Sysctl
 
 /// Read a sysctl string value by name.

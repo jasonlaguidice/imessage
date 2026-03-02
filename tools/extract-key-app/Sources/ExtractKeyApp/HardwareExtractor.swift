@@ -70,15 +70,16 @@ class HardwareExtractor: ObservableObject {
         let romEnc = ioData(platform, "oycqAZloTNDm")
         let mlbEnc = ioData(platform, "abKPld1EcMni")
 
-        // 5. Apple Silicon: ROM from en0 MAC address
-        #if arch(arm64)
-        let isAppleSilicon = true
-        if rom == nil || rom?.isEmpty == true {
-            rom = getEN0MACAddress()
+        // 5. Detect Apple Silicon at runtime (the binary is x86_64 but may
+        //    run under Rosetta on Apple Silicon hardware).
+        let isAppleSilicon = isRunningOnAppleSilicon()
+
+        if isAppleSilicon {
+            // ROM: derive from en0 MAC address on Apple Silicon
+            if rom == nil || rom?.isEmpty == true {
+                rom = getEN0MACAddress()
+            }
         }
-        #else
-        let isAppleSilicon = false
-        #endif
 
         // 6. Apple Silicon: MLB from mlb-serial-number
         if mlb == nil {
@@ -138,12 +139,14 @@ class HardwareExtractor: ObservableObject {
         if isAppleSilicon {
             warnings.append(
                 "Apple Silicon detected \u{2014} encrypted IOKit properties are absent. "
-                + "The key will need a NAC relay or enrichment on Linux."
+                + "You must run the NAC relay on this Mac and use -relay when extracting, "
+                + "or enrich the key on Linux with enrich_hw_key."
             )
         } else if !hasEncFields {
             warnings.append(
-                "Encrypted IOKit properties not found on this Intel Mac. "
-                + "If this is macOS High Sierra, use enrich_hw_key on Linux to compute them."
+                "Encrypted IOKit properties (_enc fields) not present on this Mac. "
+                + "This is normal for older Intel models and macOS versions before Mojave. "
+                + "The bridge will compute them automatically on Linux using enrich_hw_key."
             )
         }
 
@@ -178,7 +181,8 @@ class HardwareExtractor: ObservableObject {
 
         // 12. JSON → base64
         let encoder = JSONEncoder()
-        // Do NOT use .sortedKeys — field order must match Go/Rust output
+        // Don't escape forward slashes (Go doesn't) — available since macOS 10.15
+        encoder.outputFormatting = [.withoutEscapingSlashes]
         let jsonData = try encoder.encode(config)
         let base64Key = jsonData.base64EncodedString()
 

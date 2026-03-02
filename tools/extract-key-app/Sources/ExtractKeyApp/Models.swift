@@ -45,6 +45,7 @@ struct ByteArray: Codable, Equatable {
 // MARK: - HardwareConfig
 
 /// Matches rustpush/open-absinthe/src/nac.rs HardwareConfig exactly.
+/// Uses a custom encode(to:) to guarantee field order matches Go/Rust output.
 struct HardwareConfig: Codable {
     var productName: String
     var ioMacAddress: ByteArray
@@ -77,11 +78,33 @@ struct HardwareConfig: Codable {
         case mlb
         case mlbEnc = "mlb_enc"
     }
+
+    // Explicit encode to guarantee key ordering matches Go struct field order.
+    // Swift's auto-synthesized Codable uses a dictionary-backed container
+    // that does NOT preserve insertion order.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(productName, forKey: .productName)
+        try c.encode(ioMacAddress, forKey: .ioMacAddress)
+        try c.encode(platformSerialNumber, forKey: .platformSerialNumber)
+        try c.encode(platformUUID, forKey: .platformUUID)
+        try c.encode(rootDiskUUID, forKey: .rootDiskUUID)
+        try c.encode(boardID, forKey: .boardID)
+        try c.encode(osBuildNum, forKey: .osBuildNum)
+        try c.encode(platformSerialNumberEnc, forKey: .platformSerialNumberEnc)
+        try c.encode(platformUUIDEnc, forKey: .platformUUIDEnc)
+        try c.encode(rootDiskUUIDEnc, forKey: .rootDiskUUIDEnc)
+        try c.encode(rom, forKey: .rom)
+        try c.encode(romEnc, forKey: .romEnc)
+        try c.encode(mlb, forKey: .mlb)
+        try c.encode(mlbEnc, forKey: .mlbEnc)
+    }
 }
 
 // MARK: - MacOSConfig
 
 /// Matches rustpush/src/macos.rs MacOSConfig.
+/// Uses a custom encode(to:) to guarantee field order matches Go struct field order.
 struct MacOSConfig: Codable {
     var inner: HardwareConfig
     var version: String
@@ -97,6 +120,17 @@ struct MacOSConfig: Codable {
         case deviceID = "device_id"
         case icloudUA = "icloud_ua"
         case aoskitVersion = "aoskit_version"
+    }
+
+    // Explicit encode to guarantee key ordering matches Go struct field order.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(inner, forKey: .inner)
+        try c.encode(version, forKey: .version)
+        try c.encode(protocolVersion, forKey: .protocolVersion)
+        try c.encode(deviceID, forKey: .deviceID)
+        try c.encode(icloudUA, forKey: .icloudUA)
+        try c.encode(aoskitVersion, forKey: .aoskitVersion)
     }
 }
 
