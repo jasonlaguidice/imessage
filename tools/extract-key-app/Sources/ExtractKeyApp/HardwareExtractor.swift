@@ -139,14 +139,13 @@ class HardwareExtractor: ObservableObject {
         if isAppleSilicon {
             warnings.append(
                 "Apple Silicon detected \u{2014} encrypted IOKit properties are absent. "
-                + "You must run the NAC relay on this Mac and use -relay when extracting, "
-                + "or enrich the key on Linux with enrich_hw_key."
+                + "You must run the NAC relay on this Mac and use -relay when extracting."
             )
         } else if !hasEncFields {
             warnings.append(
                 "Encrypted IOKit properties (_enc fields) not present on this Mac. "
                 + "This is normal for older Intel models and macOS versions before Mojave. "
-                + "The bridge will compute them automatically on Linux using enrich_hw_key."
+                + "The bridge will compute them automatically."
             )
         }
 
