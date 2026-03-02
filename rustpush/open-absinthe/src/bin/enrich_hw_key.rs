@@ -2,6 +2,9 @@
 // fields by computing them from plaintext values using the XNU kernel
 // encryption function. Only works on x86_64 Linux.
 //
+// Preserves the original JSON key ordering so the output is byte-compatible
+// with the input tool (Go extract-key, SwiftUI app, etc.).
+//
 // Usage:
 //   cargo build --bin enrich_hw_key
 //   ./target/debug/enrich_hw_key --key <base64>
@@ -10,15 +13,8 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use open_absinthe::nac::{enrich_missing_enc_fields, HardwareConfig};
+use serde_json::{Map, Value};
 use std::io::{self, Read};
-
-/// Wrapper with inner HardwareConfig, matching MacOSConfig layout.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct WrappedConfig {
-    inner: HardwareConfig,
-    #[serde(flatten)]
-    rest: serde_json::Value,
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -61,19 +57,29 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Try parsing as wrapped MacOSConfig first, then as bare HardwareConfig
-    let (mut hw, wrapper): (HardwareConfig, Option<serde_json::Value>) =
-        if let Ok(wrapped) = serde_json::from_slice::<WrappedConfig>(&json_bytes) {
-            eprintln!("Parsed as MacOSConfig (wrapped)");
-            let rest = wrapped.rest;
-            (wrapped.inner, Some(rest))
-        } else if let Ok(hw) = serde_json::from_slice::<HardwareConfig>(&json_bytes) {
-            eprintln!("Parsed as bare HardwareConfig");
-            (hw, None)
-        } else {
-            eprintln!("Failed to parse JSON as HardwareConfig or MacOSConfig");
-            std::process::exit(1);
-        };
+    // Parse as serde_json::Value to preserve original key ordering.
+    // With the preserve_order feature, Map uses IndexMap which maintains
+    // insertion order through serialize/deserialize round-trips.
+    let mut root: Value = serde_json::from_slice(&json_bytes).unwrap_or_else(|e| {
+        eprintln!("JSON parse error: {}", e);
+        std::process::exit(1);
+    });
+
+    // Find the inner HardwareConfig — either root.inner (MacOSConfig) or root itself
+    let is_wrapped = root.get("inner").is_some();
+    let inner_value = if is_wrapped {
+        eprintln!("Parsed as MacOSConfig (wrapped)");
+        root.get("inner").unwrap().clone()
+    } else {
+        eprintln!("Parsed as bare HardwareConfig");
+        root.clone()
+    };
+
+    // Deserialize inner as HardwareConfig for enrichment
+    let mut hw: HardwareConfig = serde_json::from_value(inner_value).unwrap_or_else(|e| {
+        eprintln!("Failed to parse HardwareConfig: {}", e);
+        std::process::exit(1);
+    });
 
     // Log before state
     eprintln!("Before enrichment:");
@@ -109,14 +115,91 @@ fn main() {
     eprintln!("  rom_enc: {} bytes", hw.rom_enc.len());
     eprintln!("  mlb_enc: {} bytes", hw.mlb_enc.len());
 
-    // Re-serialize
-    let output_json = if let Some(rest) = wrapper {
-        let wrapped = WrappedConfig { inner: hw, rest };
-        serde_json::to_vec(&wrapped).expect("JSON serialization failed")
+    // Write enriched _enc fields back into the original Value tree,
+    // preserving the original key ordering for all other fields.
+    let target = if is_wrapped {
+        root.get_mut("inner").unwrap()
     } else {
-        serde_json::to_vec(&hw).expect("JSON serialization failed")
+        &mut root
     };
 
+    if let Value::Object(map) = target {
+        write_enc_field(map, "platform_serial_number_enc", &hw.platform_serial_number_enc);
+        write_enc_field(map, "platform_uuid_enc", &hw.platform_uuid_enc);
+        write_enc_field(map, "root_disk_uuid_enc", &hw.root_disk_uuid_enc);
+        write_enc_field(map, "rom_enc", &hw.rom_enc);
+        write_enc_field(map, "mlb_enc", &hw.mlb_enc);
+    }
+
+    // Reorder keys to match the exact ordering that Apple expects.
+    // This matches the Go extract-key tool and Swift app output.
+    let reordered = if is_wrapped {
+        let inner_map = root.get("inner").unwrap().as_object().unwrap();
+        let outer_map = root.as_object().unwrap();
+        let inner_ordered = reorder_inner(inner_map);
+        let mut outer = Map::new();
+        // Outer key order: aoskit_version, inner, protocol_version, device_id, icloud_ua, version
+        for key in &[
+            "aoskit_version",
+            "inner",
+            "protocol_version",
+            "device_id",
+            "icloud_ua",
+            "version",
+        ] {
+            if *key == "inner" {
+                outer.insert("inner".to_string(), Value::Object(inner_ordered.clone()));
+            } else if let Some(v) = outer_map.get(*key) {
+                outer.insert(key.to_string(), v.clone());
+            }
+        }
+        Value::Object(outer)
+    } else {
+        let map = root.as_object().unwrap();
+        Value::Object(reorder_inner(map))
+    };
+
+    let output_json = serde_json::to_vec(&reordered).expect("JSON serialization failed");
     let output_b64 = STANDARD.encode(&output_json);
     println!("{}", output_b64);
+}
+
+/// Write an _enc field value into a JSON map, preserving its position if it
+/// already exists, or appending it if new.
+fn write_enc_field(map: &mut Map<String, Value>, key: &str, data: &[u8]) {
+    let arr = Value::Array(data.iter().map(|b| Value::Number((*b).into())).collect());
+    map.insert(key.to_string(), arr);
+}
+
+/// Reorder inner (HardwareConfig) keys to match the expected ordering.
+fn reorder_inner(map: &Map<String, Value>) -> Map<String, Value> {
+    let key_order = [
+        "root_disk_uuid",
+        "mlb",
+        "product_name",
+        "platform_uuid_enc",
+        "rom",
+        "platform_serial_number",
+        "io_mac_address",
+        "platform_uuid",
+        "os_build_num",
+        "platform_serial_number_enc",
+        "board_id",
+        "root_disk_uuid_enc",
+        "mlb_enc",
+        "rom_enc",
+    ];
+    let mut ordered = Map::new();
+    for key in &key_order {
+        if let Some(v) = map.get(*key) {
+            ordered.insert(key.to_string(), v.clone());
+        }
+    }
+    // Include any extra keys not in the standard order (e.g. relay fields)
+    for (k, v) in map {
+        if !ordered.contains_key(k) {
+            ordered.insert(k.clone(), v.clone());
+        }
+    }
+    ordered
 }
