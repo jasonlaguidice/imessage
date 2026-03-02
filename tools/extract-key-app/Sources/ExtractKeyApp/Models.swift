@@ -130,25 +130,25 @@ private func jsonEscape(_ s: String) -> String {
 }
 
 extension HardwareConfig {
-    /// Serialize to JSON with key order matching Go's struct field declaration order.
+    /// Serialize to JSON with keys in alphabetical order to match the Go tool output.
     /// Swift's JSONEncoder uses NSDictionary internally which is unordered,
     /// so we build the JSON string manually.
     func toOrderedJSON() -> String {
         let pairs: [(String, String)] = [
-            ("product_name", "\"\(jsonEscape(productName))\""),
-            ("io_mac_address", ioMacAddress.jsonArray),
-            ("platform_serial_number", "\"\(jsonEscape(platformSerialNumber))\""),
-            ("platform_uuid", "\"\(jsonEscape(platformUUID))\""),
-            ("root_disk_uuid", "\"\(jsonEscape(rootDiskUUID))\""),
             ("board_id", "\"\(jsonEscape(boardID))\""),
-            ("os_build_num", "\"\(jsonEscape(osBuildNum))\""),
-            ("platform_serial_number_enc", platformSerialNumberEnc.jsonArray),
-            ("platform_uuid_enc", platformUUIDEnc.jsonArray),
-            ("root_disk_uuid_enc", rootDiskUUIDEnc.jsonArray),
-            ("rom", rom.jsonArray),
-            ("rom_enc", romEnc.jsonArray),
+            ("io_mac_address", ioMacAddress.jsonArray),
             ("mlb", "\"\(jsonEscape(mlb))\""),
             ("mlb_enc", mlbEnc.jsonArray),
+            ("os_build_num", "\"\(jsonEscape(osBuildNum))\""),
+            ("platform_serial_number", "\"\(jsonEscape(platformSerialNumber))\""),
+            ("platform_serial_number_enc", platformSerialNumberEnc.jsonArray),
+            ("platform_uuid", "\"\(jsonEscape(platformUUID))\""),
+            ("platform_uuid_enc", platformUUIDEnc.jsonArray),
+            ("product_name", "\"\(jsonEscape(productName))\""),
+            ("rom", rom.jsonArray),
+            ("rom_enc", romEnc.jsonArray),
+            ("root_disk_uuid", "\"\(jsonEscape(rootDiskUUID))\""),
+            ("root_disk_uuid_enc", rootDiskUUIDEnc.jsonArray),
         ]
         let body = pairs.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
         return "{\(body)}"
@@ -156,15 +156,15 @@ extension HardwareConfig {
 }
 
 extension MacOSConfig {
-    /// Serialize to JSON with key order matching Go's struct field declaration order.
+    /// Serialize to JSON with keys in alphabetical order to match the Go tool output.
     func toOrderedJSON() -> String {
         let pairs: [(String, String)] = [
-            ("inner", inner.toOrderedJSON()),
-            ("version", "\"\(jsonEscape(version))\""),
-            ("protocol_version", "\(protocolVersion)"),
+            ("aoskit_version", "\"\(jsonEscape(aoskitVersion))\""),
             ("device_id", "\"\(jsonEscape(deviceID))\""),
             ("icloud_ua", "\"\(jsonEscape(icloudUA))\""),
-            ("aoskit_version", "\"\(jsonEscape(aoskitVersion))\""),
+            ("inner", inner.toOrderedJSON()),
+            ("protocol_version", "\(protocolVersion)"),
+            ("version", "\"\(jsonEscape(version))\""),
         ]
         let body = pairs.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
         return "{\(body)}"
