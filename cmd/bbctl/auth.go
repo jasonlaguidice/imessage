@@ -235,6 +235,12 @@ func cmdLogout(ctx *cli.Context) error {
 		fmt.Printf("Bridge '%s' deleted\n", bridge)
 	}
 
+	// Invalidate the Matrix access token on the server
+	if mc, err := mautrix.NewClient(fmt.Sprintf("https://matrix.%s", baseDomain), "", ""); err == nil {
+		mc.AccessToken = envCfg.AccessToken
+		mc.Logout(ctx.Context)
+	}
+
 	cfg := getConfig(ctx)
 	username := cfg.Environments.Get("prod").Username
 	cfg.Environments.Get("prod").AccessToken = ""
