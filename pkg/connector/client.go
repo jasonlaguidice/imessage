@@ -5123,6 +5123,36 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
+	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
+	if inlineData != nil && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+		log := zerolog.Ctx(ctx)
+		origMime := mimeType
+		origSize := len(inlineData)
+		method := "remux"
+		converted, convertErr := ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
+			[]string{"-c", "copy", "-movflags", "+faststart"},
+			mimeType)
+		if convertErr != nil {
+			// Remux failed — try full re-encode
+			method = "re-encode"
+			converted, convertErr = ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
+				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
+					"-c:a", "aac", "-movflags", "+faststart"},
+				mimeType)
+		}
+		if convertErr != nil {
+			log.Warn().Err(convertErr).Str("original_mime", origMime).
+				Msg("FFmpeg video conversion failed, uploading original")
+		} else {
+			log.Info().Str("original_mime", origMime).
+				Str("method", method).Int("original_bytes", origSize).Int("converted_bytes", len(converted)).
+				Msg("Video transcoded to MP4")
+			inlineData = converted
+			mimeType = "video/mp4"
+			fileName = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".mp4"
+		}
+	}
+
 	// Process images: extract dimensions, convert non-JPEG to JPEG, generate thumbnail
 	var imgWidth, imgHeight int
 	var thumbData []byte
