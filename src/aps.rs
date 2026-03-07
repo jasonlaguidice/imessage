@@ -528,7 +528,7 @@ impl APSConnectionResource {
     }
 
     pub async fn get_token(&self) -> [u8; 32] {
-        self.state.read().await.token.expect("Token not found!")
+        self.state.read().await.token.expect("Token not found; re-enter device details if persistent")
     }
 
     pub async fn request_topics(&self, topics: &[&str]) -> APSInterestToken {

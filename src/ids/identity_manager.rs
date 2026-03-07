@@ -16,7 +16,7 @@ use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
 
-use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
+use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSError, IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
 
 use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, IDSUserType, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
 
@@ -368,7 +368,7 @@ impl Resource for IdentityResource {
             debug!("Register failed {}!", err);
             drop(users_lock);
 
-            let needs_relog = matches!(err, PushError::AuthInvalid(6005) | PushError::RegisterFailed(6005));
+            let needs_relog = matches!(err, PushError::AuthInvalid(IDSError(6005)) | PushError::RegisterFailed(IDSError(6005)));
             return Err(if needs_relog {
                 info!("Auth returns 6005, relog required!");
                 PushError::DoNotRetry(Box::new(err))
@@ -690,7 +690,7 @@ impl IdentityResource {
            let results = match self.user_by_handle(topic, &users, handle).await?.query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
                Ok(results) => results,
                Err(err) => {
-                   if let PushError::LookupFailed(6005) = err {
+                   if let PushError::LookupFailed(IDSError(6005)) = err {
                        warn!("IDS returned 6005; attempting to re-register");
                        drop(users);
                        drop(id_lock);

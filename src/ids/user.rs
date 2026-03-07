@@ -830,7 +830,7 @@ impl IDSUser {
 
         let parsed: HandleResult = plist::from_bytes(&request)?;
         let Some(handles) = parsed.handles else {
-            return Err(PushError::AuthInvalid(parsed.status))
+            return Err(PushError::AuthInvalid(IDSError(parsed.status)))
         };
         
         Ok(handles)
@@ -851,7 +851,7 @@ impl IDSUser {
 
         let status = parsed.as_dictionary().unwrap()["status"].as_unsigned_integer().unwrap();
         if status != 0 {
-            return Err(PushError::AuthInvalid(status))
+            return Err(PushError::AuthInvalid(IDSError(status)))
         }
 
         let devices = parsed.as_dictionary().unwrap().get("registrations").unwrap().as_array().unwrap();
@@ -992,10 +992,25 @@ impl IDSUser {
 
         let loaded: IDSLookupResp = plist::from_bytes(&request)?;
         if loaded.status != 0 || loaded.results.is_none() {
-            return Err(PushError::LookupFailed(loaded.status))
+            return Err(PushError::LookupFailed(IDSError(loaded.status)))
         }
 
         Ok(loaded.results.unwrap())
+    }
+}
+
+#[derive(Debug)]
+pub struct IDSError(pub u64);
+
+impl Display for IDSError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            6001 => write!(f, "Incompatible; Make sure Contact Key Verification and Advanced Data Protection are off. (6001)"),
+            6004 => write!(f, "Please try again (6004)"),
+            6005 => write!(f, "Bad authentication, try again and re-enter device details if persistent. (6005)"),
+            6009 => write!(f, "Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac (6009)"),
+            _unk => write!(f, "Unknown IDS error {_unk}")
+        }
     }
 }
 
@@ -1110,7 +1125,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
 
     let status = resp.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {
-        return Err(PushError::RegisterFailed(status))
+        return Err(PushError::RegisterFailed(IDSError(status)))
     }
 
     // update registrations
@@ -1119,7 +1134,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     for service in service_list {
         let dict = service.as_dictionary().unwrap();
         let service_name = dict.get("service").unwrap().as_string().unwrap();
-        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(u64::MAX))?.as_array().unwrap();
+        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(IDSError(u64::MAX)))?.as_array().unwrap();
 
         let service = id_services.iter().find(|service| service.name == service_name).expect("Service not found??");
 
@@ -1134,7 +1149,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                         return Err(PushError::CustomerMessage(plist::from_value(alert)?))
                     }
                 }
-                return Err(PushError::RegisterFailed(status));
+                return Err(PushError::RegisterFailed(IDSError(status)));
             }
 
             let mut my_handles = vec![];
@@ -1145,7 +1160,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
                 if status != 0 {
                     error!("Failed to register {uri} status {}", status);
-                    return Err(PushError::RegisterFailed(status));
+                    return Err(PushError::RegisterFailed(IDSError(status)));
                 }
                 my_handles.push(uri.to_string());
             }
