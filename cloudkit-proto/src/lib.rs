@@ -10,33 +10,43 @@ use disjoint_impls::disjoint_impls;
 
 use crate::sealed::KindSealed;
 
+impl request_operation::header::Database {
+    pub fn ck_type(&self) -> &'static str {
+        match self {
+            Self::PrivateDb => "Private",
+            Self::PublicDb => "Public",
+            Self::SharedDb => "Shared",
+        }
+    }
+}
+
 pub trait CloudKitEncryptor {
-    fn encrypt_data(&self, data: &[u8], context: &[u8]) -> Vec<u8>;
-    fn decrypt_data(&self, dec: &[u8], context: &[u8]) -> Vec<u8>;
+    fn encrypt_data(&self, data: &[u8], field_name: &str) -> Vec<u8>;
+    fn decrypt_data(&self, dec: &[u8], field_name: &str) -> Vec<u8>;
 }
 
 struct FakeCloudKitEncryptor;
 impl CloudKitEncryptor for FakeCloudKitEncryptor {
-    fn decrypt_data(&self, _: &[u8], context: &[u8]) -> Vec<u8> {
+    fn decrypt_data(&self, _: &[u8], _: &str) -> Vec<u8> {
         panic!()
     }
-    fn encrypt_data(&self, _: &[u8], context: &[u8]) -> Vec<u8> {
+    fn encrypt_data(&self, _: &[u8], _: &str) -> Vec<u8> {
         panic!()
     }
 }
 
 pub trait CloudKitRecord {
     fn to_record(&self) -> Vec<record::Field> {
-        self.to_record_encrypted(None::<(&FakeCloudKitEncryptor, _)>)
+        self.to_record_encrypted(None::<&FakeCloudKitEncryptor>)
     }
     fn from_record(value: &[record::Field]) -> Self
     where
         Self: Sized {
-        Self::from_record_encrypted(value, None::<(&FakeCloudKitEncryptor, _)>)
+        Self::from_record_encrypted(value, None::<&FakeCloudKitEncryptor>)
     }
 
-    fn to_record_encrypted(&self, encryptor: Option<(&impl CloudKitEncryptor, &RecordIdentifier)>) -> Vec<record::Field>;
-    fn from_record_encrypted(value: &[record::Field], encryptor: Option<(&impl CloudKitEncryptor, &RecordIdentifier)>) -> Self;
+    fn to_record_encrypted(&self, encryptor: Option<&impl CloudKitEncryptor>) -> Vec<record::Field>;
+    fn from_record_encrypted(value: &[record::Field], encryptor: Option<&impl CloudKitEncryptor>) -> Self;
 
     fn record_type() -> &'static str;
 }
@@ -46,11 +56,11 @@ impl<T: CloudKitRecord> CloudKitRecord for &T {
         T::record_type()
     }
 
-    fn to_record_encrypted(&self, e: Option<(&impl CloudKitEncryptor, &RecordIdentifier)>) -> Vec<record::Field> {
+    fn to_record_encrypted(&self, e: Option<&impl CloudKitEncryptor>) -> Vec<record::Field> {
         T::to_record_encrypted(&self, e)
     }
 
-    fn from_record_encrypted(value: &[record::Field], e: Option<(&impl CloudKitEncryptor, &RecordIdentifier)>) -> Self
+    fn from_record_encrypted(value: &[record::Field], e: Option<&impl CloudKitEncryptor>) -> Self
         where
             Self: Sized {
         panic!("Cannot from with a ref")
@@ -58,8 +68,8 @@ impl<T: CloudKitRecord> CloudKitRecord for &T {
 }
 
 pub trait CloudKitEncryptedValue {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value>;
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self>
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value>;
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self>
     where
         Self: Sized;
 }
@@ -72,13 +82,13 @@ pub trait CloudKitValue {
 }
 
 impl<T: CloudKitEncryptedValue> CloudKitEncryptedValue for Option<T> {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
-        self.as_ref().and_then(|a| a.to_value_encrypted(encryptor, context))
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
+        self.as_ref().and_then(|a| a.to_value_encrypted(encryptor, field_name))
     }
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self>
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self>
         where
             Self: Sized {
-        Some(T::from_value_encrypted(value, encryptor, context))
+        Some(T::from_value_encrypted(value, encryptor, field_name))
     }
 }
 
@@ -136,95 +146,94 @@ disjoint_impls! {
 }
 
 impl<T: CloudKitBytes> CloudKitEncryptedValue for T {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
         Some(record::field::Value {
             r#type: Some(FieldType::EncryptedBytesType as i32),
-            bytes_value: Some(encryptor.encrypt_data(&self.to_bytes(), context)),
+            bytes_value: Some(encryptor.encrypt_data(&self.to_bytes(), field_name)),
             is_encrypted: Some(true),
             ..Default::default()
         })
     }
 
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
-        let data = encryptor.decrypt_data(value.bytes_value.as_ref()?, context);
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
+        let data = encryptor.decrypt_data(value.bytes_value.as_ref()?, field_name);
         if data.is_empty() { return None }
         Some(Self::from_bytes(data))
     }
 }
 
 impl<T: CloudKitBytes> CloudKitEncryptedValue for Vec<T> {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
         Some(record::field::Value {
             r#type: Some(FieldType::EncryptedBytesListType as i32),
-            list_values: self.iter().filter_map(|a| a.to_bytes().to_value_encrypted(encryptor, context)).collect(),
+            list_values: self.iter().filter_map(|a| a.to_bytes().to_value_encrypted(encryptor, field_name)).collect(),
             is_encrypted: Some(false),
             ..Default::default()
         })
     }
 
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
-        Some(value.list_values.iter().filter_map(|v| CloudKitEncryptedValue::from_value_encrypted(v, encryptor, context)).collect())
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
+        Some(value.list_values.iter().filter_map(|v| CloudKitEncryptedValue::from_value_encrypted(v, encryptor, field_name)).collect())
     }
 }
 
 
 impl CloudKitEncryptedValue for i64 {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
         Some(record::field::Value {
             r#type: Some(FieldType::Int64Type as i32),
             bytes_value: Some(encryptor.encrypt_data(&record::field::EncryptedValue {
                 signed_value: Some(*self),
                 ..Default::default()
-            }.encode_to_vec(), context)),
+            }.encode_to_vec(), field_name)),
             is_encrypted: Some(true),
             ..Default::default()
         })
     }
 
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
-        Some(record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), context)[..]).unwrap().signed_value())
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
+        Some(record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), field_name)[..]).unwrap().signed_value())
     }
 }
 
 impl CloudKitEncryptedValue for String {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
         Some(record::field::Value {
             r#type: Some(FieldType::StringType as i32),
             bytes_value: Some(encryptor.encrypt_data(&record::field::EncryptedValue {
                 string_value: Some(self.clone()),
                 ..Default::default()
-            }.encode_to_vec(), context)),
+            }.encode_to_vec(), field_name)),
             is_encrypted: Some(true),
             ..Default::default()
         })
     }
 
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
-        Some(record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), context)[..]).unwrap().string_value().to_string())
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
+        Some(record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), field_name)[..]).unwrap().string_value().to_string())
     }
 }
 
 impl CloudKitEncryptedValue for SystemTime {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
-        let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
-        let duration = self.duration_since(apple_epoch).expect("Before Apple Epoch?").as_secs_f64();
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
+        // start at apple epoch
+        let duration = self.duration_since(SystemTime::UNIX_EPOCH).expect("Before Unix Epoch?").as_secs_f64() - 978307200f64;
 
         Some(record::field::Value {
             r#type: Some(FieldType::DateType as i32),
             bytes_value: Some(encryptor.encrypt_data(&record::field::EncryptedValue {
                 date_value: Some(Date { time: Some(duration) }),
                 ..Default::default()
-            }.encode_to_vec(), context)),
+            }.encode_to_vec(), field_name)),
             is_encrypted: Some(true),
             ..Default::default()
         })
     }
 
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
-        let d = record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), context)[..]).unwrap().date_value.unwrap();
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
+        let d = record::field::EncryptedValue::decode(&encryptor.decrypt_data(value.bytes_value.as_ref().unwrap(), field_name)[..]).unwrap().date_value.unwrap();
         let secs = d.time.expect("Date misses time??");
-        let apple_epoch = SystemTime::UNIX_EPOCH + Duration::from_secs(978307200);
-        Some(apple_epoch + Duration::from_secs_f64(secs))
+        Some(SystemTime::UNIX_EPOCH + Duration::from_secs_f64(secs + 978307200f64))
     }
 }
 
@@ -243,16 +252,12 @@ pub fn base64_encode(data: &[u8]) -> String {
 }
 
 impl CloudKitEncryptedValue for Asset {
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<record::field::Value> {
-        let extra_context = format!("-{}-{}", base64_encode(self.signature()), base64_encode(self.reference_signature()));
-        let context = [
-            context,
-            extra_context.as_bytes(),
-        ].concat();
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<record::field::Value> {
+        let field_name = format!("{}-{}-{}", field_name, base64_encode(self.signature()), base64_encode(self.reference_signature()));
 
         let mut copy = self.clone();
         let protection_info = copy.protection_info.as_mut().unwrap().protection_info.as_mut().unwrap();
-        *protection_info = encryptor.encrypt_data(&protection_info, &context);
+        *protection_info = encryptor.encrypt_data(&protection_info, &field_name);
         Some(record::field::Value {
             r#type: Some(FieldType::AssetType as i32),
             asset_value: Some(copy),
@@ -260,14 +265,10 @@ impl CloudKitEncryptedValue for Asset {
         })
     }
 
-    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self> {
+    fn from_value_encrypted(value: &record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self> {
         let mut copy = value.asset_value.clone();
         if let Some(copy) = &mut copy {
-            let extra_context = format!("-{}-{}", base64_encode(copy.signature()), base64_encode(copy.reference_signature()));
-            let context = [
-                context,
-                extra_context.as_bytes(),
-            ].concat();
+            let context = format!("{}-{}-{}", field_name, base64_encode(copy.signature()), base64_encode(copy.reference_signature()));
 
             let protection_info = copy.protection_info.as_mut().unwrap().protection_info.as_mut().unwrap();
             *protection_info = encryptor.decrypt_data(&protection_info, &context);

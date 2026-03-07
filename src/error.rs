@@ -200,4 +200,10 @@ pub enum PushError {
     KeystoreError(#[from] KeystoreError),
     #[error("Unknown TOTP algorithm {0}!")]
     UnknownTotpAlgorithm(u32),
+    #[error("Cloudkit user not found!")]
+    UserNotFound,
+    #[error("Cloudkit routing key not found!")]
+    NoRoutingKey,
+    #[error("Removed from Share!")]
+    RemovedFromShare,
 }

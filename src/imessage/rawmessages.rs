@@ -577,6 +577,15 @@ pub struct RichLinkImageAttachmentSubstitute {
 }
 
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all_fields = "camelCase", tag = "$class")]
+pub enum LPSpecializationMetadata {
+    LPPasswordsInviteMetadata {
+        group_name: String,
+        url_parameters: String,
+    }
+}
+
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "$class")]
@@ -585,7 +594,7 @@ pub struct LPLinkMetadata {
     pub version: u8,
     pub icon_metadata: Option<LPIconMetadata>,
     #[serde(rename = "originalURL")]
-    pub original_url: NSURL,
+    pub original_url: Option<NSURL>,
     #[serde(rename = "URL")]
     pub url: Option<NSURL>,
     pub title: Option<String>,
@@ -594,6 +603,12 @@ pub struct LPLinkMetadata {
     pub icon: Option<RichLinkImageAttachmentSubstitute>,
     pub images: Option<NSArray<LPImageMetadata>>,
     pub icons: Option<NSArray<LPIconMetadata>>,
+
+    pub is_incomplete: Option<bool>,
+    pub uses_activity_pub: Option<bool>,
+    pub is_encoded_for_local_use: Option<bool>,
+    pub collaboration_type: Option<u32>,
+    pub specialization2: Option<LPSpecializationMetadata>,
 }
 
 

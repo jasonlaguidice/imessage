@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, ops::Deref, sync
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
-use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, Field, Reference}, request_operation::header::IsolationLevel, response_operation, view_keys::ViewKey, Bottle, CloudKitRecord, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, TlkShare, ViewKeys, Voucher};
+use cloudkit_proto::{Bottle, CloudKitRecord, CreateSubscriptionRequest, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, Identifier, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, Subscription, TlkShare, ViewKeys, Voucher, ot_bottle::OtAuthenticatedCiphertext, record::{Field, Reference, reference}, request_operation::header::{ContainerEnvironment, IsolationLevel}, response_operation, view_keys::ViewKey};
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
@@ -26,7 +26,7 @@ use aes_gcm::KeyInit;
 use aes_siv::{siv::CmacSiv, Aes256SivAead};
 
 use cloudkit_proto::CuttlefishEstablishResponse;
-use crate::{TokenProvider, cloudkit::{DeleteRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey, util::{ec_key_from_apple, ec_key_to_apple}};
+use crate::{TokenProvider, cloudkit::{CreateSubscriptionOperation, DeleteRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey, util::{ec_key_from_apple, ec_key_to_apple}};
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
@@ -347,6 +347,7 @@ impl IESCiphertext {
     }
 }
 
+#[derive(Clone)]
 pub struct SivKey(pub Vec<u8>);
 
 impl SivKey {
@@ -650,7 +651,7 @@ const CUTTLEFISH_CONTAINER: CloudKitContainer = CloudKitContainer {
     env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
 };
 
-const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
+pub const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
     database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,
     bundleid: "com.apple.securityd",
     containerid: "com.apple.security.keychain",
@@ -1394,6 +1395,29 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         (self.update_state)(&state);
     }
 
+    pub async fn create_subscriptions(&self) -> Result<(), PushError> {
+        let security = self.get_security_container().await?;      
+        let mut subscriptions = vec![];
+        for zone in KEYCHAIN_ZONES {
+            let mut zone_identifier = security.private_zone(zone.to_string());
+            zone_identifier.environment = Some(ContainerEnvironment::Production as i32);
+            subscriptions.push(CreateSubscriptionOperation(CreateSubscriptionRequest {
+                subscription: Some(Subscription {
+                    identifier: Some(Identifier { 
+                        name: Some(format!("zone:{}", zone)), 
+                        r#type: Some(cloudkit_proto::identifier::Type::Subscription.into())
+                    }),
+                    evaulation_type: Some(2),
+                    zone_identifier: Some(zone_identifier),
+                    ..Default::default()
+                })
+            }))
+        }
+        // ignore inner results, assume that it was created or maybe zone didn't exist but who cares
+        security.perform_operations(&CloudKitSession::new(), &subscriptions, IsolationLevel::Zone).await?;
+        Ok(())
+    }
+
     pub async fn reset_clique(&self, device_password: &[u8]) -> Result<(), PushError> {
 
         let response: CuttlefishFetchViableBottleResponse = self.invoke_cuttlefish("fetchViableBottles", CuttlefishFetchViableBottleRequest {
@@ -1501,6 +1525,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             }).await?;
 
             self.join_clique(device_password, &private, None, &shares, viewkeys.clone()).await?;
+            let _ = self.create_subscriptions().await;
             Ok(())
         })
             .retry(&ConstantBuilder::default()

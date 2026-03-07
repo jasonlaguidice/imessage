@@ -339,15 +339,15 @@ pub struct CloudMessage {
 }
 
 impl CloudKitEncryptedValue for MessageFlags {
-    fn from_value_encrypted(value: &cloudkit_proto::record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self>
+    fn from_value_encrypted(value: &cloudkit_proto::record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self>
         where
             Self: Sized {
         
-        i64::from_value_encrypted(value, encryptor, context).map(|v| MessageFlags::from_bits_truncate(v))
+        i64::from_value_encrypted(value, encryptor, field_name).map(|v| MessageFlags::from_bits_truncate(v))
     }
 
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<cloudkit_proto::record::field::Value> {
-        self.bits().to_value_encrypted(encryptor, context)
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<cloudkit_proto::record::field::Value> {
+        self.bits().to_value_encrypted(encryptor, field_name)
     }
 }
 
@@ -526,7 +526,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
                 },
                 Err(e) => return Err(e)
             };
-            let item = T::from_record_encrypted(&record.record_field, Some((&pcskey, record.record_identifier.as_ref().unwrap())));
+            let item = T::from_record_encrypted(&record.record_field, Some(&pcskey));
 
             results.insert(identifier, Some(item));
         }
@@ -552,7 +552,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             }
 
             let mut result: HashMap<usize, Result<(), PushError>> = match container.perform_operations(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await {
-                Ok(item) => item.into_iter().enumerate().collect(),
+                Ok(item) => item.into_iter().map(|i| i.map(|_| ())).enumerate().collect(),
                 Err(e) => {
                     let joined = Arc::new(e);
                     results.extend(ids.into_iter().map(|r| (r, Err(PushError::BatchError(joined.clone())))));

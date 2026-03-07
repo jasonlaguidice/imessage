@@ -387,6 +387,14 @@ pub fn base64_decode(data: &str) -> Vec<u8> {
     general_purpose::STANDARD.decode(data).unwrap()
 }
 
+pub fn base64_encode_url(data: &[u8]) -> String {
+    general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+pub fn base64_decode_url(data: &str) -> Vec<u8> {
+    general_purpose::URL_SAFE_NO_PAD.decode(data).unwrap()
+}
+
 pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, Error> {
     plist_to_buf(value).map(|val| String::from_utf8(val).unwrap())
 }
@@ -1054,7 +1062,16 @@ const CLASS_SPECS: &[ClassData] = &[
             "image",
             "icon",
             "images",
-            "icons"
+            "icons",
+            "specialization2"
+        ]
+    },
+    ClassData {
+        name: "LPPasswordsInviteMetadata",
+        classes: &["LPPasswordsInviteMetadata", "LPSpecializationMetadata", "NSObject"],
+        uid_fields: &[
+            "groupName",
+            "urlParameters"
         ]
     },
     ClassData {
@@ -2323,18 +2340,6 @@ impl<T: Write> StreamTypedCoder<T> {
             }
         }
     }
-}
-
-#[test]
-fn test() {
-    let decoded = decode_hex("040B73747265616D747970656481E803840140848484124E5341747472696275746564537472696E67008484084E534F626A656374008592848484084E53537472696E67019484012B03EFBFBC86840269490101928484840C4E5344696374696F6E61727900948401690292849696225F5F6B494D46696C655472616E73666572475549444174747269627574654E616D6586928496962444453531414333372D363630412D344334332D384634342D33343045413132373936373186928496961D5F5F6B494D4D657373616765506172744174747269627574654E616D658692848484084E534E756D626572008484074E5356616C7565009484012A84999900868686").unwrap();
-    // let decoded = decode_hex("040B73747265616D747970656481E803840140848484124E5341747472696275746564537472696E67008484084E534F626A656374008592848484084E53537472696E67019484012B41546F207374616E64206261636B20776865726520796F752073746F6F642C2049207769736820796F7520776F756C642C2049207769736820796F7520776F756C6486840269490141928484840C4E5344696374696F6E617279009484016901928496961D5F5F6B494D4D657373616765506172744174747269627574654E616D658692848484084E534E756D626572008484074E5356616C7565009484012A84999900868686").unwrap();
-    let d = coder_decode_flattened(&decoded);
-    let d = NSAttributedString::decode(&d[0]);
-
-    let encoded = coder_encode_flattened(&[d.encode()]);
-
-    println!("{:?}", d);
 }
 
 

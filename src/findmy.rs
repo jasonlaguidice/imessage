@@ -32,6 +32,7 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
         "com.apple.private.alloy.status.keysharing",
         "com.apple.private.alloy.status.personal",
         "com.apple.private.alloy.findmy.itemsharing-crossaccount",
+        "com.apple.private.alloy.kcsharing.invite",
     ],
     client_data: &[
         ("supports-fmd-v2", Value::Boolean(true)),
@@ -808,7 +809,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
         let daemon = FindMyFriendsClient::new(config.as_ref(), state.state.lock().await.dsid.clone(), token_provider.clone(), conn.clone(), anisette.clone(), true).await?;
         Ok(FindMyClient {
-            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
+            _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
             conn,
             identity,
             daemon: Mutex::new(daemon),
@@ -887,7 +888,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             let protection_info_tag = protection_info.protection_info_tag().to_string();
 
             if record.r#type.as_ref().unwrap().name() == MasterBeaconRecord::record_type() {
-                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 info!("Got beacon {:?} {}", item, identifier);
 
@@ -897,7 +898,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     beacon_records.insert(identifier, item);
                 }
             } else if record.r#type.as_ref().unwrap().name() == BeaconNamingRecord::record_type() {
-                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 if let Some(accessory) = accessories.get_mut(&item.associated_beacon) {
                     accessory.naming = item;
@@ -906,7 +907,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     naming_records.insert(item.associated_beacon.clone(), (identifier, Some(protection_info_tag), item));
                 }
             } else if record.r#type.as_ref().unwrap().name() == KeyAlignmentRecord::record_type() {
-                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 if let Some(accessory) = accessories.get_mut(&item.beacon_identifier) {
                     accessory.alignment = item.clone();
@@ -916,28 +917,28 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     alignment_records.insert(item.beacon_identifier.clone(), (identifier, Some(protection_info_tag), item));
                 }
             } else if record.r#type.as_ref().unwrap().name() == SharingCircleSecret::record_type() {
-                let item = SharingCircleSecret::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = SharingCircleSecret::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 secrets.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == OwnerSharingCircle::record_type() {
-                let item = OwnerSharingCircle::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = OwnerSharingCircle::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 circles.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == OwnerPeerTrust::record_type() {
-                let item = OwnerPeerTrust::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = OwnerPeerTrust::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 peer_trust.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == MemberPeerTrust::record_type() {
-                let item = MemberPeerTrust::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MemberPeerTrust::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 peer_trust_member.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == MemberSharingCircle::record_type() {
-                let item = MemberSharingCircle::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MemberSharingCircle::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 circles_member.insert(identifier.clone(), item);
                 tags.insert(identifier, protection_info_tag);
             } else if record.r#type.as_ref().unwrap().name() == SharedBeaconRecord::record_type() {
-                let item = SharedBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = SharedBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 shared_beacons.insert(identifier, item);
             } else { continue }

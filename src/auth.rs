@@ -1240,7 +1240,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
 impl IdmsAuthListener {
     pub async fn new(conn: APSConnection) -> Self {
         Self {
-            _interest_token: conn.request_topics(vec!["com.apple.idmsauth"]).await,
+            _interest_token: conn.request_topics(&["com.apple.idmsauth"]).await,
         }
     }
 

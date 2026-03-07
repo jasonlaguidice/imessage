@@ -1,14 +1,15 @@
 
-use std::{collections::BTreeSet, io::Cursor, time::SystemTime};
+use std::{borrow::Borrow, collections::BTreeSet, io::Cursor, time::SystemTime};
 
 use aes::{cipher::consts::U12, Aes128};
 use aes_gcm::{AesGcm, Nonce, Tag};
 use chrono::Utc;
-use cloudkit_proto::CloudKitEncryptor;
+use cloudkit_proto::{CloudKitEncryptor, ProtectionInfo, RecordIdentifier};
 use log::{info, warn};
 use omnisette::AnisetteProvider;
-use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
+use openssl::{bn::{BigNum, BigNumContext}, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private, Public}, sha::{sha1, sha256}, sign::{Signer, Verifier}};
 use plist::{Dictionary, Value};
+use prost::bytes::Bytes;
 use rasn::{types::{Any, GeneralizedTime, SequenceOf, SetOf}, AsnType, Decode, Encode};
 use aes_gcm::KeyInit;
 use aes_gcm::AeadInPlace;
@@ -398,21 +399,23 @@ fn get_ciphertext_key(ciphertext: &[u8]) -> (Vec<u8>, usize) {
 
 #[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PCSKeyRef {
-    keytype: u32,
-    pub_key: rasn::types::OctetString,
+    pub keytype: u32,
+    pub pub_key: rasn::types::OctetString,
 }
 
 #[derive(AsnType, Encode, Decode, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PCSShareKey {
     decryption_key: PCSKeyRef,
     ciphertext: rasn::types::OctetString,
-    unk1: Option<u32>,
+    flags: Option<u32>,
 }
 
 #[derive(AsnType, Encode, Decode, Debug)]
 pub struct PCSKeySet {
     unk1: u32, // 0
     keyset: SetOf<PCSShareKey>,
+    #[rasn(tag(explicit(context, 0)))]
+    attributes: Option<SequenceOf<PCSAttribute>>,
 }
 
 #[derive(Clone)]
@@ -426,10 +429,11 @@ impl PCSKey {
         rfc6637_wrap_key(key, &self.0, "fingerprint".as_bytes())
     }
 
-    fn random() -> Self {
+    pub fn random() -> Self {
         Self(rand::random::<[u8; 16]>().to_vec())
     }
 
+    // AKA object key
     fn master_ec_key(&self) -> Result<EcKey<Private>, PushError> {
         let mut ctx = BigNumContext::new().unwrap();
         let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
@@ -454,6 +458,20 @@ impl PCSKey {
         let mut pub_point = EcPoint::new(&group)?;
         pub_point.mul_generator(&group, &num, &ctx)?;
         Ok(EcKey::from_private_components(&group, &num, &pub_point)?)
+    }
+
+    pub fn get_share_key(&self, is_share: bool) -> Self {
+        if is_share {
+            Self(kdf_ctr_hmac(&self.0, "MsaeEooevaX fooo 012".as_bytes(), &[], self.0.len()))
+        } else {
+            self.clone()
+        }
+    }
+
+    fn hmac_sign(&self, data: &[u8]) -> Result<Vec<u8>, PushError> {
+        let hmackey = kdf_ctr_hmac(&self.0, "hmackey-of-masterkey".as_bytes(), &[], self.0.len());
+        let hmac = PKey::hmac(&hmackey)?;
+        Ok(Signer::new(MessageDigest::sha256(), &hmac)?.sign_oneshot_to_vec(&data)?)
     }
 
     pub fn key_id(&self) -> Result<Vec<u8>, PushError> {
@@ -513,27 +531,24 @@ impl PCSKey {
     }
 }
 
-impl CloudKitEncryptor for PCSKey {
-    fn decrypt_data(&self, dec: &[u8], context: &[u8]) -> Vec<u8> {
-        self.decrypt(dec, context).expect("Decryption failed")
-    }
-
-    fn encrypt_data(&self, enc: &[u8], context: &[u8]) -> Vec<u8> {
-        self.encrypt(enc, context).expect("Encryption failed")
-    }
+pub struct PCSEncryptor {
+    pub keys: Vec<PCSKey>,
+    pub record_id: RecordIdentifier,
 }
-
-pub struct PCSKeys(pub Vec<PCSKey>);
-impl CloudKitEncryptor for PCSKeys {
-    fn decrypt_data(&self, dec: &[u8], context: &[u8]) -> Vec<u8> {
+impl CloudKitEncryptor for PCSEncryptor {
+    fn decrypt_data(&self, dec: &[u8], field_name: &str) -> Vec<u8> {
         let (required_key, _) = get_ciphertext_key(dec);
 
-        let key = self.0.iter().find(|k| &k.key_id().unwrap()[..required_key.len()] == &required_key[..]).expect("required key not found!");
-        key.decrypt(dec, context).expect("Decryption failed")
+        let tag = format!("{}-{}-{}", self.record_id.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(), self.record_id.value.as_ref().unwrap().name(), field_name);
+
+        let key = self.keys.iter().find(|k| &k.key_id().unwrap()[..required_key.len()] == &required_key[..]).expect("required key not found!");
+        key.decrypt(dec, tag.as_bytes()).expect("Decryption failed")
     }
 
-    fn encrypt_data(&self, enc: &[u8], context: &[u8]) -> Vec<u8> {
-        self.0.first().expect("PCS keyset empty?").encrypt(enc, context).expect("Encryption failed")
+    fn encrypt_data(&self, enc: &[u8], field_name: &str) -> Vec<u8> {
+        let tag = format!("{}-{}-{}", self.record_id.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(), self.record_id.value.as_ref().unwrap().name(), field_name);
+
+        self.keys.first().expect("PCS keyset empty?").encrypt(enc, tag.as_bytes()).expect("Encryption failed")
     }
 }
 
@@ -553,12 +568,14 @@ pub struct PCSShareProtection {
     #[rasn(tag(explicit(context, 0)))]
     meta: rasn::types::OctetString, // encrypted
     #[rasn(tag(explicit(context, 1)))]
-    attributes: PCSShareProtectionSignatureData, // not sure this should be a sequence, maybe tag should be explicit, not sure
+    signature_data: PCSShareProtectionSignatureData, // not sure this should be a sequence, maybe tag should be explicit, not sure
     hmac: rasn::types::OctetString,
     #[rasn(tag(explicit(context, 2)))]
     truncated_key_id: rasn::types::OctetString,
     #[rasn(tag(explicit(context, 3)))]
-    signature: PCSSignature,
+    signature: Option<PCSSignature>,
+    #[rasn(tag(explicit(context, 4)))]
+    attributes: Option<SequenceOf<PCSAttribute>>,
 }
 
 #[derive(AsnType, Encode, Decode, Default)]
@@ -598,6 +615,42 @@ impl PCSShareProtectionKeySet {
     }
 }
 
+struct PCSDigestData(Vec<u8>);
+
+impl PCSDigestData {
+    fn verify(&self, key: &EcKey<impl HasPublic>, sig: &PCSSignature) -> Result<(), PushError> {
+        let pkey = PKey::from_ec_key(key.clone())?;
+        if !sig.keyid.is_empty() && &*sig.keyid != TryInto::<CompactECKey<_>>::try_into(key.clone())?.compress() {
+            panic!("Mismatched key ID, expected {} got {}", encode_hex(&sig.keyid), encode_hex(&key.public_key_to_der()?))
+        }
+
+        let mut verifier = Verifier::new(MessageDigest::sha256(), &pkey)?;
+        verifier.update(&self.0)?;
+        if !verifier.verify(&sig.signature)? {
+            return Err(PushError::VerificationFailed)
+        }
+        
+        Ok(())
+    }
+
+    fn sign(&self, key: &EcKey<Private>, is_self: bool) -> Result<PCSSignature, PushError> {
+        let pkey = PKey::from_ec_key(key.clone())?;
+        let mut signer = Signer::new(MessageDigest::sha256(), &pkey)?;
+        signer.update(&self.0)?;
+
+        Ok(PCSSignature {
+            keyid: if is_self { Default::default() } else { TryInto::<CompactECKey<_>>::try_into(key.clone())?.compress().to_vec().into() },
+            digest: 1,
+            signature: signer.sign_to_vec()?.into(),
+        })
+    }
+}
+
+pub struct ParticipantMeta {
+    pub share_key: CompactECKey<Public>,
+    pub sign_with_private_key: Option<PCSPrivateKey>,
+}
+
 #[derive(AsnType, Encode, Decode)]
 pub struct PCSShareProtectionIdentities {
     #[rasn(tag(explicit(context, 0)))]
@@ -610,15 +663,15 @@ pub struct PCSShareProtectionIdentities {
 
 impl PCSShareProtection {
     fn signature_data(&self) -> PCSObjectSignature {
-        rasn::der::decode(&self.attributes.data).expect("failed to decode signature data")
+        rasn::der::decode(&self.signature_data.data).expect("failed to decode signature data")
     }
 
-    fn digest_data(&self, objsig: &PCSObjectSignature) -> Vec<u8> {
+    fn digest_data(&self, objsig: &PCSObjectSignature) -> PCSDigestData {
         let mut data = [
             &rasn::der::encode(&self.keyset).unwrap(),
             &self.meta[..],
-            &objsig.unk2.to_be_bytes(),
-            &objsig.unk1.to_be_bytes(),
+            &objsig.outer_sign_key_type.to_be_bytes(),
+            &objsig.roll_count.to_be_bytes(),
             &objsig.symm_key_count.unwrap_or(0).to_be_bytes(),
             &objsig.public.keytype.to_be_bytes(),
             &objsig.public.pub_key[..],
@@ -629,7 +682,7 @@ impl PCSShareProtection {
         if let Some(ec_key_list) = &objsig.ec_key_list {
             data.extend_from_slice(&rasn::der::encode(ec_key_list).unwrap());
         }
-        data
+        PCSDigestData(data)
     }
 
     fn hmac_data(&self) -> Vec<u8> {
@@ -644,20 +697,87 @@ impl PCSShareProtection {
         Ok(self.keyset.keyset.first().expect("No public keyset! (bad decoding?)").decryption_key.pub_key.to_vec())
     }
 
-    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
-        info!("Decoding with {}", base64_encode(&self.decode_key_public()?));
-        let account = Value::String(base64_encode(&self.decode_key_public()?));
-        let item = keychain.items[service.zone].keys.values().find(|x| x.get("acct") == Some(&account))
+    pub fn get_private_key(&self, keychain: &KeychainClientState, service: &PCSService<'_>) -> Result<PCSPrivateKey, PushError> {
+        let keys = self.keyset.keyset.iter().map(|k| Value::String(base64_encode(&k.decryption_key.pub_key))).collect::<Vec<_>>();
+        
+        let item = keychain.items[service.zone].keys.values().find(|x| matches!(x.get("acct"), Some(x) if keys.contains(x)))
             .ok_or(PushError::ShareKeyNotFound(encode_hex(&self.decode_key_public()?)))?;
-        let decoded = PCSPrivateKey::from_dict(item, keychain);
-
-        let key = decoded.key();
-
-        self.decode(&key)
+        Ok(PCSPrivateKey::from_dict(item, keychain))
     }
 
-    pub fn create(encrypt: &CompactECKey<Private>, keys: &[CompactECKey<Private>]) -> Result<Self, PushError> {
-        let master_key = PCSKey::random();
+    pub fn decrypt_with_keychain(&self, keychain: &KeychainClientState, service: &PCSService<'_>, custom_signing: bool) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+        let decoded = self.get_private_key(keychain, service)?;
+        
+        let key = decoded.key();
+        info!("Decoding with {}", base64_encode(&key.compress()));
+        
+        let signing = decoded.signing_key();
+        self.decode(&[&key], if custom_signing { Some(&signing) } else { None })
+    }
+
+    pub fn to_protection_info(&self, tag: bool) -> Result<ProtectionInfo, PushError> {
+        let encoded = rasn::der::encode(self).expect("Failed to encode protection info!");
+        Ok(ProtectionInfo {
+            protection_info_tag: if tag { Some(encode_hex(&sha1(&encoded)).to_uppercase()) } else { None },
+            protection_info: Some(encoded),
+        })
+    }
+
+    pub fn get_inner_keys(&self) -> Vec<CompactECKey<Public>> {
+        self.signature_data().ec_key_list.unwrap_or_default().into_iter().map(|key| 
+                CompactECKey::decompress(key.pub_key.to_vec().try_into().expect("bad key lsne!"))).collect()
+    }
+
+    pub fn get_roll_count(&self) -> u32 {
+        self.signature_data().roll_count
+    }
+
+    pub fn from_protection_info(info: &ProtectionInfo) -> Self {
+        rasn::der::decode(info.protection_info()).expect("Bad invite protection?")
+    }
+
+    pub fn create_new(me: &CompactECKey<Private>, keys: &[CompactECKey<Private>], access: &[CompactECKey<impl HasPublic>], is_share: bool) -> Result<Self, PushError> {
+        Ok(Self::create(me, keys, access, PCSKey::random(), Some(me), &[], None, 1, None, is_share)?)
+    }
+
+    pub fn get_key_attribute(&self, attr: u32) -> Option<Bytes> {
+        self.keyset.attributes.clone().unwrap_or_default().into_iter().find(|i| i.key == attr).map(|i| i.value)
+    }
+
+    pub fn get_encryption_keys(&self) -> Vec<Vec<u8>> {
+        self.keyset.keyset.iter().map(|k| k.decryption_key.pub_key.to_vec()).collect()
+    }
+
+    pub fn create_participant(key: &CompactECKey<impl HasPublic>, participant_key: &[CompactECKey<Private>], participant_meta: &ParticipantMeta) -> Result<Self, PushError> {
+        Self::create(
+            &key, 
+            participant_key, 
+            &[] as &[CompactECKey<Private>], 
+            PCSKey::random(),
+            None, 
+            &[], 
+            None, 
+            1,
+            Some(participant_meta), 
+            true
+        )
+    }
+
+    // don't put "me" in access
+    pub fn create(
+        me: &CompactECKey<impl HasPublic>, 
+        keys: &[CompactECKey<Private>], 
+        access: &[CompactECKey<impl HasPublic>], 
+        rm_master_key: PCSKey,
+        sign_with_key: Option<&EcKey<Private>>,
+        extra_keys: &[PCSKey], 
+        last_key: Option<PCSKey>,
+        roll_count: u32,
+        participant_meta: Option<&ParticipantMeta>,
+        is_share: bool,
+    ) -> Result<Self, PushError> {
+        let master_key = rm_master_key.get_share_key(is_share);
+        
         let mut keyset = PCSShareProtectionKeySet {
             unk1: "".to_string(),
             keys: BTreeSet::from_iter(keys.iter().map(|k| PCSPrivateKey::V1 {
@@ -670,7 +790,7 @@ impl PCSShareProtection {
         keyset.make_checksum();
 
         let identities = PCSShareProtectionIdentities {
-            symm_keys: None,
+            symm_keys: if extra_keys.is_empty() { None } else { Some(extra_keys.iter().map(|i| i.0.clone().into()).collect()) },
             tag1: Default::default(),
             identities: if keys.is_empty() { None } else { Some(BTreeSet::from_iter([
                 PCSShareProtectionIdentityData {
@@ -682,33 +802,71 @@ impl PCSShareProtection {
 
         let encrypted = master_key.encrypt(&rasn::der::encode(&identities).unwrap(), &[])?;
 
+        let mut attributes = vec![];
+        if let Some(participant) = participant_meta {
+            let pub_key = participant.sign_with_private_key.as_ref()
+                .map(|i| i.signing_key().compress())
+                .unwrap_or(me.compress());
+            attributes.push(PCSAttribute {
+                key: 8,
+                value: rasn::der::encode(&PCSKeyRef {
+                    keytype: 3,
+                    pub_key: pub_key.to_vec().into(),
+                }).unwrap().into(),
+            });
+            attributes.push(PCSAttribute {
+                key: 9,
+                value: rasn::der::encode(&PCSKeyRef {
+                    keytype: 3,
+                    pub_key: participant.share_key.compress().to_vec().into(),
+                }).unwrap().into(),
+            });
+        }
+
         let mut protection = PCSShareProtection {
             keyset: PCSKeySet {
                 unk1: 0,
-                keyset: BTreeSet::from_iter([
-                    PCSShareKey {
-                        decryption_key: PCSKeyRef {
-                            keytype: 3,
-                            pub_key: encrypt.compress().to_vec().into(),
-                        },
-                        ciphertext: master_key.wrap(encrypt)?.into(),
-                        unk1: None,
-                    }
-                ])
+                keyset: BTreeSet::from_iter(std::iter::once(PCSShareKey {
+                    decryption_key: PCSKeyRef {
+                        keytype: 3,
+                        pub_key: me.compress().to_vec().into(),
+                    },
+                    ciphertext: rm_master_key.wrap(me)?.into(),
+                    flags: None,
+                }).chain(access.iter().map(|k| PCSShareKey {
+                    decryption_key: PCSKeyRef {
+                        keytype: 3,
+                        pub_key: k.compress().to_vec().into(),
+                    },
+                    ciphertext: master_key.wrap(k).expect("Failed to wrap key?").into(),
+                    flags: if is_share { Some(1) /* mark as readonly, marks as providing derived master key not rm master key */ } else { None },
+                }))),
+                attributes: if attributes.is_empty() { None } else { Some(attributes) },
             },
             meta: encrypted.into(),
-            attributes: Default::default(),
+            signature_data: Default::default(),
             hmac: Default::default(),
             truncated_key_id: master_key.key_id()?[..4].to_vec().into(),
             signature: Default::default(),
+            attributes: None,
         };
 
         let mut num_ctx = BigNumContext::new()?;
-        let master_ec_key = master_key.master_ec_key()?;
+        let master_ec_key = rm_master_key.master_ec_key()?;
+
+        let mut signature_attributes = vec![];
+        if !extra_keys.is_empty() {
+            // add list of key ids
+            signature_attributes.push(PCSAttribute { 
+                key: 5, 
+                value: rasn::der::encode(&extra_keys.iter().map(|key| 
+                        key.key_id().expect("Bad key id??")[..4].to_vec().into()).collect::<Vec<Bytes>>()).unwrap().into(),
+            });
+        }
 
         let mut signature = PCSObjectSignature {
-            unk1: 1,
-            unk2: 3,
+            roll_count,
+            outer_sign_key_type: if sign_with_key.is_some() { 3 } else { 0 },
             public: PCSKeyRef {
                 keytype: 1,
                 pub_key: master_ec_key.public_key().to_bytes(master_ec_key.group(), PointConversionForm::UNCOMPRESSED, &mut num_ctx)?.into(),
@@ -718,87 +876,119 @@ impl PCSShareProtection {
                 keytype: 3,
                 pub_key: k.compress().to_vec().into(),
             }).collect()) },
-            symm_key_count: None,
+            symm_key_count: if extra_keys.is_empty() { None } else { Some(extra_keys.len() as u32) },
             signature_2: None,
-            attributes: None,
+            attributes: if signature_attributes.is_empty() { None } else { Some(signature_attributes) },
         };
 
         let digest_data = protection.digest_data(&signature);
+        signature.signature = digest_data.sign(&master_ec_key, true)?;
 
-        let key = PKey::from_ec_key(master_ec_key)?;
-        let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
-        signer.update(&digest_data)?;
-        signature.signature = PCSSignature {
-            keyid: Default::default(),
-            digest: 1,
-            signature: signer.sign_to_vec()?.into(),
-        };
+        if let Some(last_key) = last_key {
+            let my_sig = digest_data.sign(&last_key.master_ec_key()?, true)?;
+            signature.signature_2 = Some(my_sig);
+        }
 
-        protection.attributes = PCSShareProtectionSignatureData {
-            version: 5,
+        protection.signature_data = PCSShareProtectionSignatureData {
+            version: if is_share { 4 } else { 5 },
             data: rasn::der::encode(&signature).unwrap().into(),
         };
 
+        let mut attributes = vec![];
         
-        let key = encrypt.get_pkey();
-        let mut signer = Signer::new(MessageDigest::sha256(), &key)?;
-        signer.update(&digest_data)?;
-        protection.signature = PCSSignature {
-            keyid: encrypt.compress().to_vec().into(),
-            digest: 1,
-            signature: signer.sign_to_vec()?.into(),
-        };
+        if let Some(share) = participant_meta.and_then(|i| i.sign_with_private_key.as_ref()) {
+            let signature = digest_data.sign(&share.signing_key(), false)?;
 
-        let hmackey = kdf_ctr_hmac(&master_key.0, "hmackey-of-masterkey".as_bytes(), &[], master_key.0.len());
-        let hmac = PKey::hmac(&hmackey)?;
-        protection.hmac = Signer::new(MessageDigest::sha256(), &hmac).unwrap().sign_oneshot_to_vec(&protection.hmac_data()).unwrap().into();
+            attributes.push(PCSAttribute {
+                key: 7,
+                value: rasn::der::encode(&signature).unwrap().into(),
+            });
+        }
+        
+        if let Some(sign_with_key) = sign_with_key {
+            let signature = digest_data.sign(&sign_with_key, false)?;
+            protection.signature = Some(signature);
+        }
+
+        if !attributes.is_empty() {
+            protection.attributes = Some(attributes);
+        }
+
+        protection.hmac = master_key.hmac_sign(&protection.hmac_data())?.into();
 
         Ok(protection)
     }
 
-    pub fn decode(&self, key: &CompactECKey<Private>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
+    pub fn get_signer(&self) -> Option<CompactECKey<Public>> {
+        self.signature.as_ref().map(|a| CompactECKey::decompress(a.keyid.to_vec().try_into().expect("Key ID")))
+    }
+
+    pub fn decode(&self, keys: &[impl Borrow<CompactECKey<Private>>], custom_signing_key: Option<&CompactECKey<impl HasPublic>>) -> Result<(Vec<PCSKey>, Vec<CompactECKey<Private>>), PushError> {
         info!("Decoding share protection!");
-        let rm_master_key = PCSKey::new(key, &self.keyset.keyset.first().unwrap().ciphertext)?;
+        let (key, share_key) = keys.iter().find_map(|key| {
+            let search_ref = key.borrow().compress();
+            let other = self.keyset.keyset.iter().find(|key| &*key.decryption_key.pub_key == &search_ref[..]);
+            other.map(|other| (key.borrow(), other))
+        }).expect("Could not find decode key!!");
+        let rm_master_key = PCSKey::new(key, &share_key.ciphertext)?;
+        info!("MAster key {}", encode_hex(&rm_master_key.0));
+
+        let share_flags = share_key.flags.unwrap_or_default();
+        let readonly = (share_flags & 1) != 0;
 
         let sig = self.signature_data();
         
         let digest_data = self.digest_data(&sig);
 
-        let key = key.get_pkey();
-        let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
-        verifier.update(&digest_data)?;
-        if !verifier.verify(&self.signature.signature)? {
-            panic!("sig check failed")
-        }
+        info!("showed me off");
 
-        let key = PKey::from_ec_key(rm_master_key.master_ec_key()?)?;
-        let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
-        verifier.update(&digest_data)?;
-        if !verifier.verify(&sig.signature.signature)? {
-            if let Some(past_signature) = &sig.signature_2 {
-                let mut verifier = Verifier::new(MessageDigest::sha256(), &key)?;
-                verifier.update(&digest_data)?;
-                if !verifier.verify(&past_signature.signature)? {
-                    panic!("self sig 1 and 2 check failed")
-                }
+        // custom_signing_key is kind of reused here,
+        // signature is not set when [4] (owner sign attr 7) is set. But sometimes we need a custom sig here. 
+        if let Some(sig) = &self.signature {
+            if let Some(mine) = custom_signing_key {
+                digest_data.verify(mine, sig)?;
             } else {
-                panic!("self sig check failed")
+                digest_data.verify(key, sig)?;
             }
         }
 
-        let mut master_key = rm_master_key.clone();
-        if self.attributes.version != 5 {
-            master_key = PCSKey(kdf_ctr_hmac(&rm_master_key.0, "MsaeEooevaX fooo 012".as_bytes(), &[], rm_master_key.0.len()));
+        if !readonly {
+            let key = &rm_master_key.master_ec_key()?;
+            match digest_data.verify(key, &sig.signature) {
+                Err(PushError::VerificationFailed) => {
+                    info!("First verification failed, using backup!");
+                    if let Some(past_signature) = &sig.signature_2 {
+                        digest_data.verify(key, &past_signature)?;
+                    } else {
+                        panic!("self sig check failed")
+                    }
+                },
+                _e => _e?,
+            }
         }
 
-        let hmackey = kdf_ctr_hmac(&master_key.0, "hmackey-of-masterkey".as_bytes(), &[], master_key.0.len());
-        let hmac = PKey::hmac(&hmackey)?;
-        let signature = Signer::new(MessageDigest::sha256(), &hmac).unwrap().sign_oneshot_to_vec(&self.hmac_data()).unwrap();
-        if &signature != &self.hmac {
+        info!("come");
+
+        let owner_sign = self.attributes.clone().unwrap_or_default().into_iter().find(|a| a.key == 7);
+        if let (Some(signing), Some(review)) = (custom_signing_key, owner_sign) {
+            let parsed: PCSSignature = rasn::der::decode(&review.value).expect("Bad signature???a");
+            digest_data.verify(signing, &parsed)?;
+        }
+
+        let mut master_key = rm_master_key.clone();
+        if self.signature_data.version != 5 && !readonly {
+            master_key = rm_master_key.get_share_key(true);
+        }
+
+        assert_eq!(&master_key.key_id()?[..4].to_vec(), self.truncated_key_id.as_ref());
+
+        if &master_key.hmac_sign(&self.hmac_data())? != &self.hmac {
             panic!("HMAC check failed");
         }
 
         let decrypted = master_key.decrypt(&self.meta, &[])?;
+
+        info!("here");
 
         let identities: PCSShareProtectionIdentities = rasn::der::decode(&decrypted).unwrap();
 
@@ -822,8 +1012,10 @@ impl PCSShareProtection {
 
 #[derive(AsnType, Encode, Decode)]
 pub struct PCSObjectSignature {
-    unk1: u32,
-    unk2: u32,
+    roll_count: u32,
+    // this is a guess, it tracks with the heuristics i've collected
+    // but i don't know.
+    outer_sign_key_type: u32,
     public: PCSKeyRef,
     signature: PCSSignature,
     // the ignore fields show up in weird situations, when there are multiple keys?

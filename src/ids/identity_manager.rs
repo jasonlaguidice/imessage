@@ -414,7 +414,7 @@ impl IdentityResource {
             users: RwLock::new(users),
             config,
             identity,
-            interest_token: conn.request_topics(vec!["com.apple.private.ids"]).await,
+            interest_token: conn.request_topics(&["com.apple.private.ids"]).await,
             aps: conn,
             query_lock: Mutex::new(()),
             manager: Mutex::new(None),

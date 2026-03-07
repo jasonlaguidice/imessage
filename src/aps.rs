@@ -317,8 +317,8 @@ pub struct APSState {
 }
 
 pub struct APSInterestToken {
-    topics: Vec<&'static str>,
-    topics_channel: mpsc::Sender<(Vec<&'static str>, bool)>,
+    topics: Vec<String>,
+    topics_channel: mpsc::Sender<(Vec<String>, bool)>,
 }
 
 impl Drop for APSInterestToken {
@@ -336,8 +336,8 @@ pub struct APSConnectionResource {
     pub messages_cont: broadcast::Sender<APSMessage>,
     reader: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
     manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
-    topics: mpsc::Sender<(Vec<&'static str>, bool)>,
-    current_topics: Mutex<Vec<&'static str>>,
+    topics: mpsc::Sender<(Vec<String>, bool)>,
+    current_topics: Mutex<Vec<String>>,
     sub_counter: AtomicU32,
 }
 
@@ -494,12 +494,12 @@ impl APSConnectionResource {
 
         let topic_manager = Arc::downgrade(&resource);
         tokio::spawn(async move {
-            let mut topics: HashMap<&'static str, usize> = HashMap::new();
+            let mut topics: HashMap<String, usize> = HashMap::new();
             loop {
                 let Some((subject_topics, add)) = topics_receiver.recv().await else { break };
                 info!("Got order for topics {:?} {add}", subject_topics);
                 for topic in subject_topics {
-                    let entry = topics.entry(topic).or_default();
+                    let entry = topics.entry(topic.clone()).or_default();
                     if add {
                         *entry += 1;
                     } else {
@@ -514,7 +514,7 @@ impl APSConnectionResource {
                 if topics_receiver.is_empty() {
                     let Some(upgrade) = topic_manager.upgrade() else { break };
 
-                    let current_topics = topics.keys().map(|k| *k).collect::<Vec<_>>();
+                    let current_topics = topics.keys().cloned().collect::<Vec<_>>();
                     // helpfully, this will also block if we are currently initalizing topics from cache.
                     *upgrade.current_topics.lock().await = current_topics.clone();
                     
@@ -531,9 +531,10 @@ impl APSConnectionResource {
         self.state.read().await.token.expect("Token not found!")
     }
 
-    pub async fn request_topics(&self, topics: Vec<&'static str>) -> APSInterestToken {
-        self.topics.send((topics.clone(), true)).await.expect("Other end hung up topics??");
-        APSInterestToken { topics, topics_channel: self.topics.clone() }
+    pub async fn request_topics(&self, topics: &[&str]) -> APSInterestToken {
+        let hard_list: Vec<String> = topics.iter().map(|i| i.to_string()).collect();
+        self.topics.send((hard_list.clone(), true)).await.expect("Other end hung up topics??");
+        APSInterestToken { topics: hard_list, topics_channel: self.topics.clone() }
     }
 
     async fn do_connect(self: &Arc<Self>) -> Result<(), PushError> {
@@ -679,7 +680,7 @@ impl APSConnectionResource {
         }).await?
     }
 
-    async fn filter(&self, enabled: &[&str], ignored: &[&str], opportunistic: &[&str], paused: &[&str]) -> Result<(), PushError> {
+    async fn filter(&self, enabled: &[String], ignored: &[String], opportunistic: &[String], paused: &[String]) -> Result<(), PushError> {
         debug!("Filtering to {enabled:?} {ignored:?} {opportunistic:?} {paused:?}");
         self.send(APSMessage::Filter {
             token: Some(self.get_token().await),

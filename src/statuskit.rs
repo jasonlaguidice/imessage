@@ -333,7 +333,7 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
     pub async fn new(state: StatusKitState, update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>, account: Arc<TokenProvider<T>>, conn: APSConnection, config: Arc<dyn OSConfig>, identity: IdentityManager) -> Arc<Self> {
         let (topics_sender, mut topics_receiver) = mpsc::channel(32);
         let skclient = Arc::new(Self {
-            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.status.keysharing", "com.apple.icloud.presence.mode.status", "com.apple.icloud.presence.channel.management", "com.apple.private.alloy.status.personal"]).await,
+            _interest_token: conn.request_topics(&["com.apple.private.alloy.status.keysharing", "com.apple.icloud.presence.mode.status", "com.apple.icloud.presence.channel.management", "com.apple.private.alloy.status.personal"]).await,
             conn: conn.clone(),
             identity,
             config,
