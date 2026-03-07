@@ -505,7 +505,14 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         let zone = container.private_zone(zone.to_string());
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
         let (_assets, response) = container.perform(&CloudKitSession::new(),
-            FetchRecordChangesOperation::new(zone.clone(), continuation_token, &NO_ASSETS)).await?;
+            FetchRecordChangesOperation(cloudkit_proto::RetrieveChangesRequest { 
+                sync_continuation_token: continuation_token, 
+                zone_identifier: Some(zone.clone()), 
+                requested_changes_types: Some(3), // figure out 
+                assets_to_download: Some(NO_ASSETS.clone()), 
+                newest_first: Some(true),
+                ..Default::default()
+            })).await?;
 
         let mut results = HashMap::new();
 
