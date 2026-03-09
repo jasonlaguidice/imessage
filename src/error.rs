@@ -48,7 +48,7 @@ pub enum PushError {
     #[cfg(feature = "macos-validation-data")]
     #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
-    #[error("Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Apple left a message: {0}")]
+    #[error("Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Choose 'Get Started,' not 'Chat.' Do not mention you are using OpenBubbles. Apple left a message: {0}")]
     CustomerMessage(SupportAlert),
     #[error("Send timeout; try again")]
     SendTimedOut,

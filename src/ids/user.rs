@@ -1008,7 +1008,8 @@ impl Display for IDSError {
             6001 => write!(f, "Incompatible; Make sure Contact Key Verification and Advanced Data Protection are off. (6001)"),
             6004 => write!(f, "Please try again (6004)"),
             6005 => write!(f, "Bad authentication, try again and re-enter device details if persistent. (6005)"),
-            6009 => write!(f, "Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac (6009)"),
+            6009 => write!(f, "Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Choose 'Get Started,' not 'Chat.' Do not mention you are using OpenBubbles. (6009)"),
+            5052 => write!(f, "An alias was just removed from your account. Try again. (5052)"),
             _unk => write!(f, "Unknown IDS error {_unk}")
         }
     }
