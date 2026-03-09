@@ -11,11 +11,10 @@ use base64::Engine;
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 
-use crate::{aps::{get_message, APSInterestToken}, ids::{identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}, IDSRecvMessage}, util::{CompactECKey, base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}, APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError};
+use crate::{APSConnection, APSMessage, IdentityManager, MessageTarget, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSQuickRelaySettings, IDSSendMessage, IdentityResource, Raw}, user::{IDSService, QueryOptions}}, util::{CompactECKey, DebugMutex, DebugRwLock, base64_decode, base64_encode, duration_since_epoch, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, plist_to_bin, proto_deserialize_opt, proto_serialize_opt}};
 
 pub mod facetimep {
     include!(concat!(env!("OUT_DIR"), "/facetimep.rs"));
@@ -370,9 +369,9 @@ pub struct FTClient {
     pub identity: IdentityManager,
     os_config: Arc<dyn OSConfig>,
     _interest_token: APSInterestToken,
-    pub state: RwLock<FTState>,
+    pub state: DebugRwLock<FTState>,
     update_state: Box<dyn Fn(&FTState) + Send + Sync>,
-    pub delegated_requests: Mutex<HashMap<String, LetMeInRequest>>,
+    pub delegated_requests: DebugMutex<HashMap<String, LetMeInRequest>>,
 }
 
 impl FTClient {
@@ -384,9 +383,9 @@ impl FTClient {
             conn,
             identity,
             os_config: config,
-            state: RwLock::new(state),
+            state: DebugRwLock::new(state),
             update_state,
-            delegated_requests: Mutex::new(HashMap::new())
+            delegated_requests: DebugMutex::new(HashMap::new())
         }
     }
 

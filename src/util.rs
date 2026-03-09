@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Cursor;
+use std::mem;
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut, Range};
+use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,7 +39,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio_rustls::client;
@@ -79,6 +81,128 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
     bag.get(item).cloned().ok_or(PushError::BagKeyNotFound)
 }
 
+
+pub struct DebugGuard<'a, T>(MutexGuard<'a, T>, Location<'a>, u16, u16);
+
+impl<'a, T> Drop for DebugGuard<'a, T> {
+    fn drop(&mut self) {
+        info!("Mutex {} {}@{} dropped", self.3, self.1, self.2);
+    }
+}
+
+impl<'a, T> Deref for DebugGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl<'a, T> DerefMut for DebugGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.0
+    }
+}
+
+pub struct DebugMutex<T>(Mutex<T>, u16);
+
+impl<T> DebugMutex<T> {
+    pub fn new(v: T) -> Self {
+        let id: u16 = rand::random();
+        Self(Mutex::new(v), id)
+    }
+    
+    #[track_caller]
+    pub fn lock(&self) -> impl Future<Output = DebugGuard<'_, T>> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        info!("Locking {} mutex at {caller}@{id}", self.1);
+
+        async move {
+            let lock = self.0.lock().await;
+            info!("Locked {} mutex at {caller}@{id}", self.1);
+            DebugGuard(lock, *caller, id, self.1)
+        }
+    }
+}
+
+pub struct DebugReadGuard<'a, T>(RwLockReadGuard<'a, T>, Location<'a>, u16, u16);
+
+impl<'a, T> Drop for DebugReadGuard<'a, T> {
+    fn drop(&mut self) {
+        info!("Read mtx {} guard {}@{} dropped", self.3, self.1, self.2);
+    }
+}
+
+impl<'a, T> Deref for DebugReadGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+pub struct DebugWriteGuard<'a, T>(Option<RwLockWriteGuard<'a, T>>, Location<'a>, u16, u16);
+
+impl<'a, T> DebugWriteGuard<'a, T> {
+    pub fn downgrade(mut self) -> DebugReadGuard<'a, T> {
+        info!("Write mtx {} guard {}@{} downgraded", self.3, self.1, self.2);
+
+        DebugReadGuard(self.0.take().unwrap().downgrade(), self.1, self.2, self.3)
+    }
+}
+
+impl<'a, T> Drop for DebugWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        info!("Write mtx {} guard {}@{} dropped", self.3, self.1, self.2);
+    }
+}
+
+impl<'a, T> Deref for DebugWriteGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.0.as_ref().unwrap()
+    }
+}
+
+impl<'a, T> DerefMut for DebugWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.0.as_mut().unwrap()
+    }
+}
+
+pub struct DebugRwLock<T>(RwLock<T>, u16);
+
+impl<T> DebugRwLock<T> {
+    pub fn new(v: T) -> Self {
+        let id: u16 = rand::random();
+        Self(RwLock::new(v), id)
+    }
+
+    #[track_caller]
+    pub fn read(&self) -> impl Future<Output = DebugReadGuard<'_, T>> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        info!("Reading {} lock at {caller}@{id}", self.1);
+
+        async move {
+            let lock = self.0.read().await;
+            info!("Read {} locked at {caller}@{id}", self.1);
+            DebugReadGuard(lock, *caller, id, self.1)
+        }
+    }
+
+    #[track_caller]
+    pub fn write(&self) -> impl Future<Output = DebugWriteGuard<'_, T>> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        info!("Writing {} lock at {caller}@{id}", self.1);
+
+        async move {
+            let lock = self.0.write().await;
+            info!("Write {} locked at {caller}@{id}", self.1);
+            DebugWriteGuard(Some(lock), *caller, id, self.1)
+        }
+    }
+}
 
 
 fn build_proxy() -> Client {
@@ -360,7 +484,7 @@ where
 {
     let s: Date = Deserialize::deserialize(d)?;
     let time: SystemTime = s.into();
-    Ok(time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64)
+    Ok(time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
 }
 
 // both in der

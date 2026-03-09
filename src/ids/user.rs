@@ -15,9 +15,9 @@ use aes::cipher::KeyIvInit;
 use sha2::Sha256;
 use aes::cipher::StreamCipher;
 use super::identity_manager::KeyCache;
+use crate::util::DebugMutex;
 
 use rand::{Rng, RngCore};
-use tokio::sync::Mutex;
 
 use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
 
@@ -522,7 +522,7 @@ impl IDSNGMIdentity {
         Ok(inner.message)
     }
 
-    pub async fn encrypt_payload(&self, target: &IDSDeliveryData, cache: &Mutex<KeyCache>, body: &[u8]) -> Result<(Vec<u8>, &'static str), PushError> {
+    pub async fn encrypt_payload(&self, target: &IDSDeliveryData, cache: &DebugMutex<KeyCache>, body: &[u8]) -> Result<(Vec<u8>, &'static str), PushError> {
         let (Some(device), Some(prekey)) = (target.get_device_key(), &target.client_data.public_message_ngm_device_prekey_data_key) else {
             // fall back to legacy encryption
             return Ok((self.legacy.encrypt_payload(&target.client_data.public_message_identity_key, body)?, "pair"));
@@ -751,7 +751,7 @@ impl IDSUser {
 
     fn base_request(&self, aps: &APSState, bag: &'static str) -> Result<SignedRequest<Signed>, PushError> {
         Ok(SignedRequest::new(bag, Method::GET)
-            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
             .header("x-protocol-version", &self.protocol_version.to_string())
             .header("x-auth-user-id", &self.user_id)
             .sign(&self.auth_keypair, KeyType::Auth, aps, None)?
@@ -792,7 +792,7 @@ impl IDSUser {
             .header("content-encoding", "gzip")
             .header("accept-encoding", "gzip")
             .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
-            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
             .body(gzip_normal(&plist_to_buf(&body)?)?)
             .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
 
@@ -1103,14 +1103,14 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     ].into_iter()));
 
     let mut request = SignedRequest::new("id-register", Method::POST)
-            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
             .header("x-protocol-version", &config.get_protocol_version().to_string())
             .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
             .header("content-type", "application/x-apple-plist")
             .header("content-encoding", "gzip")
             .header("accept-encoding", "gzip")
             .body(gzip_normal(&plist_to_buf(&body)?)?)
-            .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
+            .sign(aps.keypair.as_ref().ok_or(PushError::APSNotReady("keypair"))?, KeyType::Push, aps, None)?;
 
     for (idx, user) in users.iter().enumerate() {
         request = request.header(&format!("x-auth-user-id-{idx}"), &user.user_id)

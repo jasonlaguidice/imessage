@@ -150,6 +150,8 @@ pub enum PushError {
     ReportSpamError(u32),
     #[error("Token missing")]
     TokenMissing,
+    #[error("APS not ready! {0}")]
+    APSNotReady(&'static str),
     #[error("Circle http error {0}")]
     CircleHTTPError(#[from] icloud_auth::Error),
     #[error("Circle error {0}")]

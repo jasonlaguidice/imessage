@@ -9,7 +9,6 @@ use hkdf::Hkdf;
 use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
 use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
 use sha2::Sha256;
-use tokio::sync::Mutex;
 use icloud_auth::AppleAccount;
 use log::{debug, warn};
 use omnisette::{AnisetteClient, AnisetteError, AnisetteHeaders, AnisetteProvider, ArcAnisetteClient};
@@ -18,10 +17,10 @@ use rand::Rng;
 use reqwest::{Request, header::{HeaderMap, HeaderName, HeaderValue}};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use aes_gcm::KeyInit;
 use uuid::Uuid;
-use crate::{CompactECKey, cloudkit::{DeleteRecordOperation, SaveRecordOperation, should_reset}, ids::user::QueryOptions, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, plist_to_bin}};
+use crate::{CompactECKey, cloudkit::{DeleteRecordOperation, SaveRecordOperation, should_reset}, ids::user::QueryOptions, util::{DebugMutex, base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, plist_to_bin}};
 use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, cloudkit::{pcs_keys_for_record, record_identifier, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation, ALL_ASSETS, NO_ASSETS}, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, keychain::{derive_key_into, KeychainClient}, login_apple_delegates, pcs::PCSService, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, LoginDelegate, OSConfig, PushError};
 
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
@@ -155,7 +154,7 @@ impl FindMyState {
 }
 
 pub struct FindMyStateManager {
-    pub state: Mutex<FindMyState>,
+    pub state: DebugMutex<FindMyState>,
     pub update: Box<dyn Fn(Vec<u8>) + Send + Sync>,
 }
 
@@ -164,7 +163,7 @@ impl FindMyStateManager {
 
     pub fn new(data: &[u8], update: Box<dyn Fn(Vec<u8>) + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(FindMyState::restore(data).expect("Failed to restore!")),
+            state: DebugMutex::new(FindMyState::restore(data).expect("Failed to restore!")),
             update
         })
     }
@@ -209,7 +208,7 @@ pub struct FindMyClient<P: AnisetteProvider> {
     pub conn: APSConnection,
     pub identity: IdentityManager,
     _interest_token: APSInterestToken,
-    pub daemon: Mutex<FindMyFriendsClient<P>>,
+    pub daemon: DebugMutex<FindMyFriendsClient<P>>,
     config: Arc<dyn OSConfig>,
     pub state: Arc<FindMyStateManager>,
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
@@ -812,7 +811,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
             conn,
             identity,
-            daemon: Mutex::new(daemon),
+            daemon: DebugMutex::new(daemon),
             config,
             state,
             container: Mutex::new(None),

@@ -11,11 +11,11 @@ use prost::Message;
 use rand::{Rng, RngCore};
 use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
 use serde::{Deserialize, Serialize};
-use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, select, sync::{broadcast::{self, error::RecvError, Receiver, Sender}, mpsc, Mutex, RwLock}, task::{self, JoinHandle}};
+use tokio::{io::{split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf}, net::TcpStream, select, sync::{broadcast::{self, error::RecvError, Receiver, Sender}, mpsc}, task::{self, JoinHandle}};
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use async_recursion::async_recursion;
 
-use crate::{OSConfig, PushError, activation::activate, auth::{NonceType, do_ids_signature, generate_nonce}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{APNS_BAG, KeyPair, KeyPairNew, Resource, ResourceManager, base64_encode, bin_deserialize, bin_deserialize_opt, bin_serialize, bin_serialize_opt, get_bag}};
+use crate::{OSConfig, PushError, activation::activate, auth::{NonceType, do_ids_signature, generate_nonce}, imessage::messages, statuskit::statuskitp::{Channel, SubscribeToChannel, SubscribedTopic}, util::{APNS_BAG, DebugMutex, DebugRwLock, KeyPair, KeyPairNew, Resource, ResourceManager, base64_encode, bin_deserialize, bin_deserialize_opt, bin_serialize, bin_serialize_opt, get_bag}};
 
 #[derive(DekuRead, DekuWrite, Clone, Debug)]
 #[deku(endian = "big")]
@@ -271,10 +271,13 @@ impl APSMessage {
                 opportunistic: raw.body.iter().filter_map(|f| if f.id == 4 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect(),
                 paused: raw.body.iter().filter_map(|f| if f.id == 5 { Some(f.value.clone().try_into().unwrap()) } else { None }).collect(),
             }),
-            0x8 => Some(Self::ConnectResponse {
-                token: raw.get_field(3).map(|i| i.try_into().unwrap()),
-                status: u8::from_be_bytes(raw.get_field(1).unwrap().try_into().unwrap())
-            }),
+            0x8 => {
+                info!("raw connect response {:?}", raw);
+                Some(Self::ConnectResponse {
+                    token: raw.get_field(3).map(|i| i.try_into().unwrap()),
+                    status: u8::from_be_bytes(raw.get_field(1).unwrap().try_into().unwrap())
+                })
+            },
             0xe => Some(Self::NoStorage),
             0xd => Some(Self::Pong),
             0x1d => Some(Self::SubscribeConfirm {
@@ -330,14 +333,14 @@ impl Drop for APSInterestToken {
 
 pub struct APSConnectionResource {
     pub os_config: Arc<dyn OSConfig>,
-    pub state: RwLock<APSState>,
-    socket: Mutex<Option<WriteHalf<TlsStream<TcpStream>>>>,
-    messages: RwLock<Option<broadcast::Sender<APSMessage>>>,
+    pub state: DebugRwLock<APSState>,
+    socket: DebugMutex<Option<WriteHalf<TlsStream<TcpStream>>>>,
+    messages: DebugRwLock<Option<broadcast::Sender<APSMessage>>>,
     pub messages_cont: broadcast::Sender<APSMessage>,
-    reader: Mutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
-    manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
+    reader: DebugMutex<Option<ReadHalf<TlsStream<TcpStream>>>>,
+    manager: DebugMutex<Option<Weak<ResourceManager<Self>>>>,
     topics: mpsc::Sender<(Vec<String>, bool)>,
-    current_topics: Mutex<Vec<String>>,
+    current_topics: DebugMutex<Vec<String>>,
     sub_counter: AtomicU32,
 }
 
@@ -429,15 +432,15 @@ impl APSConnectionResource {
         let (topics_sender, mut topics_receiver) = mpsc::channel(32);
         let connection = Arc::new(APSConnectionResource {
             os_config: config,
-            state: RwLock::new(state.unwrap_or_default()),
-            socket: Mutex::new(None),
-            messages: RwLock::new(None),
+            state: DebugRwLock::new(state.unwrap_or_default()),
+            socket: DebugMutex::new(None),
+            messages: DebugRwLock::new(None),
             messages_cont,
-            reader: Mutex::new(None),
-            manager: Mutex::new(None),
+            reader: DebugMutex::new(None),
+            manager: DebugMutex::new(None),
             topics: topics_sender,
             sub_counter: AtomicU32::new(1),
-            current_topics: Mutex::new(vec![]),
+            current_topics: DebugMutex::new(vec![]),
         });
         
         let result = connection.generate().await;
@@ -567,8 +570,9 @@ impl APSConnectionResource {
             self.wait_for_timeout(recv, |msg| if let APSMessage::ConnectResponse { token, status } = msg { Some((token, status)) } else { None }).await?;
         
         if status != 0 {
-            // invalidate pair for next attempt
-            state.keypair = None;
+            // don't invalidate pair, that results in shifting our token
+            // which invalidates our subscriptions
+            // state.keypair = None;
             return Err(PushError::APSConnectError(status))
         }
 

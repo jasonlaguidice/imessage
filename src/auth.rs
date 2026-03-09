@@ -15,14 +15,14 @@ use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Client, Method, Requ
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_3072, server::SrpServer};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch};
 use uuid::Uuid;
 use rand::Rng;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
 use deku::{DekuContainerWrite, DekuUpdate};
 use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
 
-use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
+use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -55,9 +55,9 @@ impl LoginDelegate {
 }
 
 pub struct TokenProvider<T: AnisetteProvider> {
-    account: Arc<Mutex<AppleAccount<T>>>,
-    mme_delegate: Mutex<Option<MobileMeDelegateResponse>>,
-    mme_refreshed: Mutex<SystemTime>,
+    account: Arc<DebugMutex<AppleAccount<T>>>,
+    mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
+    mme_refreshed: DebugMutex<SystemTime>,
     os_config: Arc<dyn OSConfig>,
 }
 
@@ -104,12 +104,12 @@ pub struct QuotaData {
 }
 
 impl<T: AnisetteProvider> TokenProvider<T> {
-    pub fn new(account: Arc<Mutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
+    pub fn new(account: Arc<DebugMutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
         Arc::new(Self {
             account,
             os_config,
-            mme_delegate: Mutex::new(None),
-            mme_refreshed: Mutex::new(SystemTime::UNIX_EPOCH),
+            mme_delegate: DebugMutex::new(None),
+            mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
         })
     }
 
@@ -814,7 +814,7 @@ struct CircleStep5 {
 }
 
 pub struct CircleClientSession<P: AnisetteProvider> {
-    account: Arc<Mutex<AppleAccount<P>>>,
+    account: Arc<DebugMutex<AppleAccount<P>>>,
     push_token: [u8; 32],
     srp_client: SrpClient<'static, Sha256>,
     a: [u8; 32],
@@ -833,7 +833,7 @@ pub struct CircleClientSession<P: AnisetteProvider> {
 impl<P: AnisetteProvider> CircleClientSession<P> {
     // WARN: you, the caller, are responsible for advertising a BLE GATT service with the uuid of session_id
     // modern OSes may refuse to add you to the circle if you are not in physical proximity
-    pub async fn new(dsid: u64, account: Arc<Mutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Result<Self, PushError> {
+    pub async fn new(dsid: u64, account: Arc<DebugMutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Result<Self, PushError> {
         // note, -0 is the attempt number. Each time there is another attempt (send new code) the -0 increments by 1
         let atxid = format!("{}-0", rand::random::<u32>() / 2);
 
@@ -1043,7 +1043,7 @@ pub struct CircleServerSession<P: AnisetteProvider> {
     dsid: u64,
     verifier: Vec<u8>,
     server: SrpServer<'static, Sha256>,
-    account: Arc<Mutex<AppleAccount<P>>>,
+    account: Arc<DebugMutex<AppleAccount<P>>>,
     b: [u8; 32],
     client_public: Option<Vec<u8>>,
     push_token: [u8; 32],
@@ -1052,7 +1052,7 @@ pub struct CircleServerSession<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> CircleServerSession<P> {
-    pub fn new(dsid: u64, otp: u32, account: Arc<Mutex<AppleAccount<P>>>, push_token: [u8; 32], trusted_peers: Option<Arc<KeychainClient<P>>>) -> Self {
+    pub fn new(dsid: u64, otp: u32, account: Arc<DebugMutex<AppleAccount<P>>>, push_token: [u8; 32], trusted_peers: Option<Arc<KeychainClient<P>>>) -> Self {
         let salt: [u8; 16] = rand::random();
         let client = SrpClient::<Sha256>::new(&G_3072);
         // check password, was guess

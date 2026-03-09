@@ -14,12 +14,11 @@ use prost::Message;
 use reqwest::{RequestBuilder, Url, header::{HeaderMap, HeaderName, HeaderValue}};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::{sync::{Mutex, Notify, RwLock}, task::JoinHandle};
 use std::str::FromStr;
 use uuid::Uuid;
 use aes_gcm::KeyInit;
 use cloudkit_proto::CloudKitEncryptor;
-use crate::{APSConnection, APSMessage, aps::APSInterestToken, util::{bin_deserialize, bin_serialize, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt}};
+use crate::{APSConnection, APSMessage, aps::APSInterestToken, util::{DebugMutex, DebugRwLock, bin_deserialize, bin_serialize, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt}};
 
 use crate::{FileContainer, OSConfig, PushError, auth::{MobileMeDelegateResponse, TokenProvider}, keychain::KeychainClient, mmcs::{AuthorizedOperation, MMCSConfig, PreparedPut, get_headers, get_mmcs, put_authorize_body, put_mmcs}, mmcsp::FordChunk, pcs::{PCSEncryptor, PCSKey, PCSKeyRef, PCSPrivateKey, PCSService, PCSShareProtection, ParticipantMeta}, prepare_put, util::{CompactECKey, REQWEST, base64_decode, base64_encode, base64_encode_url, decode_hex, decode_uleb128, encode_hex, encode_uleb128, gzip_normal, kdf_ctr_hmac, rfc6637_unwrap_key}};
 
@@ -620,7 +619,7 @@ pub struct CloudKitNotifWatcher {
     _interest_token: APSInterestToken,
     for_topic: [u8; 20],
     container: String,
-    changed_zones: Mutex<Vec<RecordZoneIdentifier>>,
+    changed_zones: DebugMutex<Vec<RecordZoneIdentifier>>,
     gen: AtomicU64,
 }
 
@@ -1257,7 +1256,7 @@ pub struct ZoneUpdatePlugin {
 
 pub struct CloudKitClient<P: AnisetteProvider> {
     pub anisette: ArcAnisetteClient<P>,
-    pub state: RwLock<CloudKitState>,
+    pub state: DebugRwLock<CloudKitState>,
     pub config: Arc<dyn OSConfig>,
     pub token_provider: Arc<TokenProvider<P>>,
 }
@@ -1302,7 +1301,7 @@ impl<'t> CloudKitContainer<'t> {
             _interest_token: conn.request_topics(&[&topic]).await,
             for_topic: sha1(topic.as_bytes()),
             container: self.containerid.to_string(),
-            changed_zones: Mutex::new(vec![]),
+            changed_zones: DebugMutex::new(vec![]),
             gen: AtomicU64::new(0),
         }
     }
@@ -1337,7 +1336,7 @@ impl<'t> CloudKitContainer<'t> {
             container: self,
             user_id: response.cloud_kit_user_id,
             client,
-            keys: Mutex::new(HashMap::new()),
+            keys: DebugMutex::new(HashMap::new()),
         })
     }
 }
@@ -1372,7 +1371,7 @@ pub struct CloudKitOpenContainer<'t, T: AnisetteProvider> {
     container: &'t CloudKitContainer<'t>,
     pub user_id: String,
     pub client: Arc<CloudKitClient<T>>,
-    pub keys: Mutex<HashMap<String, PCSZoneConfig>>,
+    pub keys: DebugMutex<HashMap<String, PCSZoneConfig>>,
     pub database_type: cloudkit_proto::request_operation::header::Database,
 }
 
@@ -1581,7 +1580,7 @@ impl<'t, T: AnisetteProvider> CloudKitOpenContainer<'t, T> {
             container: self.container,
             user_id: self.user_id.clone(),
             client: self.client.clone(),
-            keys: Mutex::new(HashMap::new()),
+            keys: DebugMutex::new(HashMap::new()),
             database_type: Database::SharedDb
         }
     }

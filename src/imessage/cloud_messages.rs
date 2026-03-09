@@ -22,8 +22,9 @@ use plist::{Data, Value};
 use prost::Message;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
-use tokio::sync::Mutex;
 use cloudkit_proto::RecordIdentifier;
+use tokio::sync::Mutex;
+use crate::util::DebugMutex;
 use log::info;
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
@@ -500,10 +501,13 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     async fn sync_records<T: CloudKitRecord>(&self, zone: &str, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+        info!("Getting records");
         let container = self.get_container().await?;
 
         let zone = container.private_zone(zone.to_string());
+        info!("Getting encryption config");
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        info!("Got encryption config");
         let (_assets, response) = container.perform(&CloudKitSession::new(),
             FetchRecordChangesOperation(cloudkit_proto::RetrieveChangesRequest { 
                 sync_continuation_token: continuation_token, 
@@ -515,6 +519,8 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             })).await?;
 
         let mut results = HashMap::new();
+
+        info!("Getting response");
 
         for change in &response.change {
             let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
@@ -537,6 +543,8 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
             results.insert(identifier, Some(item));
         }
+
+        info!("Getting finish");
 
         Ok((response.sync_continuation_token().to_vec(), results, response.status()))
     }

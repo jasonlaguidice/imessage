@@ -12,11 +12,11 @@ use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use statuskitp::{AllocatedChannel, ChannelAllocateRequest, ChannelAllocateResponse, ChannelAuth, ChannelPublishMessage, ChannelPublishRequest, ChannelPublishResponse, PublishedStatus, SharedKey, SharedKeys, SharedMessage};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 use rand::{rngs::OsRng, RngCore};
 
-use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}};
+use crate::{APSConnection, APSMessage, IdentityManager, OSConfig, PushError, TokenProvider, aps::{APSChannel, APSChannelIdentifier, APSInterestToken, get_message}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, util::{DebugMutex, DebugRwLock, base64_decode, base64_encode, decode_hex, encode_hex, plist_to_bin}};
 use crate::util::{CompactECKey, ec_serialize, ec_serialize_priv, bin_serialize, bin_deserialize, proto_serialize, proto_deserialize, ec_deserialize_priv_compact, ec_deserialize_compact, proto_serialize_vec, proto_deserialize_vec};
 use aes_gcm::KeyInit;
 
@@ -321,11 +321,11 @@ pub struct StatusKitClient<T: AnisetteProvider> {
     pub identity: IdentityManager,
     _interest_token: APSInterestToken,
     config: Arc<dyn OSConfig>,
-    pub state: RwLock<StatusKitState>,
+    pub state: DebugRwLock<StatusKitState>,
     update_state: Box<dyn Fn(&StatusKitState) + Send + Sync>,
-    active_channels: Mutex<HashSet<APSChannelIdentifier>>, // *wanted* channels (with interest token)
+    active_channels: DebugMutex<HashSet<APSChannelIdentifier>>, // *wanted* channels (with interest token)
     topics: mpsc::Sender<(Vec<APSChannelIdentifier>, bool)>,
-    published_channels: RwLock<HashSet<APSChannelIdentifier>>, // currently subscribed channels, from the POV of APNs
+    published_channels: DebugRwLock<HashSet<APSChannelIdentifier>>, // currently subscribed channels, from the POV of APNs
     token_provider: Arc<TokenProvider<T>>,
 }
 
@@ -337,11 +337,11 @@ impl<T: AnisetteProvider + Send + Sync + 'static> StatusKitClient<T> {
             conn: conn.clone(),
             identity,
             config,
-            state: RwLock::new(state),
+            state: DebugRwLock::new(state),
             update_state,
-            active_channels: Mutex::new(HashSet::new()),
+            active_channels: DebugMutex::new(HashSet::new()),
             topics: topics_sender,
-            published_channels: RwLock::new(HashSet::new()),
+            published_channels: DebugRwLock::new(HashSet::new()),
             token_provider: account
         });
 

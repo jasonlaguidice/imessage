@@ -37,6 +37,7 @@ use std::fmt::Debug;
 
 pub use icloud_auth::{DefaultAnisetteProvider, GenerateVerificationTokenRequest, default_provider, ArcAnisetteClient, LoginClientInfo, LoginState, AppleAccount, VerifyBody, TrustedPhoneNumber};
 
+pub use util::{DebugRwLock, DebugMutex};
 use activation::ActivationInfo;
 pub use aps::{APSConnectionResource, APSConnection, APSMessage, APSState};
 use async_trait::async_trait;

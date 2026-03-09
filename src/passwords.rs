@@ -9,9 +9,8 @@ use openssl::{conf, ec::{EcGroup, EcKey}, hash::MessageDigest, nid::Nid, pkey::{
 use plist::{Data, Date, Dictionary, Value};
 use prost::Message;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
-use crate::{cloudkit::{CloudKitNotifWatcher, CloudKitSession, DeleteRecordOperation, SaveRecordOperation, UserQueryOperation, ZoneDeleteOperation, handle_to_alias, pcs_keys_for_record, record_identifier}, cloudkit_proto::CloudKitEncryptor, keychain::{SECURITYD_CONTAINER, SivKey}, passwords::passwordsp::{SharingInternetPassword, SharingItem, SharingPrivateKey}, util::{base64_decode, duration_since_epoch, encode_hex}};
+use crate::{cloudkit::{CloudKitNotifWatcher, CloudKitSession, DeleteRecordOperation, SaveRecordOperation, UserQueryOperation, ZoneDeleteOperation, handle_to_alias, pcs_keys_for_record, record_identifier}, cloudkit_proto::CloudKitEncryptor, keychain::{SECURITYD_CONTAINER, SivKey}, passwords::passwordsp::{SharingInternetPassword, SharingItem, SharingPrivateKey}, util::{DebugMutex, DebugRwLock, base64_decode, duration_since_epoch, encode_hex}};
 use crate::{APSConnection, APSMessage, IdentityManager, aps::APSInterestToken, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitShare, FetchRecordChangesOperation, FetchZoneChangesOperation, NO_ASSETS, create_share, get_participant_id}, ids::{IDSRecvMessage, identity_manager::{IDSSendMessage, Raw}, user::QueryOptions}, keychain::{KeychainClientState, SavedKeychainZone, decrypt_entry}, pcs::{PCSPrivateKey, PCSService}, util::{bin_deserialize, bin_serialize, date_deserialize, date_deserialize_opt, date_serialize, date_serialize_opt, date_to_ms, ec_key_from_apple, ec_key_to_apple, ms_to_date, proto_deserialize, proto_serialize, bin_serialize_opt_vec, bin_deserialize_opt_vec}};
 
 use crate::{PushError, keychain::KeychainClient};
@@ -51,15 +50,16 @@ fn zone_identifier_key(id: &RecordZoneIdentifier) -> String {
 
 pub struct PasswordManager<P: AnisetteProvider> {
     keychain: Arc<KeychainClient<P>>,
-    pub container: Mutex<Option<(Arc<CloudKitOpenContainer<'static, P>>, Arc<CloudKitOpenContainer<'static, P>>)>>,
+    pub container: DebugMutex<Option<(Arc<CloudKitOpenContainer<'static, P>>, Arc<CloudKitOpenContainer<'static, P>>)>>,
     pub client: Arc<CloudKitClient<P>>,
     pub conn: APSConnection,
     pub identity: IdentityManager,
     _interest_token: APSInterestToken,
-    pub state: RwLock<PasswordState>,
+    pub state: DebugRwLock<PasswordState>,
     update_state: Box<dyn Fn(&PasswordState) + Send + Sync>,
     notif_watcher: CloudKitNotifWatcher,
     keychain_notif_watch: CloudKitNotifWatcher,
+    data_updated: Box<dyn Fn(Arc<Self>, bool) + Send + Sync>,
 }
 
 const SHARED_PASSWORDS_CONTAINER: CloudKitContainer = CloudKitContainer {
@@ -275,7 +275,7 @@ pub struct PasswordInvite {
     time: SystemTime,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Clone, Debug)]
 pub struct PasswordManagerMeta {
     #[serde(deserialize_with = "date_deserialize")]
     pub cdat: u64,
@@ -425,7 +425,7 @@ pub struct PasswordManagerMetaDataFormerlyShared {
 pub struct PasswordManagerMetaData {
     #[serde(rename = "s_hi", default, skip_serializing_if="Vec::is_empty")]
     pub history: Vec<PasswordManagerMetaChange>,
-    #[serde(rename = "s_as")]
+    #[serde(rename = "s_as", default)]
     pub alt_domains: Vec<PasswordManagerAltDomain>,
     pub totp: Option<PasswordManagerTotp>,
     #[serde(default, skip_serializing_if="HashMap::is_empty")]
@@ -472,7 +472,7 @@ pub struct PasswordManagerMetaDataCtx {
 impl PasswordManagerMeta {
     pub fn get_password_data(&self) -> Result<PasswordManagerMetaData, PushError> {
         if let Err(e) = plist::from_bytes::<PasswordManagerMetaData>(self.data.as_ref()) {
-            warn!("Err decoding password data {e} {:?}", plist::from_bytes::<Value>(self.data.as_ref()));
+            warn!("Err decoding password data {e} {:?} {:?}", plist::from_bytes::<Value>(self.data.as_ref()), self);
         }
         Ok(plist::from_bytes(self.data.as_ref())?)
     }
@@ -1089,18 +1089,19 @@ pub struct SiteConfig {
 
 
 impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
-    pub async fn new(keychain: Arc<KeychainClient<P>>, client: Arc<CloudKitClient<P>>, identity: IdentityManager, conn: APSConnection, state: PasswordState, update_state: Box<dyn Fn(&PasswordState) + Send + Sync>) -> Arc<Self> {
+    pub async fn new(keychain: Arc<KeychainClient<P>>, client: Arc<CloudKitClient<P>>, identity: IdentityManager, conn: APSConnection, state: PasswordState, update_state: Box<dyn Fn(&PasswordState) + Send + Sync>, data_updated: Box<dyn Fn(Arc<Self>, bool) + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
             keychain,
-            container: Mutex::new(None),
+            container: DebugMutex::new(None),
             client,
             _interest_token: conn.request_topics(&["com.apple.private.alloy.kcsharing.invite"]).await,
             identity,
             notif_watcher: SHARED_PASSWORDS_CONTAINER.watch_notifs(&conn).await,
             keychain_notif_watch: SECURITYD_CONTAINER.watch_notifs(&conn).await,
             conn,
-            state: RwLock::new(state),
+            state: DebugRwLock::new(state),
             update_state,
+            data_updated,
         })
     }
 
@@ -1126,7 +1127,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
         Ok(locked.clone().unwrap().1)
     }
 
-    async fn handle_notif(&self, msg: &APSMessage) -> Result<(), PushError> {
+    async fn handle_notif(self: &Arc<Self>, msg: &APSMessage) -> Result<(), PushError> {
         let handle = self.notif_watcher.handle(&msg).await?;
         if handle.is_empty() { return Ok(()) }
 
@@ -1139,16 +1140,18 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
             let container = self.get_shared_container().await?;
             self.sync_zones(&container, &others).await?;
         }
+        (self.data_updated)(self.clone(), false);
         Ok(())
     }
 
-    async fn handle_keychain_notif(&self, msg: &APSMessage) -> Result<(), PushError> {
+    async fn handle_keychain_notif(self: &Arc<Self>, msg: &APSMessage) -> Result<(), PushError> {
         let handle = self.keychain_notif_watch.handle(&msg).await?;
         if handle.is_empty() { return Ok(()) }
 
         let zones = handle.into_iter().map(|i| i.value.unwrap().name.unwrap()).collect::<Vec<_>>();
         let zonesref = zones.iter().map(|i| i.as_str()).collect::<Vec<_>>();
         self.keychain.sync_keychain(&zonesref).await?;
+        (self.data_updated)(self.clone(), zonesref.contains(&"WiFi"));
         Ok(())
     }
 
@@ -1263,7 +1266,10 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
             groups.zone_continuation_token = continuation;
         }
 
-        let new_changes = changes.iter().filter(|c| c.change_type() != 2);
+        let new_changes = changes.iter().filter(|c| {
+            let identifier = c.identifier.as_ref().unwrap().value.as_ref().unwrap().name();
+            c.change_type() != 2 && identifier.starts_with("group-")
+        });
         for removed_change in changes.iter().filter(|c| c.change_type() == 2) {
             groups.groups.remove(&zone_identifier_key(&removed_change.identifier.as_ref().unwrap()));
         }
@@ -1576,7 +1582,7 @@ impl<P: AnisetteProvider + Send + Sync + 'static> PasswordManager<P> {
     pub fn iter_password_entries<'a, T: PasswordEntry>(&self, items: &'a KeychainClientState, state: &'a PasswordState) -> impl Iterator<Item = (String, (Option<String>, T))> + 'a {
         let siv_key = items.get_keychain_access_key().expect("Could not get password entry");
         let siv_key_2 = siv_key.clone();
-        items.items[T::view()].keys.iter().filter_map(move |(i, k)| {
+        items.items.get(T::view()).into_iter().flat_map(|i| i.keys.iter()).filter_map(move |(i, k)| {
             let dict = decrypt_entry(k, &siv_key);
             let v: T = plist::from_value(&Value::Dictionary(dict)).ok()?;
             if v.verify() {
