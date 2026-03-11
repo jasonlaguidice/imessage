@@ -140,6 +140,14 @@ void* uniffi_rustpushgo_fn_method_client_delete_cloud_messages(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_fetch_profile(
+	void* ptr,
+	RustBuffer record_key,
+	RustBuffer decryption_key,
+	int8_t has_poster,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_get_contacts_url(
 	void* ptr,
 	RustCallStatus* out_status
@@ -157,6 +165,12 @@ void* uniffi_rustpushgo_fn_method_client_get_handles(
 
 void* uniffi_rustpushgo_fn_method_client_get_icloud_auth_headers(
 	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_init_statuskit(
+	void* ptr,
+	uint64_t callback,
 	RustCallStatus* out_status
 );
 
@@ -236,6 +250,7 @@ void* uniffi_rustpushgo_fn_method_client_send_message(
 	RustBuffer handle,
 	RustBuffer reply_guid,
 	RustBuffer reply_part,
+	RustBuffer scheduled_ms,
 	RustCallStatus* out_status
 );
 
@@ -290,6 +305,13 @@ void* uniffi_rustpushgo_fn_method_client_send_typing(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_send_unschedule(
+	void* ptr,
+	RustBuffer conversation,
+	RustBuffer handle,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_send_unsend(
 	void* ptr,
 	RustBuffer conversation,
@@ -299,12 +321,29 @@ void* uniffi_rustpushgo_fn_method_client_send_unsend(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_set_status(
+	void* ptr,
+	int8_t active,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_stop(
 	void* ptr,
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_subscribe_to_status(
+	void* ptr,
+	RustBuffer handles,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_test_cloud_messages(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_unsubscribe_all_status(
 	void* ptr,
 	RustCallStatus* out_status
 );
@@ -472,6 +511,11 @@ void* uniffi_rustpushgo_fn_method_wrappedtokenprovider_seed_mme_delegate_json(
 );
 
 void uniffi_rustpushgo_fn_init_callback_messagecallback(
+	ForeignCallback callback_stub,
+	RustCallStatus* out_status
+);
+
+void uniffi_rustpushgo_fn_init_callback_statuscallback(
 	ForeignCallback callback_stub,
 	RustCallStatus* out_status
 );
@@ -919,6 +963,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_delete_cloud_messages(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_fetch_profile(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_get_contacts_url(
 	RustCallStatus* out_status
 );
@@ -932,6 +980,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_get_handles(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_get_icloud_auth_headers(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_init_statuskit(
 	RustCallStatus* out_status
 );
 
@@ -995,7 +1047,15 @@ uint16_t uniffi_rustpushgo_checksum_method_client_send_typing(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_send_unschedule(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_send_unsend(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_set_status(
 	RustCallStatus* out_status
 );
 
@@ -1003,7 +1063,15 @@ uint16_t uniffi_rustpushgo_checksum_method_client_stop(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_subscribe_to_status(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_test_cloud_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_unsubscribe_all_status(
 	RustCallStatus* out_status
 );
 
@@ -1103,6 +1171,10 @@ uint16_t uniffi_rustpushgo_checksum_method_messagecallback_on_message(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_statuscallback_on_status_update(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_updateuserscallback_update_users(
 	RustCallStatus* out_status
 );
@@ -1113,5 +1185,6 @@ uint32_t ffi_rustpushgo_uniffi_contract_version(
 
 
 int32_t rustpushgo_cgo_MessageCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
+int32_t rustpushgo_cgo_StatusCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 int32_t rustpushgo_cgo_UpdateUsersCallback(uint64_t, int32_t, uint8_t *, int32_t, RustBuffer *);
 
