@@ -45,3 +45,4 @@ _todo/
 # Local reference app (not part of this repo's source of truth)
 /openbubbles-app-rustpush/
 docs/rustpush-bridge-parity-notes.md
+.rollback/
