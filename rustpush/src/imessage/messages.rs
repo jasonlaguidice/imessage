@@ -2297,7 +2297,7 @@ impl MessageInst {
                             wallpaper_update_key: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some("YES".to_string()) } else { None }),
                             update_info_included: normal.embedded_profile.as_ref().and_then(|p| if p.poster.is_some() { Some(15) } else { None }),
                         };
-
+        
                         if normal.parts.is_multipart() {
                             raw.xml = Some(normal.parts.to_xml(Some(&mut raw)));
                         }
@@ -2452,8 +2452,7 @@ impl MessageInst {
                     is_permanent_delete: false,
                     is_scheduled_message: None,
                 };
-                let bin = plist_to_bin(&raw).unwrap();
-                bin
+                plist_to_bin(&raw).unwrap()
             },
             Message::PermanentDelete(msg) => {
                 let raw = RawMoveToTrash {
@@ -2537,7 +2536,7 @@ impl MessageInst {
                     cv_name: loaded.cv_name.clone(),
                     sender_guid: loaded.sender_guid.clone(),
                     after_guid: None,
-                }), Message::Typing(loaded.u.unwrap_or(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp {
+                }), Message::Typing(loaded.u == Some(true), if let (Some(bid), Some(icon)) = (&loaded.bundle_id, loaded.icon) { Some(TypingApp { 
                     bundle_id: bid.clone(), 
                     icon: ungzip(icon.as_ref())?, 
                 }) } else { None }));
@@ -2582,8 +2581,8 @@ impl MessageInst {
             return match loaded {
                 RawMoveToTrash { chat, message, recoverable_delete_date: Some(recoverable_delete_date), is_permanent_delete: false, .. } => {
                     let system_time: SystemTime = recoverable_delete_date.into();
-                    wrapper.to_message(None, Message::MoveToRecycleBin(MoveToRecycleBinMessage {
-                        target: if chat.len() > 0 { DeleteTarget::Chat(chat.into_iter().next().unwrap()) } else { DeleteTarget::Messages(message) },
+                    wrapper.to_message(None, Message::MoveToRecycleBin(MoveToRecycleBinMessage { 
+                        target: if message.len() > 0 { DeleteTarget::Messages(message) } else { DeleteTarget::Chat(chat.into_iter().next().unwrap()) }, 
                         recoverable_delete_date: system_time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64,
                     }))
                 },
@@ -2609,27 +2608,13 @@ impl MessageInst {
             return wrapper.to_message(None, Message::RecoverChat(loaded.recover_chat_metadata_array.into_iter().next().unwrap()))
         }
         if let Ok(loaded) = plist::from_value::<RawUnsendMessage>(&value) {
-            let conv = match (wrapper.sender.as_ref(), wrapper.target.as_ref()) {
-                (Some(s), Some(t)) => Some(ConversationData {
-                    participants: vec![s.clone(), t.clone()],
-                    cv_name: None, sender_guid: None, after_guid: None,
-                }),
-                _ => None,
-            };
-            return wrapper.to_message(conv, Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }));
+            return wrapper.to_message(None, Message::Unsend(UnsendMessage { tuuid: loaded.message, edit_part: loaded.part_index }));
         }
         if let Ok(loaded) = plist::from_value::<RawUpdateExtensionMessage>(&value) {
             return wrapper.to_message(None, Message::UpdateExtension(UpdateExtensionMessage { for_uuid: loaded.target_id, ext: plist::from_value(&loaded.new_info)? }));
         }
         if let Ok(loaded) = plist::from_value::<RawEditMessage>(&value) {
-            let conv = match (wrapper.sender.as_ref(), wrapper.target.as_ref()) {
-                (Some(s), Some(t)) => Some(ConversationData {
-                    participants: vec![s.clone(), t.clone()],
-                    cv_name: None, sender_guid: None, after_guid: None,
-                }),
-                _ => None,
-            };
-            return wrapper.to_message(conv, Message::Edit(EditMessage {
+            return wrapper.to_message(None, Message::Edit(EditMessage {
                 tuuid: loaded.message,
                 edit_part: loaded.part_index,
                 new_parts: MessageParts::parse_parts(&loaded.new_html_body, None)
@@ -2809,6 +2794,22 @@ impl MessageInst {
             // Override sender: the APS wrapper's sender is our own number (iPhone
             // relaying the SMS), but the actual SMS sender is in the `h` field.
             msg.sender = Some(format!("tel:{}", loaded.sender));
+            // Use the stable SMS plist UUID (constant_uuid / cs field) as the
+            // message ID instead of the outer APNs envelope UUID.
+            //
+            // The APNs envelope UUID (set by to_message() above from IDSRecvMessage.U)
+            // can change when the iPhone re-relays the same SMS after reconnecting,
+            // causing the bridge to re-process old SMS messages as duplicates.
+            // The constant_uuid is assigned by the relay infrastructure and remains
+            // stable across iPhone reconnects and APNs re-deliveries.
+            //
+            // Using constant_uuid also ensures outbound tapback reply_to_guid values
+            // match the iPhone's stored message identifier, so the iPhone can route
+            // the reaction to the correct existing SMS thread rather than opening a
+            // new one.
+            if !loaded.constant_uuid.is_empty() {
+                msg.id = loaded.constant_uuid.to_uppercase();
+            }
             return Ok(msg);
         }
         if let Ok(loaded) = plist::from_value::<RawSmsOutgoingMessage>(&value) {

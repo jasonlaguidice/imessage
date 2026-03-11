@@ -122,7 +122,7 @@ pub struct IMClient {
 
 impl IMClient {
     pub async fn new(conn: APSConnection, users: Vec<IDSUser>, identity: IDSNGMIdentity, services: &'static [&'static IDSService], cache_path: PathBuf, os_config: Arc<dyn OSConfig>, mut keys_updated: Box<dyn FnMut(Vec<IDSUser>) + Send + Sync>) -> IMClient {
-        let interest = conn.request_topics(vec!["com.apple.private.alloy.sms", "com.apple.madrid"]).await;
+        let interest = conn.request_topics(&["com.apple.private.alloy.sms", "com.apple.madrid"]).await;
         let _ = Self::setup_conn(&conn).await;
 
         let mut to_refresh = conn.generated_signal.subscribe();
@@ -250,8 +250,8 @@ impl IMClient {
             target: Some(target),
             ..
         } = &payload {
-            if error_string.starts_with("ec-com.apple.messageprotection-") {
-                // refreshing identity cache can fix key-related errors
+            if error_string == "ec-com.apple.messageprotection-802" {
+                // refreshing identity cache can fix this
                 let mut cache_lock = self.identity.cache.lock().await;
                 cache_lock.invalidate(&target, &sender);
             }
@@ -334,8 +334,7 @@ impl IMClient {
         drop(ident_cache);
 
         // if we have multiple people, but not a single target going to not us, we cannot "send" this message.
-        // Read receipts and delete messages are allowed to go only to self-devices (cross-device sync).
-        if targets.len() > 1 && !matches!(message.message, Message::Read | Message::MoveToRecycleBin(_) | Message::PermanentDelete(_)) && !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
+        if targets.len() > 1 && !message_targets.iter().any(|target| !handles.contains(&target.participant)) {
             return Err(PushError::NoValidTargets);
         }
         

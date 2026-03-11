@@ -6,7 +6,7 @@ use log::{debug, error, info, warn};
 use openssl::{encrypt::{Decrypter, Encrypter}, hash::{Hasher, MessageDigest}, pkey::PKey, rsa::Padding, sha::sha1, sign::{Signer, Verifier}, symm::{decrypt, encrypt, Cipher}};
 use plist::{Data, Dictionary, Value};
 use serde::{Deserialize, Serialize};
-use tokio::{sync::{Mutex, RwLock}, task::JoinHandle};
+use tokio::{task::JoinHandle};
 use backon::Retryable;
 use rand::Rng;
 use async_recursion::async_recursion;
@@ -15,8 +15,9 @@ use rand::RngCore;
 use uuid::Uuid;
 use std::str::FromStr;
 use std::fmt::Debug;
+use crate::util::{DebugMutex, DebugRwLock};
 
-use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
+use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSError, IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
 
 use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, IDSUserType, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
 
@@ -343,13 +344,13 @@ impl KeyCache {
 }
 
 pub struct IdentityResource {
-    pub cache: Mutex<KeyCache>,
-    pub users: RwLock<Vec<IDSUser>>,
+    pub cache: DebugMutex<KeyCache>,
+    pub users: DebugRwLock<Vec<IDSUser>>,
     pub identity: IDSNGMIdentity,
     config: Arc<dyn OSConfig>,
     aps: APSConnection,
-    query_lock: Mutex<()>,
-    manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
+    query_lock: DebugMutex<()>,
+    manager: DebugMutex<Option<Weak<ResourceManager<Self>>>>,
     services: &'static [&'static IDSService],
     interest_token: APSInterestToken,
 }
@@ -368,7 +369,7 @@ impl Resource for IdentityResource {
             debug!("Register failed {}!", err);
             drop(users_lock);
 
-            let needs_relog = matches!(err, PushError::AuthInvalid(6005) | PushError::RegisterFailed(6005, _));
+            let needs_relog = matches!(err, PushError::AuthInvalid(IDSError(6005)) | PushError::RegisterFailed(IDSError(6005)));
             return Err(if needs_relog {
                 info!("Auth returns 6005, relog required!");
                 PushError::DoNotRetry(Box::new(err))
@@ -410,14 +411,14 @@ impl IdentityResource {
                         }).unwrap_or(true))); // if not exist, reregister!
         
         let resource = Arc::new(IdentityResource {
-            cache: Mutex::new(KeyCache::new(cache_path, &conn, &users, services).await),
-            users: RwLock::new(users),
+            cache: DebugMutex::new(KeyCache::new(cache_path, &conn, &users, services).await),
+            users: DebugRwLock::new(users),
             config,
             identity,
-            interest_token: conn.request_topics(vec!["com.apple.private.ids"]).await,
+            interest_token: conn.request_topics(&["com.apple.private.ids"]).await,
             aps: conn,
-            query_lock: Mutex::new(()),
-            manager: Mutex::new(None),
+            query_lock: DebugMutex::new(()),
+            manager: DebugMutex::new(None),
             services,
         });
 
@@ -690,7 +691,7 @@ impl IdentityResource {
            let results = match self.user_by_handle(topic, &users, handle).await?.query(&*self.config, &self.aps, topic, self.get_main_service(topic), handle, chunk, meta).await {
                Ok(results) => results,
                Err(err) => {
-                   if let PushError::LookupFailed(6005) = err {
+                   if let PushError::LookupFailed(IDSError(6005)) = err {
                        warn!("IDS returned 6005; attempting to re-register");
                        drop(users);
                        drop(id_lock);

@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Cursor;
+use std::mem;
 use std::num::ParseIntError;
 use std::ops::{Deref, DerefMut, Range};
+use std::panic::Location;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,7 +19,7 @@ use log::{debug, info, warn};
 use num_bigint::{BigInt, Sign};
 use openssl::bn::{BigNum, BigNumContext};
 use openssl::derive::Deriver;
-use openssl::ec::{EcGroup, EcKey, EcPoint};
+use openssl::ec::{EcGroup, EcKey, EcPoint, PointConversionForm};
 use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use openssl::pkey::{HasPublic, PKey, Private, Public};
@@ -25,7 +27,7 @@ use openssl::rsa::Rsa;
 use openssl::sha::sha256;
 use openssl::sign::{Signer, Verifier};
 use openssl::symm::{decrypt, encrypt, Cipher, Crypter, Mode};
-use plist::{Data, Dictionary, Error, Uid, Value};
+use plist::{Data, Date, Dictionary, Error, Uid, Value};
 use base64::Engine;
 use prost::Message;
 use rasn::{AsnType, Decode, Encode};
@@ -37,7 +39,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::select;
-use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
+use tokio::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::error::Elapsed;
 use tokio_rustls::client;
@@ -80,6 +82,136 @@ pub async fn get_bag(url: &str, item: &str) -> Result<Value, PushError> {
 }
 
 
+pub struct DebugGuard<'a, T>(MutexGuard<'a, T>, Location<'a>, u16, u16);
+
+impl<'a, T> Drop for DebugGuard<'a, T> {
+    fn drop(&mut self) {
+        info!("Mutex {} {}@{} dropped", self.3, self.1, self.2);
+    }
+}
+
+impl<'a, T> Deref for DebugGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+impl<'a, T> DerefMut for DebugGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.0
+    }
+}
+
+pub struct DebugMutex<T>(Mutex<T>, u16);
+
+impl<T> DebugMutex<T> {
+    pub fn new(v: T) -> Self {
+        let id: u16 = rand::random();
+        Self(Mutex::new(v), id)
+    }
+    
+    #[track_caller]
+    pub fn lock(&self) -> impl Future<Output = DebugGuard<'_, T>> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        info!("Locking {} mutex at {caller}@{id}", self.1);
+
+        async move {
+            let lock = self.0.lock().await;
+            info!("Locked {} mutex at {caller}@{id}", self.1);
+            DebugGuard(lock, *caller, id, self.1)
+        }
+    }
+}
+
+pub struct DebugReadGuard<'a, T>(RwLockReadGuard<'a, T>, Location<'a>, u16, u16);
+
+impl<'a, T> Drop for DebugReadGuard<'a, T> {
+    fn drop(&mut self) {
+        info!("Read mtx {} guard {}@{} dropped", self.3, self.1, self.2);
+    }
+}
+
+impl<'a, T> Deref for DebugReadGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+pub struct DebugWriteGuard<'a, T>(Option<RwLockWriteGuard<'a, T>>, Location<'a>, u16, u16);
+
+impl<'a, T> DebugWriteGuard<'a, T> {
+    pub fn downgrade(mut self) -> DebugReadGuard<'a, T> {
+        info!("Write mtx {} guard {}@{} downgraded", self.3, self.1, self.2);
+
+        DebugReadGuard(self.0.take().unwrap().downgrade(), self.1, self.2, self.3)
+    }
+}
+
+impl<'a, T> Drop for DebugWriteGuard<'a, T> {
+    fn drop(&mut self) {
+        info!("Write mtx {} guard {}@{} dropped", self.3, self.1, self.2);
+    }
+}
+
+impl<'a, T> Deref for DebugWriteGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &*self.0.as_ref().unwrap()
+    }
+}
+
+impl<'a, T> DerefMut for DebugWriteGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.0.as_mut().unwrap()
+    }
+}
+
+pub struct DebugRwLock<T>(RwLock<T>, u16);
+
+impl<T> DebugRwLock<T> {
+    pub fn new(v: T) -> Self {
+        let id: u16 = rand::random();
+        Self(RwLock::new(v), id)
+    }
+
+    #[track_caller]
+    pub fn read(&self) -> impl Future<Output = DebugReadGuard<'_, T>> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        info!("Reading {} lock at {caller}@{id}", self.1);
+
+        async move {
+            let lock = self.0.read().await;
+            info!("Read {} locked at {caller}@{id}", self.1);
+            DebugReadGuard(lock, *caller, id, self.1)
+        }
+    }
+
+    #[track_caller]
+    pub fn write(&self) -> impl Future<Output = DebugWriteGuard<'_, T>> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        info!("Writing {} lock at {caller}@{id}", self.1);
+
+        async move {
+            let lock = self.0.write().await;
+            info!("Write {} locked at {caller}@{id}", self.1);
+            DebugWriteGuard(Some(lock), *caller, id, self.1)
+        }
+    }
+
+    #[track_caller]
+    pub fn blocking_read(&self) -> DebugReadGuard<'_, T> {
+        let caller = Location::caller();
+        let id: u16 = rand::random();
+        let lock = self.0.blocking_read();
+        DebugReadGuard(lock, *caller, id, self.1)
+    }
+}
+
 
 fn build_proxy() -> Client {
     let mut headers = HeaderMap::new();
@@ -108,9 +240,7 @@ pub static REQWEST: LazyLock<Client> = LazyLock::new(|| {
     let mut builder = reqwest::Client::builder()
         .use_rustls_tls()
         .default_headers(headers.clone())
-        .http1_title_case_headers()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10));
+        .http1_title_case_headers();
 
     for certificate in certificates.into_iter() {
         builder = builder.add_root_certificate(certificate);
@@ -320,6 +450,51 @@ where
     x.clone().map(|i| Data::new(i)).serialize(s)
 }
 
+pub fn date_to_ms(date: Date) -> u64 {
+    let time: SystemTime = date.into();
+    time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+pub fn ms_to_date(ms: u64) -> Date {
+    (SystemTime::UNIX_EPOCH + Duration::from_millis(ms)).into()
+}
+
+pub fn date_serialize_opt<S>(x: &Option<u64>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let date: Option<Date> = x.map(|x| (SystemTime::UNIX_EPOCH + Duration::from_millis(x)).into());
+    date.serialize(s)
+}
+
+pub fn date_deserialize_opt<'de, D>(d: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<Date> = Deserialize::deserialize(d)?;
+    Ok(s.map(|s| {
+        let time: SystemTime = s.into();
+        time.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as u64
+    }))
+}
+
+pub fn date_serialize<S>(x: &u64, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    let date: Date = (SystemTime::UNIX_EPOCH + Duration::from_millis(*x)).into();
+    date.serialize(s)
+}
+
+pub fn date_deserialize<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Date = Deserialize::deserialize(d)?;
+    let time: SystemTime = s.into();
+    Ok(time.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
+}
+
 // both in der
 #[derive(Serialize, Deserialize, Clone)]
 pub struct KeyPair {
@@ -342,6 +517,14 @@ pub fn base64_encode(data: &[u8]) -> String {
 
 pub fn base64_decode(data: &str) -> Vec<u8> {
     general_purpose::STANDARD.decode(data).unwrap()
+}
+
+pub fn base64_encode_url(data: &[u8]) -> String {
+    general_purpose::URL_SAFE_NO_PAD.encode(data)
+}
+
+pub fn base64_decode_url(data: &str) -> Vec<u8> {
+    general_purpose::URL_SAFE_NO_PAD.decode(data).unwrap()
 }
 
 pub fn plist_to_string<T: serde::Serialize>(value: &T) -> Result<String, Error> {
@@ -428,6 +611,22 @@ pub fn encode_uleb128(mut val: u64) -> Vec<u8> {
         }
         result.push(byte | 0x80)
     }
+}
+
+pub fn ec_key_from_apple(apple: &[u8], curve: &EcGroup) -> EcKey<Private> {
+    let field_len = ((curve.degree() as usize) + 7) / 8;
+    let expected_uncompressed_len = 1 + 2 * field_len;
+
+    let mut num_context_ref = BigNumContext::new().unwrap();
+    let main_point = EcPoint::from_bytes(curve, &apple[..expected_uncompressed_len], &mut num_context_ref).unwrap();
+    EcKey::from_private_components(curve, &BigNum::from_slice(&apple[expected_uncompressed_len..]).unwrap(), &main_point).unwrap()
+}
+
+pub fn ec_key_to_apple(key: &EcKey<Private>) -> Vec<u8> {
+    let mut num_context_ref = BigNumContext::new().unwrap();
+    let mut point = key.public_key().to_bytes(&key.group(), PointConversionForm::UNCOMPRESSED, &mut num_context_ref).unwrap();
+    point.extend(key.private_key().to_vec());
+    point
 }
 
 #[derive(Deserialize)]
@@ -995,7 +1194,16 @@ const CLASS_SPECS: &[ClassData] = &[
             "image",
             "icon",
             "images",
-            "icons"
+            "icons",
+            "specialization2"
+        ]
+    },
+    ClassData {
+        name: "LPPasswordsInviteMetadata",
+        classes: &["LPPasswordsInviteMetadata", "LPSpecializationMetadata", "NSObject"],
+        uid_fields: &[
+            "groupName",
+            "urlParameters"
         ]
     },
     ClassData {
@@ -2264,18 +2472,6 @@ impl<T: Write> StreamTypedCoder<T> {
             }
         }
     }
-}
-
-#[test]
-fn test() {
-    let decoded = decode_hex("040B73747265616D747970656481E803840140848484124E5341747472696275746564537472696E67008484084E534F626A656374008592848484084E53537472696E67019484012B03EFBFBC86840269490101928484840C4E5344696374696F6E61727900948401690292849696225F5F6B494D46696C655472616E73666572475549444174747269627574654E616D6586928496962444453531414333372D363630412D344334332D384634342D33343045413132373936373186928496961D5F5F6B494D4D657373616765506172744174747269627574654E616D658692848484084E534E756D626572008484074E5356616C7565009484012A84999900868686").unwrap();
-    // let decoded = decode_hex("040B73747265616D747970656481E803840140848484124E5341747472696275746564537472696E67008484084E534F626A656374008592848484084E53537472696E67019484012B41546F207374616E64206261636B20776865726520796F752073746F6F642C2049207769736820796F7520776F756C642C2049207769736820796F7520776F756C6486840269490141928484840C4E5344696374696F6E617279009484016901928496961D5F5F6B494D4D657373616765506172744174747269627574654E616D658692848484084E534E756D626572008484074E5356616C7565009484012A84999900868686").unwrap();
-    let d = coder_decode_flattened(&decoded);
-    let d = NSAttributedString::decode(&d[0]);
-
-    let encoded = coder_encode_flattened(&[d.encode()]);
-
-    println!("{:?}", d);
 }
 
 

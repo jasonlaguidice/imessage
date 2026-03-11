@@ -15,9 +15,9 @@ use aes::cipher::KeyIvInit;
 use sha2::Sha256;
 use aes::cipher::StreamCipher;
 use super::identity_manager::KeyCache;
+use crate::util::DebugMutex;
 
 use rand::{Rng, RngCore};
-use tokio::sync::Mutex;
 
 use crate::{APSConnectionResource, APSState, AttachmentType, MessagePart, MessageParts, OSConfig, PushError, auth::{KeyType, Signed, SignedRequest}, ids::idsp, util::{CompactECKey, KeyPair, KeyPairNew, REQWEST, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, duration_since_epoch, ec_deserialize_priv, ec_deserialize_priv_compact, ec_serialize_priv, encode_hex, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, rsa_deserialize_priv, rsa_serialize_priv}};
 
@@ -522,7 +522,7 @@ impl IDSNGMIdentity {
         Ok(inner.message)
     }
 
-    pub async fn encrypt_payload(&self, target: &IDSDeliveryData, cache: &Mutex<KeyCache>, body: &[u8]) -> Result<(Vec<u8>, &'static str), PushError> {
+    pub async fn encrypt_payload(&self, target: &IDSDeliveryData, cache: &DebugMutex<KeyCache>, body: &[u8]) -> Result<(Vec<u8>, &'static str), PushError> {
         let (Some(device), Some(prekey)) = (target.get_device_key(), &target.client_data.public_message_ngm_device_prekey_data_key) else {
             // fall back to legacy encryption
             return Ok((self.legacy.encrypt_payload(&target.client_data.public_message_identity_key, body)?, "pair"));
@@ -751,7 +751,7 @@ impl IDSUser {
 
     fn base_request(&self, aps: &APSState, bag: &'static str) -> Result<SignedRequest<Signed>, PushError> {
         Ok(SignedRequest::new(bag, Method::GET)
-            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
             .header("x-protocol-version", &self.protocol_version.to_string())
             .header("x-auth-user-id", &self.user_id)
             .sign(&self.auth_keypair, KeyType::Auth, aps, None)?
@@ -792,7 +792,7 @@ impl IDSUser {
             .header("content-encoding", "gzip")
             .header("accept-encoding", "gzip")
             .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
-            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
             .body(gzip_normal(&plist_to_buf(&body)?)?)
             .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
 
@@ -830,7 +830,7 @@ impl IDSUser {
 
         let parsed: HandleResult = plist::from_bytes(&request)?;
         let Some(handles) = parsed.handles else {
-            return Err(PushError::AuthInvalid(parsed.status))
+            return Err(PushError::AuthInvalid(IDSError(parsed.status)))
         };
         
         Ok(handles)
@@ -851,7 +851,7 @@ impl IDSUser {
 
         let status = parsed.as_dictionary().unwrap()["status"].as_unsigned_integer().unwrap();
         if status != 0 {
-            return Err(PushError::AuthInvalid(status))
+            return Err(PushError::AuthInvalid(IDSError(status)))
         }
 
         let devices = parsed.as_dictionary().unwrap().get("registrations").unwrap().as_array().unwrap();
@@ -992,10 +992,26 @@ impl IDSUser {
 
         let loaded: IDSLookupResp = plist::from_bytes(&request)?;
         if loaded.status != 0 || loaded.results.is_none() {
-            return Err(PushError::LookupFailed(loaded.status))
+            return Err(PushError::LookupFailed(IDSError(loaded.status)))
         }
 
         Ok(loaded.results.unwrap())
+    }
+}
+
+#[derive(Debug)]
+pub struct IDSError(pub u64);
+
+impl Display for IDSError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            6001 => write!(f, "Incompatible; Make sure Contact Key Verification and Advanced Data Protection are off. (6001)"),
+            6004 => write!(f, "Please try again (6004)"),
+            6005 => write!(f, "Bad authentication, try again and re-enter device details if persistent. (6005)"),
+            6009 => write!(f, "Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Choose 'Get Started,' not 'Chat.' Do not mention you are using OpenBubbles. (6009)"),
+            5052 => write!(f, "An alias was just removed from your account. Try again. (5052)"),
+            _unk => write!(f, "Unknown IDS error {_unk}")
+        }
     }
 }
 
@@ -1087,55 +1103,15 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
         ("validation-data", Value::Data(config.generate_validation_data().await?))
     ].into_iter()));
 
-    // Log the registration payload (redact validation-data since it's large binary)
-    {
-        let mut debug_body = body.as_dictionary().unwrap().clone();
-        debug_body.remove("validation-data");
-        if let Some(services_val) = debug_body.get("services") {
-            // Also redact large binary keys in client-data for readability
-            if let Some(services_arr) = services_val.as_array() {
-                let redacted: Vec<Value> = services_arr.iter().map(|svc| {
-                    let mut svc_dict = svc.as_dictionary().unwrap().clone();
-                    if let Some(users_val) = svc_dict.get("users") {
-                        if let Some(users_arr) = users_val.as_array() {
-                            let redacted_users: Vec<Value> = users_arr.iter().map(|u| {
-                                let mut ud = u.as_dictionary().unwrap().clone();
-                                if let Some(cd) = ud.get("client-data") {
-                                    let mut cd_dict = cd.as_dictionary().unwrap().clone();
-                                    for key in &["public-message-identity-key", "public-message-ngm-device-prekey-data-key"] {
-                                        if cd_dict.contains_key(*key) {
-                                            cd_dict.insert(key.to_string(), Value::String("<redacted>".into()));
-                                        }
-                                    }
-                                    ud.insert("client-data".into(), Value::Dictionary(cd_dict));
-                                }
-                                if ud.contains_key("kt-loggable-data") {
-                                    ud.insert("kt-loggable-data".into(), Value::String("<redacted>".into()));
-                                }
-                                Value::Dictionary(ud)
-                            }).collect();
-                            svc_dict.insert("users".into(), Value::Array(redacted_users));
-                        }
-                    }
-                    Value::Dictionary(svc_dict)
-                }).collect();
-                debug_body.insert("services".into(), Value::Array(redacted));
-            }
-        }
-        info!("Registration request body: {:?}", debug_body);
-        info!("Registration headers: x-protocol-version={}, user-agent=com.apple.invitation-registration {}", 
-            config.get_protocol_version(), config.get_version_ua());
-    }
-
     let mut request = SignedRequest::new("id-register", Method::POST)
-            .header("x-push-token", &base64_encode(aps.token.as_ref().unwrap()))
+            .header("x-push-token", &base64_encode(&aps.token.ok_or(PushError::APSNotReady("token"))?))
             .header("x-protocol-version", &config.get_protocol_version().to_string())
             .header("user-agent", &format!("com.apple.invitation-registration {}", config.get_version_ua()))
             .header("content-type", "application/x-apple-plist")
             .header("content-encoding", "gzip")
             .header("accept-encoding", "gzip")
             .body(gzip_normal(&plist_to_buf(&body)?)?)
-            .sign(aps.keypair.as_ref().unwrap(), KeyType::Push, aps, None)?;
+            .sign(aps.keypair.as_ref().ok_or(PushError::APSNotReady("keypair"))?, KeyType::Push, aps, None)?;
 
     for (idx, user) in users.iter().enumerate() {
         request = request.header(&format!("x-auth-user-id-{idx}"), &user.user_id)
@@ -1144,21 +1120,13 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
 
     let response = request.send(&REQWEST).await?.bytes().await?;
 
-    let response_str = std::str::from_utf8(&response).unwrap_or("<non-utf8>").to_string();
-    info!("register response {}", response_str);
+    debug!("register response {}", std::str::from_utf8(&response).expect("resp not utf8?"));
 
     let resp: Value = plist::from_bytes(&response)?;
 
-    let resp_dict = resp.as_dictionary().unwrap();
-    let status = resp_dict.get("status").unwrap().as_unsigned_integer().unwrap();
+    let status = resp.as_dictionary().unwrap().get("status").unwrap().as_unsigned_integer().unwrap();
     if status != 0 {
-        // Check for server-provided alert or actionable error info
-        if status == 6001 || status == 6004 || status == 6009 {
-            if let Some(alert) = resp_dict.get("alert") {
-                return Err(PushError::CustomerMessage(plist::from_value(alert)?))
-            }
-        }
-        return Err(PushError::RegisterFailed(status, response_str))
+        return Err(PushError::RegisterFailed(IDSError(status)))
     }
 
     // update registrations
@@ -1167,7 +1135,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
     for service in service_list {
         let dict = service.as_dictionary().unwrap();
         let service_name = dict.get("service").unwrap().as_string().unwrap();
-        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(u64::MAX, "no users in response".to_string()))?.as_array().unwrap();
+        let users_list = dict.get("users").ok_or(PushError::RegisterFailed(IDSError(u64::MAX)))?.as_array().unwrap();
 
         let service = id_services.iter().find(|service| service.name == service_name).expect("Service not found??");
 
@@ -1177,14 +1145,12 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
             let status = user_dict.get("status").unwrap().as_unsigned_integer().unwrap();
 
             if status != 0 {
-                let user_dict_str = format!("{:?}", user_dict);
-                error!("Registration failed for user with status {}, user dict: {}", status, user_dict_str);
-                if status == 6001 || status == 6004 || status == 6009 {
+                if status == 6009 || status == 6001 {
                     if let Some(alert) = user_dict.get("alert") {
                         return Err(PushError::CustomerMessage(plist::from_value(alert)?))
                     }
                 }
-                return Err(PushError::RegisterFailed(status, user_dict_str));
+                return Err(PushError::RegisterFailed(IDSError(status)));
             }
 
             let mut my_handles = vec![];
@@ -1195,7 +1161,7 @@ pub async fn register(config: &dyn OSConfig, aps: &APSState, id_services: &[&'st
                 let uri = uri.as_dictionary().unwrap().get("uri").unwrap().as_string().unwrap();
                 if status != 0 {
                     error!("Failed to register {uri} status {}", status);
-                    return Err(PushError::RegisterFailed(status, format!("handle {} rejected", uri)));
+                    return Err(PushError::RegisterFailed(IDSError(status)));
                 }
                 my_handles.push(uri.to_string());
             }

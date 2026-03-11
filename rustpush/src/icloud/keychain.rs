@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, HashMap}, io::{Cursor, Read}, ops::Deref, sync
 
 use aes_gcm::{AesGcm, Nonce};
 use cloudkit_derive::CloudKitRecord;
-use cloudkit_proto::{ot_bottle::OtAuthenticatedCiphertext, record::{reference, Field, Reference}, request_operation::header::IsolationLevel, response_operation, view_keys::ViewKey, Bottle, CloudKitRecord, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, TlkShare, ViewKeys, Voucher};
+use cloudkit_proto::{Bottle, CloudKitRecord, CreateSubscriptionRequest, CuttlefishChange, CuttlefishChanges, CuttlefishEstablshRequest, CuttlefishFetchChangesRequest, CuttlefishFetchChangesResponse, CuttlefishFetchRecoverableTlkSharesRequest, CuttlefishFetchRecoverableTlkSharesResponse, CuttlefishFetchViableBottleRequest, CuttlefishFetchViableBottleResponse, CuttlefishJoinWithVoucherRequest, CuttlefishJoinWithVoucherResponse, CuttlefishPeer, CuttlefishResetRequest, CuttlefishResetResponse, CuttlefishSerializedKey, CuttlefishUpdateTrustRequest, CuttlefishUpdateTrustResponse, EscrowData, EscrowMeta, FunctionInvokeResponse, Identifier, OtBottle, OtInternalBottle, OtPrivateKey, PeerDynamicInfo, PeerPermanentInfo, PeerStableInfo, Record, RecordZoneIdentifier, ResponseOperation, SignedInfo, Subscription, TlkShare, ViewKeys, Voucher, ot_bottle::OtAuthenticatedCiphertext, record::{Field, Reference, reference}, request_operation::header::{ContainerEnvironment, IsolationLevel}, response_operation, view_keys::ViewKey};
 use deku::{DekuContainerWrite, DekuRead, DekuUpdate, DekuWrite};
 use hkdf::Hkdf;
 use icloud_auth::AppleAccount;
@@ -10,6 +10,7 @@ use keystore::{AesKeystoreKey, EcCurve, EcKeystoreKey, EncryptMode, KeystoreAcce
 use omnisette::{AnisetteProvider, ArcAnisetteClient};
 use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint, PointConversionForm}, encrypt::Encrypter, hash::MessageDigest, nid::Nid, pkcs5::pbkdf2_hmac, pkey::{HasPublic, PKey, Private, Public}, rsa::Padding, sha::{sha1, sha256}, sign::{Signer, Verifier}, stack::Stack, symm::{decrypt, encrypt, Cipher}, x509::{store::{X509Store, X509StoreBuilder}, X509StoreContext, X509}};
 use plist::{Data, Date, Dictionary, Value};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use std::str::FromStr;
@@ -26,11 +27,10 @@ use aes_gcm::KeyInit;
 use aes_siv::{siv::CmacSiv, Aes256SivAead};
 
 use cloudkit_proto::CuttlefishEstablishResponse;
-use crate::{TokenProvider, cloudkit::{SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey};
+use crate::{TokenProvider, cloudkit::{CreateSubscriptionOperation, DeleteRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier, should_reset}, keychain, pcs::PCSKey, util::{DebugRwLock, DebugMutex, ec_key_from_apple, ec_key_to_apple}};
 use aes::{cipher::{consts::{U12, U16, U32}, Unsigned}, Aes128, Aes256};
 use sha2::{digest::FixedOutputReset, Digest, Sha256, Sha384};
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_2048, server::SrpServer};
-use tokio::sync::{Mutex, RwLock};
 use crate::{aps::APSInterestToken, auth::MobileMeDelegateResponse, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FunctionInvokeOperation, ALL_ASSETS}, util::{CompactECKey, base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, decode_uleb128, duration_since_epoch, ec_deserialize_priv, ec_serialize_priv, encode_hex, kdf_ctr_hmac, plist_to_bin, plist_to_string, proto_deserialize, proto_deserialize_opt, proto_serialize, proto_serialize_opt, rfc6637_unwrap_key, NSData, NSDataClass, REQWEST}, APSConnection, APSMessage, IdentityManager, KeyedArchive, OSConfig, PushError};
 
 use backon::{BackoffBuilder, ConstantBuilder, ExponentialBuilder};
@@ -181,7 +181,6 @@ impl CuttlefishEncItem {
         self.parentkeyref.record_identifier.as_ref().unwrap().value.as_ref().unwrap().name()
     }
 
-    // TODO not secure for raw passwords length, padding is lazy. Only cryptographic keys for now
     fn encrypt(&mut self, uuid: &str, key: &SivKey, data: Dictionary) -> Result<(), PushError> {
         let record_key: [u8; 64] = rand::random();
         self.wrappedkey = base64_encode(&key.encrypt(&record_key));
@@ -195,8 +194,15 @@ impl CuttlefishEncItem {
         headers.extend(aad.into_values());
         
         let mut data = plist_to_bin(&data)?;
-        data.push(0x80); // lazy padding
-        data.push(0x00);
+        data.push(0x80);
+
+        const BLOCK_PAD_SIZE: usize = 20;
+        let mut blocks = (data.len() + (BLOCK_PAD_SIZE - 1)) / BLOCK_PAD_SIZE;
+        if blocks == 1 {
+            blocks += 1;
+        }
+
+        data.resize(blocks * BLOCK_PAD_SIZE, 0);
 
         let data = cipher.encrypt::<&[Vec<u8>], &Vec<u8>>(&headers, &data).unwrap();
         self.data = [&iv[..], &data].concat();
@@ -341,6 +347,7 @@ impl IESCiphertext {
     }
 }
 
+#[derive(Clone)]
 pub struct SivKey(pub Vec<u8>);
 
 impl SivKey {
@@ -423,21 +430,6 @@ fn msg_from_bin(bin: &[u8], header_len: usize, section_count: usize) -> (Vec<u8>
         bin[start + 4..start + 4 + size].to_vec()
     });
     (header, offsets.collect())
-}
-
-fn ec_key_from_apple(apple: &[u8]) -> EcKey<Private> {
-    let curve = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
-    let mut num_context_ref = BigNumContext::new().unwrap();
-    let main_point = EcPoint::from_bytes(&curve, &apple[..97], &mut num_context_ref).unwrap();
-    EcKey::from_private_components(&curve, &BigNum::from_slice(&apple[97..]).unwrap(), &main_point).unwrap()
-}
-
-fn ec_key_to_apple(key: &EcKey<Private>) -> Vec<u8> {
-    let mut num_context_ref = BigNumContext::new().unwrap();
-    let mut point = key.public_key().to_bytes(&key.group(), PointConversionForm::UNCOMPRESSED, &mut num_context_ref).unwrap();
-    assert_eq!(point.len(), 97);
-    point.extend(key.private_key().to_vec());
-    point
 }
 
 struct KeyVaultMessage {
@@ -659,7 +651,7 @@ const CUTTLEFISH_CONTAINER: CloudKitContainer = CloudKitContainer {
     env: cloudkit_proto::request_operation::header::ContainerEnvironment::Production,
 };
 
-const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
+pub const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
     database_type: cloudkit_proto::request_operation::header::Database::PrivateDb,
     bundleid: "com.apple.securityd",
     containerid: "com.apple.security.keychain",
@@ -669,7 +661,7 @@ const SECURITYD_CONTAINER: CloudKitContainer = CloudKitContainer {
 pub struct KeychainClient<P: AnisetteProvider> {
     pub anisette: ArcAnisetteClient<P>,
     pub token_provider: Arc<TokenProvider<P>>,
-    pub state: RwLock<KeychainClientState>,
+    pub state: DebugRwLock<KeychainClientState>,
     pub config: Arc<dyn OSConfig>,
     pub update_state: Box<dyn Fn(&KeychainClientState) + Send + Sync>,
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
@@ -1225,34 +1217,58 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     }
 
     async fn sync_changes(&self) -> Result<(), PushError> {
-        let token = self.state.read().await.state_token.clone();
+        let mut token = self.state.read().await.state_token.clone();
 
-        let result = self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
-            sync_token: token
-        }).await;
-        let changes: CuttlefishFetchChangesResponse = match result {
-            Ok(changes) => changes,
-            Err(PushError::CloudKitError(e)) => {
-                info!("result {e:?}");
-                if matches!(&e.error, Some(error) if error.error_description() == ".changeTokenExpired") {
-                    info!("Change token reset, locking");
-                    // someone reset our clique...
-                    let mut lock = self.state.write().await;
-                    info!("Change token reset, locked");
-                    lock.state_token = None;
-                    lock.state.clear();
-                    self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
-                        sync_token: None
-                    }).await?
-                } else { return Err(PushError::CloudKitError(e)) }
+        loop {
+            let result = self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
+                sync_token: token
+            }).await;
+            let changes: CuttlefishFetchChangesResponse = match result {
+                Ok(changes) => changes,
+                Err(PushError::CloudKitError(e)) => {
+                    info!("result {e:?}");
+                    if matches!(&e.error, Some(error) if error.error_description() == ".changeTokenExpired") {
+                        info!("Change token reset, locking");
+                        // someone reset our clique...
+                        let mut lock = self.state.write().await;
+                        info!("Change token reset, locked");
+                        lock.state_token = None;
+                        lock.state.clear();
+                        self.invoke_cuttlefish("fetchChanges", CuttlefishFetchChangesRequest {
+                            sync_token: None
+                        }).await?
+                    } else { return Err(PushError::CloudKitError(e)) }
+                }
+                Err(e) => return Err(e),
+            };
+
+            let CuttlefishFetchChangesResponse { changes: Some(changes) } = changes else { return Ok(()) };
+
+            let mut state = self.state.write().await;
+            token = changes.sync_token.clone();
+            if changes.changes.is_empty() {
+                state.state_token = changes.sync_token.clone();
+                break;
             }
-            Err(e) => return Err(e),
-        };
 
-        let CuttlefishFetchChangesResponse { changes: Some(changes) } = changes else { return Ok(()) };
+            self.apply_changes(changes, &mut state);
+
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_keychain(&self, uuid: &str, zone: &str) -> Result<(), PushError> {
+        let security_container = self.get_security_container().await?;
+        let record_zone = security_container.private_zone(zone.to_string());
+
+        security_container.perform(&CloudKitSession::new(), DeleteRecordOperation::new(record_identifier(record_zone, uuid))).await?;
 
         let mut state = self.state.write().await;
-        self.apply_changes(changes, &mut state);
+        let zone = state.items.entry(zone.to_string()).or_default();
+        zone.keys.remove(uuid);
+
+        (self.update_state)(&state);
 
         Ok(())
     }
@@ -1287,7 +1303,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         item.encrypt(&uuid, &key.decode(&state.get_cloudkey_access_key()?), dict.clone())?;
 
         let mut ops = vec![SaveRecordOperation::new(
-                record_identifier(record_zone.clone(), &uuid), item, None, false)];
+                record_identifier(record_zone.clone(), &uuid), item, None, true)];
 
         if let Some(tag) = associated_tag {
             ops.push(SaveRecordOperation::new(record_identifier(record_zone.clone(), tag), CuttlefishCurrentItem {
@@ -1386,6 +1402,29 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             }
         }
         (self.update_state)(&state);
+    }
+
+    pub async fn create_subscriptions(&self) -> Result<(), PushError> {
+        let security = self.get_security_container().await?;      
+        let mut subscriptions = vec![];
+        for zone in KEYCHAIN_ZONES {
+            let mut zone_identifier = security.private_zone(zone.to_string());
+            zone_identifier.environment = Some(ContainerEnvironment::Production as i32);
+            subscriptions.push(CreateSubscriptionOperation(CreateSubscriptionRequest {
+                subscription: Some(Subscription {
+                    identifier: Some(Identifier { 
+                        name: Some(format!("zone:{}", zone)), 
+                        r#type: Some(cloudkit_proto::identifier::Type::Subscription.into())
+                    }),
+                    evaulation_type: Some(2),
+                    zone_identifier: Some(zone_identifier),
+                    ..Default::default()
+                })
+            }))
+        }
+        // ignore inner results, assume that it was created or maybe zone didn't exist but who cares
+        security.perform_operations(&CloudKitSession::new(), &subscriptions, IsolationLevel::Zone).await?;
+        Ok(())
     }
 
     pub async fn reset_clique(&self, device_password: &[u8]) -> Result<(), PushError> {
@@ -1495,6 +1534,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             }).await?;
 
             self.join_clique(device_password, &private, None, &shares, viewkeys.clone()).await?;
+            let _ = self.create_subscriptions().await;
             Ok(())
         })
             .retry(&ConstantBuilder::default()
@@ -1586,16 +1626,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
                 modified = true;
             }
 
-            let my_id = &state.user_identity.as_ref().unwrap().identifier;
             for excluded in &trust.excludeds {
-                if excluded == my_id {
-                    warn!(
-                        "Ignoring exclusion of ourselves ({}) from peer {}",
-                        excluded,
-                        peer.0.hash.as_ref().unwrap()
-                    );
-                    continue;
-                }
                 if current_state.excludeds.contains(excluded) { continue }
                 if current_state.includeds.contains(excluded) {
                     current_state.includeds.retain(|a| a != excluded);
@@ -1684,6 +1715,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         if !verifier.verify(outer_bottle.escrowed_key_signature())? {
             return Err(PushError::BadMsg)
         }
+        info!("Available as {} {:?}", outer_bottle.peer_id(), state.state.keys().collect::<Vec<_>>());
         let Some(peer) = state.state.get(outer_bottle.peer_id()) else { return Err(PushError::PeerNotFound) };
         peer.verify_signature(outer_bottle.bottle(), outer_bottle.peer_key_signature())?;
 
@@ -1693,13 +1725,15 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             &*[&cipertext.ciphertext()[..], &cipertext.authentication_code()[..]].concat()).map_err(|_| PushError::AESGCMError)?;
 
         let decoded = OtInternalBottle::decode(Cursor::new(&result))?;
+
+        let key_group = EcGroup::from_curve_name(Nid::SECP384R1).unwrap();
         
         // reconstruct a keychain identity for our other peer
         Ok(KeychainUserIdentity {
             identifier: outer_bottle.peer_id().to_string(),
             info: peer.0.permanent_info.clone().unwrap(),
-            signing_key: SoftEcKey(ec_key_from_apple(decoded.signing_key.as_ref().unwrap().key_data.as_ref().unwrap())),
-            encryption_key: SoftEcKey(ec_key_from_apple(decoded.encryption_key.as_ref().unwrap().key_data.as_ref().unwrap())),
+            signing_key: SoftEcKey(ec_key_from_apple(decoded.signing_key.as_ref().unwrap().key_data.as_ref().unwrap(), &key_group)),
+            encryption_key: SoftEcKey(ec_key_from_apple(decoded.encryption_key.as_ref().unwrap().key_data.as_ref().unwrap(), &key_group)),
             current_state: peer.get_dynamic_info()?,
         })
     }
@@ -1727,6 +1761,7 @@ impl<P: AnisetteProvider> KeychainClient<P> {
         self.sync_changes().await?;
 
         let mut state = self.state.write().await;
+        info!("Deriving trust from peer {peer_id} {:?}", state.state.keys().collect::<Vec<_>>());
         let Some(included_peer) = state.state.get(peer_id) else { return Err(PushError::PeerNotFound) };
 
         let dynamic = included_peer.get_dynamic_info()?;
@@ -1758,26 +1793,15 @@ impl<P: AnisetteProvider> KeychainClient<P> {
 
         let mut keys = vec![];
         let state = self.state.read().await;
-        let known_peer_count = state.state.len();
-        let total_shares = response.shares.len();
-        info!("fetch_shares_for {}: {} share(s) from server, {} known peer(s) in state", user.identifier, total_shares, known_peer_count);
-        if total_shares > 0 && known_peer_count == 0 {
-            warn!("fetch_shares_for: state.state is empty — all shares will be skipped (sender verification impossible)!");
-        }
-        let mut skipped_no_peer = 0usize;
         for share in response.shares {
-            info!("Processing TLK share for zone {}", share.service());
+            info!("Entering on key {}", share.service());
             let Some(share_record) = &share.share else {
                 warn!("Missing key!");
                 continue;
             };
             let item = CuttlefishTlkShare::from_record(&share_record.inner.as_ref().unwrap().record_field);
 
-            let Some(sending_peer) = state.state.get(&item.sender) else {
-                skipped_no_peer += 1;
-                warn!("Skipping TLK share for zone {} — sender {} not found in known peers", share.service(), item.sender);
-                continue;
-            };
+            let Some(sending_peer) = state.state.get(&item.sender) else { continue };
             sending_peer.verify_signature_dig(MessageDigest::sha256(), &item.data_for_signing(), &base64_decode(&item.signature))?;
 
 
@@ -1809,11 +1833,6 @@ impl<P: AnisetteProvider> KeychainClient<P> {
             
             keys.push(result);
         }
-
-        if skipped_no_peer > 0 {
-            warn!("fetch_shares_for: skipped {}/{} share(s) due to unknown sender peers", skipped_no_peer, total_shares);
-        }
-        info!("fetch_shares_for: recovered {} TLK key(s) from {} share(s)", keys.len(), total_shares);
 
         Ok(keys)
     }
@@ -1881,22 +1900,16 @@ impl<P: AnisetteProvider> KeychainClient<P> {
     pub async fn join_clique_from_escrow(&self, bottle: &EscrowData, password: &[u8], device_password: &[u8]) -> Result<(), PushError> {
         let other_identity = self.recover_bottle(bottle, password).await?;
 
-        // IMPORTANT: Fetch TLK shares BEFORE creating the new identity.
-        // recover_bottle() synced state.state with known peers. new_user_identity()
-        // clears state.state, and fetch_shares_for() needs those peers to verify
-        // each share's sender signature (it silently skips shares whose sender
-        // is not in state.state). Moving this before new_user_identity() ensures
-        // we actually recover the TLK keys needed for keychain decryption.
-        let shares = self.fetch_shares_for(&other_identity).await?;
-
         let new_identity = self.new_user_identity().await?;
         let state = self.state.read().await;
         let my_identity = state.user_identity.as_ref().unwrap();
 
+        info!("Self vouching as {} {:?}", other_identity.identifier, state.state.keys().collect::<Vec<_>>());
         let voucher = other_identity.vouch_for(my_identity.identifier.clone())?;
 
         drop(state);
 
+        let shares = self.fetch_shares_for(&other_identity).await?;
         self.join_clique(device_password, &new_identity, Some(voucher), &shares, vec![]).await?;
         Ok(())
     }

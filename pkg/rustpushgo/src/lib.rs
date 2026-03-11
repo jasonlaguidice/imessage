@@ -17,9 +17,9 @@ use rustpush::{
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
     OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, UnsendMessage,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
-    TokenProvider,
+    TokenProvider, MobileMeDelegateResponse,
+    base64_decode, encode_hex, ResourceState, decode_hex, base64_encode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
-    util::{base64_decode, encode_hex, ResourceState},
 };
 use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
 use omnisette::default_provider;
@@ -445,7 +445,7 @@ async fn create_keychain_clients(
     let cloudkit_state = rustpush::cloudkit::CloudKitState::new(dsid.clone())
         .ok_or(WrappedError::GenericError { msg: "Failed to create CloudKitState".into() })?;
     let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-        state: tokio::sync::RwLock::new(cloudkit_state),
+        state: rustpush::DebugRwLock::new(cloudkit_state),
         anisette: anisette.clone(),
         config: os_config.clone(),
         token_provider: token_provider.clone(),
@@ -475,7 +475,7 @@ async fn create_keychain_clients(
     let keychain = Arc::new(rustpush::keychain::KeychainClient {
         anisette: anisette.clone(),
         token_provider: token_provider.clone(),
-        state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
+        state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
         config: os_config.clone(),
         update_state: Box::new(move |state| {
             if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
@@ -784,7 +784,7 @@ pub async fn restore_token_provider(
     account.username = Some(username);
 
     // Restore hashed password
-    let hashed_password = rustpush::util::decode_hex(&hashed_password_hex)
+    let hashed_password = decode_hex(&hashed_password_hex)
         .map_err(|e| WrappedError::GenericError { msg: format!("Invalid hashed_password hex: {}", e) })?;
     account.hashed_password = Some(hashed_password);
 
@@ -803,7 +803,7 @@ pub async fn restore_token_provider(
         expiration: std::time::UNIX_EPOCH, // expired — forces auto-refresh on first use
     });
 
-    let account = Arc::new(tokio::sync::Mutex::new(account));
+    let account = Arc::new(rustpush::DebugMutex::new(account));
     let token_provider = TokenProvider::new(account, os_config);
 
     info!("Restored TokenProvider from persisted credentials");
@@ -1092,7 +1092,7 @@ impl std::io::Write for SharedWriter {
 /// The attributedBody is an NSAttributedString containing ranges with
 /// __kIMFileTransferGUIDAttributeName → attachment GUID.
 fn extract_attachment_guids_from_attributed_body(data: &[u8]) -> Vec<String> {
-    use rustpush::util::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
+    use rustpush::{coder_decode_flattened, NSAttributedString, StCollapsedValue};
 
     let decoded = match std::panic::catch_unwind(|| {
         let flat = coder_decode_flattened(data);
@@ -1300,7 +1300,7 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
 
             // Encode rich link as special attachments for the Go side
             if let Some(ref lm) = normal.link_meta {
-                let original_url: String = lm.data.original_url.clone().into();
+                let original_url: String = lm.data.original_url.clone().map(|u| u.into()).unwrap_or_default();
                 let url: String = lm.data.url.clone().map(|u| u.into()).unwrap_or_default();
                 let title = lm.data.title.clone().unwrap_or_default();
                 let summary = lm.data.summary.clone().unwrap_or_default();
@@ -1851,7 +1851,7 @@ impl LoginSession {
         let mut spd_bytes = Vec::new();
         plist::to_writer_binary(&mut spd_bytes, spd)
             .map_err(|e| WrappedError::GenericError { msg: format!("Failed to serialize SPD: {}", e) })?;
-        let spd_base64 = rustpush::util::base64_encode(&spd_bytes);
+        let spd_base64 = base64_encode(&spd_bytes);
 
         let account_persist = AccountPersistData {
             username: self.username.clone(),
@@ -1939,7 +1939,7 @@ impl LoginSession {
         // so the first get_mme_token() doesn't need to re-fetch.
         let owned_account = guard.take()
             .ok_or(WrappedError::GenericError { msg: "Account already consumed".to_string() })?;
-        let account_arc = Arc::new(tokio::sync::Mutex::new(owned_account));
+        let account_arc = Arc::new(rustpush::DebugMutex::new(owned_account));
         let token_provider = TokenProvider::new(account_arc, os_config.clone());
 
         // Seed the MobileMe delegate so get_contacts_url() and get_mme_token()
@@ -2314,7 +2314,7 @@ impl Client {
             },
         )?;
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: tokio::sync::RwLock::new(cloudkit_state),
+            state: rustpush::DebugRwLock::new(cloudkit_state),
             anisette: anisette.clone(),
             config: os_config.clone(),
             token_provider: tp.inner.clone(),
@@ -2348,7 +2348,7 @@ impl Client {
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette,
             token_provider: tp.inner.clone(),
-            state: tokio::sync::RwLock::new(keychain_state.expect("keychain state missing")),
+            state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
             config: os_config,
             update_state: Box::new(move |state| {
                 if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
@@ -2499,10 +2499,10 @@ impl Client {
                 let title_str = fields.get(2).copied().unwrap_or("");
                 let summary_str = fields.get(3).copied().unwrap_or("");
 
-                let original_url = NSURL {
+                let original_url = Some(NSURL {
                     base: "$null".to_string(),
                     relative: original_url_str.to_string(),
-                };
+                });
                 let url = if url_str.is_empty() {
                     None
                 } else {
@@ -2529,6 +2529,11 @@ impl Client {
                         icon: None,
                         images: None,
                         icons: None,
+                        is_incomplete: None,
+                        uses_activity_pub: None,
+                        is_encoded_for_local_use: None,
+                        collaboration_type: None,
+                        specialization2: None,
                     },
                     attachments: vec![],
                 };
@@ -3608,7 +3613,7 @@ impl Client {
 
         // Create CloudKitClient
         let cloudkit = Arc::new(rustpush::cloudkit::CloudKitClient {
-            state: tokio::sync::RwLock::new(cloudkit_state),
+            state: rustpush::DebugRwLock::new(cloudkit_state),
             anisette: anisette.clone(),
             config: os_config.clone(),
             token_provider: tp.inner.clone(),
@@ -3624,7 +3629,7 @@ impl Client {
         let keychain = Arc::new(rustpush::keychain::KeychainClient {
             anisette: anisette.clone(),
             token_provider: tp.inner.clone(),
-            state: tokio::sync::RwLock::new(keychain_state),
+            state: rustpush::DebugRwLock::new(keychain_state),
             config: os_config.clone(),
             update_state: Box::new(|_state| {
                 // For now, don't persist keychain state
@@ -3796,18 +3801,9 @@ async fn sync_messages_fallback(
             }
         };
 
-        let rec_id = match record.record_identifier.as_ref() {
-            Some(id) => id,
-            None => {
-                warn!("sync_messages_fallback: skipping record {}: missing record_identifier", identifier);
-                skipped += 1;
-                continue;
-            }
-        };
-
         // from_record_encrypted may panic on corrupt field data — catch it
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            CloudMessage::from_record_encrypted(&record.record_field, Some((&pcskey, rec_id)))
+            CloudMessage::from_record_encrypted(&record.record_field, Some(&pcskey))
         }));
 
         match result {

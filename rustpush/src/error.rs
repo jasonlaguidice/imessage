@@ -10,7 +10,7 @@ use plist::Value;
 use thiserror::Error;
 use tokio::{sync::{broadcast::{self, error::SendError}, Mutex}, time::error::Elapsed};
 
-use crate::{aps::APSMessage, ids::user::SupportAlert, util::ResourceFailure};
+use crate::{aps::APSMessage, ids::user::{IDSError, SupportAlert}, util::ResourceFailure};
 
 
 #[derive(Error, Debug)]
@@ -25,17 +25,17 @@ pub enum PushError {
     AuthError(plist::Value),
     #[error("Authentication establishment error {0:?}")]
     CertError(plist::Dictionary),
-    #[error("Error registering with IDS: status={0} response={1}")]
-    RegisterFailed(u64, String),
+    #[error("Registration Error {0}")]
+    RegisterFailed(IDSError),
     #[error("IO error: {0}")]
     IoError(#[from] io::Error),
-    #[error("IDS Lookup failed {0}")]
-    LookupFailed(u64),
+    #[error("Lookup Error {0}")]
+    LookupFailed(IDSError),
     #[error("AES key error: {0:?}")]
     KeyError(KeyError),
     #[error("IDS key missing for {0}")]
     KeyNotFound(String),
-    #[error("No valid IDS targets for message")]
+    #[error("Could not deliver message. The recipient does not have iMessage or you are being rate-limited.")]
     NoValidTargets,
     #[error("Failed to connect to APS {0}")]
     APSConnectError(u8),
@@ -48,9 +48,9 @@ pub enum PushError {
     #[cfg(feature = "macos-validation-data")]
     #[error("Absinthe error {0}")]
     AbsintheError(#[from] AbsintheError),
-    #[error("{0}")]
+    #[error("Your iMessage access is temporarily disabled. Try again later, or ask Apple to allow you to use iMessage: https://apple.co/IMFT-mac. Choose 'Get Started,' not 'Chat.' Do not mention you are using OpenBubbles. Apple left a message: {0}")]
     CustomerMessage(SupportAlert),
-    #[error("Send timeout")]
+    #[error("Send timeout; try again")]
     SendTimedOut,
     #[error("Send error {0}")]
     SendErr(i64),
@@ -63,7 +63,7 @@ pub enum PushError {
     #[error("Failed to authenticate. Try logging in to account.apple.com to fix your Apple Account or create a new one: {1:?} {0}")]
     MobileMeError(String, Option<String>),
     #[error("Bad auth cert {0}")]
-    AuthInvalid(u64),
+    AuthInvalid(IDSError),
     #[error("APS parse error {0}")]
     APSParseError(#[from] DekuError),
     #[error("Other side hung up! {0}")]
@@ -118,7 +118,7 @@ pub enum PushError {
     ProtobufError(#[from] prost::DecodeError),
     #[error("Alias error {0}")]
     AliasError(u32),
-    #[error("Handle not found {0}")]
+    #[error("The handle {0} no longer exists on your account. Did you lose your number? Go to the new chat creator to use a different handle.")]
     HandleNotFound(String),
     #[error("AES GCM error")]
     AESGCMError,
@@ -150,6 +150,8 @@ pub enum PushError {
     ReportSpamError(u32),
     #[error("Token missing")]
     TokenMissing,
+    #[error("APS not ready! {0}")]
+    APSNotReady(&'static str),
     #[error("Circle http error {0}")]
     CircleHTTPError(#[from] icloud_auth::Error),
     #[error("Circle error {0}")]
@@ -180,8 +182,6 @@ pub enum PushError {
     Bad2FaCode,
     #[error("PCS record key id not found!")]
     PCSRecordKeyMissing,
-    #[error("PCS decrypt error: {0}")]
-    PCSDecryptError(String),
     #[error("Circle is over!")]
     CircleOver,
     #[error("Too many requests!")]
@@ -200,4 +200,12 @@ pub enum PushError {
     CircleNotFound(String),
     #[error("Keystore error {0}!")]
     KeystoreError(#[from] KeystoreError),
+    #[error("Unknown TOTP algorithm {0}!")]
+    UnknownTotpAlgorithm(u32),
+    #[error("Cloudkit user not found!")]
+    UserNotFound,
+    #[error("Cloudkit routing key not found!")]
+    NoRoutingKey,
+    #[error("Removed from Share!")]
+    RemovedFromShare,
 }

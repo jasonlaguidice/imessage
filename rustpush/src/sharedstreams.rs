@@ -7,10 +7,10 @@ use openssl::sha::sha1;
 use plist::{Date, Dictionary, Value};
 use reqwest::header::{HeaderMap, HeaderName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, imessage::messages::AttachmentPreparedPut, login_apple_delegates, mmcs::{authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs, Container, FileContainer, MMCSConfig, PreparedPut}, util::{base64_encode, decode_hex, encode_hex, plist_to_string, Resource, ResourceManager, REQWEST}, APSConnection, APSConnectionResource, APSMessage, APSState, LoginDelegate, OSConfig, PushError, ResourceState};
+use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, LoginDelegate, OSConfig, PushError, ResourceState, aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, imessage::messages::AttachmentPreparedPut, login_apple_delegates, mmcs::{Container, FileContainer, MMCSConfig, PreparedPut, authorize_get, authorize_put, get_mmcs, prepare_put, put_mmcs}, util::{DebugMutex, DebugRwLock, REQWEST, Resource, ResourceManager, base64_encode, decode_hex, encode_hex, plist_to_string}};
 use rand::Rng;
 use uuid::Uuid;
-use tokio::{process::Command, runtime::Handle, select, sync::{Mutex, RwLock}};
+use tokio::{process::Command, runtime::Handle, select};
 use std::{future::Future, io::{BufRead, BufReader, Seek}, sync::Weak};
 use std::{collections::HashSet, fs::{self, File}, time::{Duration, SystemTime}};
 use std::{collections::HashMap, io::{Read, Write}, path::PathBuf, str::FromStr, sync::Arc};
@@ -212,11 +212,11 @@ impl SharedAlbum {
 pub struct SharedStreamClient<P: AnisetteProvider> {
     anisette: ArcAnisetteClient<P>,
     _interest_token: APSInterestToken,
-    pub state: RwLock<SharedStreamsState>,
+    pub state: DebugRwLock<SharedStreamsState>,
     update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>,
     config: Arc<dyn OSConfig>,
     aps: APSConnection,
-    root_tag: Mutex<Option<String>>,
+    root_tag: DebugMutex<Option<String>>,
     token_provider: Arc<TokenProvider<P>>,
 }
 
@@ -587,11 +587,11 @@ impl<P: AnisetteProvider> SharedStreamClient<P> {
 
     pub async fn new(state: SharedStreamsState, update_state: Box<dyn Fn(&SharedStreamsState) + Send + Sync>, token_provider: Arc<TokenProvider<P>>, aps: APSConnection, anisette: ArcAnisetteClient<P>, config: Arc<dyn OSConfig>) -> SharedStreamClient<P> {
         SharedStreamClient {
-            _interest_token: aps.request_topics(vec!["com.apple.sharedstreams"]).await,
-            state: RwLock::new(state),
+            _interest_token: aps.request_topics(&["com.apple.sharedstreams"]).await,
+            state: DebugRwLock::new(state),
             update_state,
             anisette,
-            root_tag: Mutex::new(None),
+            root_tag: DebugMutex::new(None),
             aps,
             config,
             token_provider,
@@ -670,14 +670,14 @@ impl Drop for ForegroundLock {
 
 pub struct SyncController<P: AnisetteProvider + Send + Sync + 'static, F: FilePackager + Send + Sync + 'static> {
     pub client: SharedStreamClient<P>,
-    pub sync_states: Mutex<HashMap<String, SyncState>>,
+    pub sync_states: DebugMutex<HashMap<String, SyncState>>,
     pub sync_statuses: tokio::sync::watch::Sender<HashMap<String, SyncStatus>>,
-    pub dirty_map: Mutex<HashMap<String, bool>>,
-    packager: Mutex<F>,
+    pub dirty_map: DebugMutex<HashMap<String, bool>>,
+    packager: DebugMutex<F>,
     sync_interval: Duration,
-    manager: Mutex<Option<Weak<ResourceManager<Self>>>>,
-    watcher: Mutex<RecommendedWatcher>,
-    receiver: Mutex<tokio::sync::mpsc::Receiver<notify::Result<Event>>>,
+    manager: DebugMutex<Option<Weak<ResourceManager<Self>>>>,
+    watcher: DebugMutex<RecommendedWatcher>,
+    receiver: DebugMutex<tokio::sync::mpsc::Receiver<notify::Result<Event>>>,
     state_location: PathBuf,
     foreground_update_locked: Arc<std::sync::Mutex<()>>,
     foreground_locked: tokio::sync::watch::Sender<u32>,
@@ -701,14 +701,14 @@ impl<P, F> SyncController<P, F>
 
         let resource = Arc::new(Self {
             client,
-            dirty_map: Mutex::new(states.iter().map(|i| (i.0.clone(), true)).collect()),
-            sync_states: Mutex::new(states),
+            dirty_map: DebugMutex::new(states.iter().map(|i| (i.0.clone(), true)).collect()),
+            sync_states: DebugMutex::new(states),
             sync_statuses: tokio::sync::watch::channel(HashMap::new()).0,
-            packager: Mutex::new(packager),
+            packager: DebugMutex::new(packager),
             sync_interval,
-            manager: Mutex::new(None),
-            watcher: Mutex::new(watcher),
-            receiver: Mutex::new(rx),
+            manager: DebugMutex::new(None),
+            watcher: DebugMutex::new(watcher),
+            receiver: DebugMutex::new(rx),
             state_location,
             foreground_update_locked: Arc::new(std::sync::Mutex::new(())),
             foreground_locked: tokio::sync::watch::channel(0).0,

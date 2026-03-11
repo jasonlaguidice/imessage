@@ -21,6 +21,7 @@ struct CloudKitAttributes {
     rename: Option<String>,
     encrypted: Flag,
     unencrypted: Flag,
+    skip: Flag,
 }
 
 fn snake_to_camel(s: &str) -> String {
@@ -56,8 +57,9 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
     let mut fields: Vec<proc_macro2::TokenStream> = vec![];
     let mut read_fields: Vec<proc_macro2::TokenStream> = vec![];
     for mut field in s.fields {
-        let CloudKitAttributes { rename, encrypted, unencrypted } = deluxe::extract_attributes(&mut field).unwrap();
+        let CloudKitAttributes { rename, encrypted, unencrypted, skip } = deluxe::extract_attributes(&mut field).unwrap();
 
+        if skip.into() { continue }
         let mut is_encrypted: bool = record_encrypted.into();
         if encrypted.into() {
             is_encrypted = true;
@@ -83,9 +85,8 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
         if is_encrypted {
             fields.push(quote! {
                 {
-                    let e = encryptor.as_ref().expect("No encryption key provided for record decryption!");
-                    let tag = format!("{}-{}-{}", e.1.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(), e.1.value.as_ref().unwrap().name(), #name_lit);
-                    if let Some(field) = cloudkit_proto::CloudKitEncryptedValue::to_value_encrypted(&self.#ident, e.0, tag.as_bytes()) {
+                    let e = encryptor.expect("No encryption key provided for record decryption!");
+                    if let Some(field) = cloudkit_proto::CloudKitEncryptedValue::to_value_encrypted(&self.#ident, e, #name_lit) {
                         results.push(cloudkit_proto::record::Field {
                             identifier: Some(cloudkit_proto::record::field::Identifier {
                                 name: Some(#name.to_string())
@@ -97,9 +98,8 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
             });
             read_fields.push(quote! {
                 #name => {
-                    let e = encryptor.as_ref().expect("No encryption key provided for record decryption!");
-                    let tag = format!("{}-{}-{}", e.1.zone_identifier.as_ref().unwrap().value.as_ref().unwrap().name(), e.1.value.as_ref().unwrap().name(), #name_lit);
-                    default.#ident = cloudkit_proto::CloudKitEncryptedValue::from_value_encrypted(data.value.as_ref().expect("No Value??"), e.0, tag.as_bytes()).expect(&format!("Field {} not found!", #name_lit));
+                    let e = encryptor.expect("No encryption key provided for record decryption!");
+                    default.#ident = cloudkit_proto::CloudKitEncryptedValue::from_value_encrypted(data.value.as_ref().expect("No Value??"), e, #name_lit).expect(&format!("Field {} not found!", #name_lit));
                 }
             })
         } else {
@@ -123,7 +123,7 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
 
     quote! {
         impl cloudkit_proto::CloudKitRecord for #name {
-            fn to_record_encrypted(&self, encryptor: Option<(&impl CloudKitEncryptor, &RecordIdentifier)>) -> Vec<cloudkit_proto::record::Field> {
+            fn to_record_encrypted(&self, encryptor: Option<&impl CloudKitEncryptor>) -> Vec<cloudkit_proto::record::Field> {
                 let mut results = Vec::with_capacity(#field_count);
 
                 #(#fields)*
@@ -131,7 +131,7 @@ pub fn cloudkitrecord_derive(input: TokenStream) -> TokenStream {
                 results
             }
 
-            fn from_record_encrypted(value: &[cloudkit_proto::record::Field], encryptor: Option<(&impl CloudKitEncryptor, &RecordIdentifier)>) -> Self
+            fn from_record_encrypted(value: &[cloudkit_proto::record::Field], encryptor: Option<&impl CloudKitEncryptor>) -> Self
                 where
                     Self: Sized {
                 let mut default = Self::default();

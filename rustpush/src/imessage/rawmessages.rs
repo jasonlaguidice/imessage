@@ -368,7 +368,6 @@ struct RawMMCSBalloon {
 
 #[derive(Serialize, Deserialize, Default)]
 struct RawEncryptedTyping {
-    #[serde(default)]
     pv: u32,
     #[serde(rename = "p")]
     participants: Option<Vec<String>>,
@@ -380,7 +379,6 @@ struct RawEncryptedTyping {
     gt: Option<bool>,
     #[serde(rename = "gid")]
     sender_guid: Option<String>,
-    #[serde(default)]
     gv: String,
     v: Option<String>,
     #[serde(rename = "n")]
@@ -513,9 +511,7 @@ pub struct OperatedChat {
     #[serde(rename = "groupID")]
     pub group_id: String,
     pub guid: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_incoming_messages: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub was_reported_as_junk: Option<bool>
 }
 
@@ -528,10 +524,8 @@ struct RawMoveToTrash {
     message: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     permanent_delete_chat_metadata_array: Vec<OperatedChat>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     recoverable_delete_date: Option<Date>,
     is_permanent_delete: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     is_scheduled_message: Option<bool>,
 }
 
@@ -583,6 +577,15 @@ pub struct RichLinkImageAttachmentSubstitute {
 }
 
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all_fields = "camelCase", tag = "$class")]
+pub enum LPSpecializationMetadata {
+    LPPasswordsInviteMetadata {
+        group_name: String,
+        url_parameters: String,
+    }
+}
+
 #[repr(C)]
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase", tag = "$class")]
@@ -591,7 +594,7 @@ pub struct LPLinkMetadata {
     pub version: u8,
     pub icon_metadata: Option<LPIconMetadata>,
     #[serde(rename = "originalURL")]
-    pub original_url: NSURL,
+    pub original_url: Option<NSURL>,
     #[serde(rename = "URL")]
     pub url: Option<NSURL>,
     pub title: Option<String>,
@@ -600,6 +603,12 @@ pub struct LPLinkMetadata {
     pub icon: Option<RichLinkImageAttachmentSubstitute>,
     pub images: Option<NSArray<LPImageMetadata>>,
     pub icons: Option<NSArray<LPIconMetadata>>,
+
+    pub is_incomplete: Option<bool>,
+    pub uses_activity_pub: Option<bool>,
+    pub is_encoded_for_local_use: Option<bool>,
+    pub collaboration_type: Option<u32>,
+    pub specialization2: Option<LPSpecializationMetadata>,
 }
 
 

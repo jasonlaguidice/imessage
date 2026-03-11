@@ -6,7 +6,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use backon::{ConstantBuilder, ExponentialBuilder, Retryable};
+use backon::{ConstantBuilder, Retryable};
 use cloudkit_derive::CloudKitRecord;
 use cloudkit_proto::request_operation::header::IsolationLevel;
 use cloudkit_proto::retrieve_changes_response::RecordChange;
@@ -22,12 +22,13 @@ use plist::{Data, Value};
 use prost::Message;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::Sha256;
-use tokio::sync::Mutex;
 use cloudkit_proto::RecordIdentifier;
-use log::{info, warn};
+use tokio::sync::Mutex;
+use crate::util::DebugMutex;
+use log::info;
 use uuid::Uuid;
 use crate::cloud_messages::cloudmessagesp::{ChatProto, MessageProto, MessageProto2, MessageProto3, MessageProto4};
-use crate::cloudkit::{pcs_keys_for_record, record_identifier, AssetsToDownload, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
+use crate::cloudkit::{pcs_keys_for_record, record_identifier, CloudKitSession, CloudKitUploadRequest, DeleteRecordOperation, FetchRecordChangesOperation, FetchRecordOperation, FetchedRecords, QueryRecordOperation, SaveRecordOperation, ZoneDeleteOperation, ALL_ASSETS, NO_ASSETS};
 use crate::mmcs::{prepare_put_v2, PreparedPut};
 use crate::pcs::{get_boundary_key, PCSKey, PCSService};
 use bitflags::bitflags;
@@ -265,9 +266,6 @@ pub struct CloudChat {
     #[serde(default, serialize_with = "proto_serialize_opt", deserialize_with = "proto_deserialize_opt")]
     #[cloudkit(rename = "gp")]
     pub group_photo: Option<Asset>,
-    #[serde(default)]
-    #[cloudkit(unencrypted)]
-    pub dids: Vec<String>,
 }
 
 pub fn proto_deserialize_opt_gzip<'de, D, T>(d: D) -> Result<Option<GZipWrapper<T>>, D::Error>
@@ -342,15 +340,15 @@ pub struct CloudMessage {
 }
 
 impl CloudKitEncryptedValue for MessageFlags {
-    fn from_value_encrypted(value: &cloudkit_proto::record::field::Value, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<Self>
+    fn from_value_encrypted(value: &cloudkit_proto::record::field::Value, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<Self>
         where
             Self: Sized {
         
-        i64::from_value_encrypted(value, encryptor, context).map(|v| MessageFlags::from_bits_truncate(v))
+        i64::from_value_encrypted(value, encryptor, field_name).map(|v| MessageFlags::from_bits_truncate(v))
     }
 
-    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, context: &[u8]) -> Option<cloudkit_proto::record::field::Value> {
-        self.bits().to_value_encrypted(encryptor, context)
+    fn to_value_encrypted(&self, encryptor: &impl CloudKitEncryptor, field_name: &str) -> Option<cloudkit_proto::record::field::Value> {
+        self.bits().to_value_encrypted(encryptor, field_name)
     }
 }
 
@@ -503,121 +501,53 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         return Ok(locked.clone().unwrap())
     }
 
-    async fn sync_records<T: CloudKitRecord>(
-        &self,
-        zone: &str,
-        continuation_token: Option<Vec<u8>>,
-    ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
-        self.sync_records_with_assets::<T>(zone, continuation_token, &NO_ASSETS).await
-    }
-
-    async fn sync_records_with_assets<T: CloudKitRecord>(
-        &self,
-        zone: &str,
-        continuation_token: Option<Vec<u8>>,
-        assets: &AssetsToDownload,
-    ) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+    async fn sync_records<T: CloudKitRecord>(&self, zone: &str, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<T>>, i32), PushError> {
+        info!("Getting records");
         let container = self.get_container().await?;
 
-        let zone_id = container.private_zone(zone.to_string());
-        let mut key = container
-            .get_zone_encryption_config(&zone_id, &self.keychain, &MESSAGES_SERVICE)
-            .await?;
-        let (_assets, response) = container
-            .perform(
-                &CloudKitSession::new(),
-                FetchRecordChangesOperation::new(zone_id.clone(), continuation_token, assets),
-            )
-            .await?;
+        let zone = container.private_zone(zone.to_string());
+        info!("Getting encryption config");
+        let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        info!("Got encryption config");
+        let (_assets, response) = container.perform(&CloudKitSession::new(),
+            FetchRecordChangesOperation(cloudkit_proto::RetrieveChangesRequest { 
+                sync_continuation_token: continuation_token, 
+                zone_identifier: Some(zone.clone()), 
+                requested_changes_types: Some(3), // figure out 
+                assets_to_download: Some(NO_ASSETS.clone()), 
+                newest_first: Some(true),
+                ..Default::default()
+            })).await?;
 
         let mut results = HashMap::new();
-        let mut refreshed_zone_key_config = false;
-        let mut skipped = 0usize;
+
+        info!("Getting response");
 
         for change in &response.change {
-            let identifier = change
-                .identifier
-                .as_ref()
-                .unwrap()
-                .value
-                .as_ref()
-                .unwrap()
-                .name()
-                .to_string();
+            let identifier = change.identifier.as_ref().unwrap().value.as_ref().unwrap().name().to_string();
 
             let Some(record) = &change.record else {
                 results.insert(identifier, None);
                 continue;
             };
-            if record.r#type.as_ref().unwrap().name() != T::record_type() {
-                continue;
-            }
+            if record.r#type.as_ref().unwrap().name() != T::record_type() { continue }
 
-            // Some accounts have historical records that reference missing/old PCS keys.
-            // Don't fail the whole sync; skip the record and continue.
-            let pcskey = match pcs_keys_for_record(record, &key) {
-                Ok(key) => Some(key),
-                Err(PushError::PCSRecordKeyMissing) if !refreshed_zone_key_config => {
-                    // Try one cache refresh (keychain/zone config can be stale during setup).
-                    container.clear_cache_zone_encryption_config(&zone_id).await;
-                    key = container
-                        .get_zone_encryption_config(&zone_id, &self.keychain, &MESSAGES_SERVICE)
-                        .await?;
-                    refreshed_zone_key_config = true;
-                    match pcs_keys_for_record(record, &key) {
-                        Ok(key) => Some(key),
-                        Err(PushError::PCSRecordKeyMissing) => {
-                            skipped += 1;
-                            warn!(
-                                "Skipping CloudKit record {} in zone {}: PCS record key missing",
-                                identifier, zone
-                            );
-                            None
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                Err(err) if matches!(
-                    err,
-                    PushError::PCSRecordKeyMissing
-                        | PushError::ShareKeyNotFound(_)
-                        | PushError::DecryptionKeyNotFound(_)
-                        | PushError::MasterKeyNotFound
-                ) => {
-                    skipped += 1;
-                    warn!(
-                        "Skipping CloudKit record {} in zone {} due to PCS key error: {}",
-                        identifier, zone, err
-                    );
-                    None
-                }
-                Err(e) => return Err(e),
+            let pcskey = match pcs_keys_for_record(&record, &key) {
+                Ok(key) => key,
+                Err(PushError::PCSRecordKeyMissing) => {
+                    container.clear_cache_zone_encryption_config(&zone).await;
+                    return Err(PushError::PCSRecordKeyMissing)
+                },
+                Err(e) => return Err(e)
             };
-
-            let Some(pcskey) = pcskey else {
-                continue;
-            };
-
-            let item = T::from_record_encrypted(
-                &record.record_field,
-                Some((&pcskey, record.record_identifier.as_ref().unwrap())),
-            );
+            let item = T::from_record_encrypted(&record.record_field, Some(&pcskey));
 
             results.insert(identifier, Some(item));
         }
 
-        if skipped > 0 {
-            warn!(
-                "CloudKit sync skipped {} undecryptable record(s) in zone {}",
-                skipped, zone
-            );
-        }
+        info!("Getting finish");
 
-        Ok((
-            response.sync_continuation_token().to_vec(),
-            results,
-            response.status(),
-        ))
+        Ok((response.sync_continuation_token().to_vec(), results, response.status()))
     }
 
     async fn save_records<T: CloudKitRecord>(&self, zone: &str, records: HashMap<String, T>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
@@ -638,7 +568,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
             }
 
             let mut result: HashMap<usize, Result<(), PushError>> = match container.perform_operations(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await {
-                Ok(item) => item.into_iter().enumerate().collect(),
+                Ok(item) => item.into_iter().map(|i| i.map(|_| ())).enumerate().collect(),
                 Err(e) => {
                     let joined = Arc::new(e);
                     results.extend(ids.into_iter().map(|r| (r, Err(PushError::BatchError(joined.clone())))));
@@ -653,27 +583,20 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     async fn delete_records(&self, zone: &str, records: &[String]) -> Result<(), PushError> {
-        log::info!("CloudKit delete: zone={} records={}", zone, records.len());
         let container = self.get_container().await?;
 
-        let zone_id = container.private_zone(zone.to_string());
+        let zone = container.private_zone(zone.to_string());
 
-        for (batch_idx, batch) in records.chunks(256).enumerate() {
+        for batch in records.chunks(256) {
             let mut operations = vec![];
             for record_id in batch {
-                operations.push(DeleteRecordOperation::new(record_identifier(zone_id.clone(), record_id)));
+                operations.push(DeleteRecordOperation::new(record_identifier(zone.clone(), record_id)));
             }
-            let attempt = std::sync::atomic::AtomicU32::new(0);
             (|| async {
-                let a = attempt.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if a > 1 {
-                    log::warn!("CloudKit delete retry: zone={} batch={} attempt={}", zone, batch_idx, a);
-                }
                 container.perform_operations_checked(&CloudKitSession::new(), &operations, IsolationLevel::Operation).await
-            }).retry(&ExponentialBuilder::default().with_min_delay(Duration::from_secs(2)).with_max_delay(Duration::from_secs(30)).with_max_times(5)).await?;
+            }).retry(&ConstantBuilder::default().with_delay(Duration::from_secs(5)).with_max_times(3)).await?;
         }
 
-        log::info!("CloudKit delete complete: zone={} records={}", zone, records.len());
         Ok(())
     }
 
@@ -708,6 +631,15 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(def)
     }
 
+    pub async fn warm_zone_keys(&self) -> Result<(), PushError> {
+        let container = self.get_container().await?;
+        for zone_name in ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"] {
+            let zone = container.private_zone(zone_name.to_string());
+            container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
+        }
+        Ok(())
+    }
+
     pub async fn reset(&self) -> Result<(), PushError> {
         let container = self.get_container().await?;
 
@@ -729,20 +661,6 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
         Ok(())
     }
 
-    /// Pre-fetch and cache zone encryption configs for all three Manatee zones.
-    /// Call this while still in the clique so that subsequent sync_records calls
-    /// hit the cache and don't need to re-check clique membership.
-    pub async fn warm_zone_keys(&self) -> Result<(), PushError> {
-        let container = self.get_container().await?;
-        for zone_name in ["chatManateeZone", "messageManateeZone", "attachmentManateeZone"] {
-            let zone_id = container.private_zone(zone_name.to_string());
-            container
-                .get_zone_encryption_config(&zone_id, &self.keychain, &MESSAGES_SERVICE)
-                .await?;
-        }
-        Ok(())
-    }
-
     pub async fn sync_chats(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudChat>>, i32), PushError> {
         self.sync_records("chatManateeZone", continuation_token).await
     }
@@ -753,43 +671,6 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
     pub async fn delete_chats(&self, chats: &[String]) -> Result<(), PushError> {
         self.delete_records("chatManateeZone", chats).await
-    }
-
-    /// Sync all chat records from CloudKit, find ones matching the given
-    /// chat_identifier (e.g. "iMessage;-;user@example.com"), and delete them.
-    /// Returns the number of records deleted.
-    pub async fn find_and_delete_chats_by_identifier(&self, chat_identifier: &str) -> Result<usize, PushError> {
-        log::info!("CloudKit find-and-delete: searching for chat_identifier={}", chat_identifier);
-
-        // Full sync to get all chat records with their record_names.
-        let mut token: Option<Vec<u8>> = None;
-        let mut matching_record_names: Vec<String> = Vec::new();
-
-        loop {
-            let (next_token, chats, status) = self.sync_chats(token).await?;
-            for (record_name, chat_opt) in &chats {
-                if let Some(chat) = chat_opt {
-                    if chat.chat_identifier == chat_identifier {
-                        log::info!("CloudKit find-and-delete: found match record_name={} cid={}", record_name, chat_identifier);
-                        matching_record_names.push(record_name.clone());
-                    }
-                }
-            }
-            if status == 3 {
-                break; // done
-            }
-            token = Some(next_token);
-        }
-
-        if matching_record_names.is_empty() {
-            log::info!("CloudKit find-and-delete: no chat records found for cid={}", chat_identifier);
-            return Ok(0);
-        }
-
-        let count = matching_record_names.len();
-        self.delete_chats(&matching_record_names).await?;
-        log::info!("CloudKit find-and-delete: deleted {} chat records for cid={}", count, chat_identifier);
-        Ok(count)
     }
 
     pub async fn sync_messages(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudMessage>>, i32), PushError> {
@@ -805,22 +686,7 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
     }
 
     pub async fn sync_attachments(&self, continuation_token: Option<Vec<u8>>) -> Result<(Vec<u8>, HashMap<String, Option<CloudAttachment>>, i32), PushError> {
-        let result = self.sync_records_with_assets::<CloudAttachment>("attachmentManateeZone", continuation_token, &ALL_ASSETS).await?;
-        // Pre-populate Ford key cache from synced records so MMCS dedup can resolve key mismatches.
-        let mut cached = 0usize;
-        let total = result.1.values().filter(|v| v.is_some()).count();
-        for record in result.1.values().flatten() {
-            if let Some(pi) = record.lqa.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
-                crate::icloud::mmcs::register_ford_key(pi);
-                cached += 1;
-            }
-            if let Some(pi) = record.avid.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
-                crate::icloud::mmcs::register_ford_key(pi);
-                cached += 1;
-            }
-        }
-        log::info!("sync_attachments: {} Ford keys cached from {} records", cached, total);
-        Ok(result)
+        self.sync_records("attachmentManateeZone", continuation_token).await
     }
 
     pub async fn save_attachments(&self, attachments: HashMap<String, CloudAttachment>) -> Result<HashMap<String, Result<(), PushError>>, PushError> {
@@ -846,41 +712,20 @@ impl<P: AnisetteProvider> CloudMessagesClient<P> {
 
         let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
 
-        // Pre-populate Ford key cache from all records so MMCS dedup can resolve key mismatches.
-        for r in &record {
-            if let Some(pi) = r.lqa.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
-                crate::icloud::mmcs::register_ford_key(pi);
-            }
-            if let Some(pi) = r.avid.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
-                crate::icloud::mmcs::register_ford_key(pi);
-            }
-        }
-
         container.get_assets(&records.assets, record.iter().map(|i| &i.lqa).zip(files.into_values()).collect::<Vec<_>>()).await?;
         Ok(())
     }
 
-    /// Download the Live Photo video (avid asset) from a CloudKit attachment record.
-    /// This is the MOV companion stored alongside the HEIC still in the same record.
     pub async fn download_attachment_avid<T: Write + Send + Sync>(&self, files: HashMap<String, T>) -> Result<(), PushError> {
         let container = self.get_container().await?;
         let zone = container.private_zone("attachmentManateeZone".to_string());
         let key = container.get_zone_encryption_config(&zone, &self.keychain, &MESSAGES_SERVICE).await?;
 
-        let invoke = container.perform_operations(&CloudKitSession::new(),
+        let invoke = container.perform_operations(&CloudKitSession::new(), 
             &FetchRecordOperation::many(&ALL_ASSETS, &zone, &files.keys().cloned().collect::<Vec<_>>()), IsolationLevel::Operation).await?;
         let records = FetchedRecords::new(&invoke);
 
         let record: Vec<CloudAttachment> = files.keys().map(|f| records.get_record(f, Some(&key))).collect::<Vec<_>>();
-
-        for r in &record {
-            if let Some(pi) = r.lqa.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
-                crate::icloud::mmcs::register_ford_key(pi);
-            }
-            if let Some(pi) = r.avid.protection_info.as_ref().and_then(|p| p.protection_info.as_ref()) {
-                crate::icloud::mmcs::register_ford_key(pi);
-            }
-        }
 
         container.get_assets(&records.assets, record.iter().map(|i| &i.avid).zip(files.into_values()).collect::<Vec<_>>()).await?;
         Ok(())

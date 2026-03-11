@@ -37,6 +37,126 @@ message ZoneSaveRequest {
   optional Zone zone = 1;
 }
 
+message ResolveTokenRequest {
+  optional string routingKey = 1;
+  optional bytes shortTokenHash = 2;
+  optional bool forceFetch = 3;
+  optional bool shouldFetchRootRecord = 4;
+  repeated string rootRecordDesiredKeys = 5;
+  optional string participantId = 6;
+}
+
+message ShareMetadata {
+  optional string routingKey = 1;
+  optional bytes protectedFullToken = 2;
+  optional Participant ownerParticipant = 3;
+  optional Participant callerParticipant = 4;
+  optional int32 participantPermission = 5;
+  optional int32 participantState = 6;
+  optional int32 participantType = 7;
+  optional Record.Type rootRecordType = 8;
+  // 9 = signedCryptoRequirements
+}
+
+message ResolveTokenResponse {
+  optional string container = 1;
+  optional RequestOperation.Header.ContainerEnvironment containerEnvironment = 2;
+  repeated Record records = 3;
+  optional Record shareRecord = 4;
+  optional ShareMetadata shareMetadata = 5;
+  optional Zone recordZone = 8;
+}
+
+message ShareAcceptRequest {
+  optional ShareIdentifier shareId = 1;
+  optional string etag = 2;
+  optional ProtectionInfo selfAddedPcs = 3;
+  optional ProtectionInfo publicKey = 4;
+  optional ProtectionInfo protectionInfo = 5;
+  optional string participantId = 6;
+  optional int32 publicKeyVersion = 7;
+  optional bool acceptedInProcess = 8;
+}
+
+message ShareAcceptResponse {
+  optional ShareInfo share = 1;
+}
+
+message ShareDeclineRequest {
+  optional ShareIdentifier shareId = 1;
+  optional string participantId = 2;
+  optional ProtectionInfo protectionInfo = 3;
+}
+
+enum UserAliasType {
+  HashedEmailType = 1;
+  ContainerUserIdentifier = 2;
+  HashedCanonicalPhoneNumber = 3;
+}
+
+message UserAlias {
+  optional string identifier = 1;
+  optional UserAliasType type = 2;
+}
+
+message UserQueryRequest {
+  optional UserAlias alias = 1;
+  optional bool publicKeyRequested = 4;
+}
+
+message User {
+  optional Identifier identifier = 1;
+  optional UserAlias alias = 2;
+  optional string firstName = 3;
+  optional string lastName = 4;
+  optional ProtectionInfo protectionInfo = 5;
+  optional bool isInNetwork = 6;
+}
+
+message UserQueryResponse {
+  optional User user = 1;
+}
+
+message TokenRegistration {
+  optional bytes token = 1;
+  optional string bundleId = 2;
+  optional RequestOperation.Header.ContainerEnvironment environment = 3;
+  optional bool skipBundleIdCheck = 4;
+}
+
+message TokenRegistrationRequest {
+  optional TokenRegistration registration = 1;
+}
+
+message TokenUnregistrationRequest {
+  optional TokenRegistration registration = 1;
+}
+
+message SubscriptionNotification {
+  optional bytes alert = 1; // submessage, complex and unnessesary for our use case
+  optional bool shouldBadge = 2;
+  repeated bytes additionalFields = 3;
+  optional bool shouldSendContentAvailable = 4;
+  optional bool shouldSendMutableContent = 5;
+  optional string collapseIdKey = 6;
+}
+
+message Subscription {
+  optional Identifier identifier = 1;
+  optional int32 evaulationType = 2;
+  optional int32 owner = 3;
+  repeated int32 mutationTriggers = 4;
+  optional SubscriptionNotification notification = 5;
+  repeated bytes filters = 6; // submessage unknonw
+  repeated bytes recordTypes = 7;
+  optional bool fireOnce = 8;
+  optional RecordZoneIdentifier zoneIdentifier = 10;
+}
+
+message CreateSubscriptionRequest {
+  optional Subscription subscription = 1;
+}
+
 // Based on https://gist.github.com/horrorho/9c0ff20055b854f4298750cfad635fe2
 // and https://github.com/horrorho/InflatableDonkey/blob/master/src/main/resources/cloud_kit.proto
 message RequestOperation {
@@ -103,12 +223,20 @@ message RequestOperation {
     optional ZoneSaveRequest zoneSaveRequest = 200;
     optional ZoneRetrieveRequest zoneRetrieveRequest = 201;
     optional ZoneDeleteRequest zoneDeleteRequest = 202;
+    optional RetrieveZoneChangesRequest retrieveZoneChangesRequest = 203;
     optional RecordSaveRequest recordSaveRequest = 210;
     optional RecordRetrieveRequest recordRetrieveRequest = 211;
     optional RetrieveChangesRequest retrieveChangesRequest = 213;
     optional RecordDeleteRequest recordDeleteRequest = 214;
+    optional ResolveTokenRequest resolveTokenRequest = 216;
     optional QueryRetrieveRequest queryRetrieveRequest = 220;
     optional AssetUploadTokenRetrieveRequest assetUploadTokenRetrieveRequest = 230;
+    optional CreateSubscriptionRequest createSubscriptionRequest = 300;
+    optional UserQueryRequest userQueryRequest = 401;
+    optional ShareAcceptRequest shareAcceptRequest = 503;
+    optional ShareDeclineRequest shareDeclineRequest = 504;
+    optional TokenRegistrationRequest tokenRegistrationRequest = 800;
+    optional TokenUnregistrationRequest tokenUnregistrationRequest = 801;
     optional FunctionInvokeRequest functionInvokeRequest = 1101;
   }
 
@@ -469,6 +597,10 @@ message RequestOperation {
     optional string zoneProtectionInfoTag = 7;
     optional string recordProtectionInfoTag = 8;
   }
+
+  message RecordSaveResponse {
+    optional Record serverFields = 4;
+  }
   
   message ResponseOperation {
     message Result {
@@ -587,10 +719,15 @@ message RequestOperation {
     optional ZoneSaveResponse zoneSaveResponse = 200;
     optional ZoneRetrieveResponse zoneRetrieveResponse = 201;
     optional ZoneDeleteResponse zoneDeleteResponse = 202;
+    optional RetrieveZoneChangesResponse retrieveZoneChangesResponse = 203;
+    optional RecordSaveResponse recordSaveResponse = 210;
     optional RecordRetrieveResponse recordRetrieveResponse = 211;
     optional RetrieveChangesResponse retrieveChangesResponse = 213;
+    optional ResolveTokenResponse resolveTokenResponse = 216;
     optional QueryRetrieveResponse queryRetrieveResponse = 220;
     optional AssetUploadTokenRetrieveResponse assetUploadTokenRetrieveResponse = 230;
+    optional UserQueryResponse userQueryResponse = 401;
+    optional ShareAcceptResponse shareAcceptResponse = 503;
     optional FunctionInvokeResponse functionInvokeResponse = 1101;
   }
 
@@ -610,6 +747,26 @@ message RequestOperation {
     optional bool newestFirst = 7;
     optional bool ignoreCallingDeviceChanges = 8;
     optional bool includeMergeableDeltas = 9;
+  }
+
+  message RetrieveZoneChangesRequest {
+    optional bytes syncContinuationToken = 1;
+    optional uint32 maxChangedZones = 2;
+  }
+
+  message RetrieveZoneChangesResponse {
+    message ChangedZone {
+      optional RecordZoneIdentifier identifier = 1;
+      optional int32 changeType = 2;
+      optional int32 deleteType = 3;
+      optional bytes capabilities = 4;
+      optional bool isAnnonymous = 5;
+      optional bytes annonymousZoneInfo = 6;
+      optional RecordZoneIdentifier zoneParentIdentifier = 7;
+    }
+    repeated ChangedZone changes = 1;
+    optional bytes syncContinuationToken = 2;
+    optional int32 status = 3;
   }
 
   message RetrieveChangesResponse {
@@ -667,7 +824,9 @@ message RequestOperation {
       RECORD_RETRIEVE_VERSIONS_TYPE = 212;
       RECORD_RETRIEVE_CHANGES_TYPE = 213;
       RECORD_DELETE_TYPE = 214;
+      RESOLVE_TOKEN_TYPE = 216;
       QUERY_RETRIEVE_TYPE = 220;
+      SHARE_DECLINE_TYPE = 221; // don't ask me why
       ASSET_UPLOAD_TOKEN_RETRIEVE_TYPE = 230;
       CONTAINER_DELETE_TYPE = 240;
       CONTAINER_RESET_TYPE = 241;
@@ -968,6 +1127,19 @@ message RequestOperation {
       message Type {
         optional string name = 1;
       }
+
+      message StableUrl {
+        optional string routingKey = 1;
+        // base token is dumb, private token is the base64urlsafe encryptedPSK
+        // full token is base token and private token joined (see fullTokenFromBaseToken:privateToken:)
+        // sharing token is sha256 of full token
+        // string sharing token is base64 url safe encoded sharing token
+        // sha256 hash of UTF-8 string sharing token
+        optional bytes shortTokenHash = 2;
+        optional bytes protectedFullToken = 3;
+        optional bytes encryptedPublicSharingKey = 4;
+        optional string displayedHostname = 5;
+      }
   
       optional string etag= 1;
       optional RecordIdentifier recordIdentifier = 2;
@@ -982,7 +1154,95 @@ message RequestOperation {
       repeated Record.Field pluginFields = 12;
       optional ProtectionInfo protectionInfo = 13;
       optional uint32 permission = 15;
+      optional ShareInfo shareInfo = 16;
+      optional StableUrl stableUrl = 22;
       optional bytes pcsKey = 24;
+  }
+
+  message Participant {
+    message ContactInformation {
+      optional string emailAddress = 1;
+      optional string containerScopedUserId = 2;
+      optional string firstName = 3;
+      optional string lastName = 4;
+      optional string phoneNumber = 5;
+      optional string canonicalPhoneNumber = 6;
+    }
+
+    optional Identifier participantId = 1;
+    optional Identifier userId = 2;
+
+    optional ContactInformation contactInformation = 3;
+    optional int32 state = 4;
+    optional int32 participantType = 5;
+    optional int32 permission = 6;
+    optional Identifier inviterId = 7;
+    optional bool createdInProcess = 8;
+    optional ProtectionInfo publicKey = 9;
+    optional int64 acceptTimestamp = 10;
+    optional ProtectionInfo protectionInfo = 11;
+    optional bytes outOfNetworkPrivateKey = 12;
+    optional int32 outOfNetworkKeyType = 13;
+    optional int32 publicKeyVersion = 14;
+    optional bool acceptedInProcess = 15;
+    optional bool isInNetwork = 16;
+    optional Date acceptedTimestampDate = 17;
+    optional bool isOrgUser = 18;
+    optional bytes protectionInfoPublicKey = 19;
+    optional int32 keyHealth = 20;
+    optional Date inviteTimestampDate = 21;
+    optional bool isAnnonymousInvitedParticipant = 23;
+    optional bool isApprovedRequestor = 24;
+    optional bytes encryptedContactInformation = 25;
+    optional Date inviteNSSecTimestampDate = 26;
+    optional Date acceptedNSSecTimestampDate = 27;
+  }
+
+  message ProtectionInfoKeysToRemove {
+      
+  }
+
+
+  // CKDPShare
+  message ShareInfo {
+    message ShareAccessRequesters {
+
+    }
+
+    message ShareAccessBlockedRequesters {
+
+    }
+
+    optional ShareIdentifier identifier = 1;
+    optional string etag = 2;
+    optional int32 publicAccess = 3;
+    // invitedPcs contains ONE unlock key for selfAddedPcs
+    optional ProtectionInfo invitedPcs = 4;
+    // has two unlock keys, one is invitedPcs
+    optional ProtectionInfo selfAddedPcs = 5;
+    repeated Participant participants = 6;
+    optional string shortTokenRoutingKey = 7;
+    repeated Participant addPotentialMatch = 8;
+    repeated bytes invitedKeyToRemoves = 9;
+    optional bool publisherModel = 10;
+    optional bool annonymousPublicAccess = 11;
+    optional string displayedHostname = 12;
+    optional int32 publisherModelType = 13;
+    optional int32 participantSelfRemovalBehavior = 14;
+    optional bool denyAccessRequests = 15;
+    optional ShareAccessRequesters requestingAccess = 18;
+    optional ShareAccessBlockedRequesters blockedAccess = 19;
+    optional bytes cryptoRequirementsSigningKey = 20;
+    optional bool allowAnyoneToResolveShare = 21;
+    optional ProtectionInfoKeysToRemove pcsInvitedKeysToRemove = 22;
+    optional ProtectionInfoKeysToRemove pcsAddedKeysToRemove = 23;
+    optional bytes shortTokenHash = 101;
+    optional string origin = 102;
+  }
+
+  message Invitation {
+    optional bytes protectionInfo = 1;
+    optional bytes publicKey = 2;
   }
 
   // the abuse of the cloudkit file continues, this should really go in a PCS file, but it only has two messages...
@@ -1030,6 +1290,7 @@ message RequestOperation {
   message RecordZoneIdentifier {
      optional Identifier value = 1;
      optional Identifier ownerIdentifier = 2;
+     optional RequestOperation.Header.ContainerEnvironment environment = 3;
   }
   
   message Identifier {

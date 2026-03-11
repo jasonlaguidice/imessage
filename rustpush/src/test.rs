@@ -13,7 +13,7 @@ use omnisette::{default_provider, AnisetteHeaders, DefaultAnisetteProvider};
 use open_absinthe::nac::HardwareConfig;
 use openssl::sha::sha256;
 use plist::{Data, Dictionary, Value};
-use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
+use rustpush::{APSConnectionResource, APSState, Attachment, CircleClientSession, CircleServerSession, CompactECKey, ConversationData, DebugMutex, DebugRwLock, EntitlementAuthState, FileContainer, IDSNGMIdentity, IDSUser, IDSUserIdentity, IMClient, IdmsAuthListener, IdmsMessage, IndexedMessagePart, KeyedArchive, LoginDelegate, MADRID_SERVICE, MMCSFile, Message, MessageInst, MessageParts, MessageType, NormalMessage, PushError, RelayConfig, ShareProfileMessage, SharedPoster, TokenProvider, UpdateProfileMessage, authenticate_apple, authenticate_smsless, cloud_messages::{CloudMessagesClient, MESSAGES_SERVICE}, cloudkit::{CloudKitClient, CloudKitContainer, CloudKitSession, CloudKitState, DeleteRecordOperation, FetchZoneOperation, ZoneDeleteOperation, ZoneSaveOperation, record_identifier}, facetime::{FACETIME_SERVICE, FTClient, FTMember, FTMessage, FTState, VIDEO_SERVICE}, findmy::{BeaconNamingRecord, FindMyClient, FindMyState, FindMyStateManager, MULTIPLEX_SERVICE}, get_gateways_for_mccmnc, keychain::{CloudKey, KEYCHAIN_ZONES, KeychainClient, KeychainClientState}, login_apple_delegates, macos::MacOSConfig, name_photo_sharing::{IMessageNameRecord, IMessageNicknameRecord, IMessagePosterRecord, ProfilesClient}, passwords::{PasswordManager, PasswordState, SHARED_PASSWORDS_SERVICE}, pcs::{PCSKey, PCSPrivateKey}, posterkit::{PhotoPosterContentsFrame, PosterType, SimplifiedIncomingCallPoster, SimplifiedPoster, SimplifiedTranscriptPoster, TranscriptDynamicUserData}, prepare_put, register, sharedstreams::{AssetDetails, AssetFile, AssetMetadata, CollectionMetadata, FFMpegFilePackager, FileMetadata, FilePackager, PreparedAsset, PreparedFile, SharedStreamClient, SharedStreamsState, SyncController, SyncState, round_seconds}, statuskit::{StatusKitClient, StatusKitState, StatusKitStatus}};
 use sha2::Sha256;
 use tokio::{fs, io::{self, AsyncBufReadExt, BufReader}, process::Command, sync::RwLock};
 use tokio::io::AsyncWriteExt;
@@ -305,9 +305,6 @@ async fn main() {
             icloud_ua: "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0".to_string(),
             aoskit_version: "com.apple.AOSKit/282 (com.apple.accountsd/113)".to_string(),
             udid: Some("55A1CFBF5BB56AD1159BD2CB7D6FF546E48EAAE4BF16188A07B1FB9C83138CA2".to_string()),
-            nac_relay_url: None,
-            relay_token: None,
-            relay_cert_fp: None,
         }
     });
     // let host = "https://registration-relay.beeper.com".to_string();
@@ -366,7 +363,7 @@ async fn main() {
         // account.send_2fa_to_devices().await.unwrap();
         // let result = account.verify_2fa(tfa_closure()).await.unwrap();
 
-        let done = Arc::new(tokio::sync::Mutex::new(account));
+        let done = Arc::new(DebugMutex::new(account));
 
         if let LoginState::NeedsDevice2FA = result {
             let mut s = CircleClientSession::new(dsid, done.clone(), connection.get_token().await).await.unwrap();
@@ -471,7 +468,7 @@ async fn main() {
     // panic!("test {:?}", entitlementresult.phone);
 
 
-    let account = Arc::new(tokio::sync::Mutex::new(acc.unwrap()));
+    let account = Arc::new(DebugMutex::new(acc.unwrap()));
     
     account.lock().await.update_postdata("Apple Device", None, &["icloud", "imessage", "facetime"]).await.unwrap();
 
@@ -511,7 +508,7 @@ async fn main() {
     let token_provider = TokenProvider::new(account.clone(), config.clone());
 
     let cloudkit = Arc::new(CloudKitClient {
-        state: RwLock::new(state),
+        state: DebugRwLock::new(state),
         anisette: anisette_client.clone(),
         config: config.clone(),
         token_provider: token_provider.clone(),
@@ -589,7 +586,7 @@ async fn main() {
     let keychain = Arc::new(KeychainClient {
         anisette: anisette_client.clone(),
         token_provider: token_provider.clone(),
-        state: RwLock::new(state),
+        state: DebugRwLock::new(state),
         config: config.clone(),
         update_state: Box::new(move |update| {
             plist::to_file_xml(&id_path, update).unwrap();
@@ -606,6 +603,12 @@ async fn main() {
             std::fs::write(&id_path, state).unwrap()
         })), 
     token_provider.clone(), anisette_client.clone(), client.identity.clone()).await.unwrap();
+
+    let state: PasswordState = plist::from_file("passwords.plist").unwrap_or_default();
+    let passwords = PasswordManager::new(
+        keychain.clone(), cloudkit.clone(), client.identity.clone(), connection.clone(), state, Box::new(move |state| {
+            plist::to_file_xml("passwords.plist", state).unwrap();
+        })).await;
 
 
     if let Some(mut s) = session {
@@ -668,6 +671,51 @@ async fn main() {
         // keychain.join_clique_from_escrow(&bottles.0, item.as_bytes(), b"antifa").await.unwrap();
 
         // keychain.sync_keychain(&KEYCHAIN_ZONES).await.unwrap();
+
+        let container = keychain.get_security_container().await.unwrap();
+        // let container = passwords.get_container().await.unwrap();
+
+        // let zone = container.private_zone("group-93757E7E-7715-4557-8709-A7CEEC968BFE".to_string());
+        // let pcs_config = container.get_zone_encryption_config(&zone, &keychain, &SHARED_PASSWORDS_SERVICE).await.unwrap();
+        // let mut zone = container.get_zone_share(&zone, &pcs_config).await.unwrap();
+
+
+        // let zone = container.shared_zone("group-DE1587A8-88FB-4363-B29F-6A2D5A6518F8".to_string(), "_a049d4a4a0f3dafd37d508781b723960".to_string());
+        // let pcs_config = container.get_zone_encryption_config(&zone, &keychain, &SHARED_PASSWORDS_SERVICE).await.unwrap();
+        // let mut zone = container.get_zone_share(&zone, &pcs_config).await.unwrap();
+
+
+        // container.create_sync_subscription().await.unwrap();
+        keychain.create_subscriptions().await.unwrap();
+        // container.register_token(&connection).await.unwrap();
+
+
+        // passwords.sync_passwords().await.unwrap();
+        // tokio::time::sleep(Duration::from_secs(10)).await;
+        // passwords.sync_passwords().await.unwrap();
+
+        // container.update_zone_share(pcs_config, &keychain, &SHARED_PASSWORDS_SERVICE, &mut zone).await.unwrap();
+
+
+        // passwords.test().await.unwrap();
+
+
+        // PCSPrivateKey::get_service_key(&keychain, &SHARED_PASSWORDS_SERVICE, config.as_ref()).await.unwrap();
+
+        // let state = keychain.state.read().await;
+        // let items = state.items["Manatee"].current_keys.get("com.apple.ProtectedCloudStorage-com.apple.security.keychain.shared").unwrap().clone();
+        // drop(state);
+        // keychain.delete_keychain(&items, "Manatee").await.unwrap();
+        
+        // passwords.test().await.unwrap();
+
+        // let id = passwords.create_group("three, two, e").await.unwrap();
+        // passwords.invite_user("8AC8FD27-B9AE-4EFE-A605-72E55A635023", "mailto:sandboxalt@gmail.com").await.unwrap();
+        // passwords.remove_user("8AC8FD27-B9AE-4EFE-A605-72E55A635023", "mailto:sandboxalt@gmail.com").await.unwrap();
+
+
+
+        // panic!("{:?}", zone);
 
 
         // findmy_client.accept_item_share("CA065844-8DA5-4F99-AE74-858DEABA34DE").await.unwrap();
@@ -885,6 +933,9 @@ async fn main() {
         tokio::select! {
             msg = subscription.recv() => {
                 let msg = msg.unwrap();
+                if let Err(e) = passwords.handle(msg.clone()).await {
+                    info!("err {e}");
+                }
                 // if let Err(e) = findmy_client.handle(msg.clone()).await {
                 //     info!("err {e}");
                 // }

@@ -9,7 +9,6 @@ use hkdf::Hkdf;
 use keystore::{AesKeystoreKey, EncryptMode, KeystoreAccessRules, KeystoreEncryptKey};
 use openssl::{bn::{BigNum, BigNumContext}, derive::Deriver, ec::{EcGroup, EcKey, EcPoint}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, sha::sha256, sign::{Signer, Verifier}};
 use sha2::Sha256;
-use tokio::sync::Mutex;
 use icloud_auth::AppleAccount;
 use log::{debug, warn};
 use omnisette::{AnisetteClient, AnisetteError, AnisetteHeaders, AnisetteProvider, ArcAnisetteClient};
@@ -18,10 +17,10 @@ use rand::Rng;
 use reqwest::{Request, header::{HeaderMap, HeaderName, HeaderValue}};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex, broadcast};
 use aes_gcm::KeyInit;
 use uuid::Uuid;
-use crate::{CompactECKey, cloudkit::{DeleteRecordOperation, SaveRecordOperation, should_reset}, ids::user::QueryOptions, util::{base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, plist_to_bin}};
+use crate::{CompactECKey, cloudkit::{DeleteRecordOperation, SaveRecordOperation, should_reset}, ids::user::QueryOptions, util::{DebugMutex, base64_decode, base64_encode, bin_deserialize, bin_deserialize_opt_vec, bin_serialize, bin_serialize_opt_vec, decode_hex, plist_to_bin}};
 use crate::{aps::APSInterestToken, auth::{MobileMeDelegateResponse, TokenProvider}, cloudkit::{pcs_keys_for_record, record_identifier, CloudKitClient, CloudKitContainer, CloudKitOpenContainer, CloudKitSession, FetchRecordChangesOperation, FetchRecordOperation, ALL_ASSETS, NO_ASSETS}, ids::{identity_manager::{DeliveryHandle, IDSSendMessage, IdentityManager, MessageTarget, Raw}, user::IDSService, IDSRecvMessage}, keychain::{derive_key_into, KeychainClient}, login_apple_delegates, pcs::PCSService, util::{duration_since_epoch, encode_hex, REQWEST}, APSConnection, APSMessage, LoginDelegate, OSConfig, PushError};
 
 pub const MULTIPLEX_SERVICE: IDSService = IDSService {
@@ -32,6 +31,7 @@ pub const MULTIPLEX_SERVICE: IDSService = IDSService {
         "com.apple.private.alloy.status.keysharing",
         "com.apple.private.alloy.status.personal",
         "com.apple.private.alloy.findmy.itemsharing-crossaccount",
+        "com.apple.private.alloy.kcsharing.invite",
     ],
     client_data: &[
         ("supports-fmd-v2", Value::Boolean(true)),
@@ -154,7 +154,7 @@ impl FindMyState {
 }
 
 pub struct FindMyStateManager {
-    pub state: Mutex<FindMyState>,
+    pub state: DebugMutex<FindMyState>,
     pub update: Box<dyn Fn(Vec<u8>) + Send + Sync>,
 }
 
@@ -163,7 +163,7 @@ impl FindMyStateManager {
 
     pub fn new(data: &[u8], update: Box<dyn Fn(Vec<u8>) + Send + Sync>) -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(FindMyState::restore(data).expect("Failed to restore!")),
+            state: DebugMutex::new(FindMyState::restore(data).expect("Failed to restore!")),
             update
         })
     }
@@ -208,7 +208,7 @@ pub struct FindMyClient<P: AnisetteProvider> {
     pub conn: APSConnection,
     pub identity: IdentityManager,
     _interest_token: APSInterestToken,
-    pub daemon: Mutex<FindMyFriendsClient<P>>,
+    pub daemon: DebugMutex<FindMyFriendsClient<P>>,
     config: Arc<dyn OSConfig>,
     pub state: Arc<FindMyStateManager>,
     pub container: Mutex<Option<Arc<CloudKitOpenContainer<'static, P>>>>,
@@ -808,10 +808,10 @@ impl<P: AnisetteProvider> FindMyClient<P> {
     pub async fn new(conn: APSConnection, client: Arc<CloudKitClient<P>>, keychain: Arc<KeychainClient<P>>, config: Arc<dyn OSConfig>, state: Arc<FindMyStateManager>, token_provider: Arc<TokenProvider<P>>, anisette: ArcAnisetteClient<P>, identity: IdentityManager) -> Result<FindMyClient<P>, PushError> {
         let daemon = FindMyFriendsClient::new(config.as_ref(), state.state.lock().await.dsid.clone(), token_provider.clone(), conn.clone(), anisette.clone(), true).await?;
         Ok(FindMyClient {
-            _interest_token: conn.request_topics(vec!["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
+            _interest_token: conn.request_topics(&["com.apple.private.alloy.fmf", "com.apple.private.alloy.fmd", "com.apple.private.alloy.findmy.itemsharing-crossaccount"]).await,
             conn,
             identity,
-            daemon: Mutex::new(daemon),
+            daemon: DebugMutex::new(daemon),
             config,
             state,
             container: Mutex::new(None),
@@ -887,7 +887,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
             let protection_info_tag = protection_info.protection_info_tag().to_string();
 
             if record.r#type.as_ref().unwrap().name() == MasterBeaconRecord::record_type() {
-                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MasterBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 info!("Got beacon {:?} {}", item, identifier);
 
@@ -897,7 +897,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     beacon_records.insert(identifier, item);
                 }
             } else if record.r#type.as_ref().unwrap().name() == BeaconNamingRecord::record_type() {
-                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = BeaconNamingRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 if let Some(accessory) = accessories.get_mut(&item.associated_beacon) {
                     accessory.naming = item;
@@ -906,7 +906,7 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     naming_records.insert(item.associated_beacon.clone(), (identifier, Some(protection_info_tag), item));
                 }
             } else if record.r#type.as_ref().unwrap().name() == KeyAlignmentRecord::record_type() {
-                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = KeyAlignmentRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 if let Some(accessory) = accessories.get_mut(&item.beacon_identifier) {
                     accessory.alignment = item.clone();
@@ -916,28 +916,28 @@ impl<P: AnisetteProvider> FindMyClient<P> {
                     alignment_records.insert(item.beacon_identifier.clone(), (identifier, Some(protection_info_tag), item));
                 }
             } else if record.r#type.as_ref().unwrap().name() == SharingCircleSecret::record_type() {
-                let item = SharingCircleSecret::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = SharingCircleSecret::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 secrets.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == OwnerSharingCircle::record_type() {
-                let item = OwnerSharingCircle::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = OwnerSharingCircle::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 circles.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == OwnerPeerTrust::record_type() {
-                let item = OwnerPeerTrust::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = OwnerPeerTrust::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 peer_trust.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == MemberPeerTrust::record_type() {
-                let item = MemberPeerTrust::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MemberPeerTrust::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 peer_trust_member.insert(identifier, item);
             } else if record.r#type.as_ref().unwrap().name() == MemberSharingCircle::record_type() {
-                let item = MemberSharingCircle::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = MemberSharingCircle::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 circles_member.insert(identifier.clone(), item);
                 tags.insert(identifier, protection_info_tag);
             } else if record.r#type.as_ref().unwrap().name() == SharedBeaconRecord::record_type() {
-                let item = SharedBeaconRecord::from_record_encrypted(&record.record_field, Some((&pcs_keys_for_record(&record, &key)?, record.record_identifier.as_ref().unwrap())));
+                let item = SharedBeaconRecord::from_record_encrypted(&record.record_field, Some(&pcs_keys_for_record(&record, &key)?));
 
                 shared_beacons.insert(identifier, item);
             } else { continue }

@@ -4,7 +4,7 @@ use aes::{cipher::consts::U16, Aes128};
 use cloudkit_proto::{octagon_pairing_message::{self, Step5}, CuttlefishPeer, OctagonPairingMessage, OctagonWrapper, SignedInfo};
 use deku::{DekuRead, DekuWrite};
 use hkdf::Hkdf;
-use icloud_auth::{AppleAccount, CircleSendMessage, LoginState};
+use icloud_auth::{AppleAccount, CircleSendMessage, GenerateVerificationTokenRequest, LoginState};
 use keystore::{KeystoreAccessRules, KeystoreDigest, KeystorePadding, KeystorePublicKey, KeystoreSignKey, RsaKey};
 use log::{debug, info, warn};
 use omnisette::{AnisetteClient, AnisetteProvider};
@@ -15,14 +15,14 @@ use reqwest::{header::{HeaderMap, HeaderName, HeaderValue}, Client, Method, Requ
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::Sha256;
 use srp::{client::{SrpClient, SrpClientVerifier}, groups::G_3072, server::SrpServer};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch};
 use uuid::Uuid;
 use rand::Rng;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce, aead::Aead};
 use deku::{DekuContainerWrite, DekuUpdate};
 use x509_cert::{attr::AttributeTypeAndValue, der::{EncodePem, asn1::{BitString, Null, SetOfVec, Utf8StringRef}, pem::LineEnding}, name::{Name, RdnSequence, RelativeDistinguishedName}, request::{CertReq, CertReqInfo}, spki::{AlgorithmIdentifier, ObjectIdentifier, SubjectPublicKeyInfo}};
 
-use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
+use crate::{APSConnection, APSConnectionResource, APSMessage, APSState, OSConfig, PushError, aps::{APSInterestToken, get_message}, ids::user::{IDSUser, IDSUserIdentity, IDSUserType}, keychain::{EncodedPeer, KeychainClient, PrivateUserIdentity}, util::{DebugMutex, IDS_BAG, KeyPair, KeyPairNew, PhoneNumberResponse, REQWEST, base64_decode, base64_encode, decode_hex, duration_since_epoch, encode_hex, get_bag, gzip, gzip_normal, plist_to_bin, plist_to_buf, plist_to_string, ungzip}};
 
 #[derive(Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -55,9 +55,9 @@ impl LoginDelegate {
 }
 
 pub struct TokenProvider<T: AnisetteProvider> {
-    account: Arc<Mutex<AppleAccount<T>>>,
-    mme_delegate: Mutex<Option<MobileMeDelegateResponse>>,
-    mme_refreshed: Mutex<SystemTime>,
+    account: Arc<DebugMutex<AppleAccount<T>>>,
+    mme_delegate: DebugMutex<Option<MobileMeDelegateResponse>>,
+    mme_refreshed: DebugMutex<SystemTime>,
     os_config: Arc<dyn OSConfig>,
 }
 
@@ -104,12 +104,12 @@ pub struct QuotaData {
 }
 
 impl<T: AnisetteProvider> TokenProvider<T> {
-    pub fn new(account: Arc<Mutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
+    pub fn new(account: Arc<DebugMutex<AppleAccount<T>>>, os_config: Arc<dyn OSConfig>) -> Arc<Self> {
         Arc::new(Self {
             account,
             os_config,
-            mme_delegate: Mutex::new(None),
-            mme_refreshed: Mutex::new(SystemTime::UNIX_EPOCH),
+            mme_delegate: DebugMutex::new(None),
+            mme_refreshed: DebugMutex::new(SystemTime::UNIX_EPOCH),
         })
     }
 
@@ -144,6 +144,10 @@ impl<T: AnisetteProvider> TokenProvider<T> {
         Ok(plist::from_bytes(&data)?)
     }
 
+    pub async fn generate_verification_token(&self, request: GenerateVerificationTokenRequest) -> Result<String, PushError> {
+        Ok(self.account.lock().await.generate_verification_token(request).await?)
+    }
+
     pub async fn get_gsa_token(&self, token: &str) -> Option<String> {
         self.account.lock().await.get_token(token).await
     }
@@ -154,168 +158,93 @@ impl<T: AnisetteProvider> TokenProvider<T> {
 
     pub async fn refresh_mme(&self) -> Result<(), PushError> {
         let mut mme = self.mme_delegate.lock().await;
-        let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or_else(|| {
-            warn!("refresh_mme: PET token not found in account tokens");
-            PushError::TokenMissing
-        })?;
+        let pet = self.get_gsa_token("com.apple.gs.idms.pet").await.ok_or(PushError::TokenMissing)?;
         let account = self.account.lock().await;
 
         let Some(spd) = &account.spd else { panic!("No spd!") };
         let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
-        let username = account.username.as_ref().unwrap().clone();
 
-        info!("refresh_mme: refreshing MobileMe delegate for user={} adsid={} pet_len={}", username, adsid, pet.len());
+        let delegates = login_apple_delegates(account.username.as_ref().unwrap(), &pet, adsid, None, 
+            &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
 
-        let result = login_apple_delegates(&username, &pet, adsid, None, 
-            &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await;
-        drop(account);
+        *mme = delegates.mobileme;
+        *self.mme_refreshed.lock().await = SystemTime::now();
 
-        match result {
-            Ok(delegates) => {
-                *mme = delegates.mobileme;
-                *self.mme_refreshed.lock().await = SystemTime::now();
-                info!("refresh_mme: MobileMe delegate refreshed successfully");
-                Ok(())
-            }
-            Err(e) => {
-                warn!("refresh_mme: PET-based auth failed ({}), trying password re-auth...", e);
-                // PET expired — try re-authenticating with stored password to get a fresh PET
-                let mut account = self.account.lock().await;
-                let has_password = account.hashed_password.is_some();
-                let has_username = account.username.is_some();
-                if has_password && has_username {
-                    let username = account.username.clone().unwrap();
-                    let password = account.hashed_password.clone().unwrap();
-                    info!("refresh_mme: re-authenticating with stored password for user={}", username);
-                    match account.login_email_pass(&username, &password).await {
-                        Ok(login_state) => {
-                            info!("refresh_mme: password re-auth returned {:?}", login_state);
-                            // Get fresh PET
-                            if let Some(new_pet) = account.get_pet() {
-                                let spd = account.spd.as_ref().expect("No SPD after re-auth!");
-                                let adsid = spd.get("adsid").expect("No adsid!").as_string().unwrap();
-                                info!("refresh_mme: got fresh PET (len={}), fetching MobileMe delegate", new_pet.len());
-                                let delegates = login_apple_delegates(&username, &new_pet, adsid, None,
-                                    &mut *account.anisette.lock().await, &*self.os_config, &[LoginDelegate::MobileMe]).await?;
-                                *mme = delegates.mobileme;
-                                *self.mme_refreshed.lock().await = SystemTime::now();
-                                info!("refresh_mme: MobileMe delegate refreshed via password re-auth");
-                                Ok(())
-                            } else {
-                                Err(PushError::TokenMissing)
-                            }
-                        }
-                        Err(auth_err) => {
-                            warn!("refresh_mme: password re-auth also failed: {}", auth_err);
-                            Err(e) // return original error
-                        }
-                    }
-                } else {
-                    warn!("refresh_mme: no stored password for re-auth (has_password={}, has_username={})", has_password, has_username);
-                    Err(e)
-                }
-            }
-        }
+        Ok(())
     }
 
     pub async fn get_mme_token(&self, token: &str) -> Result<String, PushError> {
-        // Refresh every 2 hours to keep the MobileMe delegate fresh.
-        // PET tokens expire after a few hours, so we must refresh while still valid.
+        // refresh every week
         if self.mme_delegate.lock().await.is_none() || SystemTime::now().duration_since(*self.mme_refreshed.lock().await).unwrap() 
-            > Duration::from_secs(60 * 60 * 2) {
+            > Duration::from_secs(60 * 60 * 24 * 7) {
             self.refresh_mme().await?;
         }
         self.mme_delegate.lock().await.as_ref().expect("no MME?").tokens.get(token).ok_or(PushError::TokenMissing).cloned()
     }
 
-    /// Seed the MobileMe delegate directly (avoids a network refresh on first use).
-    pub async fn seed_mme_delegate(&self, delegate: MobileMeDelegateResponse) {
-        *self.mme_delegate.lock().await = Some(delegate);
-        *self.mme_refreshed.lock().await = SystemTime::now();
-    }
-
-    /// Get the full set of HTTP headers needed for iCloud MobileMe API calls.
-    /// Includes Authorization (X-MobileMe-AuthToken), anisette headers, and
-    /// X-Mme-Client-Info. Auto-refreshes mmeAuthToken if stale.
-    pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, PushError> {
-        let mme_token = self.get_mme_token("mmeAuthToken").await?;
-
-        let account = self.account.lock().await;
-        let spd = account.spd.as_ref().ok_or(PushError::TokenMissing)?;
-        let dsid = spd.get("DsPrsId")
-            .or_else(|| spd.get("dsid"))
-            .and_then(|v| v.as_unsigned_integer().map(|i| i.to_string())
-                .or_else(|| v.as_signed_integer().map(|i| i.to_string()))
-                .or_else(|| v.as_string().map(|s| s.to_string())))
-            .ok_or(PushError::TokenMissing)?;
-
-        let anisette_headers = account.anisette.lock().await.get_headers().await?.clone();
-        drop(account);
-
-        let auth_payload = format!("{}:{}", dsid, mme_token);
-        let auth_b64 = base64_encode(auth_payload.as_bytes());
-
-        let mut headers = HashMap::new();
-        headers.insert("Authorization".to_string(), format!("X-MobileMe-AuthToken {}", auth_b64));
-
-        for (k, v) in &anisette_headers {
-            headers.insert(k.clone(), v.clone());
-        }
-
-        Ok(headers)
-    }
-
-    /// Get the contacts CardDAV URL from the MobileMe delegate config.
-    /// Triggers a delegate refresh if not yet loaded.
-    pub async fn get_contacts_url(&self) -> Result<Option<String>, PushError> {
-        // Ensure MobileMe delegate is loaded
-        let _ = self.get_mme_token("mmeAuthToken").await?;
-        let mme = self.mme_delegate.lock().await;
-        Ok(mme.as_ref().and_then(|d| {
-            d.config.get("com.apple.Dataclass.Contacts")
-                .and_then(|v| v.as_dictionary())
-                .and_then(|d| d.get("url"))
-                .and_then(|v| v.as_string())
-                .map(|s| s.to_string())
-        }))
-    }
-
-    /// Get the DSID from the account's SPD.
     pub async fn get_dsid(&self) -> Result<String, PushError> {
         let account = self.account.lock().await;
         let spd = account.spd.as_ref().ok_or(PushError::TokenMissing)?;
-        Ok(spd.get("DsPrsId")
-            .or_else(|| spd.get("dsid"))
-            .and_then(|v| v.as_unsigned_integer().map(|i| i.to_string())
-                .or_else(|| v.as_signed_integer().map(|i| i.to_string()))
-                .or_else(|| v.as_string().map(|s| s.to_string())))
-            .ok_or(PushError::TokenMissing)?)
+        Ok(spd.get("DsPrsId").ok_or(PushError::TokenMissing)?.as_unsigned_integer().ok_or(PushError::TokenMissing)?.to_string())
     }
 
-    /// Get the ADSID from the account's SPD.
     pub async fn get_adsid(&self) -> Result<String, PushError> {
         let account = self.account.lock().await;
         let spd = account.spd.as_ref().ok_or(PushError::TokenMissing)?;
-        Ok(spd.get("adsid")
-            .and_then(|v| v.as_string().map(|s| s.to_string()))
-            .ok_or(PushError::TokenMissing)?)
+        Ok(spd.get("adsid").ok_or(PushError::TokenMissing)?.as_string().ok_or(PushError::TokenMissing)?.to_string())
     }
 
-    /// Get the MobileMe delegate response, refreshing if needed.
     pub async fn get_mme_delegate(&self) -> Result<MobileMeDelegateResponse, PushError> {
-        let _ = self.get_mme_token("mmeAuthToken").await?;
-        let mme = self.mme_delegate.lock().await;
-        mme.clone().ok_or(PushError::TokenMissing)
+        if self.mme_delegate.lock().await.is_none() {
+            self.refresh_mme().await?;
+        }
+        self.mme_delegate.lock().await.clone().ok_or(PushError::TokenMissing)
     }
 
-    /// Get the account (for creating CloudKit/Keychain clients).
-    pub fn get_account(&self) -> Arc<Mutex<AppleAccount<T>>> {
+    pub fn get_account(&self) -> Arc<DebugMutex<AppleAccount<T>>> {
         self.account.clone()
     }
 
-    /// Get the OS config.
     pub fn get_os_config(&self) -> Arc<dyn OSConfig> {
         self.os_config.clone()
+    }
+
+    pub async fn get_icloud_auth_headers(&self) -> Result<HashMap<String, String>, PushError> {
+        let token = self.get_mme_token("mmeAuthToken").await?;
+        let dsid = self.get_dsid().await?;
+        let account = self.account.lock().await;
+        let anisette = account.anisette.clone();
+        drop(account);
+        let anisette_headers: HashMap<String, String> = anisette.lock().await.get_headers().await?
+            .clone();
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), format!("Basic {}", base64::encode(format!("{}:{}", dsid, token))));
+        headers.insert("X-Client-UDID".to_string(), self.os_config.get_udid().to_lowercase());
+        headers.insert("X-MMe-Country".to_string(), "US".to_string());
+        headers.insert("X-MMe-Client-Info".to_string(), self.os_config.get_mme_clientinfo("com.apple.AppleAccount/1.0 (com.apple.Preferences/1112.96)"));
+        headers.insert("X-MMe-Language".to_string(), "en".to_string());
+        let adsid = self.get_adsid().await?;
+        headers.insert("X-Apple-ADSID".to_string(), adsid);
+        headers.extend(anisette_headers);
+        Ok(headers)
+    }
+
+    pub async fn get_contacts_url(&self) -> Result<Option<String>, PushError> {
+        if self.mme_delegate.lock().await.is_none() {
+            self.refresh_mme().await?;
+        }
+        let delegate = self.mme_delegate.lock().await;
+        let delegate = delegate.as_ref().ok_or(PushError::TokenMissing)?;
+        Ok(delegate.config.get("com.apple.Dataclass.Contacts")
+            .and_then(|v| v.as_dictionary())
+            .and_then(|d| d.get("contactsURL"))
+            .and_then(|v| v.as_string())
+            .map(|s| s.to_string()))
+    }
+
+    pub async fn seed_mme_delegate(&self, delegate: MobileMeDelegateResponse) {
+        *self.mme_delegate.lock().await = Some(delegate);
+        *self.mme_refreshed.lock().await = SystemTime::now();
     }
 }
 
@@ -326,7 +255,7 @@ pub struct IDSDelegateResponse {
     pub profile_id: String,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 pub struct MobileMeDelegateResponse {
     pub tokens: HashMap<String, String>,
     #[serde(rename = "com.apple.mobileme")]
@@ -347,7 +276,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
     };
 
     let validation_data = os_config.generate_validation_data().await?;
-    info!("login_apple_delegates: validation data generated ({} bytes)", validation_data.len());
+
     let base_headers = anisette.get_headers().await?;
     let mut anisette_headers: HeaderMap = base_headers.into_iter().map(|(a, b)| (HeaderName::from_str(&a).unwrap(), b.parse().unwrap())).collect();
 
@@ -366,23 +295,7 @@ pub async fn login_apple_delegates<T: AnisetteProvider>(username: &str, pet: &st
             .body(plist_to_string(&request)?)
             .send()
             .await?;
-    let status = resp.status();
     let text = resp.text().await?;
-
-    debug!("login_apple_delegates response: HTTP {} body_len={}", status, text.len());
-
-    if !status.is_success() {
-        warn!("login_apple_delegates: server returned HTTP {} (body: {} bytes)", status.as_u16(), text.len());
-        if !text.is_empty() {
-            debug!("login_apple_delegates: response body: {}", &text[..text.len().min(2000)]);
-        }
-    }
-
-    if text.is_empty() {
-        return Err(PushError::AuthError(plist::Value::String(
-            format!("Empty response from {} (HTTP {})", os_config.get_login_url(), status.as_u16())
-        )));
-    }
 
     let parsed = plist::Value::from_reader(Cursor::new(text.as_str()))?;
     let parsed_dict = parsed.as_dictionary().unwrap();
@@ -966,7 +879,7 @@ struct CircleStep5 {
 }
 
 pub struct CircleClientSession<P: AnisetteProvider> {
-    account: Arc<Mutex<AppleAccount<P>>>,
+    account: Arc<DebugMutex<AppleAccount<P>>>,
     push_token: [u8; 32],
     srp_client: SrpClient<'static, Sha256>,
     a: [u8; 32],
@@ -985,7 +898,7 @@ pub struct CircleClientSession<P: AnisetteProvider> {
 impl<P: AnisetteProvider> CircleClientSession<P> {
     // WARN: you, the caller, are responsible for advertising a BLE GATT service with the uuid of session_id
     // modern OSes may refuse to add you to the circle if you are not in physical proximity
-    pub async fn new(dsid: u64, account: Arc<Mutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Result<Self, PushError> {
+    pub async fn new(dsid: u64, account: Arc<DebugMutex<AppleAccount<P>>>, push_token: [u8; 32]) -> Result<Self, PushError> {
         // note, -0 is the attempt number. Each time there is another attempt (send new code) the -0 increments by 1
         let atxid = format!("{}-0", rand::random::<u32>() / 2);
 
@@ -1195,7 +1108,7 @@ pub struct CircleServerSession<P: AnisetteProvider> {
     dsid: u64,
     verifier: Vec<u8>,
     server: SrpServer<'static, Sha256>,
-    account: Arc<Mutex<AppleAccount<P>>>,
+    account: Arc<DebugMutex<AppleAccount<P>>>,
     b: [u8; 32],
     client_public: Option<Vec<u8>>,
     push_token: [u8; 32],
@@ -1204,7 +1117,7 @@ pub struct CircleServerSession<P: AnisetteProvider> {
 }
 
 impl<P: AnisetteProvider> CircleServerSession<P> {
-    pub fn new(dsid: u64, otp: u32, account: Arc<Mutex<AppleAccount<P>>>, push_token: [u8; 32], trusted_peers: Option<Arc<KeychainClient<P>>>) -> Self {
+    pub fn new(dsid: u64, otp: u32, account: Arc<DebugMutex<AppleAccount<P>>>, push_token: [u8; 32], trusted_peers: Option<Arc<KeychainClient<P>>>) -> Self {
         let salt: [u8; 16] = rand::random();
         let client = SrpClient::<Sha256>::new(&G_3072);
         // check password, was guess
@@ -1392,7 +1305,7 @@ impl<P: AnisetteProvider> CircleServerSession<P> {
 impl IdmsAuthListener {
     pub async fn new(conn: APSConnection) -> Self {
         Self {
-            _interest_token: conn.request_topics(vec!["com.apple.idmsauth"]).await,
+            _interest_token: conn.request_topics(&["com.apple.idmsauth"]).await,
         }
     }
 
