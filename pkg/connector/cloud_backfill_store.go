@@ -1018,6 +1018,55 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 
 // listCloudChatIDsByPortalID returns all distinct CloudKit chat identifiers
 // (cloud_chat_id values) currently known for a portal.
+// getCloudChatRecordNamesByPortalID returns all non-empty CloudKit record_names
+// for cloud_chat rows belonging to a portal. Used by the fast-path delete in
+// HandleMatrixDeleteChat to avoid a full CloudKit scan when local record_names
+// are already known (e.g. after a CloudKit sync has populated them).
+func (s *cloudBackfillStore) getCloudChatRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND record_name <> ''`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// getCloudMessageRecordNamesByPortalID returns all non-empty CloudKit record_names
+// for cloud_message rows belonging to a portal. Used by the fast-path delete in
+// HandleMatrixDeleteChat to avoid a full CloudKit message scan.
+func (s *cloudBackfillStore) getCloudMessageRecordNamesByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT record_name FROM cloud_message WHERE login_id=$1 AND portal_id=$2 AND record_name <> ''`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, rows.Err()
+}
+
+// listCloudChatIDsByPortalID returns all distinct CloudKit chat identifiers
+// (cloud_chat_id values) currently known for a portal.
 func (s *cloudBackfillStore) listCloudChatIDsByPortalID(ctx context.Context, portalID string) ([]string, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT DISTINCT cloud_chat_id FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND cloud_chat_id <> ''`,
@@ -1191,8 +1240,23 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
-		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, deleted, created_ts, updated_ts)
+		VALUES (
+			$1, $2, $3, $4, $5,
+			CASE
+				WHEN EXISTS (
+					SELECT 1 FROM cloud_chat cc
+					WHERE cc.login_id=$1 AND cc.portal_id=$3
+				)
+				AND NOT EXISTS (
+					SELECT 1 FROM cloud_chat cc
+					WHERE cc.login_id=$1 AND cc.portal_id=$3 AND cc.deleted=FALSE
+				)
+				THEN TRUE
+				ELSE FALSE
+			END,
+			$6, $7
+		)
 	`, s.loginID, uuid, portalID, timestampMS, isFromMe, nowMS, nowMS)
 	return err
 }
@@ -1541,6 +1605,15 @@ func (s *cloudBackfillStore) listPortalIDsWithNewestTimestamp(ctx context.Contex
 		WHERE NOT EXISTS (
 			SELECT 1 FROM cloud_chat fc
 			WHERE fc.login_id=$1 AND fc.portal_id=sub.portal_id AND COALESCE(fc.is_filtered, 0) != 0
+		)
+		-- Exclude portals where every cloud_chat row is soft-deleted (user explicitly
+		-- deleted the chat). A live cloud_message row can exist for such portals when
+		-- persistMessageUUID inserts an APNs echo after the portal was deleted. Without
+		-- this guard, the live cloud_message row causes createPortalsFromCloudSync to
+		-- resurrect the portal after a restart (when recentlyDeletedPortals is empty).
+		AND (
+			NOT EXISTS (SELECT 1 FROM cloud_chat dc WHERE dc.login_id=$1 AND dc.portal_id=sub.portal_id)
+			OR EXISTS (SELECT 1 FROM cloud_chat dc WHERE dc.login_id=$1 AND dc.portal_id=sub.portal_id AND dc.deleted=FALSE)
 		)
 		GROUP BY sub.portal_id
 		ORDER BY newest_ts DESC

@@ -95,8 +95,11 @@ func (c *IMClient) setCloudSyncDone() {
 	// eventually force-flushing if nothing makes progress for 5 minutes
 	// (i.e. a portal is genuinely stuck and will never finish).
 	go func() {
-		const noProgressTimeout = 5 * time.Minute
+		noProgressTimeout := 5 * time.Minute
 		lastCount := atomic.LoadInt64(&c.pendingInitialBackfills)
+		if lastCount >= 50 {
+			noProgressTimeout = 15 * time.Minute
+		}
 		deadline := time.Now().Add(noProgressTimeout)
 		for time.Now().Before(deadline) {
 			if atomic.LoadInt64(&c.pendingInitialBackfills) <= 0 {
@@ -111,8 +114,8 @@ func (c *IMClient) setCloudSyncDone() {
 			}
 		}
 		remaining := atomic.LoadInt64(&c.pendingInitialBackfills)
-		log.Warn().Int64("remaining", remaining).
-			Msg("APNs buffer flush timeout: no forward backfill progress in 5 minutes, forcing flush")
+		log.Warn().Int64("remaining", remaining).Dur("timeout", noProgressTimeout).
+			Msg("APNs buffer flush timeout: no forward backfill progress, forcing flush")
 		// Mirror what onForwardBackfillDone does: stamp the flush time so the
 		// read-receipt grace window (handleReadReceipt) knows the burst is done.
 		atomic.StoreInt64(&c.apnsBufferFlushedAt, time.Now().UnixMilli())

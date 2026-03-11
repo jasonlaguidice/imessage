@@ -1,48 +1,52 @@
-.idea
+# IDE / editor
+.idea/
+.vscode/
 
+# Config & runtime data (generated per-install)
 *.yaml
 !.pre-commit-config.yaml
 !example-config.yaml
 !example-registration.yaml
-
 *.session
 *.json
 *.db*
 *.log
 
+# Built binaries
 /mautrix-imessage
 /mautrix-imessage-v2
+/mautrix-imessage.app/
+/mautrix-imessage-v2.app/
 /bbctl
-/mautrix-imessage.app
 /extract-key
 /extract-key-intel
 /start
-/data/
 
 # Rust build artifacts
 librustpushgo.a
 **/target/
-state/
-rustpush/certs/fairplay/
-
-
-# Development/test prompt files
-ENDTOEND_TEST_PROMPT.md
-RUSTPUSH_INTEGRATION_PROMPT.md
-prompts/
-mautrix-imessage-v2.app/
 .build-commit
-.DS_Store
-.apl.history
+
+# Data / state directories
+/data/
+state/
+
+# Tool build outputs
 tools/apl/
 tools/extract-key-app/.build/
 tools/extract-key-app/ExtractKey.app/
 tools/nac-relay-app/.build/
 tools/nac-relay-app/NACRelay.app/
-!rustpush/open-absinthe/src/bin/
-_todo/
 
-# Local reference app (not part of this repo's source of truth)
-/openbubbles-app-rustpush/
-docs/rustpush-bridge-parity-notes.md
+# Upstream rustpush (fetched at build time)
+/third_party/
+
+# OS junk
+.DS_Store
+
+# Local dev / scratch
+.apl.history
 .rollback/
+_todo/
+prompts/
+/openbubbles-app-rustpush/

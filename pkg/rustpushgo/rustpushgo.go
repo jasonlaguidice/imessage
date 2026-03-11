@@ -3742,6 +3742,13 @@ type WrappedMessage struct {
 	IsSmsActivation           *bool
 	IsSmsConfirmSent          *bool
 	IsMarkUnread              bool
+	IsMessageReadOnDevice     bool
+	IsUnschedule              bool
+	IsUpdateExtension         bool
+	UpdateExtensionForUuid    *string
+	IsUpdateProfileSharing    bool
+	IsNotifyAnyways           bool
+	IsSetTranscriptBackground bool
 	StickerData               *[]byte
 	StickerMime               *string
 	IsShareProfile            bool
@@ -3807,6 +3814,13 @@ func (r *WrappedMessage) Destroy() {
 	FfiDestroyerOptionalBool{}.Destroy(r.IsSmsActivation)
 	FfiDestroyerOptionalBool{}.Destroy(r.IsSmsConfirmSent)
 	FfiDestroyerBool{}.Destroy(r.IsMarkUnread)
+	FfiDestroyerBool{}.Destroy(r.IsMessageReadOnDevice)
+	FfiDestroyerBool{}.Destroy(r.IsUnschedule)
+	FfiDestroyerBool{}.Destroy(r.IsUpdateExtension)
+	FfiDestroyerOptionalString{}.Destroy(r.UpdateExtensionForUuid)
+	FfiDestroyerBool{}.Destroy(r.IsUpdateProfileSharing)
+	FfiDestroyerBool{}.Destroy(r.IsNotifyAnyways)
+	FfiDestroyerBool{}.Destroy(r.IsSetTranscriptBackground)
 	FfiDestroyerOptionalBytes{}.Destroy(r.StickerData)
 	FfiDestroyerOptionalString{}.Destroy(r.StickerMime)
 	FfiDestroyerBool{}.Destroy(r.IsShareProfile)
@@ -3881,6 +3895,13 @@ func (c FfiConverterTypeWrappedMessage) Read(reader io.Reader) WrappedMessage {
 		FfiConverterOptionalBoolINSTANCE.Read(reader),
 		FfiConverterOptionalBoolINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
+		FfiConverterBoolINSTANCE.Read(reader),
 		FfiConverterOptionalBytesINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterBoolINSTANCE.Read(reader),
@@ -3951,6 +3972,13 @@ func (c FfiConverterTypeWrappedMessage) Write(writer io.Writer, value WrappedMes
 	FfiConverterOptionalBoolINSTANCE.Write(writer, value.IsSmsActivation)
 	FfiConverterOptionalBoolINSTANCE.Write(writer, value.IsSmsConfirmSent)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsMarkUnread)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsMessageReadOnDevice)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsUnschedule)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsUpdateExtension)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.UpdateExtensionForUuid)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsUpdateProfileSharing)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsNotifyAnyways)
+	FfiConverterBoolINSTANCE.Write(writer, value.IsSetTranscriptBackground)
 	FfiConverterOptionalBytesINSTANCE.Write(writer, value.StickerData)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.StickerMime)
 	FfiConverterBoolINSTANCE.Write(writer, value.IsShareProfile)

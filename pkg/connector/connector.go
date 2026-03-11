@@ -310,6 +310,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		cloudStore:         newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
 		recentUnsends:         make(map[string]time.Time),
 		recentOutboundUnsends: make(map[string]time.Time),
+		sharedProfileFetch:    make(map[string]sharedProfileFetchState),
 		smsPortals:            make(map[string]bool),
 		imGroupNames:        make(map[string]string),
 		imGroupGuids:        make(map[string]string),

@@ -834,6 +834,7 @@ func completeLoginWithMeta(
 		cloudStore:         newCloudBackfillStore(main.Bridge.DB.Database, loginID),
 		recentUnsends:         make(map[string]time.Time),
 		recentOutboundUnsends: make(map[string]time.Time),
+		sharedProfileFetch:    make(map[string]sharedProfileFetchState),
 		smsPortals:            make(map[string]bool),
 		imGroupNames:        make(map[string]string),
 		imGroupGuids:        make(map[string]string),

@@ -9,7 +9,11 @@ UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
 RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis rustpush/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard rustpush/open-absinthe/build.rs)
+# rustpush source root (default: upstream checkout in third_party/).
+# Override at invocation time, e.g.:
+#   make RUSTPUSH_DIR=/path/to/rustpush build
+RUSTPUSH_DIR ?= third_party/rustpush-upstream
+RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
@@ -94,7 +98,57 @@ else
   CARGO_FEATURES := --features hardware-key
 endif
 
-$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
+UPSTREAM_REPO := https://github.com/OpenBubbles/rustpush.git
+PATCH_DIR     := patches/rustpush-upstream
+FAIRPLAY_CERTS := 4056631661436364584235346952193 \
+                  4056631661436364584235346952194 \
+                  4056631661436364584235346952195 \
+                  4056631661436364584235346952196 \
+                  4056631661436364584235346952197 \
+                  4056631661436364584235346952198 \
+                  4056631661436364584235346952199 \
+                  4056631661436364584235346952200 \
+                  4056631661436364584235346952201 \
+                  4056631661436364584235346952208
+
+.PHONY: ensure-rustpush-source
+
+# Fetch upstream rustpush, generate FairPlay cert stubs, apply patches – all inline.
+ensure-rustpush-source:
+	@if [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
+		if [ ! -d third_party/rustpush-upstream/.git ]; then \
+			echo "Cloning upstream rustpush..."; \
+			mkdir -p third_party; \
+			git clone --recurse-submodules $(UPSTREAM_REPO) third_party/rustpush-upstream; \
+		fi; \
+		if [ ! -d third_party/rustpush-upstream/certs/fairplay ]; then \
+			echo "Generating FairPlay cert stubs..."; \
+			mkdir -p third_party/rustpush-upstream/certs/fairplay; \
+			for name in $(FAIRPLAY_CERTS); do \
+				cp third_party/rustpush-upstream/certs/legacy-fairplay/fairplay.crt \
+				   third_party/rustpush-upstream/certs/fairplay/$$name.crt; \
+				cp third_party/rustpush-upstream/certs/legacy-fairplay/fairplay.pem \
+				   third_party/rustpush-upstream/certs/fairplay/$$name.pem; \
+			done; \
+		fi; \
+		echo "Applying upstream compatibility overlays..."; \
+		for patch in rustpush-core.patch icloud-auth.patch; do \
+			case $$patch in \
+				icloud-auth.patch) repo_dir=third_party/rustpush-upstream/apple-private-apis/icloud-auth ;; \
+				*) repo_dir=third_party/rustpush-upstream ;; \
+			esac; \
+			if git -C $$repo_dir apply --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
+				git -C $$repo_dir apply $(CURDIR)/$(PATCH_DIR)/$$patch; \
+				echo "  applied $$patch"; \
+			elif git -C $$repo_dir apply --reverse --check $(CURDIR)/$(PATCH_DIR)/$$patch >/dev/null 2>&1; then \
+				echo "  already applied $$patch"; \
+			else \
+				echo "error: failed to apply $$patch" >&2; exit 1; \
+			fi; \
+		done; \
+	fi
+
+$(RUST_LIB): ensure-rustpush-source $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 
