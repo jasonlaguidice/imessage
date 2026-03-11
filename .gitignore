@@ -12,6 +12,7 @@
 
 /mautrix-imessage
 /mautrix-imessage-v2
+/bbctl
 /mautrix-imessage.app
 /extract-key
 /extract-key-intel
@@ -40,3 +41,7 @@ tools/nac-relay-app/.build/
 tools/nac-relay-app/NACRelay.app/
 !rustpush/open-absinthe/src/bin/
 _todo/
+
+# Local reference app (not part of this repo's source of truth)
+/openbubbles-app-rustpush/
+docs/rustpush-bridge-parity-notes.md

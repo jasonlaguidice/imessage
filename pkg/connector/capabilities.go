@@ -27,8 +27,10 @@ var caps = &event.RoomFeatures{
 	ID: "fi.mau.imessage.capabilities.2025_03",
 
 	Formatting: map[event.FormattingFeature]event.CapabilitySupportLevel{
-		event.FmtBold:   event.CapLevelDropped,
-		event.FmtItalic: event.CapLevelDropped,
+		event.FmtBold:          event.CapLevelFullySupported,
+		event.FmtItalic:        event.CapLevelFullySupported,
+		event.FmtUnderline:     event.CapLevelFullySupported,
+		event.FmtStrikethrough: event.CapLevelFullySupported,
 	},
 	File: map[event.CapabilityMsgType]*event.FileFeatures{
 		event.MsgImage: {
@@ -77,10 +79,19 @@ var caps = &event.RoomFeatures{
 			MaxSize: iMessageMaxFileSize,
 		},
 	},
-	Reply:               event.CapLevelFullySupported,
-	Edit:                event.CapLevelFullySupported,
-	Delete:              event.CapLevelFullySupported,
-	DeleteChat:          true,
+	Reply:      event.CapLevelFullySupported,
+	Edit:       event.CapLevelFullySupported,
+	Delete:     event.CapLevelFullySupported,
+	DeleteChat: true,
+	State: map[string]*event.StateFeatures{
+		event.StateRoomName.Type:   {Level: event.CapLevelFullySupported},
+		event.StateRoomAvatar.Type: {Level: event.CapLevelFullySupported},
+	},
+	MemberActions: map[event.MemberAction]event.CapabilitySupportLevel{
+		event.MemberActionInvite: event.CapLevelFullySupported,
+		event.MemberActionKick:   event.CapLevelFullySupported,
+		event.MemberActionLeave:  event.CapLevelFullySupported,
+	},
 	Reaction:            event.CapLevelFullySupported,
 	ReactionCount:       1,
 	ReadReceipts:        true,
@@ -90,9 +101,12 @@ var caps = &event.RoomFeatures{
 var capsDM *event.RoomFeatures
 
 func init() {
-	c := *caps
-	capsDM = &c
+	capsDM = caps.Clone()
 	capsDM.ID = "fi.mau.imessage.capabilities.2025_03+dm"
+	delete(capsDM.State, event.StateRoomName.Type)
+	delete(capsDM.State, event.StateRoomAvatar.Type)
+	delete(capsDM.MemberActions, event.MemberActionInvite)
+	delete(capsDM.MemberActions, event.MemberActionKick)
 }
 
 var generalCaps = &bridgev2.NetworkGeneralCapabilities{

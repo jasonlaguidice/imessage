@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"html"
 	"image"
-	"math"
 	"image/jpeg"
+	"math"
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
@@ -76,7 +76,6 @@ type failedAttachmentEntry struct {
 }
 
 const maxAttachmentRetries = 3
-
 
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
@@ -260,6 +259,9 @@ var _ bridgev2.IdentifierResolvingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*IMClient)(nil)
 var _ bridgev2.BackfillingNetworkAPIWithLimits = (*IMClient)(nil)
 var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
+var _ bridgev2.RoomNameHandlingNetworkAPI = (*IMClient)(nil)
+var _ bridgev2.RoomAvatarHandlingNetworkAPI = (*IMClient)(nil)
+var _ bridgev2.MembershipHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
 
@@ -433,9 +435,9 @@ func (c *IMClient) sendGhostReadReceipt(
 		"ts": readTime.UnixMilli(),
 	}
 	req := &mautrix.ReqSetReadMarkers{
-		Read:            msg.MXID,
-		FullyRead:       msg.MXID,
-		BeeperReadExtra: extraData,
+		Read:                 msg.MXID,
+		FullyRead:            msg.MXID,
+		BeeperReadExtra:      extraData,
 		BeeperFullyReadExtra: extraData,
 	}
 	err = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
@@ -824,7 +826,15 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		return
 	}
 	if msg.IsPeerCacheInvalidate {
-		log.Debug().Msg("Peer cache invalidated")
+		log.Debug().Str("sender", ptrStringOr(msg.Sender, "")).Msg("Peer cache invalidated")
+		if msg.Sender != nil && *msg.Sender != "" && !c.isMyHandle(*msg.Sender) {
+			go func(sender string) {
+				conv := rustpushgo.WrappedConversation{Participants: []string{c.handle, sender}}
+				if err := c.client.SendPeerCacheInvalidate(conv, c.handle); err != nil {
+					log.Warn().Err(err).Str("sender", sender).Msg("Failed to send peer cache invalidate response")
+				}
+			}(ptrStringOr(msg.Sender, ""))
+		}
 		return
 	}
 	if msg.IsMoveToRecycleBin || msg.IsPermanentDelete {
@@ -849,6 +859,24 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 	if msg.IsIconChange {
 		go c.handleIconChange(log, msg)
+		return
+	}
+
+	// Handle informational message types that don't produce Matrix events
+	if msg.IsMarkUnread {
+		log.Debug().Str("sender", ptrStringOr(msg.Sender, "")).Msg("Received mark-unread request (ignored)")
+		return
+	}
+	if msg.IsRecoverChat {
+		log.Info().Str("sender", ptrStringOr(msg.Sender, "")).Msg("Received recover-chat request (ignored)")
+		return
+	}
+	if msg.IsSmsActivation != nil {
+		log.Debug().Bool("enable", *msg.IsSmsActivation).Msg("Received SMS activation toggle (ignored)")
+		return
+	}
+	if msg.IsSmsConfirmSent != nil {
+		log.Debug().Bool("confirmed", *msg.IsSmsConfirmSent).Msg("Received SMS confirm sent (ignored)")
 		return
 	}
 
@@ -1144,8 +1172,8 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 					return lc.Str("msg_uuid", attID)
 				},
 			},
-			Data:               attMsg,
-			ID:                 makeMessageID(attID),
+			Data: attMsg,
+			ID:   makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
 				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding)
 			},
@@ -1194,6 +1222,9 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 	}
 	newText := ptrStringOr(msg.EditNewText, "")
 
+	// Capture HTML in a local var for the closure
+	editHtmlVal := msg.Html
+
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[string]{
 		EventMeta: simplevent.EventMeta{
 			Type:      bridgev2.RemoteEventEdit,
@@ -1209,14 +1240,19 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 			if len(existing) > 0 {
 				targetPart = existing[0]
 			}
+			content := &event.MessageEventContent{
+				MsgType: event.MsgText,
+				Body:    text,
+			}
+			if editHtmlVal != nil && *editHtmlVal != "" {
+				content.Format = event.FormatHTML
+				content.FormattedBody = *editHtmlVal
+			}
 			return &bridgev2.ConvertedEdit{
 				ModifiedParts: []*bridgev2.ConvertedEditPart{{
 					Part: targetPart,
 					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgText,
-						Body:    text,
-					},
+					Content: content,
 				}},
 			}, nil
 		},
@@ -1521,9 +1557,92 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	if msg.IsPermanentDelete {
 		deleteType = "PermanentDelete"
 	}
-	// Apple-initiated chat deletes are intentionally ignored. The Beeper
-	// portal is not touched — only local Beeper deletes remove portals.
-	log.Info().Str("delete_type", deleteType).Msg("Ignoring incoming Apple chat delete (bidirectional delete disabled)")
+	portalKey := c.resolveDeletePortalKey(log, msg)
+	if portalKey.ID == "" || portalKey.ID == "unknown" {
+		log.Warn().
+			Str("delete_type", deleteType).
+			Str("chat_guid", ptrStringOr(msg.DeleteChatGuid, "")).
+			Strs("participants", msg.DeleteChatParticipants).
+			Msg("Couldn't resolve portal for incoming Apple delete event")
+		return
+	}
+
+	sender := c.makeEventSender(msg.Sender)
+	if sender.Sender == "" {
+		sender = bridgev2.EventSender{IsFromMe: true, SenderLogin: c.UserLogin.ID, Sender: makeUserID(c.handle)}
+	}
+
+	timestamp := time.Now()
+	if msg.TimestampMs > 0 {
+		timestamp = time.UnixMilli(int64(msg.TimestampMs))
+	}
+
+	if len(msg.DeleteMessageUuids) == 0 {
+		// Chat-level delete target.
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.ChatDelete{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventChatDelete,
+				PortalKey: portalKey,
+				Sender:    sender,
+				Timestamp: timestamp,
+			},
+			OnlyForMe: true,
+			Children:  false,
+		})
+		log.Info().Str("delete_type", deleteType).Str("portal_id", string(portalKey.ID)).Msg("Queued chat delete from incoming Apple delete event")
+		return
+	}
+
+	// Message-level delete target.
+	for _, target := range msg.DeleteMessageUuids {
+		if target == "" {
+			continue
+		}
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventMessageRemove,
+				PortalKey: portalKey,
+				Sender:    sender,
+				Timestamp: timestamp,
+			},
+			TargetMessage: makeMessageID(target),
+			OnlyForMe:     true,
+		})
+	}
+	log.Info().
+		Str("delete_type", deleteType).
+		Str("portal_id", string(portalKey.ID)).
+		Int("message_count", len(msg.DeleteMessageUuids)).
+		Msg("Queued message deletes from incoming Apple delete event")
+}
+
+func (c *IMClient) resolveDeletePortalKey(log zerolog.Logger, msg rustpushgo.WrappedMessage) networkid.PortalKey {
+	ctx := context.Background()
+
+	if msg.DeleteChatGuid != nil && *msg.DeleteChatGuid != "" && c.cloudStore != nil {
+		if portalID, err := c.cloudStore.getChatPortalID(ctx, *msg.DeleteChatGuid); err != nil {
+			log.Warn().Err(err).Str("chat_guid", *msg.DeleteChatGuid).Msg("Failed to resolve portal by cloud chat ID")
+		} else if portalID != "" {
+			return networkid.PortalKey{ID: networkid.PortalID(portalID), Receiver: c.UserLogin.ID}
+		}
+	}
+
+	if msg.DeleteChatGroupId != nil && *msg.DeleteChatGroupId != "" {
+		return networkid.PortalKey{ID: networkid.PortalID("gid:" + strings.ToLower(*msg.DeleteChatGroupId)), Receiver: c.UserLogin.ID}
+	}
+
+	if len(msg.DeleteChatParticipants) > 0 {
+		return c.makePortalKey(msg.DeleteChatParticipants, nil, msg.Sender, msg.DeleteChatGroupId)
+	}
+
+	if msg.Sender != nil && *msg.Sender != "" {
+		normalized := normalizeIdentifierForPortalID(*msg.Sender)
+		if normalized != "" {
+			return networkid.PortalKey{ID: networkid.PortalID(normalized), Receiver: c.UserLogin.ID}
+		}
+	}
+
+	return networkid.PortalKey{ID: "unknown", Receiver: c.UserLogin.ID}
 }
 
 func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -1822,8 +1941,15 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
+	// Extract HTML formatting for iMessage rich text
+	var htmlToSend *string
+	if msg.Content.Format == event.FormatHTML && msg.Content.FormattedBody != "" {
+		h := msg.Content.FormattedBody
+		htmlToSend = &h
+	}
+
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := c.client.SendMessage(conv, textToSend, c.handle, replyGuid, replyPart)
+	uuid, err := c.client.SendMessage(conv, textToSend, htmlToSend, c.handle, replyGuid, replyPart)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
@@ -2007,7 +2133,13 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	_ = matrixEdited
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart)
+	// When FileName is set, Body contains the caption text rather than the filename.
+	var caption *string
+	if msg.Content.FileName != "" && msg.Content.Body != "" {
+		caption = &msg.Content.Body
+	}
+
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -2060,7 +2192,12 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	conv := c.portalToConversation(msg.Portal)
 	targetGUID := string(msg.EditTarget.ID)
 
-	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
+	var editHtml *string
+	if msg.Content.Format == event.FormatHTML && msg.Content.FormattedBody != "" {
+		h := msg.Content.FormattedBody
+		editHtml = &h
+	}
+	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, editHtml, c.handle)
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
@@ -2122,9 +2259,9 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 }
 
 // HandleMatrixDeleteChat is called when the user deletes a chat in Matrix/Beeper.
-// It cleans up local state (echo detection, local DB) but does NOT touch Apple:
-// no MoveToRecycleBin APNs message, no CloudKit record deletion. The chat stays
-// on the user's Apple devices; only the Beeper portal is removed.
+// It attempts to mirror that operation to Apple by sending MoveToRecycleBin /
+// PermanentDelete and deleting matching CloudKit records, then cleans up local
+// state for echo suppression and restart safety.
 func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.MatrixDeleteChat) error {
 	if c.client == nil {
 		return bridgev2.ErrNotLoggedIn
@@ -2141,6 +2278,21 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 
 	log := zerolog.Ctx(ctx)
 	portalID := string(msg.Portal.ID)
+	conv := c.portalToConversation(msg.Portal)
+
+	chatIdentifiers := c.resolveDeleteChatIdentifiers(ctx, msg.Portal)
+	if len(chatIdentifiers) == 0 {
+		log.Warn().Str("portal_id", portalID).Msg("No Apple chat identifiers found for delete mirroring")
+	}
+	for _, chatID := range chatIdentifiers {
+		if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatID); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Str("chat_identifier", chatID).Msg("Failed to send MoveToRecycleBin")
+		}
+		if c.Main.Config.CloudKitBackfill {
+			c.findAndDeleteCloudChatByIdentifier(log.With().Str("portal_id", portalID).Logger(), chatID)
+			c.findAndDeleteCloudMessagesByChatIdentifier(log.With().Str("portal_id", portalID).Logger(), chatID)
+		}
+	}
 
 	// Mark as deleted in memory — NOT a tombstone, just echo protection.
 	// New messages from this contact should still create fresh portals.
@@ -2176,6 +2328,52 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 	return nil
 }
 
+// resolveDeleteChatIdentifiers returns CloudKit chat identifiers that can be
+// used for MoveToRecycleBin/PermanentDelete operations.
+func (c *IMClient) resolveDeleteChatIdentifiers(ctx context.Context, portal *bridgev2.Portal) []string {
+	portalID := string(portal.ID)
+	isGroup := strings.HasPrefix(portalID, "gid:") || strings.Contains(portalID, ",")
+	service := "iMessage"
+	if c.isPortalSMS(portalID) {
+		service = "SMS"
+	}
+	seen := make(map[string]struct{}, 2)
+	out := make([]string, 0, 2)
+
+	add := func(id string) {
+		if id == "" {
+			return
+		}
+		if _, ok := seen[id]; ok {
+			return
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+
+	if c.cloudStore != nil {
+		if ids, err := c.cloudStore.listCloudChatIDsByPortalID(ctx, portalID); err == nil {
+			for _, id := range ids {
+				add(id)
+			}
+		}
+	}
+
+	// Fallback when cloud metadata doesn't exist yet.
+	// Matches openbubbles behavior:
+	// - DM: <service>;-;<participant>
+	// - Group: <service>;+;chat<random>
+	if len(out) == 0 {
+		if isGroup {
+			add(fmt.Sprintf("%s;+;chat%d", service, time.Now().UnixNano()))
+		} else {
+			add(fmt.Sprintf("%s;-;%s", service, stripIdentifierPrefix(portalID)))
+		}
+	}
+
+	return out
+}
+
 // findAndDeleteCloudChatByIdentifier syncs all chat records from CloudKit,
 // finds ones matching the given chat_identifier (e.g. "iMessage;-;user@example.com"),
 // and deletes them. Used as a fallback when local DB doesn't have record_names.
@@ -2183,6 +2381,148 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 // Note: This uses the same CloudSyncChats API starting from nil token (full scan).
 // CloudKit change tokens are client-side state — this does NOT advance the main
 // sync controller's server-side watermark or cause it to miss changes.
+// HandleMatrixRoomName is called when a Matrix user renames a group chat.
+// It sends an iMessage RenameMessage so all of the user's Apple devices update.
+func (c *IMClient) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.MatrixRoomName) (bool, error) {
+	if c.client == nil {
+		return false, bridgev2.ErrNotLoggedIn
+	}
+	portal := msg.Portal
+	portalID := string(portal.ID)
+	if !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
+		return false, fmt.Errorf("room name changes are only supported in group chats")
+	}
+
+	newName := msg.Content.Name
+	conv := c.portalToConversation(portal)
+
+	if _, err := c.client.SendRenameGroup(conv, newName, c.handle); err != nil {
+		return false, fmt.Errorf("failed to send group rename to iMessage: %w", err)
+	}
+
+	// Update in-memory name cache and portal metadata for immediate consistency.
+	c.imGroupNamesMu.Lock()
+	c.imGroupNames[portalID] = newName
+	c.imGroupNamesMu.Unlock()
+	if meta, ok := portal.Metadata.(*PortalMetadata); ok {
+		meta.GroupName = newName
+	}
+
+	return true, nil
+}
+
+// HandleMatrixRoomAvatar is called when a Matrix user changes the group chat icon.
+// It downloads the avatar from Matrix and uploads it to MMCS, then sends an
+// IconChange to all of the user's Apple devices.
+func (c *IMClient) HandleMatrixRoomAvatar(ctx context.Context, msg *bridgev2.MatrixRoomAvatar) (bool, error) {
+	if c.client == nil {
+		return false, bridgev2.ErrNotLoggedIn
+	}
+	portal := msg.Portal
+	portalID := string(portal.ID)
+	if !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
+		return false, fmt.Errorf("room avatar changes are only supported in group chats")
+	}
+
+	groupVersion := uint64(time.Now().Unix())
+	conv := c.portalToConversation(portal)
+
+	if msg.Content.URL == "" {
+		// Empty URL means the avatar was removed.
+		if _, err := c.client.SendIconClear(conv, groupVersion, c.handle); err != nil {
+			return false, fmt.Errorf("failed to clear group icon on iMessage: %w", err)
+		}
+		if meta, ok := portal.Metadata.(*PortalMetadata); ok {
+			meta.GroupVersion = groupVersion
+		}
+		return true, nil
+	}
+
+	data, err := c.Main.Bridge.Bot.DownloadMedia(ctx, msg.Content.URL, msg.Content.MSC3414File)
+	if err != nil {
+		return false, fmt.Errorf("failed to download avatar from Matrix: %w", err)
+	}
+
+	if _, err := c.client.SendIconChange(conv, data, groupVersion, c.handle); err != nil {
+		return false, fmt.Errorf("failed to send group icon change to iMessage: %w", err)
+	}
+	if meta, ok := portal.Metadata.(*PortalMetadata); ok {
+		meta.GroupVersion = groupVersion
+	}
+
+	return true, nil
+}
+
+// HandleMatrixMembership is called when a Matrix user invites or kicks someone
+// in a group chat. It computes the new full participant list and sends a
+// ChangeParticipants message to the user's Apple devices.
+func (c *IMClient) HandleMatrixMembership(ctx context.Context, msg *bridgev2.MatrixMembershipChange) (*bridgev2.MatrixMembershipResult, error) {
+	if c.client == nil {
+		return nil, bridgev2.ErrNotLoggedIn
+	}
+	portal := msg.Portal
+	portalID := string(portal.ID)
+	if !strings.HasPrefix(portalID, "gid:") && !strings.Contains(portalID, ",") {
+		return nil, fmt.Errorf("membership changes are only supported in group chats")
+	}
+
+	// Resolve the target's iMessage identifier from the Ghost.
+	ghost, ok := msg.Target.(*bridgev2.Ghost)
+	if !ok {
+		// Target is the bridge user themselves — no iMessage operation needed.
+		return nil, nil
+	}
+	targetID := string(ghost.ID)
+
+	// Get the current member list for the group.
+	current := c.resolveGroupMembers(ctx, portalID)
+
+	var newParticipants []string
+	switch msg.Type {
+	case bridgev2.Invite, bridgev2.Join:
+		// Validate that the invitee has an iMessage account.
+		valid := c.client.ValidateTargets([]string{targetID}, c.handle)
+		if len(valid) == 0 {
+			return nil, fmt.Errorf("user %s does not have an active iMessage account", targetID)
+		}
+		targetID = valid[0] // use the canonical form returned by IDS
+		// Build the new list: existing members + new member (deduplicated).
+		seen := make(map[string]struct{}, len(current)+1)
+		for _, p := range current {
+			seen[p] = struct{}{}
+			newParticipants = append(newParticipants, p)
+		}
+		if _, exists := seen[targetID]; !exists {
+			newParticipants = append(newParticipants, targetID)
+		}
+
+	case bridgev2.Kick, bridgev2.Leave:
+		// Build the new list: existing members minus the removed member.
+		targetNorm := strings.ToLower(stripIdentifierPrefix(targetID))
+		for _, p := range current {
+			if strings.ToLower(stripIdentifierPrefix(p)) != targetNorm {
+				newParticipants = append(newParticipants, p)
+			}
+		}
+
+	default:
+		// Other membership events (ban, profile change, etc.) are not bridged.
+		return nil, nil
+	}
+
+	groupVersion := uint64(time.Now().Unix())
+	conv := c.portalToConversation(portal)
+
+	if _, err := c.client.SendChangeParticipants(conv, newParticipants, groupVersion, c.handle); err != nil {
+		return nil, fmt.Errorf("failed to send participant change to iMessage: %w", err)
+	}
+	if meta, ok := portal.Metadata.(*PortalMetadata); ok {
+		meta.GroupVersion = groupVersion
+	}
+
+	return nil, nil
+}
+
 func (c *IMClient) findAndDeleteCloudChatByIdentifier(log zerolog.Logger, chatIdentifier string) {
 	log.Info().Str("chat_identifier", chatIdentifier).Msg("Querying CloudKit for chat records to delete")
 
@@ -5027,10 +5367,11 @@ func (c *IMClient) resolveGroupMembers(ctx context.Context, portalID string) []s
 
 // resolveGroupName determines the best display name for a group portal.
 // Priority: 1) in-memory cache (user-set iMessage group name from real-time
-//              protocol cv_name, e.g. when someone explicitly renames a group)
-//           2) CloudKit display_name (user-set group name persisted to iCloud,
-//              the "name" field on CKChatRecord = cv_name from chat.db)
-//           3) contact-resolved member names via buildGroupName
+//
+//	   protocol cv_name, e.g. when someone explicitly renames a group)
+//	2) CloudKit display_name (user-set group name persisted to iCloud,
+//	   the "name" field on CKChatRecord = cv_name from chat.db)
+//	3) contact-resolved member names via buildGroupName
 func (c *IMClient) resolveGroupName(ctx context.Context, portalID string) string {
 	// 1) In-memory cache (populated from real-time iMessage rename messages)
 	c.imGroupNamesMu.RLock()
@@ -5212,6 +5553,17 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 		} else {
 			content.Body = *msg.Subject
 		}
+	} else if msg.Html != nil && *msg.Html != "" {
+		content.Format = event.FormatHTML
+		content.FormattedBody = *msg.Html
+	}
+
+	if msg.Effect != nil && *msg.Effect != "" {
+		if content.Format != event.FormatHTML {
+			content.Format = event.FormatHTML
+			content.FormattedBody = html.EscapeString(content.Body)
+		}
+		content.FormattedBody = fmt.Sprintf(`<span data-mx-imessage-effect="%s">%s</span>`, html.EscapeString(*msg.Effect), content.FormattedBody)
 	}
 
 	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
@@ -5341,6 +5693,11 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			Duration: durationMs,
 		}
 		content.Info.Size = len(inlineData)
+	}
+
+	// Also mark as voice if the iMessage voice flag is set
+	if attMsg.WrappedMessage.IsVoice && content.MSC3245Voice == nil {
+		content.MSC3245Voice = &event.MSC3245Voice{}
 	}
 
 	if inlineData != nil && intent != nil {

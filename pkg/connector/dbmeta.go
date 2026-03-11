@@ -13,9 +13,10 @@ import (
 )
 
 type PortalMetadata struct {
-	ThreadID   string `json:"thread_id,omitempty"`
-	SenderGuid string `json:"sender_guid,omitempty"` // Persistent iMessage group UUID
-	GroupName  string `json:"group_name,omitempty"`   // iMessage cv_name for outbound routing
+	ThreadID     string `json:"thread_id,omitempty"`
+	SenderGuid   string `json:"sender_guid,omitempty"`   // Persistent iMessage group UUID
+	GroupName    string `json:"group_name,omitempty"`    // iMessage cv_name for outbound routing
+	GroupVersion uint64 `json:"group_version,omitempty"` // Monotonically increasing group version
 }
 
 type GhostMetadata struct{}

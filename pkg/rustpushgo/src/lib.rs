@@ -15,8 +15,10 @@ use rustpush::{
     APSState, Attachment, AttachmentType, ConversationData, DeleteTarget, EditMessage,
     IDSNGMIdentity, IDSUser, IMClient, LoginDelegate, MADRID_SERVICE, MMCSFile, Message,
     MessageInst, MessagePart, MessageParts, MessageType, MoveToRecycleBinMessage, NormalMessage, PermanentDeleteMessage,
-    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, UnsendMessage,
+    OperatedChat, OSConfig, ReactMessage, ReactMessageType, Reaction, RenameMessage,
+    ChangeParticipantMessage, IconChangeMessage, UnsendMessage,
     IndexedMessagePart, LinkMeta, LPLinkMetadata, RichLinkImageAttachmentSubstitute, NSURL,
+    TextFlags, TextFormat, TextEffect,
     TokenProvider, MobileMeDelegateResponse,
     base64_decode, encode_hex, ResourceState, decode_hex, base64_encode,
     cloudkit::{ZoneDeleteOperation, CloudKitSession},
@@ -910,6 +912,36 @@ pub struct WrappedMessage {
     // Pre-downloaded photo bytes for IconChange messages.
     // Some(bytes) only when is_icon_change=true, group_photo_cleared=false, and download succeeded.
     pub icon_change_photo_data: Option<Vec<u8>>,
+
+    // HTML-formatted text body. Some(...) when the message contains any non-plain
+    // formatting (bold, italic, underline, strikethrough, text effects, mentions).
+    // Go side should prefer this over `text` when present.
+    pub html: Option<String>,
+
+    // Voice message flag. True for voice memo / audio message attachments.
+    pub is_voice: bool,
+
+    // Screen/bubble effect identifier (e.g., "com.apple.MobileSMS.expressivesend.impact").
+    pub effect: Option<String>,
+
+    // Scheduled send timestamp in milliseconds. Some(ms) when message is scheduled.
+    pub scheduled_ms: Option<u64>,
+
+    // Recover chat: true when a previously deleted chat is being restored.
+    pub is_recover_chat: bool,
+
+    // SMS activation: true = activation request, false = deactivation.
+    pub is_sms_activation: Option<bool>,
+
+    // SMS confirmed sent status.
+    pub is_sms_confirm_sent: Option<bool>,
+
+    // Mark unread flag.
+    pub is_mark_unread: bool,
+
+    // Sticker data for sticker tapback reactions (tapback_type=7).
+    pub sticker_data: Option<Vec<u8>>,
+    pub sticker_mime: Option<String>,
 }
 
 #[derive(uniffi::Record, Clone)]
@@ -1159,6 +1191,181 @@ fn apple_timestamp_ns_to_unix_ms(timestamp_ns: i64) -> i64 {
     APPLE_EPOCH_UNIX_MS.saturating_add(timestamp_ns / 1_000_000)
 }
 
+/// Convert message parts into HTML. Returns Some(html) only if there is any
+/// non-plain formatting (bold/italic/underline/strikethrough, text effects,
+/// or mentions). Returns None for plain-text-only messages so the Go side can
+/// skip HTML encoding.
+fn parts_to_html(parts: &MessageParts) -> Option<String> {
+    let has_formatting = parts.0.iter().any(|p| match &p.part {
+        MessagePart::Text(_, fmt) => !matches!(fmt, TextFormat::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false })),
+        MessagePart::Mention(_, _) => true,
+        _ => false,
+    });
+    if !has_formatting {
+        return None;
+    }
+
+    let mut html = String::new();
+    for indexed_part in &parts.0 {
+        match &indexed_part.part {
+            MessagePart::Text(text, format) => {
+                let escaped = html_escape(text);
+                match format {
+                    TextFormat::Flags(flags) => {
+                        let mut open = String::new();
+                        let mut close = String::new();
+                        if flags.bold { open.push_str("<strong>"); close.insert_str(0, "</strong>"); }
+                        if flags.italic { open.push_str("<em>"); close.insert_str(0, "</em>"); }
+                        if flags.underline { open.push_str("<u>"); close.insert_str(0, "</u>"); }
+                        if flags.strikethrough { open.push_str("<del>"); close.insert_str(0, "</del>"); }
+                        html.push_str(&open);
+                        html.push_str(&escaped);
+                        html.push_str(&close);
+                    }
+                    TextFormat::Effect(effect) => {
+                        let effect_name = match effect {
+                            TextEffect::Big => "big",
+                            TextEffect::Small => "small",
+                            TextEffect::Shake => "shake",
+                            TextEffect::Nod => "nod",
+                            TextEffect::Explode => "explode",
+                            TextEffect::Ripple => "ripple",
+                            TextEffect::Bloom => "bloom",
+                            TextEffect::Jitter => "jitter",
+                        };
+                        html.push_str(&format!(
+                            "<span data-mx-imessage-effect=\"{}\">",
+                            effect_name
+                        ));
+                        html.push_str(&escaped);
+                        html.push_str("</span>");
+                    }
+                }
+            }
+            MessagePart::Mention(uri, display) => {
+                let escaped_display = html_escape(display);
+                let escaped_uri = html_escape(uri);
+                html.push_str(&format!(
+                    "<a href=\"{}\">@{}</a>",
+                    escaped_uri, escaped_display
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if html.is_empty() {
+        None
+    } else {
+        Some(html)
+    }
+}
+
+/// Minimal HTML escaping for user-provided text.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
+/// Parse Matrix HTML into iMessage MessageParts with formatting.
+/// Returns None if no formatting tags are found (plain text fallback).
+fn parse_html_to_parts(html: &str, plain_text: &str) -> Option<MessageParts> {
+    // Quick check: if no HTML tags at all, return None to use plain text
+    if !html.contains('<') {
+        return None;
+    }
+
+    let mut parts: Vec<IndexedMessagePart> = Vec::new();
+    let mut pos = 0;
+    let bytes = html.as_bytes();
+    let len = bytes.len();
+    // Track nested formatting state
+    let mut bold = false;
+    let mut italic = false;
+    let mut underline = false;
+    let mut strikethrough = false;
+
+    while pos < len {
+        if bytes[pos] == b'<' {
+            // Find end of tag
+            let tag_end = match html[pos..].find('>') {
+                Some(e) => pos + e + 1,
+                None => break,
+            };
+            let tag_content = &html[pos + 1..tag_end - 1].trim().to_lowercase();
+            match tag_content.as_str() {
+                "strong" | "b" => bold = true,
+                "/strong" | "/b" => bold = false,
+                "em" | "i" => italic = true,
+                "/em" | "/i" => italic = false,
+                "u" => underline = true,
+                "/u" => underline = false,
+                "del" | "s" | "strike" => strikethrough = true,
+                "/del" | "/s" | "/strike" => strikethrough = false,
+                "br" | "br/" | "br /" => {
+                    // Line break — emit as text
+                    let flags = TextFlags { bold, italic, underline, strikethrough };
+                    parts.push(IndexedMessagePart {
+                        part: MessagePart::Text("\n".to_string(), TextFormat::Flags(flags)),
+                        idx: None,
+                        ext: None,
+                    });
+                }
+                _ => {
+                    // Skip unknown tags (p, div, span, etc.)
+                }
+            }
+            pos = tag_end;
+        } else {
+            // Collect text until next tag
+            let text_end = html[pos..].find('<').map(|e| pos + e).unwrap_or(len);
+            let raw_text = &html[pos..text_end];
+            let decoded = html_unescape(raw_text);
+            if !decoded.is_empty() {
+                let flags = TextFlags { bold, italic, underline, strikethrough };
+                let format = if flags.bold || flags.italic || flags.underline || flags.strikethrough {
+                    TextFormat::Flags(flags)
+                } else {
+                    TextFormat::default()
+                };
+                parts.push(IndexedMessagePart {
+                    part: MessagePart::Text(decoded, format),
+                    idx: None,
+                    ext: None,
+                });
+            }
+            pos = text_end;
+        }
+    }
+
+    // If all parts are plain text (no formatting), return None
+    let has_formatting = parts.iter().any(|p| {
+        if let MessagePart::Text(_, fmt) = &p.part {
+            !matches!(fmt, TextFormat::Flags(TextFlags { bold: false, italic: false, underline: false, strikethrough: false }))
+        } else {
+            false
+        }
+    });
+
+    if !has_formatting || parts.is_empty() {
+        return None;
+    }
+
+    Some(MessageParts(parts))
+}
+
+/// Basic HTML entity unescaping.
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+     .replace("&lt;", "<")
+     .replace("&gt;", ">")
+     .replace("&quot;", "\"")
+     .replace("&#39;", "'")
+     .replace("&apos;", "'")
+}
+
 fn decode_continuation_token(token_b64: Option<String>) -> Result<Option<Vec<u8>>, WrappedError> {
     match token_b64 {
         Some(token) if !token.is_empty() => BASE64_STANDARD
@@ -1270,6 +1477,16 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
         is_icon_change: false,
         group_photo_cleared: false,
         icon_change_photo_data: None,
+        html: None,
+        is_voice: false,
+        effect: None,
+        scheduled_ms: None,
+        is_recover_chat: false,
+        is_sms_activation: None,
+        is_sms_confirm_sent: None,
+        is_mark_unread: false,
+        sticker_data: None,
+        sticker_mime: None,
     };
 
     match &msg.message {
@@ -1279,6 +1496,10 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.reply_guid = normal.reply_guid.clone();
             w.reply_part = normal.reply_part.clone();
             w.is_sms = matches!(normal.service, MessageType::SMS { .. });
+            w.html = parts_to_html(&normal.parts);
+            w.is_voice = normal.voice;
+            w.effect = normal.effect.clone();
+            w.scheduled_ms = normal.scheduled.as_ref().map(|s| s.ms);
 
             for indexed_part in &normal.parts.0 {
                 if let MessagePart::Attachment(att) = &indexed_part.part {
@@ -1370,12 +1591,26 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
                     w.tapback_type = Some(7);
                 }
             }
+            // For sticker reactions, try to extract the sticker image data
+            if let ReactMessageType::React { reaction: Reaction::Sticker { body, .. }, .. } = &react.reaction {
+                // Extract inline attachment data from the sticker body parts
+                for indexed_part in &body.0 {
+                    if let MessagePart::Attachment(att) = &indexed_part.part {
+                        if let AttachmentType::Inline(data) = &att.a_type {
+                            w.sticker_data = Some(data.clone());
+                            w.sticker_mime = Some(att.mime.clone());
+                            break;
+                        }
+                    }
+                }
+            }
         }
         Message::Edit(edit) => {
             w.is_edit = true;
             w.edit_target_uuid = Some(edit.tuuid.clone());
             w.edit_part = Some(edit.edit_part);
             w.edit_new_text = Some(edit.new_parts.raw_text());
+            w.html = parts_to_html(&edit.new_parts);
         }
         Message::Unsend(unsend) => {
             w.is_unsend = true;
@@ -1420,7 +1655,26 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
             w.is_icon_change = true;
             w.group_photo_cleared = change.file.is_none();
         }
-        _ => {}
+        Message::EnableSmsActivation(enable) => {
+            w.is_sms_activation = Some(*enable);
+        }
+        Message::SmsConfirmSent(status) => {
+            w.is_sms_confirm_sent = Some(*status);
+        }
+        Message::MarkUnread => {
+            w.is_mark_unread = true;
+        }
+        Message::RecoverChat(chat) => {
+            w.is_recover_chat = true;
+            populate_delete_target(&mut w, &DeleteTarget::Chat(chat.clone()));
+        }
+        Message::MessageReadOnDevice | Message::Unschedule |
+        Message::UpdateExtension(_) | Message::UpdateProfile(_) |
+        Message::UpdateProfileSharing(_) | Message::ShareProfile(_) |
+        Message::NotifyAnyways | Message::SetTranscriptBackground(_) => {
+            // These message types are received but not bridgeable to Matrix.
+            // Log at debug level in the Go callback; no fields to set.
+        }
     }
 
     w
@@ -2472,6 +2726,7 @@ impl Client {
         &self,
         conversation: WrappedConversation,
         text: String,
+        html: Option<String>,
         handle: String,
         reply_guid: Option<String>,
         reply_part: Option<String>,
@@ -2545,10 +2800,34 @@ impl Client {
             (text, None)
         };
 
-        let mut normal = NormalMessage::new(actual_text.clone(), service);
-        normal.link_meta = link_meta;
-        normal.reply_guid = reply_guid.clone();
-        normal.reply_part = reply_part.clone();
+        let parts = if let Some(ref html_str) = html {
+            parse_html_to_parts(html_str, &actual_text)
+        } else {
+            None
+        };
+
+        let mut normal = if let Some(parts) = parts {
+            let mut n = NormalMessage {
+                parts,
+                effect: None,
+                reply_guid: reply_guid.clone(),
+                reply_part: reply_part.clone(),
+                service: service.clone(),
+                subject: None,
+                app: None,
+                link_meta,
+                voice: false,
+                scheduled: None,
+                embedded_profile: None,
+            };
+            n
+        } else {
+            let mut n = NormalMessage::new(actual_text.clone(), service.clone());
+            n.link_meta = link_meta;
+            n.reply_guid = reply_guid.clone();
+            n.reply_part = reply_part.clone();
+            n
+        };
         let mut msg = MessageInst::new(
             conv.clone(),
             &handle,
@@ -2661,20 +2940,31 @@ impl Client {
         target_uuid: String,
         edit_part: u64,
         new_text: String,
+        new_html: Option<String>,
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
+        let new_parts = if let Some(ref html_str) = new_html {
+            parse_html_to_parts(html_str, &new_text)
+                .unwrap_or_else(|| MessageParts(vec![IndexedMessagePart {
+                    part: MessagePart::Text(new_text, Default::default()),
+                    idx: None,
+                    ext: None,
+                }]))
+        } else {
+            MessageParts(vec![IndexedMessagePart {
+                part: MessagePart::Text(new_text, Default::default()),
+                idx: None,
+                ext: None,
+            }])
+        };
         let mut msg = MessageInst::new(
             conv,
             &handle,
             Message::Edit(EditMessage {
                 tuuid: target_uuid,
                 edit_part,
-                new_parts: MessageParts(vec![IndexedMessagePart {
-                    part: MessagePart::Text(new_text, Default::default()),
-                    idx: None,
-                    ext: None,
-                }]),
+                new_parts,
             }),
         );
         self.client.send(&mut msg).await
@@ -2803,6 +3093,7 @@ impl Client {
         handle: String,
         reply_guid: Option<String>,
         reply_part: Option<String>,
+        body: Option<String>,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
         // Detect voice messages by UTI (CAF files from OGG→CAF remux are voice recordings)
@@ -2839,6 +3130,10 @@ impl Client {
             ext: None,
         }];
 
+        // Captions are sent via the subject field in the iMessage plist,
+        // not as a separate text part in the XML body.
+        let subject = body.clone().filter(|s| !s.is_empty());
+
         let mut msg = MessageInst::new(
             conv.clone(),
             &handle,
@@ -2848,7 +3143,7 @@ impl Client {
                 reply_guid: reply_guid.clone(),
                 reply_part: reply_part.clone(),
                 service,
-                subject: None,
+                subject,
                 app: None,
                 link_meta: None,
                 voice: is_voice,
@@ -2870,6 +3165,7 @@ impl Client {
                     idx: None,
                     ext: None,
                 }];
+                let sms_subject = body.filter(|s| !s.is_empty());
                 let mut sms_msg = MessageInst::new(
                     conv,
                     &handle,
@@ -2879,7 +3175,7 @@ impl Client {
                         reply_guid: reply_guid,
                         reply_part: reply_part,
                         service: sms_service,
-                        subject: None,
+                        subject: sms_subject,
                         app: None,
                         link_meta: None,
                         voice: is_voice,
@@ -2893,6 +3189,123 @@ impl Client {
             }
             Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) }),
         }
+    }
+
+    /// Rename an iMessage group chat. Delivers a RenameMessage to all participants
+    /// so the group name updates on all of the user's Apple devices.
+    pub async fn send_rename_group(
+        &self,
+        conversation: WrappedConversation,
+        new_name: String,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::RenameMessage(RenameMessage { new_name }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send rename: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Update the participant list for an iMessage group chat.
+    /// `new_participants` must be the FULL new list of all participants (not
+    /// just the delta). `group_version` should be strictly increasing; using
+    /// the current Unix timestamp in seconds is a safe default when the exact
+    /// protocol counter is unknown.
+    pub async fn send_change_participants(
+        &self,
+        conversation: WrappedConversation,
+        new_participants: Vec<String>,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::ChangeParticipants(ChangeParticipantMessage {
+                new_participants,
+                group_version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send participant change: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Upload `photo_data` to MMCS and deliver an IconChange message to set the
+    /// group chat photo on all of the user's Apple devices. The image should be
+    /// a 570×570 PNG as Apple expects. `group_version` should be strictly
+    /// increasing; using the current Unix timestamp in seconds is a safe default.
+    pub async fn send_icon_change(
+        &self,
+        conversation: WrappedConversation,
+        photo_data: Vec<u8>,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        // Prepare the MMCS encryption envelope (computes signature/key).
+        let cursor = Cursor::new(&photo_data);
+        let prepared = MMCSFile::prepare_put(cursor).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to prepare icon MMCS upload: {}", e) })?;
+
+        // Upload to Apple's MMCS servers and get back the file descriptor.
+        let cursor2 = Cursor::new(&photo_data);
+        let mmcs = MMCSFile::new(&self.conn, &prepared, cursor2, |_current, _total| {}).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to upload icon to MMCS: {}", e) })?;
+
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::IconChange(IconChangeMessage {
+                file: Some(mmcs),
+                group_version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon change: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Deliver an IconChange message that clears (removes) the group chat photo
+    /// on all of the user's Apple devices.
+    pub async fn send_icon_clear(
+        &self,
+        conversation: WrappedConversation,
+        group_version: u64,
+        handle: String,
+    ) -> Result<String, WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(
+            conv,
+            &handle,
+            Message::IconChange(IconChangeMessage {
+                file: None,
+                group_version,
+            }),
+        );
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send icon clear: {}", e) })?;
+        Ok(msg.id.clone())
+    }
+
+    /// Broadcast a PeerCacheInvalidate to all participants in the conversation.
+    /// Receiving clients respond by refreshing their IDS key cache for the sender,
+    /// which resolves delivery failures caused by stale/rotated identity keys.
+    pub async fn send_peer_cache_invalidate(
+        &self,
+        conversation: WrappedConversation,
+        handle: String,
+    ) -> Result<(), WrappedError> {
+        let conv: ConversationData = (&conversation).into();
+        let mut msg = MessageInst::new(conv, &handle, Message::PeerCacheInvalidate);
+        self.client.send(&mut msg).await
+            .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send peer cache invalidate: {}", e) })?;
+        Ok(())
     }
 
     pub async fn cloud_sync_chats(

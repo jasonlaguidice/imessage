@@ -163,7 +163,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
-
 	// Migration: add deleted column to cloud_chat if missing.
 	// Soft-deletes cloud_chat rows alongside cloud_message rows so that
 	// restore-chat can recover group name and participants.
@@ -1017,6 +1016,33 @@ func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, 
 	return normalized, nil
 }
 
+// listCloudChatIDsByPortalID returns all distinct CloudKit chat identifiers
+// (cloud_chat_id values) currently known for a portal.
+func (s *cloudBackfillStore) listCloudChatIDsByPortalID(ctx context.Context, portalID string) ([]string, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT cloud_chat_id FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND cloud_chat_id <> ''`,
+		s.loginID, portalID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	chatIDs := make([]string, 0, 2)
+	for rows.Next() {
+		var chatID string
+		if err = rows.Scan(&chatID); err != nil {
+			return nil, err
+		}
+		chatIDs = append(chatIDs, chatID)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return chatIDs, nil
+}
+
 // getDisplayNameByPortalID returns the CloudKit display_name for a given portal_id.
 // This is the user-set group name (cv_name from the iMessage protocol), NOT an
 // auto-generated label. Returns empty string if none found or if the group is unnamed.
@@ -1737,7 +1763,7 @@ func (s *cloudBackfillStore) hasCloudReadReceipt(ctx context.Context, uuid strin
 // isCloudBackfilledMessage checks whether a message UUID exists in the
 // cloud_message table as a CloudKit-synced message. CloudKit entries (from
 // upsertMessageBatch) have record_name populated, while real-time entries
-// (from persistMessageUUID) have record_name=''. This distinguishes
+// (from persistMessageUUID) have record_name=”. This distinguishes
 // backfilled messages whose ghost receipts should be suppressed from
 // real-time messages whose ghost receipts should go through.
 func (s *cloudBackfillStore) isCloudBackfilledMessage(ctx context.Context, uuid string) (bool, error) {
