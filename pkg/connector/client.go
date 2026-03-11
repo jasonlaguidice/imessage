@@ -2294,6 +2294,14 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 		}
 	}
 
+	// Purge the recoverable-delete zones from CloudKit so that records parked
+	// in recoverableMessageDeleteZone don't get re-synced and resurrect portals.
+	if c.Main.Config.CloudKitBackfill {
+		if err := c.client.PurgeRecoverableZones(); err != nil {
+			log.Warn().Err(err).Str("portal_id", portalID).Msg("Failed to purge CloudKit recoverable zones")
+		}
+	}
+
 	// Mark as deleted in memory — NOT a tombstone, just echo protection.
 	// New messages from this contact should still create fresh portals.
 	c.recentlyDeletedPortalsMu.Lock()
