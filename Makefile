@@ -28,7 +28,7 @@ ifneq ($(COMMIT),$(PREV_COMMIT))
   $(shell echo $(COMMIT) > $(COMMIT_FILE))
 endif
 
-.PHONY: build clean install install-beeper uninstall reset rust bindings check-deps check-deps-linux
+.PHONY: build clean install install-beeper uninstall reset rust bindings check-deps check-deps-linux mutation mutation-install
 
 # ===========================================================================
 # Path validation – spaces in the working directory break CGO linker flags
@@ -253,3 +253,14 @@ ifeq ($(UNAME_S),Darwin)
 endif
 	rm -f $(APP_NAME) $(BBCTL) $(RUST_LIB) extract-key tools/extract-key/extract-key
 	cd pkg/rustpushgo && cargo clean 2>/dev/null || true
+
+# ===========================================================================
+# Local mutation testing (ooze)
+# ===========================================================================
+# Intentionally local-only: this target is not wired into GitHub Actions.
+
+mutation-install:
+	go install github.com/gtramontina/ooze@latest
+
+mutation: mutation-install
+	go test -v -tags=mutation ./imessage -run TestMutation

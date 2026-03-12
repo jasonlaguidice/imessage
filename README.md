@@ -320,8 +320,22 @@ Key options:
 make build      # Build .app bundle (macOS) or binary (Linux)
 make rust       # Build Rust library only
 make bindings   # Regenerate Go FFI bindings (needs uniffi-bindgen-go)
+make mutation   # Run local mutation testing (ooze) for imessage/
 make clean      # Remove build artifacts
 ```
+
+Mutation testing is intentionally local-only and is not part of GitHub Actions CI/CD.
+Use it on demand when improving test quality:
+
+```bash
+make mutation
+```
+
+Notes:
+
+- This installs `ooze` locally via `go install github.com/gtramontina/ooze@latest`.
+- The mutation run targets `imessage/` with `go test -tags=mutation`.
+- Current mutation threshold is `0.70` in [imessage/mutation_test.go](imessage/mutation_test.go).
 
 ### Source layout
 
