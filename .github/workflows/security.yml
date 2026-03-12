@@ -25,13 +25,10 @@ jobs:
       - name: Install libolm-dev
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
-
       # Only scan pure-Go packages; packages importing rustpushgo need
       # the Rust static library which is impractical to build here.
       - name: Run govulncheck
-        run: govulncheck ./imessage/... ./cmd/bbctl/...
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./imessage/... ./cmd/bbctl/...
 
   cargo-audit:
     name: Rust dependency audit
@@ -50,4 +47,11 @@ jobs:
 
       - name: Audit Rust dependencies
         working-directory: pkg/rustpushgo
-        run: cargo audit
+        run: |
+          # Current rustpush upstream transitively includes known advisories.
+          # Track and remove ignores when upstream dependency versions are bumped.
+          cargo audit \
+            --ignore RUSTSEC-2024-0421 \
+            --ignore RUSTSEC-2025-0009 \
+            --ignore RUSTSEC-2024-0336 \
+            --ignore RUSTSEC-2025-0018
