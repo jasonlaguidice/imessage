@@ -90,6 +90,9 @@ jobs:
         run: make build
 
       - name: Test pkg/connector/
+        env:
+          CGO_CFLAGS: -I/opt/homebrew/include
+          CGO_LDFLAGS: -L/opt/homebrew/lib
         run: go test -v -count=1 -coverprofile=coverage-connector-macos.out ./pkg/connector/...
 
       - name: Upload coverage artifact
