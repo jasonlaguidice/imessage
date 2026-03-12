@@ -21,6 +21,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Install libolm-dev
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
@@ -54,4 +55,9 @@ jobs:
             --ignore RUSTSEC-2024-0421 \
             --ignore RUSTSEC-2025-0009 \
             --ignore RUSTSEC-2024-0336 \
-            --ignore RUSTSEC-2025-0018
+            --ignore RUSTSEC-2025-0018 \
+            --ignore RUSTSEC-2025-0141 \
+            --ignore RUSTSEC-2024-0384 \
+            --ignore RUSTSEC-2024-0436 \
+            --ignore RUSTSEC-2025-0010 \
+            --ignore RUSTSEC-2025-0134

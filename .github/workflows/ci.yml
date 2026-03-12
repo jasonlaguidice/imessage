@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: go vet (imessage)
         run: go vet ./imessage/...
@@ -42,6 +43,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Run tests with coverage
         run: go test -v -count=1 -coverprofile=coverage-imessage.out ./imessage/...
@@ -68,6 +70,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -120,6 +123,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

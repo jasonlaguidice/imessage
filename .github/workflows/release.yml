@@ -21,6 +21,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Install libolm-dev
         run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
@@ -45,6 +46,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -66,6 +68,9 @@ jobs:
         run: make build
 
       - name: Test pkg/connector/
+        env:
+          CGO_CFLAGS: -I/opt/homebrew/include
+          CGO_LDFLAGS: -L/opt/homebrew/lib
         run: go test -v -count=1 ./pkg/connector/...
 
       - name: Create tarball
@@ -95,6 +100,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          check-latest: true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -146,6 +152,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: tools/extract-key/go.mod
+          check-latest: true
 
       - name: Build extract-key
         run: make extract-key
