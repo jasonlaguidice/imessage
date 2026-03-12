@@ -35,9 +35,17 @@ jobs:
   # Build macOS universal binary + app bundle
   # ───────────────────────────────────────────────────────────────
   build-macos:
-    name: Build macOS
+    name: Build macOS (${{ matrix.arch }})
     needs: test
-    runs-on: macos-14
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-13
+            arch: x86_64
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,23 +68,23 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             pkg/rustpushgo/target
-          key: cargo-release-macos-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-release-macos-
+          key: cargo-release-macos-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-release-macos-${{ matrix.arch }}-
 
       - name: Build
         run: make build
 
       - name: Create tarball
         run: |
-          tar czf mautrix-imessage-v2-macos-arm64.tar.gz \
+          tar czf mautrix-imessage-v2-macos-${{ matrix.arch }}.tar.gz \
             mautrix-imessage-v2.app/ bbctl \
             scripts/install.sh scripts/install-beeper.sh scripts/reset-bridge.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: macos-arm64
-          path: mautrix-imessage-v2-macos-arm64.tar.gz
+          name: macos-${{ matrix.arch }}
+          path: mautrix-imessage-v2-macos-${{ matrix.arch }}.tar.gz
 
   # ───────────────────────────────────────────────────────────────
   # Build Linux amd64 binary
@@ -198,5 +206,6 @@ jobs:
           generate_release_notes: true
           files: |
             artifacts/macos-arm64/mautrix-imessage-v2-macos-arm64.tar.gz
+            artifacts/macos-x86_64/mautrix-imessage-v2-macos-x86_64.tar.gz
             artifacts/linux-amd64/mautrix-imessage-v2-linux-amd64.tar.gz
             artifacts/extract-key-macos/extract-key

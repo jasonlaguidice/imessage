@@ -86,8 +86,16 @@ jobs:
   # Full build – Rust + Go on macOS and Linux
   # ───────────────────────────────────────────────────────────────
   build-macos:
-    name: Build (macOS)
-    runs-on: macos-14          # Apple Silicon runner
+    name: Build (macOS ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14     # Apple Silicon
+            arch: arm64
+          - runner: macos-13     # Intel
+            arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
@@ -109,8 +117,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             pkg/rustpushgo/target
-          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-macos-
+          key: cargo-macos-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-macos-${{ matrix.arch }}-
 
       - name: Build
         run: make build
@@ -118,7 +126,7 @@ jobs:
       - name: Upload macOS app bundle
         uses: actions/upload-artifact@v4
         with:
-          name: mautrix-imessage-v2-macos
+          name: mautrix-imessage-v2-macos-${{ matrix.arch }}
           path: |
             mautrix-imessage-v2.app/
             bbctl
