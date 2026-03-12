@@ -3386,7 +3386,12 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 				capturedClient := c.client
 				chatInfo.Avatar = &bridgev2.Avatar{
 					ID: networkid.AvatarID("cloudkit-gp:" + guid),
-					Get: func(ctx context.Context) ([]byte, error) {
+					Get: func(ctx context.Context) (data []byte, err error) {
+						defer func() {
+							if r := recover(); r != nil {
+								err = fmt.Errorf("CloudKit group photo download failed: %v", r)
+							}
+						}()
 						return capturedClient.CloudDownloadGroupPhoto(capturedGuid)
 					},
 				}
