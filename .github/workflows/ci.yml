@@ -24,17 +24,11 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install libolm-dev
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
-
       - name: go vet (imessage)
         run: go vet ./imessage/...
 
-      - name: go vet (cmd)
-        run: go vet ./cmd/...
-
-      - name: go vet (connector)
-        run: go vet ./pkg/connector/...
+      - name: go vet (bbctl)
+        run: go vet ./cmd/bbctl/...
 
   # ───────────────────────────────────────────────────────────────
   # Unit tests – pure-Go packages (no Rust/CGO bridge needed)
@@ -59,43 +53,15 @@ jobs:
           path: coverage-imessage.out
           retention-days: 7
 
-  test-connector:
-    name: Test pkg/connector/
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Install libolm-dev
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
-
-      - name: Run tests with coverage
-        run: go test -v -count=1 -coverprofile=coverage-connector.out ./pkg/connector/...
-
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage-connector
-          path: coverage-connector.out
-          retention-days: 7
+  # NOTE: pkg/connector/ tests require the Rust static library (librustpushgo.a)
+  # and are run as part of the build jobs below (after `make build`).
 
   # ───────────────────────────────────────────────────────────────
   # Full build – Rust + Go on macOS and Linux
   # ───────────────────────────────────────────────────────────────
   build-macos:
-    name: Build (macOS ${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-14     # Apple Silicon
-            arch: arm64
-          - runner: macos-13     # Intel
-            arch: x86_64
+    name: Build (macOS)
+    runs-on: macos-14          # Apple Silicon (ARM64)
     steps:
       - uses: actions/checkout@v4
 
@@ -104,7 +70,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action/setup@v1
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install dependencies
         run: |
@@ -117,16 +83,26 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             pkg/rustpushgo/target
-          key: cargo-macos-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-macos-${{ matrix.arch }}-
+          key: cargo-macos-arm64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-macos-arm64-
 
       - name: Build
         run: make build
 
+      - name: Test pkg/connector/
+        run: go test -v -count=1 -coverprofile=coverage-connector-macos.out ./pkg/connector/...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-connector-macos
+          path: coverage-connector-macos.out
+          retention-days: 7
+
       - name: Upload macOS app bundle
         uses: actions/upload-artifact@v4
         with:
-          name: mautrix-imessage-v2-macos-${{ matrix.arch }}
+          name: mautrix-imessage-v2-macos-arm64
           path: |
             mautrix-imessage-v2.app/
             bbctl
@@ -143,7 +119,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-action/setup@v1
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install system dependencies
         run: |
@@ -165,6 +141,16 @@ jobs:
 
       - name: Build
         run: make build
+
+      - name: Test pkg/connector/
+        run: go test -v -count=1 -coverprofile=coverage-connector-linux.out ./pkg/connector/...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-connector-linux
+          path: coverage-connector-linux.out
+          retention-days: 7
 
       - name: Upload Linux binary
         uses: actions/upload-artifact@v4

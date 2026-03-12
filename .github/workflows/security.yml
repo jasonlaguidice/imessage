@@ -22,11 +22,16 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install libolm-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
+
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
 
+      # Only scan pure-Go packages; packages importing rustpushgo need
+      # the Rust static library which is impractical to build here.
       - name: Run govulncheck
-        run: govulncheck ./...
+        run: govulncheck ./imessage/... ./cmd/bbctl/...
 
   cargo-audit:
     name: Rust dependency audit
@@ -34,10 +39,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch upstream rustpush source
-        run: |
-          mkdir -p third_party
-          git clone --recurse-submodules https://github.com/OpenBubbles/rustpush.git third_party/rustpush-upstream
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Fetch and prepare rustpush source
+        run: make ensure-rustpush-source
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
