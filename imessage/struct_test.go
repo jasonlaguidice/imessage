@@ -1,10 +1,41 @@
 package imessage
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/rs/zerolog"
+	log "maunium.net/go/maulogger/v2"
+
+	"github.com/lrhodin/imessage/ipc"
 )
+
+type testBridge struct {
+	cfg *PlatformConfig
+}
+
+func (tb *testBridge) GetIPC() *ipc.Processor { return nil }
+
+func (tb *testBridge) GetLog() log.Logger { return nil }
+
+func (tb *testBridge) GetZLog() *zerolog.Logger { return nil }
+
+func (tb *testBridge) GetConnectorConfig() *PlatformConfig { return tb.cfg }
+
+func (tb *testBridge) PingServer() (start, serverTs, end time.Time) {
+	return time.Time{}, time.Time{}, time.Time{}
+}
+
+func (tb *testBridge) SendBridgeStatus(state BridgeStatus) {}
+
+func (tb *testBridge) ReIDPortal(oldGUID, newGUID string, mergeExisting bool) bool { return false }
+
+func (tb *testBridge) GetMessagesSince(chatGUID string, since time.Time) []string { return nil }
+
+func (tb *testBridge) SetPushKey(req *PushKeyRequest) {}
 
 // ---------------------------------------------------------------------------
 // Message.SenderText
@@ -247,6 +278,33 @@ func TestAttachment_Read_TildeExpansion(t *testing.T) {
 	}
 }
 
+func TestAttachment_Read_MissingFile(t *testing.T) {
+	a := &Attachment{PathOnDisk: "/definitely/not/a/real/file"}
+	if _, err := a.Read(); err == nil {
+		t.Fatal("Read() expected error for missing file, got nil")
+	}
+}
+
+func TestAttachment_Read_TildeMissingFile(t *testing.T) {
+	a := &Attachment{PathOnDisk: "~/definitely-not-a-real-file-imessage-test"}
+	if _, err := a.Read(); err == nil {
+		t.Fatal("Read() expected error for missing ~/ file, got nil")
+	}
+}
+
+func TestAttachment_Read_HomeDirError(t *testing.T) {
+	orig := userHomeDir
+	userHomeDir = func() (string, error) {
+		return "", errors.New("boom")
+	}
+	t.Cleanup(func() { userHomeDir = orig })
+
+	a := &Attachment{PathOnDisk: "~/any-file"}
+	if _, err := a.Read(); err == nil {
+		t.Fatal("Read() expected home directory error, got nil")
+	}
+}
+
 func TestAttachment_Delete(t *testing.T) {
 	tmp := t.TempDir()
 	f := filepath.Join(tmp, "deleteme.txt")
@@ -285,6 +343,30 @@ func TestSendFilePrepare(t *testing.T) {
 	// Verify the file is inside the directory
 	if filepath.Dir(filePath) != dir {
 		t.Errorf("file not inside temp dir: %q not in %q", filePath, dir)
+	}
+}
+
+func TestSendFilePrepare_WriteError(t *testing.T) {
+	// Nested path without parent dir inside temp upload dir should fail write.
+	_, _, err := SendFilePrepare(filepath.Join("no-such-dir", "test.txt"), []byte("x"))
+	if err == nil {
+		t.Fatal("SendFilePrepare() expected write error, got nil")
+	}
+}
+
+func TestSendFilePrepare_TempDirError(t *testing.T) {
+	// Force TempDir() to fail by pointing TMPDIR to a regular file.
+	tmpFile, err := os.CreateTemp("", "imessage-upload-file-*")
+	if err != nil {
+		t.Fatalf("CreateTemp() error: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	t.Setenv("TMPDIR", tmpPath)
+	if _, _, err := SendFilePrepare("test.txt", []byte("x")); err == nil {
+		t.Fatal("SendFilePrepare() expected temp dir error, got nil")
 	}
 }
 
@@ -357,17 +439,88 @@ func TestTempDir(t *testing.T) {
 	}
 }
 
+func TestTempDir_MkdirAllError(t *testing.T) {
+	// Force os.TempDir() to return a regular file path so MkdirAll fails.
+	tmpFile, err := os.CreateTemp("", "imessage-tempdir-file-*")
+	if err != nil {
+		t.Fatalf("CreateTemp() error: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	tmpFile.Close()
+	defer os.Remove(tmpPath)
+
+	orig := os.Getenv("TMPDIR")
+	t.Setenv("TMPDIR", tmpPath)
+	defer func() {
+		if orig == "" {
+			os.Unsetenv("TMPDIR")
+		} else {
+			os.Setenv("TMPDIR", orig)
+		}
+	}()
+
+	if _, err := TempDir("test-imessage"); err == nil {
+		t.Fatal("TempDir() expected error when TMPDIR points to file, got nil")
+	}
+}
+
+func TestTempDir_MkdirTempError(t *testing.T) {
+	origPerm := TempDirPermissions
+	TempDirPermissions = 0400
+	t.Cleanup(func() { TempDirPermissions = origPerm })
+
+	base := filepath.Join(t.TempDir(), "no-write-temp-root")
+	t.Setenv("TMPDIR", base)
+
+	if _, err := TempDir("test-imessage"); err == nil {
+		t.Fatal("TempDir() expected error from MkdirTemp in non-writable TMPDIR, got nil")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // NewAPI (error path only — no real implementations registered in test)
 // ---------------------------------------------------------------------------
 
 func TestNewAPI_UnknownPlatform(t *testing.T) {
-	// We can't fully test NewAPI without a real Bridge, but we can verify
-	// the error path when an unknown platform is requested.
-	// NewAPI calls bridge.GetConnectorConfig() which requires a Bridge mock.
-	// Instead, just verify the Implementations map exists and is empty or
-	// does not include a bogus platform.
-	if _, ok := Implementations["__bogus_platform__"]; ok {
-		t.Error("Implementations should not contain __bogus_platform__")
+	bridge := &testBridge{cfg: &PlatformConfig{Platform: "__bogus_platform__"}}
+	api, err := NewAPI(bridge)
+	if err == nil {
+		t.Fatal("NewAPI() expected error for unknown platform, got nil")
+	}
+	if api != nil {
+		t.Fatal("NewAPI() expected nil API on unknown platform")
+	}
+}
+
+func TestNewAPI_KnownPlatform(t *testing.T) {
+	const platform = "__unit_test_platform__"
+	origImpl, hadOrig := Implementations[platform]
+	t.Cleanup(func() {
+		if hadOrig {
+			Implementations[platform] = origImpl
+		} else {
+			delete(Implementations, platform)
+		}
+	})
+
+	called := false
+	Implementations[platform] = func(b Bridge) (API, error) {
+		called = true
+		if b == nil {
+			t.Fatal("implementation received nil bridge")
+		}
+		return nil, nil
+	}
+
+	bridge := &testBridge{cfg: &PlatformConfig{Platform: platform}}
+	api, err := NewAPI(bridge)
+	if err != nil {
+		t.Fatalf("NewAPI() unexpected error: %v", err)
+	}
+	if api != nil {
+		t.Fatal("NewAPI() expected nil API from test implementation")
+	}
+	if !called {
+		t.Fatal("expected implementation to be called")
 	}
 }
