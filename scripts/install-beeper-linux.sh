@@ -10,7 +10,7 @@ BRIDGE_NAME="${BRIDGE_NAME:-sh-imessage}"
 BINARY="$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")"
 CONFIG="$DATA_DIR/config.yaml"
 
-# Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
+# Where we build/cache bbctl (filtered full clone)
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
 BBCTL_REPO="${BBCTL_REPO:-https://github.com/beeper/bridge-manager.git}"
 BBCTL_BRANCH="${BBCTL_BRANCH:-main}"
@@ -76,12 +76,9 @@ build_bbctl() {
         git reset --hard --quiet "origin/$branch"
     else
         rm -rf "$BBCTL_DIR"
-        git clone --filter=blob:none --no-checkout --quiet \
+        git clone --filter=blob:none --quiet \
             --branch "$branch" "$repo" "$BBCTL_DIR"
         cd "$BBCTL_DIR"
-        git sparse-checkout init --cone
-        git sparse-checkout set cmd/bbctl
-        git checkout --quiet "$branch"
     fi
     go build -o bbctl ./cmd/bbctl/ 2>&1
     cd - >/dev/null
@@ -802,16 +799,13 @@ printf "\n  ${BOLD}iMessage Bridge${RESET}\n\n"
 
 # Bootstrap sparse clone if it doesn't exist yet
 if [ ! -d "$BBCTL_DIR/.git" ] && command -v go >/dev/null 2>&1; then
-    step "Setting up bbctl sparse checkout..."
+    step "Setting up bbctl checkout..."
     EXISTING_BBCTL=""
     [ -x "$BBCTL_DIR/bbctl" ] && EXISTING_BBCTL=$(mktemp) && cp "$BBCTL_DIR/bbctl" "$EXISTING_BBCTL"
     rm -rf "$BBCTL_DIR"
     mkdir -p "$(dirname "$BBCTL_DIR")"
-    git clone --filter=blob:none --no-checkout --quiet \
+    git clone --filter=blob:none --quiet \
         --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
-    git -C "$BBCTL_DIR" sparse-checkout init --cone
-    git -C "$BBCTL_DIR" sparse-checkout set cmd/bbctl
-    git -C "$BBCTL_DIR" checkout --quiet "$BBCTL_BRANCH"
     (cd "$BBCTL_DIR" && go build -o bbctl ./cmd/bbctl/ 2>&1) | sed 's/^/  /'
     [ -n "$EXISTING_BBCTL" ] && rm -f "$EXISTING_BBCTL"
     ok "bbctl ready"
