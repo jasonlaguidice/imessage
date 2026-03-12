@@ -12,8 +12,10 @@ CONFIG="$DATA_DIR/config.yaml"
 
 # Where we build/cache bbctl (sparse clone — only cmd/bbctl/)
 BBCTL_DIR="${BBCTL_DIR:-$HOME/.local/share/mautrix-imessage/bbctl}"
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
-BBCTL_BRANCH="${BBCTL_BRANCH:-master}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/beeper/bridge-manager.git}"
+BBCTL_BRANCH="${BBCTL_BRANCH:-main}"
+BBCTL_FALLBACK_REPO="${BBCTL_FALLBACK_REPO:-https://github.com/lrhodin/imessage.git}"
+BBCTL_FALLBACK_BRANCH="${BBCTL_FALLBACK_BRANCH:-master}"
 
 echo ""
 echo "═══════════════════════════════════════════════"
@@ -64,20 +66,22 @@ if [ -d "$OLD_BBCTL_DIR/.git" ] && [ "$BBCTL_DIR" != "$OLD_BBCTL_DIR" ]; then
 fi
 
 build_bbctl() {
+	local repo="$1" branch="$2"
     echo "Building bbctl..."
     mkdir -p "$(dirname "$BBCTL_DIR")"
     if [ -d "$BBCTL_DIR/.git" ]; then
         cd "$BBCTL_DIR"
+        git remote set-url origin "$repo"
         git fetch --quiet origin
-        git reset --hard --quiet "origin/$BBCTL_BRANCH"
+        git reset --hard --quiet "origin/$branch"
     else
         rm -rf "$BBCTL_DIR"
         git clone --filter=blob:none --no-checkout --quiet \
-            --branch "$BBCTL_BRANCH" "$BBCTL_REPO" "$BBCTL_DIR"
+            --branch "$branch" "$repo" "$BBCTL_DIR"
         cd "$BBCTL_DIR"
         git sparse-checkout init --cone
         git sparse-checkout set cmd/bbctl
-        git checkout --quiet "$BBCTL_BRANCH"
+        git checkout --quiet "$branch"
     fi
     go build -o bbctl ./cmd/bbctl/ 2>&1
     cd - >/dev/null
@@ -90,7 +94,13 @@ if [ -n "$PREBUILT_BBCTL" ] && [ -x "$PREBUILT_BBCTL" ]; then
     cp "$PREBUILT_BBCTL" "$BBCTL"
     echo "✓ Installed bbctl to $BBCTL_DIR/"
 elif [ ! -x "$BBCTL" ]; then
-    build_bbctl
+    if ! build_bbctl "$BBCTL_REPO" "$BBCTL_BRANCH"; then
+        echo "⚠  Failed to build bbctl from $BBCTL_REPO ($BBCTL_BRANCH)"
+        echo "   Retrying with fallback source: $BBCTL_FALLBACK_REPO ($BBCTL_FALLBACK_BRANCH)"
+        BBCTL_REPO="$BBCTL_FALLBACK_REPO"
+        BBCTL_BRANCH="$BBCTL_FALLBACK_BRANCH"
+        build_bbctl "$BBCTL_FALLBACK_REPO" "$BBCTL_FALLBACK_BRANCH"
+    fi
 else
     echo "✓ Found bbctl: $BBCTL"
 fi
@@ -770,7 +780,7 @@ BINARY="$BINARY"
 CONFIG="$CONFIG"
 HEADER_EOF
 cat >> "$DATA_DIR/start.sh" << 'BODY_EOF'
-BBCTL_REPO="${BBCTL_REPO:-https://github.com/lrhodin/imessage.git}"
+BBCTL_REPO="${BBCTL_REPO:-https://github.com/beeper/bridge-manager.git}"
 
 # Extend PATH to find go
 export PATH="$PATH:/usr/local/go/bin:/opt/homebrew/bin:$HOME/go/bin"
