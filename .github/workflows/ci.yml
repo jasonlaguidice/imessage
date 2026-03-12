@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───────────────────────────────────────────────────────────────
+  # Lint – quick static analysis
+  # ───────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install libolm-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
+
+      - name: go vet (imessage)
+        run: go vet ./imessage/...
+
+      - name: go vet (cmd)
+        run: go vet ./cmd/...
+
+      - name: go vet (connector)
+        run: go vet ./pkg/connector/...
+
+  # ───────────────────────────────────────────────────────────────
+  # Unit tests – pure-Go packages (no Rust/CGO bridge needed)
+  # ───────────────────────────────────────────────────────────────
+  test-imessage:
+    name: Test imessage/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run tests with coverage
+        run: go test -v -count=1 -coverprofile=coverage-imessage.out ./imessage/...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-imessage
+          path: coverage-imessage.out
+          retention-days: 7
+
+  test-connector:
+    name: Test pkg/connector/
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install libolm-dev
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
+
+      - name: Run tests with coverage
+        run: go test -v -count=1 -coverprofile=coverage-connector.out ./pkg/connector/...
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-connector
+          path: coverage-connector.out
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────
+  # Full build – Rust + Go on macOS and Linux
+  # ───────────────────────────────────────────────────────────────
+  build-macos:
+    name: Build (macOS)
+    runs-on: macos-14          # Apple Silicon runner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+
+      - name: Install dependencies
+        run: |
+          brew install libolm protobuf
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/rustpushgo/target
+          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-macos-
+
+      - name: Build
+        run: make build
+
+      - name: Upload macOS app bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: mautrix-imessage-v2-macos
+          path: |
+            mautrix-imessage-v2.app/
+            bbctl
+          retention-days: 14
+
+  build-linux:
+    name: Build (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-action/setup@v1
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential cmake pkg-config git curl \
+            libolm-dev libclang-dev libssl-dev libunicorn-dev \
+            protobuf-compiler sqlite3
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            pkg/rustpushgo/target
+          key: cargo-linux-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-linux-
+
+      - name: Build
+        run: make build
+
+      - name: Upload Linux binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: mautrix-imessage-v2-linux
+          path: |
+            mautrix-imessage-v2
+            bbctl
+          retention-days: 14
