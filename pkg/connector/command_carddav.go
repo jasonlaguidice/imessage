@@ -364,7 +364,7 @@ func fnCardDAVRemove(ce *commands.Event) {
 
 	// Fall back to iCloud contacts
 	log := client.UserLogin.Log
-	client.contacts = newCloudContactsClient(client.client, log)
+	client.contacts = newCloudContactsClient(client.client, meta.MmeDelegateJSON, log)
 	if client.contacts != nil {
 		_ = client.contacts.SyncContacts(log)
 		client.setContactsReady(log)

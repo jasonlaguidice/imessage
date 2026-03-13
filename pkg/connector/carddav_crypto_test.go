@@ -1,18 +1,17 @@
 package connector
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
-func TestEncryptDecryptRoundTrip(t *testing.T) {
-	// Set up a temp directory for the key file
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
+func testKey() []byte {
+	return DeriveCardDAVKey("test-bridge-secret", "test-user-login-id")
+}
 
+func TestEncryptDecryptRoundTrip(t *testing.T) {
+	key := testKey()
 	password := "my-secret-app-password"
-	encrypted, err := EncryptCardDAVPassword(password)
+	encrypted, err := EncryptCardDAVPassword(key, password)
 	if err != nil {
 		t.Fatalf("EncryptCardDAVPassword error: %v", err)
 	}
@@ -23,7 +22,7 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 		t.Fatal("encrypted should differ from plaintext")
 	}
 
-	decrypted, err := DecryptCardDAVPassword(encrypted)
+	decrypted, err := DecryptCardDAVPassword(key, encrypted)
 	if err != nil {
 		t.Fatalf("DecryptCardDAVPassword error: %v", err)
 	}
@@ -33,16 +32,14 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 }
 
 func TestEncryptDecryptRoundTrip_LongPassword(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
+	key := testKey()
 	password := "this-is-a-very-long-password-with-special-chars-!@#$%^&*()"
-	encrypted, err := EncryptCardDAVPassword(password)
+	encrypted, err := EncryptCardDAVPassword(key, password)
 	if err != nil {
 		t.Fatalf("EncryptCardDAVPassword error: %v", err)
 	}
 
-	decrypted, err := DecryptCardDAVPassword(encrypted)
+	decrypted, err := DecryptCardDAVPassword(key, encrypted)
 	if err != nil {
 		t.Fatalf("DecryptCardDAVPassword error: %v", err)
 	}
@@ -52,122 +49,54 @@ func TestEncryptDecryptRoundTrip_LongPassword(t *testing.T) {
 }
 
 func TestDecryptWithWrongKey(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
-	encrypted, err := EncryptCardDAVPassword("my-password")
+	key := testKey()
+	encrypted, err := EncryptCardDAVPassword(key, "my-password")
 	if err != nil {
 		t.Fatalf("EncryptCardDAVPassword error: %v", err)
 	}
 
-	// Overwrite key file with different key
-	keyPath := filepath.Join(tmpDir, "mautrix-imessage", cardDAVKeyFileName)
-	newKey := make([]byte, 32)
-	for i := range newKey {
-		newKey[i] = byte(i)
-	}
-	os.WriteFile(keyPath, newKey, 0600)
-
-	_, err = DecryptCardDAVPassword(encrypted)
+	wrongKey := DeriveCardDAVKey("different-bridge-secret", "different-user")
+	_, err = DecryptCardDAVPassword(wrongKey, encrypted)
 	if err == nil {
 		t.Error("DecryptCardDAVPassword should fail with wrong key")
 	}
 }
 
 func TestDecryptInvalidBase64(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
-	// Generate a key so loadCardDAVKey succeeds
-	_, err := generateCardDAVKey()
-	if err != nil {
-		t.Fatalf("generateCardDAVKey error: %v", err)
-	}
-
-	_, err = DecryptCardDAVPassword("not-valid-base64!!!")
+	key := testKey()
+	_, err := DecryptCardDAVPassword(key, "not-valid-base64!!!")
 	if err == nil {
 		t.Error("DecryptCardDAVPassword should fail with invalid base64")
 	}
 }
 
 func TestDecryptTooShort(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
-	_, err := generateCardDAVKey()
-	if err != nil {
-		t.Fatalf("generateCardDAVKey error: %v", err)
-	}
-
-	// Very short base64 (1 byte decoded)
-	_, err = DecryptCardDAVPassword("AA==")
+	key := testKey()
+	_, err := DecryptCardDAVPassword(key, "AA==")
 	if err == nil {
 		t.Error("DecryptCardDAVPassword should fail with too-short ciphertext")
 	}
 }
 
-func TestLoadCardDAVKey_WrongSize(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
-	dir := filepath.Join(tmpDir, "mautrix-imessage")
-	os.MkdirAll(dir, 0700)
-	os.WriteFile(filepath.Join(dir, cardDAVKeyFileName), []byte("too-short"), 0600)
-
-	_, err := loadCardDAVKey()
-	if err == nil {
-		t.Error("loadCardDAVKey should fail with wrong-size key file")
+func TestDeriveCardDAVKey_Deterministic(t *testing.T) {
+	key1 := DeriveCardDAVKey("secret", "user1")
+	key2 := DeriveCardDAVKey("secret", "user1")
+	if string(key1) != string(key2) {
+		t.Error("DeriveCardDAVKey should be deterministic for same inputs")
 	}
 }
 
-func TestLoadCardDAVKey_Missing(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
-	_, err := loadCardDAVKey()
-	if err == nil {
-		t.Error("loadCardDAVKey should fail when key file is missing")
+func TestDeriveCardDAVKey_PerUser(t *testing.T) {
+	key1 := DeriveCardDAVKey("secret", "user1")
+	key2 := DeriveCardDAVKey("secret", "user2")
+	if string(key1) == string(key2) {
+		t.Error("DeriveCardDAVKey should produce different keys for different users")
 	}
 }
 
-func TestCardDAVKeyDir_XDGSet(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", "/tmp/test-xdg")
-	got := cardDAVKeyDir()
-	want := "/tmp/test-xdg/mautrix-imessage"
-	if got != want {
-		t.Errorf("cardDAVKeyDir() = %q, want %q", got, want)
-	}
-}
-
-func TestCardDAVKeyDir_XDGUnset(t *testing.T) {
-	t.Setenv("XDG_DATA_HOME", "")
-	got := cardDAVKeyDir()
-	home, _ := os.UserHomeDir()
-	want := filepath.Join(home, ".local", "share", "mautrix-imessage")
-	if got != want {
-		t.Errorf("cardDAVKeyDir() = %q, want %q", got, want)
-	}
-}
-
-func TestGenerateCardDAVKey(t *testing.T) {
-	tmpDir := t.TempDir()
-	t.Setenv("XDG_DATA_HOME", tmpDir)
-
-	key, err := generateCardDAVKey()
-	if err != nil {
-		t.Fatalf("generateCardDAVKey error: %v", err)
-	}
+func TestDeriveCardDAVKey_Length(t *testing.T) {
+	key := DeriveCardDAVKey("secret", "user1")
 	if len(key) != 32 {
-		t.Errorf("key length = %d, want 32", len(key))
-	}
-
-	// Verify file was written
-	keyPath := filepath.Join(tmpDir, "mautrix-imessage", cardDAVKeyFileName)
-	fileKey, err := os.ReadFile(keyPath)
-	if err != nil {
-		t.Fatalf("key file read error: %v", err)
-	}
-	if string(fileKey) != string(key) {
-		t.Error("key file content doesn't match returned key")
+		t.Errorf("DeriveCardDAVKey length = %d, want 32", len(key))
 	}
 }
