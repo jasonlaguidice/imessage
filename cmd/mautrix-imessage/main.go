@@ -54,6 +54,9 @@ func init() {
 		for _, h := range connector.BridgeCommands() {
 			proc.AddHandler(h)
 		}
+		// Pass the AS token to the connector for per-user CardDAV key derivation.
+		nc := m.Connector.(*connector.IMConnector)
+		nc.BridgeSecret = m.Config.AppService.ASToken
 	}
 }
 
@@ -87,10 +90,6 @@ func main() {
 			for _, h := range handles {
 				fmt.Println(h)
 			}
-			return
-		case "carddav-setup":
-			// Discover CardDAV URL + encrypt password for install scripts.
-			runCardDAVSetup()
 			return
 		}
 	}

@@ -40,6 +40,7 @@ func BridgeCommands() []*commands.FullHandler {
 	return []*commands.FullHandler{
 		cmdRestoreChat,
 		cmdContacts,
+		cmdCardDAV,
 	}
 }
 
