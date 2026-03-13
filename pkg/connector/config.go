@@ -40,10 +40,6 @@ type IMConfig struct {
 	// compatibility.  Requires ffmpeg to be installed.  Default is false.
 	VideoTranscoding bool `yaml:"video_transcoding"`
 
-	// PreferredHandle overrides the outgoing iMessage identity.
-	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
-	// If empty, the handle chosen during login is used.
-	PreferredHandle string `yaml:"preferred_handle"`
 
 	// DefaultHardwareKey is a server-wide hardware key (base64-encoded JSON) that
 	// users can opt to use during login instead of supplying their own.
@@ -135,7 +131,6 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "cloudkit_backfill")
 	helper.Copy(up.Str, "backfill_source")
 	helper.Copy(up.Bool, "video_transcoding")
-	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "default_hardware_key")
 }
 

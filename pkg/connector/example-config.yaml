@@ -18,11 +18,6 @@ backfill_source: cloudkit
 # Requires ffmpeg to be installed on the system.
 video_transcoding: false
 
-# Override the outgoing iMessage identity (what recipients see your messages "from").
-# Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
-# Leave empty to use the handle chosen during login.
-# Available handles are logged on startup.
-preferred_handle: ""
 
 # Server-wide hardware key for cross-platform (non-macOS) operation.
 # When set, users can choose to use this shared key during login instead of providing their own.
