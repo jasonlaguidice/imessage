@@ -677,18 +677,6 @@ func loadCachedSession(user *bridgev2.User, log zerolog.Logger) *cachedSessionSt
 			}
 		}
 	}
-	// Fall back to session file (survives DB resets)
-	state := loadSessionState(log)
-	if state.IDSIdentity != "" || state.APSState != "" || state.IDSUsers != "" {
-		log.Info().Msg("Found existing session state in backup file")
-		return &cachedSessionState{
-			IDSIdentity:     state.IDSIdentity,
-			APSState:        state.APSState,
-			IDSUsers:        state.IDSUsers,
-			PreferredHandle: state.PreferredHandle,
-			source:          "backup file",
-		}
-	}
 	return nil
 }
 
@@ -948,25 +936,6 @@ func completeLoginWithMeta(
 	} else {
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
 	}
-
-	// Persist full session state to backup file so it survives DB resets.
-	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:              meta.IDSIdentity,
-		APSState:                 meta.APSState,
-		IDSUsers:                 meta.IDSUsers,
-		PreferredHandle:          meta.PreferredHandle,
-		Platform:                 meta.Platform,
-		HardwareKey:              meta.HardwareKey,
-		DeviceID:                 meta.DeviceID,
-		AccountUsername:          meta.AccountUsername,
-		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-		AccountPET:               meta.AccountPET,
-		AccountADSID:             meta.AccountADSID,
-		AccountDSID:              meta.AccountDSID,
-		AccountSPDBase64:         meta.AccountSPDBase64,
-		MmeDelegateJSON:          meta.MmeDelegateJSON,
-		CloudKitBackfill:         meta.CloudKitBackfill,
-	})
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 
