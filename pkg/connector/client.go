@@ -765,17 +765,31 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 		// No CloudKit gate needed — open immediately
 		c.setCloudSyncDone()
-	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
+	} else if cloudStoreReady && c.cloudKitBackfillEnabled() {
 		c.startCloudSyncController(log)
 	} else {
-		if !c.Main.Config.CloudKitBackfill {
-			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
+		if !c.cloudKitBackfillEnabled() {
+			log.Info().Msg("CloudKit backfill not enabled for this user — skipping cloud sync")
 		}
 		// No CloudKit — open the APNs portal-creation gate immediately
 		// so real-time messages can create portals without waiting.
 		c.setCloudSyncDone()
 	}
 
+}
+
+// cloudKitBackfillEnabled returns true when both the server and this specific
+// user login have CloudKit backfill enabled. The server flag gates global
+// bridge backfill settings; the per-user flag records the user's choice at
+// login time and is paired to their stored hardware key / session state.
+func (c *IMClient) cloudKitBackfillEnabled() bool {
+	if !c.Main.Config.CloudKitBackfill {
+		return false
+	}
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		return meta.CloudKitBackfill
+	}
+	return false
 }
 
 func (c *IMClient) Disconnect() {
@@ -3684,9 +3698,9 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return c.chatDB.FetchMessages(ctx, params, c)
 	}
 
-	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
-		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
-			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
+	if !c.cloudKitBackfillEnabled() || c.cloudStore == nil {
+		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.cloudKitBackfillEnabled()).
+			Msg("FetchMessages: backfill not enabled for this user or no cloud store, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
 	}
 
