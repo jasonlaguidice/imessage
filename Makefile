@@ -8,8 +8,24 @@ DATA_DIR    ?= $(HOME)/.local/share/mautrix-imessage
 UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
-RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' 2>/dev/null)
-RUSTPUSH_SRC:= $(shell find rustpush/src rustpush/apple-private-apis rustpush/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard rustpush/open-absinthe/build.rs)
+RUST_SRC    := $(shell find pkg/rustpushgo/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
+               pkg/rustpushgo/build.rs \
+               $(shell find nac-validation/src -name '*.rs' -o -name '*.m' -o -name '*.h' 2>/dev/null) \
+               nac-validation/build.rs
+# rustpush source root (default: upstream worktree checkout).
+# Override at invocation time, e.g.:
+#   make RUSTPUSH_DIR=rustpush-master build
+RUSTPUSH_DIR ?= third_party/rustpush-upstream
+# rustpush source strategy:
+#   fork (default): clone cameronaaron/rustpush which has all bridge-compat
+#                   fixes already applied — no runtime patching needed.
+#   upstream:       clone raw OpenBubbles/rustpush (no patches; for testing only).
+# Pinned OpenBubbles/rustpush commit. Edit this file manually to bump, then
+# test locally before committing. The Makefile reads the SHA on build and
+# checks out that exact commit — no auto-bump, no branch drift, no fork refs.
+RUSTPUSH_PIN_FILE := third_party/rustpush-upstream.sha
+RUSTPUSH_PIN      := $(shell cat $(RUSTPUSH_PIN_FILE) 2>/dev/null)
+RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(RUSTPUSH_DIR)/apple-private-apis $(RUSTPUSH_DIR)/open-absinthe/src -name '*.rs' -o -name '*.s' 2>/dev/null) $(wildcard $(RUSTPUSH_DIR)/open-absinthe/build.rs)
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
@@ -95,7 +111,143 @@ else
   CARGO_FEATURES := --features hardware-key
 endif
 
-$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES)
+UPSTREAM_REPO := https://github.com/OpenBubbles/rustpush.git
+FAIRPLAY_CERTS := 4056631661436364584235346952193 \
+                  4056631661436364584235346952194 \
+                  4056631661436364584235346952195 \
+                  4056631661436364584235346952196 \
+                  4056631661436364584235346952197 \
+                  4056631661436364584235346952198 \
+                  4056631661436364584235346952199 \
+                  4056631661436364584235346952200 \
+                  4056631661436364584235346952201 \
+                  4056631661436364584235346952208
+
+.PHONY: ensure-rustpush-source
+
+# Prepare rustpush sources the same way upstream CI does: checkout with
+# submodules present and fake FairPlay certs available for build-time signing.
+ensure-rustpush-source:
+	@if [ "$(RUSTPUSH_DIR)" = "rustpush-master" ]; then \
+		if [ ! -f rustpush-master/apple-private-apis/icloud-auth/Cargo.toml ]; then \
+			if [ -f $(FALLBACK_RUSTPUSH_DIR)/apple-private-apis/icloud-auth/Cargo.toml ]; then \
+				echo "Hydrating rustpush-master/apple-private-apis from $(FALLBACK_RUSTPUSH_DIR)..."; \
+				mkdir -p rustpush-master/apple-private-apis; \
+				rm -rf rustpush-master/apple-private-apis/icloud-auth rustpush-master/apple-private-apis/omnisette; \
+				cp -R $(FALLBACK_RUSTPUSH_DIR)/apple-private-apis/icloud-auth rustpush-master/apple-private-apis/; \
+				cp -R $(FALLBACK_RUSTPUSH_DIR)/apple-private-apis/omnisette rustpush-master/apple-private-apis/; \
+			else \
+				echo "error: rustpush-master is missing apple-private-apis and fallback $(FALLBACK_RUSTPUSH_DIR) copy is unavailable" >&2; exit 1; \
+			fi; \
+		fi; \
+		if [ ! -f rustpush-master/open-absinthe/Cargo.toml ]; then \
+			if [ -f $(FALLBACK_RUSTPUSH_DIR)/open-absinthe/Cargo.toml ]; then \
+				echo "Hydrating rustpush-master/open-absinthe from $(FALLBACK_RUSTPUSH_DIR)..."; \
+				rm -rf rustpush-master/open-absinthe; \
+				cp -R $(FALLBACK_RUSTPUSH_DIR)/open-absinthe rustpush-master/; \
+			else \
+				echo "error: rustpush-master is missing open-absinthe and fallback $(FALLBACK_RUSTPUSH_DIR) copy is unavailable" >&2; exit 1; \
+			fi; \
+		fi; \
+		if [ ! -d rustpush-master/certs/fairplay ]; then \
+			echo "Generating rustpush-master FairPlay cert stubs..."; \
+			mkdir -p rustpush-master/certs/fairplay; \
+			for name in $(FAIRPLAY_CERTS); do \
+				cp rustpush-master/certs/legacy-fairplay/fairplay.crt rustpush-master/certs/fairplay/$$name.crt; \
+				cp rustpush-master/certs/legacy-fairplay/fairplay.pem rustpush-master/certs/fairplay/$$name.pem; \
+			done; \
+		fi; \
+	elif [ "$(RUSTPUSH_DIR)" = "third_party/rustpush-upstream" ]; then \
+		if [ -z "$(RUSTPUSH_PIN)" ]; then \
+			echo "error: $(RUSTPUSH_PIN_FILE) is missing or empty — required to pin rustpush SHA" >&2; exit 1; \
+		fi; \
+		export GIT_CONFIG_COUNT=1; \
+		export GIT_CONFIG_KEY_0="url.https://github.com/.insteadOf"; \
+		export GIT_CONFIG_VALUE_0="git@github.com:"; \
+		if [ ! -d third_party/rustpush-upstream/.git ]; then \
+			echo "Cloning OpenBubbles/rustpush at pinned SHA $(RUSTPUSH_PIN)..."; \
+			mkdir -p third_party; \
+			git clone $(UPSTREAM_REPO) third_party/rustpush-upstream || exit 1; \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN) || exit 1; \
+			git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
+			git -C third_party/rustpush-upstream submodule update --init --recursive || exit 1; \
+		fi; \
+		current=$$(git -C third_party/rustpush-upstream rev-parse HEAD 2>/dev/null || echo none); \
+		if [ "$$current" != "$(RUSTPUSH_PIN)" ]; then \
+			echo "Checking out pinned rustpush SHA $(RUSTPUSH_PIN) (was $$current)..."; \
+			git -C third_party/rustpush-upstream remote set-url origin $(UPSTREAM_REPO); \
+			echo "Discarding any local mods to third_party/rustpush-upstream before checkout..."; \
+			git -C third_party/rustpush-upstream reset --hard HEAD || exit 1; \
+			git -C third_party/rustpush-upstream clean -fd || exit 1; \
+			git -C third_party/rustpush-upstream fetch --all --tags --prune || exit 1; \
+			git -C third_party/rustpush-upstream checkout $(RUSTPUSH_PIN) || { echo "error: failed to checkout pinned SHA $(RUSTPUSH_PIN)" >&2; exit 1; }; \
+			git -C third_party/rustpush-upstream submodule sync --recursive || exit 1; \
+			git -C third_party/rustpush-upstream submodule update --init --recursive || exit 1; \
+		fi; \
+		if [ ! -d third_party/rustpush-upstream/certs/fairplay ]; then \
+			echo "Generating FairPlay cert stubs..."; \
+			mkdir -p third_party/rustpush-upstream/certs/fairplay; \
+			for name in $(FAIRPLAY_CERTS); do \
+				cp third_party/rustpush-upstream/certs/legacy-fairplay/fairplay.crt \
+				   third_party/rustpush-upstream/certs/fairplay/$$name.crt; \
+				cp third_party/rustpush-upstream/certs/legacy-fairplay/fairplay.pem \
+				   third_party/rustpush-upstream/certs/fairplay/$$name.pem; \
+			done; \
+		fi; \
+		if [ -d rustpush/open-absinthe ] && [ -f rustpush/open-absinthe/Cargo.toml ]; then \
+			if ! diff -rq rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe >/dev/null 2>&1; then \
+				echo "Overlaying our open-absinthe (native NAC wiring) onto $(RUSTPUSH_DIR)/open-absinthe..."; \
+				rm -rf third_party/rustpush-upstream/open-absinthe; \
+				cp -Rp rustpush/open-absinthe third_party/rustpush-upstream/open-absinthe; \
+			fi; \
+		fi; \
+		if grep -q '^mod activation;' $(RUSTPUSH_DIR)/src/lib.rs 2>/dev/null; then \
+			echo "Making rustpush activation module public (needed by RelayOSConfig)..."; \
+			sed -i.bak 's/^mod activation;/pub mod activation;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
+		fi; \
+		if grep -q '^mod ids;' $(RUSTPUSH_DIR)/src/lib.rs 2>/dev/null; then \
+			echo "Making rustpush ids module public (needed by FT RespondedElsewhere overlay)..."; \
+			sed -i.bak 's/^mod ids;/pub mod ids;/' $(RUSTPUSH_DIR)/src/lib.rs && rm -f $(RUSTPUSH_DIR)/src/lib.rs.bak; \
+		fi; \
+		if grep -q '^    token: String,$$' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs 2>/dev/null; then \
+			echo "Making FetchedToken.token pub (needed to replay persisted PET on session restore)..."; \
+			sed -i.bak 's/^    token: String,$$/    pub token: String,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs.bak; \
+		fi; \
+		if grep -q '^    expiration: SystemTime,$$' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs 2>/dev/null; then \
+			echo "Making FetchedToken.expiration pub..."; \
+			sed -i.bak 's/^    expiration: SystemTime,$$/    pub expiration: SystemTime,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/client.rs.bak; \
+		fi; \
+		if grep -q '^pub use client::{AppleAccount, LoginState,' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/lib.rs 2>/dev/null; then \
+			echo "Re-exporting FetchedToken from icloud_auth crate root..."; \
+			sed -i.bak 's/^pub use client::{AppleAccount, LoginState,/pub use client::{AppleAccount, FetchedToken, LoginState,/' $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/lib.rs && rm -f $(RUSTPUSH_DIR)/apple-private-apis/icloud-auth/src/lib.rs.bak; \
+		fi; \
+		if grep -q '^            for excluded in &trust.excludeds {$$' $(RUSTPUSH_DIR)/src/icloud/keychain.rs 2>/dev/null && \
+		   ! grep -q 'Ignoring exclusion of ourselves' $(RUSTPUSH_DIR)/src/icloud/keychain.rs 2>/dev/null; then \
+			echo "Patching keychain.rs to ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1)..."; \
+			KEYCHAIN_REPL=$$(printf '            let my_id = \\&state.user_identity.as_ref().unwrap().identifier;\\\n&\\\n                if excluded == my_id {\\\n                    warn!(\\\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\\\n                        excluded,\\\n                        peer.0.hash.as_ref().unwrap()\\\n                    );\\\n                    continue;\\\n                }') && \
+			sed -i.bak "s|^            for excluded in \&trust\.excludeds {\$$|$${KEYCHAIN_REPL}|" $(RUSTPUSH_DIR)/src/icloud/keychain.rs && rm -f $(RUSTPUSH_DIR)/src/icloud/keychain.rs.bak; \
+		fi; \
+		if grep -q '^    let mut request = SignedRequest::new("id-register", Method::POST)$$' $(RUSTPUSH_DIR)/src/ids/user.rs 2>/dev/null && \
+		   ! grep -q 'RUSTPUSH_LOG_REGISTER_BODY' $(RUSTPUSH_DIR)/src/ids/user.rs 2>/dev/null; then \
+			echo "Patching user.rs to add env-gated REGISTER body XML dump (StatusKit reliability diagnostic; ports d77b1ac4)..."; \
+			sed -i.bak 's|^    let mut request = SignedRequest::new("id-register", Method::POST)$$|    if std::env::var("RUSTPUSH_LOG_REGISTER_BODY").is_ok() { info!("REGISTER body XML: {}", plist_to_string(\&body).unwrap_or_default()); } let mut request = SignedRequest::new("id-register", Method::POST)|' $(RUSTPUSH_DIR)/src/ids/user.rs && rm -f $(RUSTPUSH_DIR)/src/ids/user.rs.bak; \
+		fi; \
+		if grep -q 'panic!("No saved channel for identifier!")' $(RUSTPUSH_DIR)/src/statuskit.rs 2>/dev/null; then \
+			echo "Softening statuskit.rs:119 panic to warn+default APSChannel (StatusKit reliability)..."; \
+			sed -i.bak 's|            panic!("No saved channel for identifier!")$$|            warn!("StatusKit: no saved channel for identifier — using last_msg_ns=0 (will replay)"); return APSChannel { identifier: channel.clone(), last_msg_ns: 0, subscribe: join };|' $(RUSTPUSH_DIR)/src/statuskit.rs && rm -f $(RUSTPUSH_DIR)/src/statuskit.rs.bak; \
+		fi; \
+		if grep -q 'else { panic!("Channel not found!") };' $(RUSTPUSH_DIR)/src/statuskit.rs 2>/dev/null; then \
+			echo "Softening statuskit.rs:736 panic to warn+Ok(None) (StatusKit reliability — presence-before-keysharing race)..."; \
+			sed -i.bak 's|let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { panic!("Channel not found!") };|let Some(referenced_channel) = state.keys.get_mut(\&base64_encode(\&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(\&channel.id)); return Ok(None); };|' $(RUSTPUSH_DIR)/src/statuskit.rs && rm -f $(RUSTPUSH_DIR)/src/statuskit.rs.bak; \
+		fi; \
+	fi
+
+# `ensure-rustpush-source` is an order-only prereq (the `|` separator):
+# it runs before the recipe when needed, but its phony "always-dirty"
+# timestamp doesn't force $(RUST_LIB) to rebuild on every `make` invocation.
+# Only actual Rust source changes / Cargo.toml changes should trigger a
+# rebuild; the pinned SHA + submodule setup is idempotent once done.
+$(RUST_LIB): $(RUST_SRC) $(RUSTPUSH_SRC) $(CARGO_FILES) | ensure-rustpush-source
 	cd pkg/rustpushgo && $(CARGO_ENV) cargo build --release $(CARGO_FEATURES)
 	cp pkg/rustpushgo/target/release/librustpushgo.a .
 

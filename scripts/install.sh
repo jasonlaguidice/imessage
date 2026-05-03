@@ -532,6 +532,72 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     echo ""
 fi
 
+# ── Optional shell shortcuts (asked before preferred handle so the
+#    handle prompt remains the last interactive step) ─────────────
+# LOG_OUT isn't computed until later in the script, so derive it inline
+# here using the same formula as the LaunchAgent block below.
+_SHORTCUT_DATA_ABS="$(cd "$DATA_DIR" && pwd)"
+_SHORTCUT_LOG_OUT="$_SHORTCUT_DATA_ABS/bridge.stdout.log"
+
+echo ""
+echo "Want easy commands you can type from any terminal to control the bridge?"
+echo "  start-imessage     stop-imessage     restart-imessage     imessage-log"
+read -r -p "Add them? [y/N]: " _shortcut_ans
+case "$_shortcut_ans" in
+    [yY]|[yY][eE][sS])
+        case "$SHELL" in
+            */zsh)  RC_FILE="$HOME/.zshrc" ;;
+            */bash) RC_FILE="$HOME/.bashrc" ;;
+            *)      RC_FILE="" ;;
+        esac
+        if [ -z "$RC_FILE" ]; then
+            echo "  Couldn't detect your shell from \$SHELL ($SHELL) — skipping. (Bash and Zsh are supported.)"
+        else
+            MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
+            MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
+            if [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
+                awk -v s="$MARKER_START" -v e="$MARKER_END" '
+                    $0 == s { skip = 1; next }
+                    $0 == e { skip = 0; next }
+                    !skip   { print }
+                ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
+            fi
+            cat >> "$RC_FILE" <<EOF
+$MARKER_START
+alias start-imessage='launchctl bootstrap gui/\$(id -u) $PLIST'
+alias stop-imessage='launchctl bootout gui/\$(id -u)/$BUNDLE_ID'
+alias restart-imessage='launchctl kickstart -k gui/\$(id -u)/$BUNDLE_ID'
+alias imessage-log='tail -f $_SHORTCUT_LOG_OUT'
+$MARKER_END
+EOF
+            echo "  ✓ Shortcuts added. Open a new terminal (or run \`source $RC_FILE\` here) and you can type:"
+            echo "      start-imessage   stop-imessage   restart-imessage   imessage-log"
+        fi
+        ;;
+    *)
+        # User declined. If a previous run installed shortcuts, treat the
+        # decline as "remove them" so the rc file matches the user's choice.
+        case "$SHELL" in
+            */zsh)  RC_FILE="$HOME/.zshrc" ;;
+            */bash) RC_FILE="$HOME/.bashrc" ;;
+            *)      RC_FILE="" ;;
+        esac
+        MARKER_START="# >>> mautrix-imessage shortcuts (managed) >>>"
+        MARKER_END="# <<< mautrix-imessage shortcuts (managed) <<<"
+        if [ -n "$RC_FILE" ] && [ -f "$RC_FILE" ] && grep -qF "$MARKER_START" "$RC_FILE"; then
+            awk -v s="$MARKER_START" -v e="$MARKER_END" '
+                $0 == s { skip = 1; next }
+                $0 == e { skip = 0; next }
+                !skip   { print }
+            ' "$RC_FILE" > "$RC_FILE.tmp" && mv "$RC_FILE.tmp" "$RC_FILE"
+            echo "  Removed previously-installed shortcuts from $RC_FILE."
+        else
+            echo "  Skipped — re-run this installer to add them later."
+        fi
+        ;;
+esac
+echo ""
+
 # ── Preferred handle (runs every time, can reconfigure) ────────
 HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
 CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
@@ -647,6 +713,111 @@ if [ -t 0 ]; then
                 ;;
             *)
                 echo "✓ Video transcoding disabled"
+                ;;
+        esac
+    fi
+fi
+
+# ── Ensure disable_facetime key exists in config ──────────────
+if ! grep -q 'disable_facetime:' "$CONFIG" 2>/dev/null; then
+    sed -i '' '/video_transcoding:/a\
+    disable_facetime: false' "$CONFIG"
+fi
+
+# ── Disable FaceTime Bridge (use native Apple FT instead) ────────
+CURRENT_DISABLE_FT=$(grep 'disable_facetime:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*disable_facetime: *//' || true)
+if [ -n "${DISABLE_FACETIME:-}" ]; then
+    case "$DISABLE_FACETIME" in
+        1|true|TRUE|yes|YES)
+            sed -i '' "s/disable_facetime: .*/disable_facetime: true/" "$CONFIG"
+            echo "✓ FaceTime Bridge disabled (DISABLE_FACETIME env)"
+            ;;
+        *)
+            sed -i '' "s/disable_facetime: .*/disable_facetime: false/" "$CONFIG"
+            echo "✓ FaceTime Bridge enabled (DISABLE_FACETIME env)"
+            ;;
+    esac
+elif [ -t 0 ]; then
+    echo ""
+    echo "FaceTime Bridge:"
+    echo "  If you have an Apple device that already handles FaceTime, the"
+    echo "  bridge's FT wrapper just clutters your chat. Disable it to skip"
+    echo "  !im facetime commands and inbound FT notices."
+    echo ""
+    if [ "$CURRENT_DISABLE_FT" = "true" ]; then
+        read -p "Disable FaceTime Bridge? [Y/n]:" DIS_FT
+        case "$DIS_FT" in
+            [nN]*)
+                sed -i '' "s/disable_facetime: .*/disable_facetime: false/" "$CONFIG"
+                echo "✓ FaceTime Bridge enabled"
+                ;;
+            *)
+                echo "✓ FaceTime Bridge disabled"
+                ;;
+        esac
+    else
+        read -p "Disable FaceTime Bridge (use native Apple FT)? [y/N]: " DIS_FT
+        case "$DIS_FT" in
+            [yY]*)
+                sed -i '' "s/disable_facetime: .*/disable_facetime: true/" "$CONFIG"
+                echo "✓ FaceTime Bridge disabled"
+                ;;
+            *)
+                echo "✓ FaceTime Bridge enabled"
+                ;;
+        esac
+    fi
+fi
+
+# ── Ensure statuskit_notifications key exists in config ─────
+if ! grep -q 'statuskit_notifications:' "$CONFIG" 2>/dev/null; then
+    sed -i '' '/disable_facetime:/a\
+    statuskit_notifications: true' "$CONFIG"
+fi
+
+# ── StatusKit notifications (iOS 18 Focus / DND inline notices) ───
+CURRENT_STATUSKIT_NOTIF=$(grep 'statuskit_notifications:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*statuskit_notifications: *//' || true)
+if [ -n "${STATUSKIT_NOTIFICATIONS:-}" ]; then
+    case "$STATUSKIT_NOTIFICATIONS" in
+        1|true|TRUE|yes|YES)
+            sed -i '' "s/statuskit_notifications: .*/statuskit_notifications: true/" "$CONFIG"
+            echo "✓ StatusKit notifications enabled (STATUSKIT_NOTIFICATIONS env)"
+            ;;
+        *)
+            sed -i '' "s/statuskit_notifications: .*/statuskit_notifications: false/" "$CONFIG"
+            echo "✓ StatusKit notifications disabled (STATUSKIT_NOTIFICATIONS env)"
+            ;;
+    esac
+elif [ -t 0 ]; then
+    echo ""
+    echo "StatusKit notifications:"
+    echo "  When a contact enables iOS 18 Focus or Do Not Disturb on their"
+    echo "  iPhone, the bridge can post a silent notice in the DM portal"
+    echo "  (\"🔕 Name has notifications silenced (Do Not Disturb).\") and"
+    echo "  update Matrix ghost presence — the same affordance Apple's"
+    echo "  Messages app shows in-conversation. Disabling keeps the"
+    echo "  StatusKit registration intact but suppresses the notices."
+    echo ""
+    if [ "$CURRENT_STATUSKIT_NOTIF" = "false" ]; then
+        read -p "Enable StatusKit notifications? [y/N]: " EN_SK
+        case "$EN_SK" in
+            [yY]*)
+                sed -i '' "s/statuskit_notifications: .*/statuskit_notifications: true/" "$CONFIG"
+                echo "✓ StatusKit notifications enabled"
+                ;;
+            *)
+                echo "✓ StatusKit notifications disabled"
+                ;;
+        esac
+    else
+        read -p "Enable StatusKit notifications? [Y/n]: " EN_SK
+        case "$EN_SK" in
+            [nN]*)
+                sed -i '' "s/statuskit_notifications: .*/statuskit_notifications: false/" "$CONFIG"
+                echo "✓ StatusKit notifications disabled"
+                ;;
+            *)
+                echo "✓ StatusKit notifications enabled"
                 ;;
         esac
     fi
@@ -783,3 +954,4 @@ echo "  Logs:    tail -f $LOG_OUT"
 echo "  Restart: launchctl kickstart -k gui/$(id -u)/$BUNDLE_ID"
 echo "  Stop:    launchctl bootout gui/$(id -u)/$BUNDLE_ID"
 echo ""
+

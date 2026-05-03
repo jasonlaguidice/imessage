@@ -4,6 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::rc::Rc;
+use std::sync::{Mutex, OnceLock};
 
 use goblin::mach::cputype::CPU_TYPE_X86_64;
 use goblin::mach::Mach;
@@ -14,6 +15,127 @@ use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 use unicorn_engine::{RegisterX86, Unicorn};
 
 use crate::AbsintheError;
+
+// ============================================================================
+// NAC relay config (Apple Silicon hardware keys)
+// ============================================================================
+//
+// Hardware keys extracted from Apple Silicon Macs can't be driven by the
+// local unicorn x86-64 emulator. For those users, `extract-key` embeds a
+// relay URL + bearer token into the hardware-key JSON blob. At runtime,
+// the wrapper calls `set_relay_config` to stash the URL + token + optional
+// cert fingerprint here, and `ValidationCtx::new()` checks it first. If a
+// relay is configured, NAC flows through a 3-step HTTPS protocol against
+// the relay server (`tools/nac-relay`, running on a Mac) instead of the
+// local emulator. The relay uses native `AAAbsintheContext` via
+// `nac-validation` to produce real Apple-accepted bytes at each step.
+
+#[derive(Clone, Debug)]
+pub struct RelayConfig {
+    pub url: String,
+    pub token: Option<String>,
+    pub cert_fp: Option<String>,
+}
+
+fn relay_config() -> &'static Mutex<Option<RelayConfig>> {
+    static CONFIG: OnceLock<Mutex<Option<RelayConfig>>> = OnceLock::new();
+    CONFIG.get_or_init(|| Mutex::new(None))
+}
+
+/// Install a NAC relay so subsequent `ValidationCtx::new()` calls route
+/// validation through the relay's single-shot `/validation-data` endpoint
+/// instead of the local x86-64 emulator. Idempotent; overwriting is fine.
+///
+/// The URL should be the full relay endpoint, e.g.
+/// `https://host:5001/validation-data`. If a bare base URL is passed
+/// (no `/validation-data` suffix), the suffix is appended automatically.
+pub fn set_relay_config(url: String, token: Option<String>, cert_fp: Option<String>) {
+    let trimmed = url.trim_end_matches('/');
+    let full_url = if trimmed.ends_with("/validation-data") {
+        trimmed.to_string()
+    } else {
+        format!("{}/validation-data", trimmed)
+    };
+    let cfg = RelayConfig { url: full_url, token, cert_fp };
+    let mut slot = match relay_config().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    info!("NAC relay URL: {}", cfg.url);
+    *slot = Some(cfg);
+}
+
+fn get_relay_config() -> Option<RelayConfig> {
+    let slot = match relay_config().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    slot.clone()
+}
+
+// ---------------------------------------------------------------------------
+// Pre-fetched validation data (Apple Silicon relay path)
+//
+// The bridge pre-fetches validation data from the relay and stashes it here.
+// sign() checks this before returning the emulator's NACSign output — if
+// set, the relay's data is authoritative and the emulator result is discarded.
+// This lets the emulator handle NACInit/KeyEstablishment (producing valid
+// request bytes for upstream's Apple handshake) while the relay provides
+// the actual signed validation data.
+// ---------------------------------------------------------------------------
+
+fn prefetched_data() -> &'static Mutex<Option<Vec<u8>>> {
+    static DATA: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
+    DATA.get_or_init(|| Mutex::new(None))
+}
+
+/// Stash pre-fetched validation data from the NAC relay.
+/// The next call to `ValidationCtx::sign()` will return this data
+/// instead of the emulator's NACSign output.
+pub fn set_prefetched_validation_data(data: Vec<u8>) {
+    info!("NAC: stashed {} bytes of pre-fetched relay validation data", data.len());
+    let mut slot = match prefetched_data().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *slot = Some(data);
+}
+
+/// Take the pre-fetched validation data (if any). Returns None if
+/// nothing was stashed or it was already consumed.
+fn take_prefetched_validation_data() -> Option<Vec<u8>> {
+    let mut slot = match prefetched_data().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    slot.take()
+}
+
+/// Build a ureq agent that trusts the relay's self-signed TLS certificate
+/// if a fingerprint is configured. Matches the danger-accept-invalid-certs
+/// behavior the master-branch reqwest client used.
+fn relay_agent(cfg: &RelayConfig) -> Result<ureq::Agent, AbsintheError> {
+    use native_tls::TlsConnector;
+    let mut builder = TlsConnector::builder();
+    builder.danger_accept_invalid_certs(true);
+    builder.danger_accept_invalid_hostnames(true);
+    let connector = builder
+        .build()
+        .map_err(|e| AbsintheError::Other(format!("relay TLS build failed: {e}")))?;
+    let agent = ureq::AgentBuilder::new()
+        .tls_connector(std::sync::Arc::new(connector))
+        .timeout(std::time::Duration::from_secs(30))
+        .build();
+    // cert_fp pinning is best-effort: ureq exposes the peer cert only when
+    // rustls is used. For now we rely on the bearer token as the primary
+    // authenticator (matches the master-branch reqwest path).
+    let _ = cfg.cert_fp;
+    Ok(agent)
+}
+
+// relay_post_json and b64_decode removed — the relay now uses a single-shot
+// POST to /validation-data (matching master's approach) instead of a 3-step
+// JSON protocol.
 
 // ============================================================================
 // XNU IOKit property encryption (x86_64 Linux only)
@@ -806,10 +928,54 @@ const HOOK_SYMBOLS: &[&str] = &[
 // ValidationCtx
 // ============================================================================
 
+/// Public validation context used by rustpush's `MacOSConfig` to generate
+/// APNs validation data. Two internal modes:
+///
+/// - **Emulator** (default): runs Apple's NAC binary inside a Unicorn x86-64
+///   emulator, feeding it IOKit-equivalent hardware identifiers (with optional
+///   `_enc` fields) and handshaking with Apple's validation servers.
+///
+/// - **Native** (macOS + `native-nac` feature): delegates each NAC step to
+///   Apple's private `AAAbsintheContext` class via our `nac-validation`
+///   crate's three-step API (`NacContext::init` → `key_establishment` →
+///   `sign`). `new()` calls `NACInit(cert)` and returns the real request
+///   bytes that upstream `MacOSConfig::generate_validation_data` then POSTs
+///   to `id-initialize-validation`; `key_establishment()` feeds Apple's
+///   response back into the same context; `sign()` produces the final
+///   validation bytes. Upstream rustpush remains entirely unmodified — the
+///   exact same HTTP flow runs, it just happens to be driven by
+///   `AAAbsintheContext` instead of the unicorn emulator. `_enc` hardware
+///   fields are irrelevant on this path because AAAbsintheContext reads the
+///   real hardware identifiers from IOKit itself.
 pub struct ValidationCtx {
-    uc: UnsafeCell<Unicorn<'static, ()>>,
-    state: Rc<RefCell<EmuState>>,
-    validation_ctx_addr: u64,
+    inner: ValidationCtxInner,
+}
+
+enum ValidationCtxInner {
+    Emulator {
+        uc: UnsafeCell<Unicorn<'static, ()>>,
+        state: Rc<RefCell<EmuState>>,
+        validation_ctx_addr: u64,
+    },
+    #[cfg(all(target_os = "macos", feature = "native-nac"))]
+    Native {
+        // UnsafeCell so `sign(&self)` can call NacContext's `&mut self`
+        // methods without violating aliasing rules. ValidationCtx is only
+        // used from a single task — the `unsafe impl Send` below mirrors
+        // that invariant.
+        ctx: UnsafeCell<nac_validation::NacContext>,
+    },
+    /// Relay mode: single-shot POST to a `tools/nac-relay` server running
+    /// on a real Mac. The relay does the full NACInit → Apple POST →
+    /// NACKeyEstablishment → NACSign dance internally and returns the
+    /// final validation data. Used when the hardware-key JSON carries a
+    /// `nac_relay_url` (Apple Silicon Macs whose keys can't run in the
+    /// unicorn x86-64 emulator).
+    Relay {
+        /// Complete validation data returned by the relay's single-shot
+        /// `/validation-data` endpoint.
+        validation_data: Vec<u8>,
+    },
 }
 
 unsafe impl Send for ValidationCtx {}
@@ -825,6 +991,92 @@ impl ValidationCtx {
         out_request_bytes: &mut Vec<u8>,
         hw_config: &HardwareConfig,
     ) -> Result<ValidationCtx, AbsintheError> {
+        // ====================================================================
+        // Relay path — Apple Silicon hardware keys routed through a Mac-hosted
+        // `tools/nac-relay` server. Single POST to `/validation-data` returns
+        // the complete validation data (the relay does the full NACInit →
+        // Apple POST → NACKeyEstablishment → NACSign dance internally).
+        // We store the result and return it from sign(); key_establishment
+        // is a no-op. out_request_bytes is left empty since the relay
+        // already completed the Apple handshake server-side.
+        // ====================================================================
+        if let Some(cfg) = get_relay_config() {
+            info!("NAC relay: single-shot POST to {}", cfg.url);
+            let agent = relay_agent(&cfg)?;
+            let mut req = agent.post(&cfg.url);
+            if let Some(ref tok) = cfg.token {
+                req = req.set("Authorization", &format!("Bearer {tok}"));
+            }
+            match req.call() {
+                Ok(resp) => {
+                    use base64::Engine;
+                    let body = resp.into_string()
+                        .map_err(|e| AbsintheError::Other(format!("relay read error: {e}")))?;
+                    let validation_data = base64::engine::general_purpose::STANDARD
+                        .decode(body.trim())
+                        .map_err(|e| AbsintheError::Other(format!("relay base64 decode: {e}")))?;
+                    info!("NAC relay: got {} bytes of validation data", validation_data.len());
+                    // Stash the relay data for sign() and pre-fetch.
+                    // out_request_bytes left empty — the bridge
+                    // pre-fetches and uses RelayOSConfig to return
+                    // relay data directly from generate_validation_data(),
+                    // bypassing the Apple handshake entirely (same as master).
+                    return Ok(ValidationCtx {
+                        inner: ValidationCtxInner::Relay { validation_data },
+                    });
+                }
+                Err(e) => {
+                    return Err(AbsintheError::Other(format!(
+                        "NAC relay failed ({}): {e}. \
+                         Ensure the nac-relay server is running on the Mac that provided \
+                         this hardware key.",
+                        cfg.url
+                    )));
+                }
+            }
+        }
+
+        // ====================================================================
+        // Native NAC fast path — macOS only, requires `native-nac` feature.
+        // Delegates to AAAbsintheContext via the `nac-validation` crate. The
+        // unicorn emulator is entirely skipped; hardware `_enc` fields are
+        // irrelevant because Apple's native framework reads real hardware
+        // identifiers from IOKit itself.
+        //
+        // True 3-step path: NacContext::init produces NACInit request bytes
+        // for upstream MacOSConfig's POST to `id-initialize-validation`,
+        // key_establishment() consumes Apple's response on the SAME context,
+        // and sign() returns the validation data correlated with that
+        // exchange. Apple's signin/v2/login correlates the validation data
+        // with the session_info we just exchanged — using a one-shot result
+        // (which runs its own internal exchange) breaks that correlation
+        // and triggers `MobileMeError`.
+        // ====================================================================
+        #[cfg(all(target_os = "macos", feature = "native-nac"))]
+        {
+            match nac_validation::NacContext::init(cert_chain) {
+                Ok((ctx, request_bytes)) => {
+                    info!(
+                        "NAC native path: NacContext::init produced {} request bytes",
+                        request_bytes.len()
+                    );
+                    *out_request_bytes = request_bytes;
+                    return Ok(ValidationCtx {
+                        inner: ValidationCtxInner::Native {
+                            ctx: UnsafeCell::new(ctx),
+                        },
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        "NAC native path: NacContext::init failed, falling back to emulator: {}",
+                        e
+                    );
+                    // Fall through to emulator path below.
+                }
+            }
+        }
+
         // Log hardware key diagnostics
         info!("NAC init: product={} serial={} board={} build={}",
             hw_config.product_name, hw_config.platform_serial_number,
@@ -958,45 +1210,99 @@ impl ValidationCtx {
         *out_request_bytes = request_data;
 
         Ok(ValidationCtx {
-            uc: UnsafeCell::new(uc),
-            state,
-            validation_ctx_addr,
+            inner: ValidationCtxInner::Emulator {
+                uc: UnsafeCell::new(uc),
+                state,
+                validation_ctx_addr,
+            },
         })
     }
 
     /// Process the session-info response from Apple.
     pub fn key_establishment(&mut self, response: &[u8]) -> Result<(), AbsintheError> {
-        let resp_addr = {
-            let mut st = self.state.borrow_mut();
-            st.heap_alloc(response.len() as u64)
-        };
-        let uc = self.uc.get_mut();
-        uc.mem_write(resp_addr, response)
-            .map_err(|e| AbsintheError::Other(format!("Failed to write response: {:?}", e)))?;
+        match &mut self.inner {
+            ValidationCtxInner::Relay { .. } => {
+                // No-op — the relay already completed the full handshake
+                // in the single-shot /validation-data call during new().
+                Ok(())
+            }
+            #[cfg(all(target_os = "macos", feature = "native-nac"))]
+            ValidationCtxInner::Native { ctx, .. } => {
+                debug!(
+                    "NAC key_establishment: native path, {} bytes -> AAAbsintheContext",
+                    response.len()
+                );
+                // Drive key_establishment on ctx so it reaches a valid state
+                // (needed in case the 3-step NACSign path is used as fallback).
+                // Safety: single-task use; see ValidationCtx struct doc.
+                let ctx = unsafe { &mut *ctx.get() };
+                ctx.key_establishment(response)
+                    .map_err(|e| AbsintheError::Other(format!("NACKeyEstablishment: {e}")))?;
+                Ok(())
+            }
+            ValidationCtxInner::Emulator { uc, state, validation_ctx_addr } => {
+                let resp_addr = {
+                    let mut st = state.borrow_mut();
+                    st.heap_alloc(response.len() as u64)
+                };
+                let uc = uc.get_mut();
+                uc.mem_write(resp_addr, response)
+                    .map_err(|e| AbsintheError::Other(format!("Failed to write response: {:?}", e)))?;
 
-        let ret = call_func(
-            uc,
-            NAC_KEY_EST,
-            &[self.validation_ctx_addr, resp_addr, response.len() as u64],
-        )?;
+                let ret = call_func(
+                    uc,
+                    NAC_KEY_EST,
+                    &[*validation_ctx_addr, resp_addr, response.len() as u64],
+                )?;
 
-        if ret != 0 {
-            return Err(AbsintheError::NacError(-(ret as i64 as i32)));
+                if ret != 0 {
+                    return Err(AbsintheError::NacError(-(ret as i64 as i32)));
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     /// Generate signed validation data.
     pub fn sign(&self) -> Result<Vec<u8>, AbsintheError> {
+        // Check for pre-fetched relay data first — if the bridge stashed
+        // validation data from the NAC relay, it's authoritative.
+        if let Some(data) = take_prefetched_validation_data() {
+            info!("NAC sign: returning pre-fetched relay validation data ({} bytes)", data.len());
+            return Ok(data);
+        }
+
+        let (uc, state, validation_ctx_addr) = match &self.inner {
+            ValidationCtxInner::Relay { validation_data } => {
+                info!("NAC sign: returning relay validation data ({} bytes)", validation_data.len());
+                return Ok(validation_data.clone());
+            }
+            #[cfg(all(target_os = "macos", feature = "native-nac"))]
+            ValidationCtxInner::Native { ctx } => {
+                // 3-step NACSign on the context whose key_establishment was
+                // driven by the upstream HTTP flow — produces validation
+                // data correlated with this connection's session_info.
+                // Safety: single-task use; see ValidationCtx struct doc.
+                let ctx = unsafe { &mut *ctx.get() };
+                let bytes = ctx
+                    .sign()
+                    .map_err(|e| AbsintheError::Other(format!("NACSign: {e}")))?;
+                debug!("NAC sign: native 3-step path produced {} bytes", bytes.len());
+                return Ok(bytes);
+            }
+            ValidationCtxInner::Emulator { uc, state, validation_ctx_addr } => {
+                (uc, state, *validation_ctx_addr)
+            }
+        };
         // sign() takes &self but we need &mut for the emulator.
         // Safety: ValidationCtx is only used from one thread (enforced by
         // the single-threaded usage pattern and unsafe Send impl).
-        let uc = unsafe { &mut *self.uc.get() };
+        let uc = unsafe { &mut *uc.get() };
 
         let out_data_ptr;
         let out_data_len_ptr;
         {
-            let mut st = self.state.borrow_mut();
+            let mut st = state.borrow_mut();
             out_data_ptr = st.heap_alloc(8);
             out_data_len_ptr = st.heap_alloc(8);
         }
@@ -1005,7 +1311,7 @@ impl ValidationCtx {
             uc,
             NAC_SIGN,
             &[
-                self.validation_ctx_addr,
+                validation_ctx_addr,
                 0,
                 0,
                 out_data_ptr,

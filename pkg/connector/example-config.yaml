@@ -31,6 +31,35 @@ heic_jpeg_quality: 95
 # Available handles are logged on startup.
 preferred_handle: ""
 
+# Override the display name pre-filled on the FaceTime web join page (the
+# `#n=…` fragment in the ring-notice link). If empty, the bridge reads
+# "First Last" from the Apple Account SPD; if that's also blank it falls
+# back to the bare iMessage handle (e.g. "+15551234567").
+facetime_display_name: ""
+
+# Disable bridge FaceTime integration. When true, !facetime* commands aren't
+# registered and inbound ring / missed / answered-elsewhere / peer-invite
+# notices are suppressed. Intended for users with their own Apple device who
+# answer FaceTime natively — the bridge wrapper adds nothing in that case.
+disable_facetime: false
+
+# Publish "available" to StatusKit once after startup. Peer iOS reciprocates
+# with a reshare, which is what gives the bridge the keys needed to decrypt
+# contacts' Focus/DND presence. Leaving this on dramatically improves the
+# chance of seeing others' Focus state in Matrix. Set to false to opt out.
+statuskit_share_on_startup: true
+
+# StatusKit notifications surface iOS 18 Focus / Do Not Disturb state
+# changes from your contacts inline in the relevant DM portal. When a
+# contact enables DND on their iPhone, a silent m.notice appears in the
+# DM ("🔕 Name has notifications silenced (Do Not Disturb).") plus a
+# Matrix ghost presence update, and clears when they turn it off — the
+# same affordance Apple's Messages app shows in-conversation. Set this
+# to false to suppress the notices and presence updates while leaving
+# StatusKit registration / key exchange running normally (the IDS-layer
+# 4-service identity is unaffected, so peer reshare eligibility is kept).
+statuskit_notifications: true
+
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
 # When configured, this is used instead of iCloud contacts.

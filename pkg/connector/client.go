@@ -25,6 +25,7 @@ import (
 	"regexp"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -47,7 +48,9 @@ import (
 	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/format"
 	"maunium.net/go/mautrix/id"
+	"maunium.net/go/mautrix/pushrules"
 
 	"github.com/lrhodin/imessage/imessage"
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
@@ -135,6 +138,60 @@ type IMClient struct {
 	// Contact source for name resolution (iCloud or external CardDAV)
 	contacts contactSource
 
+	// sharedProfiles is the in-memory cache of shared iMessage profile records
+	// (Name & Photo Sharing) received via ShareProfile / UpdateProfile
+	// messages, keyed by sender identifier (e.g. "tel:+1234567890"). Values
+	// are *sharedProfileRow. Fronts sharedProfileStore which persists them
+	// across restarts; see pkg/connector/shared_profile.go.
+	sharedProfiles     sync.Map
+	sharedProfileStore *sharedProfileStore
+
+	// statusKitPresence tracks the last-known availability state per contact
+	// handle, keyed by iMessage identifier string (e.g. "tel:+1234567890").
+	// Stored as bool (true = available). Used to suppress duplicate bot notices
+	// when StatusKit re-delivers the same presence state on reconnect.
+	statusKitPresence sync.Map // map[string]bool
+
+	// statusKitPresenceByPortal mirrors statusKitPresence but keyed by the
+	// resolved DM portal ID — i.e. canonical-per-peer regardless of which
+	// alias (mailto: vs tel:) StatusKit routed the notification through.
+	// Peer iOS publishes status to every alias of the same Apple ID, so
+	// without this canonical dedup the bridge fires N notices per state
+	// change for a peer with N registered handles.
+	statusKitPresenceByPortal sync.Map // map[networkid.PortalID]string
+
+	// statusKitPortalCache memoizes the resolved DM portal ID for a StatusKit
+	// presence handle. Populated after a successful IDS correlation lookup
+	// (see resolveStatusPortalViaIDS) so we only pay the IDS round trip once
+	// per unresolved handle per session. Values are networkid.PortalID.
+	statusKitPortalCache sync.Map // map[string]networkid.PortalID
+
+	// sharedStreamAssetCache tracks the last observed asset GUID set per shared
+	// album for this session. The Shared Streams watcher uses it to suppress
+	// false-positive "new content" notices from Apple's getchanges endpoint,
+	// which also fires on metadata-only album updates.
+	sharedStreamAssetCache   map[string]map[string]struct{}
+	sharedStreamAssetCacheMu sync.Mutex
+
+	// sharedAlbumRooms caches dedicated Matrix rooms created for browsing
+	// shared album content. Keyed by album GUID; ephemeral per session.
+	sharedAlbumRooms   map[string]id.RoomID
+	sharedAlbumRoomsMu sync.Mutex
+
+	// statusKitBotRulePushed is set to true after we successfully install a
+	// sender push rule via the double puppet that silences push notifications
+	// from the bridge bot. Done once per session; the rule is durable on the
+	// homeserver so re-installs across sessions are harmless but redundant.
+	statusKitBotRulePushed atomic.Bool
+
+	// lastPresenceSubscribe timestamps the most recent call to
+	// subscribeToContactPresence. OnKeysReceived triggers re-subscription
+	// when new keys arrive, but multiple key-sharing messages can arrive in
+	// quick succession — the debounce prevents redundant APNs subscription
+	// storms.
+	lastPresenceSubscribe     time.Time
+	lastPresenceSubscribeLock sync.Mutex
+
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
 	contactsReadyLock sync.RWMutex
@@ -155,6 +212,22 @@ type IMClient struct {
 
 	// Cloud backfill local cache store.
 	cloudStore *cloudBackfillStore
+
+	// Layer-2 MMCS attachment recovery: persists descriptors for attachments
+	// whose push-time download exhausted the rustpushgo retry (Layer 1).
+	// AttachmentRetrier drains this on a timer with its own longer-horizon
+	// backoff (30s → 2m → 10m → 30m → 1h → 6h) and falls back to CloudKit
+	// if the MMCS URL has expired. See pending_attachment_store.go +
+	// attachment_retrier.go.
+	pendingAttachments *pendingAttachmentStore
+	retrierOnce        sync.Once
+
+	// Ford key cache — reimplementation of the 94f7b8e Ford cross-batch
+	// deduplication fix in Go. Populated aggressively during CloudKit
+	// attachment sync from every record's `lqa.protection_info` (and
+	// `avid.protection_info` for Live Photos), consulted on download to
+	// recover from MMCS dedup key mismatches. See pkg/connector/ford_cache.go.
+	fordCache *FordKeyCache
 
 	// Chat.db backfill (macOS with Full Disk Access only)
 	chatDB *chatDB
@@ -318,6 +391,7 @@ var _ bridgev2.BackfillingNetworkAPIWithLimits = (*IMClient)(nil)
 var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
+var _ rustpushgo.StatusCallback = (*IMClient)(nil)
 
 // ============================================================================
 // APNs message reorder buffer
@@ -432,13 +506,12 @@ func (b *messageBuffer) stop() {
 }
 
 // sendGhostReadReceipt sends a "they read my message" receipt from the ghost
-// user with the correct timestamp. The standard framework path
-// (QueueRemoteEvent → MarkRead → SetReadMarkers) doesn't work because the
-// ghost isn't double-puppeted, so the homeserver ignores BeeperReadExtra["ts"]
-// and uses server time instead. This method bypasses the framework by calling
-// SetBeeperInboxState directly on the ghost's underlying Matrix client, which
-// the homeserver honors for BeeperReadExtra["ts"] regardless of puppet status.
-// Falls back to QueueRemoteEvent if the direct path fails.
+// user with the correct iMessage read timestamp. The standard framework path
+// (QueueRemoteEvent → MarkRead) also calls SetReadMarkers, but goes through
+// ASIntent.MarkRead which strips BeeperReadExtra["ts"] for non-custom-puppet
+// users. By calling SetReadMarkers directly on the ghost's underlying Matrix
+// client we include the custom timestamp, giving Hungry the best chance of
+// honoring it. Falls back to QueueRemoteEvent if the direct path fails.
 func (c *IMClient) sendGhostReadReceipt(
 	log *zerolog.Logger,
 	ghostUserID networkid.UserID,
@@ -466,17 +539,48 @@ func (c *IMClient) sendGhostReadReceipt(
 		return
 	}
 
-	// Step 3: Look up the target message's Matrix event ID in the bridge DB.
-	msg, err := c.Main.Bridge.DB.Message.GetLastPartByID(ctx, portalKey.Receiver, makeMessageID(guid))
-	if err != nil || msg == nil || msg.HasFakeMXID() {
+	// Step 3: Look up the target message in the bridge DB and ensure we target
+	// the same room as the portal to avoid "target event in different room".
+	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portalKey.Receiver, makeMessageID(guid))
+	if err != nil || len(dbMessages) == 0 {
 		log.Debug().Err(err).Str("portal_id", string(portalKey.ID)).Str("guid", guid).
 			Msg("Target message not in bridge DB, falling back to QueueRemoteEvent with ReadUpTo")
 		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
 		return
 	}
+	targetMsg := dbMessages[0]
+	for _, candidate := range dbMessages {
+		if candidate.HasFakeMXID() {
+			continue
+		}
+		if candidate.Room.ID == portalKey.ID && candidate.Room.Receiver == portalKey.Receiver {
+			targetMsg = candidate
+			break
+		}
+	}
+	if targetMsg == nil || targetMsg.HasFakeMXID() {
+		log.Debug().
+			Str("portal_id", string(portalKey.ID)).
+			Str("guid", guid).
+			Msg("No usable Matrix event ID for ghost read receipt, falling back to QueueRemoteEvent")
+		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
+		return
+	}
+	if targetMsg.Room.ID != portalKey.ID || targetMsg.Room.Receiver != portalKey.Receiver {
+		log.Debug().
+			Str("portal_id", string(portalKey.ID)).
+			Str("target_room_portal", string(targetMsg.Room.ID)).
+			Str("guid", guid).
+			Msg("Skipping direct ghost read receipt due to portal/target room mismatch")
+		c.queueGhostReceiptFallback(ghostUserID, targetMsg.Room, guid, readTime)
+		return
+	}
 
 	// Step 4: Type-assert to access the ghost's underlying Matrix client
-	// and call SetBeeperInboxState directly (bypasses IsCustomPuppet check).
+	// and call SetReadMarkers directly (bypasses IsCustomPuppet check so
+	// BeeperReadExtra["ts"] is included, giving Hungry the iMessage read time).
+	// Do NOT use SetBeeperInboxState here — Hungry returns HTTP 400 for ghost
+	// (appservice puppet) users because they have no Beeper inbox.
 	asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent)
 	if !ok {
 		log.Warn().Str("portal_id", string(portalKey.ID)).
@@ -489,18 +593,16 @@ func (c *IMClient) sendGhostReadReceipt(
 		"ts": readTime.UnixMilli(),
 	}
 	req := &mautrix.ReqSetReadMarkers{
-		Read:                 msg.MXID,
-		FullyRead:            msg.MXID,
+		Read:                 targetMsg.MXID,
+		FullyRead:            targetMsg.MXID,
 		BeeperReadExtra:      extraData,
 		BeeperFullyReadExtra: extraData,
 	}
-	err = asIntent.Matrix.SetBeeperInboxState(ctx, portal.MXID, &mautrix.ReqSetBeeperInboxState{
-		ReadMarkers: req,
-	})
+	err = asIntent.Matrix.SetReadMarkers(ctx, portal.MXID, req)
 	if err != nil {
 		log.Warn().Err(err).Str("portal_id", string(portalKey.ID)).
-			Stringer("event_id", msg.MXID).
-			Msg("SetBeeperInboxState failed for ghost, falling back to QueueRemoteEvent")
+			Stringer("event_id", targetMsg.MXID).
+			Msg("SetReadMarkers failed for ghost, falling back to QueueRemoteEvent")
 		c.queueGhostReceiptFallback(ghostUserID, portalKey, guid, readTime)
 		return
 	}
@@ -508,10 +610,10 @@ func (c *IMClient) sendGhostReadReceipt(
 	log.Info().
 		Str("portal_id", string(portalKey.ID)).
 		Str("guid", guid).
-		Stringer("event_id", msg.MXID).
+		Stringer("event_id", targetMsg.MXID).
 		Int64("read_time_ms", readTime.UnixMilli()).
 		Str("read_time", readTime.UTC().Format(time.RFC3339)).
-		Msg("Set ghost read receipt via SetBeeperInboxState with correct timestamp")
+		Msg("Set ghost read receipt via SetReadMarkers with correct timestamp")
 }
 
 // queueGhostReceiptFallback sends a ghost read receipt via the standard
@@ -570,6 +672,15 @@ func (c *IMClient) onForwardBackfillDone() {
 		if contactsReady {
 			go c.refreshGhostNamesFromContacts(log.Logger)
 		}
+
+		// Fresh-bridge path: ghosts only exist after backfill creates them.
+		// subscribeAfterInit runs at connect time with zero ghosts on a fresh
+		// install and returns without inviting. This post-backfill hook fires
+		// the sweep once ghosts exist. Warm restart already has ghosts and
+		// invites via subscribeAfterInit, so this is a no-op dup there — the
+		// per-handle invite is idempotent on peer's side (re-delivery just
+		// hits the server-side retry loop).
+		go c.inviteContactsToStatusSharing(log.Logger)
 	}
 }
 
@@ -677,6 +788,22 @@ func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Conte
 	}
 }
 
+// safeRestoreTokenProvider wraps RestoreTokenProvider with a panic recovery.
+// Uniffi converts Rust panics to Go panics (CALL_UNEXPECTED_ERROR); without
+// recovery here the whole process crashes instead of degrading gracefully.
+func safeRestoreTokenProvider(
+	config *rustpushgo.WrappedOsConfig,
+	conn *rustpushgo.WrappedApsConnection,
+	username, hashedPwHex, pet, spdBase64 string,
+) (tp *rustpushgo.WrappedTokenProvider, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("RestoreTokenProvider panicked: %v", r)
+		}
+	}()
+	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
+}
+
 func (c *IMClient) Connect(ctx context.Context) {
 	c.startupTime = time.Now()
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
@@ -710,19 +837,32 @@ func (c *IMClient) Connect(ctx context.Context) {
 		meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 		if meta.AccountUsername != "" && meta.AccountPET != "" && meta.AccountSPDBase64 != "" {
 			log.Info().Msg("Restoring iCloud TokenProvider from persisted credentials")
-			tp, err := rustpushgo.RestoreTokenProvider(c.config, c.connection,
+			tp, err := safeRestoreTokenProvider(c.config, c.connection,
 				meta.AccountUsername, meta.AccountHashedPasswordHex,
 				meta.AccountPET, meta.AccountSPDBase64)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
 				c.tokenProvider = &tp
-				// Don't seed the cached MobileMe delegate — it's likely expired.
-				// Instead, let get_mme_token() detect the empty delegate and call
-				// refresh_mme(), which triggers the full auto-refresh chain:
-				//   expired PET → get_token() → login_email_pass() → fresh PET
-				//   → login_apple_delegates() → fresh MobileMe delegate
-				log.Info().Msg("TokenProvider restored — MobileMe delegate will be refreshed on first use")
+				// Seed the persisted MobileMe delegate so CloudKit / keychain
+				// ops have something to work with on first use. The wrapper's
+				// RestoreTokenProvider path intentionally returns a
+				// WrappedTokenProvider with empty mme_delegate_bytes (see
+				// pkg/rustpushgo/src/lib.rs::restore_token_provider — "callers
+				// must seed_mme_delegate_json() from persisted state before
+				// using keychain/contacts features"), so we seed it here. The
+				// delegate is whatever was captured during the most recent
+				// successful login; if it's expired, CloudKit calls will
+				// surface an auth error and the user can re-login.
+				if meta.MmeDelegateJSON != "" {
+					if seedErr := tp.SeedMmeDelegateJson(meta.MmeDelegateJSON); seedErr != nil {
+						log.Warn().Err(seedErr).Msg("Failed to seed persisted MobileMe delegate — CloudKit unavailable until re-login")
+					} else {
+						log.Info().Msg("Seeded persisted MobileMe delegate into restored TokenProvider")
+					}
+				} else {
+					log.Warn().Msg("TokenProvider restored but no persisted MobileMe delegate — CloudKit unavailable until re-login captures a fresh one")
+				}
 			}
 		}
 	}
@@ -737,6 +877,28 @@ func (c *IMClient) Connect(ctx context.Context) {
 		return
 	}
 	c.client = client
+
+	// GSA /circle "Apple Device" announce intentionally DISABLED.
+	//
+	// update_postdata("Apple Device", ["icloud","imessage","facetime"]) posts
+	// to gsas.apple.com/grandslam/GsService2/postdata declaring the bridge as
+	// a full Apple Device with FaceTime enrolled on the iCloud account.
+	// Empirically this hijacks the account's FT enrollment: the user's real
+	// Mac stopped receiving the "This Mac has access to FaceTime" confirmation,
+	// inbound calls connect but peer can't see the bridge's video, and outbound
+	// calls connect without media. Signaling (link tap, LetMeIn approve,
+	// JoinEvent) keeps working because that rides IDS, but Apple's server-side
+	// FT media negotiation routes to the announce-declared device profile
+	// which the bridge can't actually fulfill.
+	//
+	// The original motivation (StatusKit reshare eligibility on peer iOS) is
+	// carried by the 4-service IDS register bundle (MADRID+MULTIPLEX+FACETIME+
+	// VIDEO) landed in ce0c90bf — peer iOS gates reshare on the IDS identity
+	// shape, not on the GSA /circle enrollment.
+	//
+	// The Rust-side announce_apple_device_if_needed method is left in place
+	// (unused) so re-enabling is a one-line change if we ever find a safe
+	// device_name / services combination that doesn't disturb FT.
 
 	// Get our handle (precedence: config > login metadata > first handle)
 	handles := client.GetHandles()
@@ -778,6 +940,25 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
 
+	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
+	// for outbound, "nextincomingcall" for inbound). Done in the
+	// background because it's network-dependent and not load-bearing for
+	// connect; a failed pre-mint means the first outbound/inbound call
+	// mints on-demand (same as legacy behavior). With the bridge's long
+	// uptime, pre-minting here gives Apple's FT server days of
+	// identity-propagation time before the link is actually used.
+	if c.handle != "" {
+		go func(handle string) {
+			ft, ftErr := c.client.GetFacetimeClient()
+			if ftErr != nil {
+				log.Warn().Err(ftErr).Msg("Pre-mint FaceTime links: GetFacetimeClient failed; links will be minted on demand")
+				return
+			}
+			premintFaceTimeLinks(ft, handle)
+			log.Info().Str("handle", handle).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
+		}(c.handle)
+	}
+
 	if c.Main.Config.VideoTranscoding {
 		if ffmpeg.Supported() {
 			log.Info().Msg("Video transcoding enabled (ffmpeg found)")
@@ -793,6 +974,150 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Persist state after connect (APS tokens, IDS keys, device ID)
 	c.persistState(log)
 
+	// Reset StatusKit APNs channel cursors to 1 BEFORE init so the client
+	// loads the reset state and APNs replays the current presence for each
+	// contact on the next subscription. Keys are preserved.
+	if c.client != nil {
+		c.client.ResetStatuskitCursors()
+	}
+
+	// Initialize StatusKit presence system (non-fatal — runs in background).
+	// Once initialized, the Rust receive loop intercepts StatusKit APNs
+	// messages and invokes OnStatusUpdate for subscribed handles.
+	go func() {
+		if c.client == nil {
+			return
+		}
+		// Wrapped in a 30s timeout to prevent silent goroutine hangs if the
+		// Rust future (StatusKitClient::new → request_topics) never completes.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Warn().Interface("panic", r).Msg("StatusKit init panicked — treating as init failure")
+					done <- fmt.Errorf("statuskit init panicked: %v", r)
+				}
+			}()
+			done <- c.client.InitStatuskit(c)
+		}()
+		subscribeAfterInit := func(err error) {
+			// Guard against Disconnect having nil'd c.client during the
+			// init window (e.g. bridge shutdown or reconnect cycle while
+			// InitStatuskit was still running past its 30s timeout).
+			if c.client == nil {
+				return
+			}
+			// Registration state is independent of StatusKit init — log it
+			// unconditionally so we can see MULTIPLEX presence even when
+			// init fails. If MULTIPLEX is absent, key exchange cannot work
+			// regardless of how many invites we send.
+			services := c.client.GetRegisteredServices()
+			multiplexPresent := false
+			for _, s := range services {
+				if s == "com.apple.private.alloy.multiplex1" {
+					multiplexPresent = true
+					break
+				}
+			}
+			log.Info().
+				Bool("multiplex_registered", multiplexPresent).
+				Strs("registered_services", services).
+				Bool("init_ok", err == nil).
+				Msg("StatusKit startup")
+
+			if err != nil {
+				log.Warn().Err(err).Msg("StatusKit initialization failed — presence updates unavailable")
+				return
+			}
+			log.Info().Msg("StatusKit presence system initialized")
+			// subscribeToContactPresence may have raced ahead of InitStatuskit
+			// and failed with "StatusKit not initialized". Re-run it now that
+			// the StatusKit client is guaranteed to be ready.
+			c.subscribeToContactPresence(log)
+			// Delayed re-subscribe (~5s): catches peers whose reshare landed
+			// in the brief window between StatusKitClient::new spawning the
+			// APNs recv loop and the Rust-side status_callback being installed.
+			// Reshares in that window have their on_keys_received() call
+			// silently dropped by the `if let Some(cb)` guard in the recv loop;
+			// the bridge has the keys but never re-subscribes for that peer's
+			// presence channel. The 5s delay is comfortably larger than the
+			// callback-install gap (sub-millisecond on typical hardware) and
+			// the first round of inbound reshares (peer-network RTT bounded).
+			go func() {
+				time.Sleep(5 * time.Second)
+				if c.client == nil {
+					return
+				}
+				log.Info().Msg("StatusKit: delayed re-subscribe (catches install-callback race)")
+				c.subscribeToContactPresence(log)
+			}()
+			// Fan-out StatusKit invites matching OB-Android's shape: one
+			// handle per IDS message, paced with a small inter-send delay.
+			// OB invites per-chat-activation (and on app resume); bridge
+			// approximates with a startup sweep. Empirically the batched
+			// 23-handles-in-one-invite call we used previously appeared to
+			// either trigger peer-side filtering or not propagate to each
+			// peer's distribution set the way one-at-a-time invites do —
+			// 12h on passive-only yielded zero real-iOS reshares, whereas
+			// OB (which invites one at a time) gets reshares fine.
+			go c.inviteContactsToStatusSharing(log)
+			// Share status "available" once at startup. Empirically, peer iOS
+			// reciprocates a share with its own reshare, which is what gives
+			// us the key material to decrypt their subsequent presence
+			// updates. OB-Android only calls share_status from its zen-mode
+			// hooks (StatusQuery.kt on OS DND change) — but bridge has no OS
+			// DND to hook, and gating share behind a bot command puts a
+			// per-user setup step in the way that most users won't discover.
+			// So: share "available" unconditionally on startup. Bridge has no
+			// Focus mode of its own; "available" is the only truthful state.
+			// Gated on statuskit_share_on_startup (default true, user-overridable).
+			if c.Main.Config.StatusKitShareOnStartup {
+				go func() {
+					defer func() {
+						if r := recover(); r != nil {
+							log.Warn().Interface("panic", r).Msg("StatusKit startup share panicked")
+						}
+					}()
+					sk, err := c.client.GetStatuskitClient()
+					if err != nil || sk == nil {
+						log.Debug().Err(err).Msg("StatusKit startup share skipped — client not ready")
+						return
+					}
+					if err := c.safeRefreshPetTokenThrottled(); err != nil {
+						log.Debug().Err(err).Msg("StatusKit startup share: PET refresh skipped")
+					}
+					if err := sk.ShareStatus(true, nil); err != nil {
+						log.Warn().Err(err).Msg("StatusKit startup share_status failed")
+						return
+					}
+					log.Info().Msg("StatusKit startup share_status(available) published")
+				}()
+			} else {
+				log.Info().Msg("StatusKit startup share disabled via config (statuskit_share_on_startup: false)")
+			}
+
+			// Complement the `StatusKit startup` line above with the peer-key
+			// count, which is only available once the StatusKit client is ready.
+			if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+				log.Info().Int("known_peer_keys", len(sk.GetKnownHandles())).Msg("StatusKit peer keys loaded")
+			}
+		}
+		select {
+		case err := <-done:
+			subscribeAfterInit(err)
+		case <-ctx.Done():
+			// The Rust FFI call (StatusKitClient::new → request_topics) is
+			// taking longer than 30s. Don't block the connect flow, but keep
+			// a goroutine alive to subscribe as soon as it eventually finishes.
+			// The Rust side WILL set shared_statuskit/status_callback once
+			// StatusKitClient::new completes; we just need to subscribe then.
+			log.Warn().Msg("StatusKit initialization taking >30s — will subscribe when ready")
+			go func() { subscribeAfterInit(<-done) }()
+		}
+	}()
+
 	// Pre-populate sender_guid cache from existing portal metadata
 	go c.loadSenderGuidsFromDB(log)
 
@@ -800,6 +1125,40 @@ func (c *IMClient) Connect(ctx context.Context) {
 	c.stopChan = make(chan struct{})
 	c.msgBuffer = &messageBuffer{client: c}
 	go c.periodicStateSave(log)
+	go c.periodicPetRefresh(log)
+	go c.periodicStatusSharingReinvite(log)
+	go c.startSharedStreamsWatcher(log)
+
+	// Ensure shared-profile schema and hydrate the in-memory cache from the
+	// DB. Runs on every bridge start so existing installs pick up the table
+	// without needing a fresh login or reconfiguration.
+	if err := c.ensureSharedProfileSchema(context.Background()); err != nil {
+		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
+	} else {
+		c.loadSharedProfilesIntoCache(context.Background(), log)
+		// Independent of CardDAV: push cached state to ghosts immediately
+		// and re-fetch each row from CloudKit. Decoupled from
+		// setContactsReady so a slow MobileMe-delegate retry doesn't gate
+		// the share-profile path (it only depends on ProfilesClient /
+		// keychain init, not on contacts).
+		go c.refreshSharedProfilesOnConnect(log)
+	}
+
+	// Ensure Layer-2 MMCS attachment retry schema and spawn the background
+	// worker. The worker is cheap when the queue is empty (one DB SELECT per
+	// tick) so running it unconditionally matches the shared_profiles pattern.
+	// sync.Once guards against Connect being re-invoked (reconnect, relogin,
+	// session restore) — two retrier goroutines on the same table would race
+	// on GetDue and emit duplicate edits for the same attachment.
+	if c.pendingAttachments != nil {
+		if err := c.pendingAttachments.ensureSchema(context.Background()); err != nil {
+			log.Warn().Err(err).Msg("Failed to ensure pending_attachment_retry schema")
+		} else {
+			c.retrierOnce.Do(func() {
+				go (&attachmentRetrier{Client: c}).Run(c.stopChan)
+			})
+		}
+	}
 
 	// Ensure CloudKit backfill schema/storage is available.
 	cloudStoreReady := true
@@ -816,6 +1175,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+
+	// Eagerly silence bridge bot push notifications so the rule is in place
+	// before any bot message (StatusKit notices, admin messages, etc.) fires.
+	// Run in a goroutine to avoid blocking Connect on the homeserver round-trip.
+	go c.ensureBotPushRuleSilenced(ctx)
+
+	go c.maybeSendManagementRoomWelcome(context.Background(), log)
 
 	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
 	if c.Main.Config.CardDAV.IsConfigured() {
@@ -889,6 +1255,68 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 }
 
+// maybeSendManagementRoomWelcome posts a one-time welcome notice to the user's
+// management room on first successful connect, then sets WelcomeSent in
+// UserLoginMetadata so subsequent connects don't repost. The room itself is
+// auto-created by bridgev2's GetManagementRoom on first call.
+func (c *IMClient) maybeSendManagementRoomWelcome(ctx context.Context, log zerolog.Logger) {
+	meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if !ok || meta.WelcomeSent {
+		return
+	}
+	mgmtRoom, err := c.UserLogin.User.GetManagementRoom(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Welcome: failed to get management room")
+		return
+	}
+	prefix := c.Main.Bridge.Config.CommandPrefix
+	markdown := fmt.Sprintf(managementRoomWelcomeMarkdown, prefix)
+	content := format.RenderMarkdown(markdown, true, false)
+	if _, err := c.Main.Bridge.Bot.SendMessage(ctx, mgmtRoom, event.EventMessage, &event.Content{Parsed: content}, nil); err != nil {
+		log.Warn().Err(err).Str("management_room", string(mgmtRoom)).Msg("Welcome: failed to send welcome message")
+		return
+	}
+	meta.WelcomeSent = true
+	if err := c.UserLogin.Save(ctx); err != nil {
+		log.Warn().Err(err).Msg("Welcome: failed to persist welcome_sent flag")
+		return
+	}
+	log.Info().Str("management_room", string(mgmtRoom)).Msg("Welcome: posted management-room welcome notice")
+}
+
+// managementRoomWelcomeMarkdown is the body posted on first connect. The
+// single %s (used as %[1]s) is the bridge command prefix (e.g. "!im").
+const managementRoomWelcomeMarkdown = `### Welcome to your iMessage bridge
+
+You're signed in. This is your **management room** — the bot uses it to deliver bridge-wide notices and it's where you run bridge commands.
+
+#### Get started
+
+- ` + "`start-chat`" + ` — open a new chat. Type ` + "`start-chat`" + ` and the bot asks ` + "`1` (phone)" + ` or ` + "`2` (email)" + `, then prompts for the value. For phones, include the country code with a leading ` + "`+`" + ` — e.g. ` + "`+15551234567`" + ` for the US, ` + "`+442079460958`" + ` for the UK. Spaces, dashes, and parens get stripped automatically. You can also skip the picker by passing the identifier directly: ` + "`start-chat +15551234567`" + ` or ` + "`start-chat someone@icloud.com`" + `.
+- ` + "`contacts`" + ` — sync names from your iCloud contacts so chats show real names instead of phone numbers.
+- ` + "`restore-chat`" + ` — bring back a deleted iMessage chat. Lists everything that can be restored; reply with the number you want.
+- ` + "`help`" + ` — every available command, grouped by section.
+
+#### Sign out cleanly
+
+- ` + "`logout`" + ` — sign out of the bridge. Lists your active handles; reply with a number (or ` + "`all`" + `) to confirm. The bot tells you exactly how to finish the cleanup at appleid.apple.com so Apple stops treating the bridge as a registered device.
+
+#### Where to type commands
+
+- **Here in the management room**: type the command bare — ` + "`start-chat`" + `, ` + "`help`" + `, ` + "`logout`" + `.
+- **Inside a chat room** (a DM or group): prefix with ` + "`%[1]s`" + ` — e.g. ` + "`%[1]s facetime`" + ` to start a call from a DM.
+- To abort an interactive command (like the ` + "`start-chat`" + ` picker): type ` + "`cancel`" + ` here, or ` + "`%[1]s cancel`" + ` from a portal room.
+
+#### Notices the bot will post here
+
+- FaceTime invites, missed-call notices, and "answered elsewhere" updates when there's no portal yet
+- Chat-restore confirmations and recycle-bin activity
+- StatusKit / presence updates
+- Shared-album / Shared Streams activity
+
+Run ` + "`help`" + ` any time for the full command list.
+`
+
 func (c *IMClient) Disconnect() {
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
@@ -930,6 +1358,687 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 // ============================================================================
 // Callbacks from rustpush
 // ============================================================================
+
+// statusKitModeLabel converts a Focus/DND mode identifier to a human-readable
+// label for use in bridge bot notices.
+func statusKitModeLabel(mode *string) string {
+	if mode == nil || *mode == "" {
+		return ""
+	}
+	switch *mode {
+	case "com.apple.donotdisturb.mode.default":
+		return "Do Not Disturb"
+	case "com.apple.donotdisturb.mode.sleep":
+		return "Sleep"
+	default:
+		// Focus modes use identifiers like "com.apple.focus.mode.personal"
+		// or user-defined UUIDs. Humanise what we can; fall back to a generic label.
+		if strings.Contains(*mode, "focus") {
+			return "Focus"
+		}
+		return "Do Not Disturb"
+	}
+}
+
+// OnStatusUpdate is called by StatusKit when a contact's presence changes.
+// Posts an m.notice in the contact DM and the last active shared group so the
+// user sees status inline where they're actively chatting, similar to Apple's
+// in-conversation "has notifications silenced" affordance.
+// Also sets Matrix ghost presence for clients that render it.
+//
+// IMPORTANT: this function is called from a Rust FFI callback (inside the APNs
+// receive loop). It must return quickly — any blocking work, especially any
+// call back into Rust (e.g. ResolveHandle), would block the receive loop and
+// can deadlock on a single-threaded tokio runtime. All non-trivial work is
+// therefore dispatched to a goroutine immediately after the fast dedup check.
+func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
+	log := c.UserLogin.Log.With().
+		Str("component", "statuskit").
+		Str("user", user).
+		Logger()
+
+	if !c.Main.Config.StatusKitNotifications {
+		log.Debug().Msg("StatusKit notifications disabled in config — dropping update")
+		return
+	}
+
+	// Suppress duplicate notices: only act when the state actually changes.
+	// Apple sends available=true for BOTH DND-on and DND-off; the real
+	// discriminator is whether mode is set. Track by mode string so that
+	// DND→Sleep (two different silenced modes) still fires two notices.
+	modeKey := "available"
+	if mode != nil && *mode != "" {
+		modeKey = *mode
+	}
+	// kvKeyFor returns the KV store key used to persist StatusKit state for
+	// a given user handle across bridge restarts.
+	kvKeyFor := func(u string) database.Key {
+		return database.Key("statuskit.presence." + u)
+	}
+
+	if prev, loaded := c.statusKitPresence.Load(user); loaded {
+		if prev.(string) == modeKey {
+			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged, skipping notice")
+			return
+		}
+	} else {
+		// Not in memory (first call this session for this user): check KV store
+		// for the state persisted from the previous bridge run.  If it matches
+		// the incoming state, warm the in-memory cache and skip the notice so
+		// users don't see a flood of "has notifications turned on/off" messages
+		// every time the bridge restarts.
+		if c.Main.Bridge.DB.KV.Get(context.Background(), kvKeyFor(user)) == modeKey {
+			c.statusKitPresence.Store(user, modeKey)
+			log.Debug().Bool("available", available).Str("mode", modeKey).Msg("StatusKit: presence unchanged (restored from DB), skipping notice")
+			return
+		}
+	}
+
+	log.Info().
+		Bool("available", available).
+		Str("mode_key", modeKey).
+		Msg("StatusKit: received presence update — dispatching to goroutine")
+
+	// Capture values for the goroutine (mode is a pointer; copy the string).
+	var modeCopy *string
+	if mode != nil {
+		s := *mode
+		modeCopy = &s
+	}
+
+	// Optimistic dedup: store the new modeKey BEFORE dispatching so that
+	// rapid-fire re-deliveries of the same state (e.g. APNs replay on
+	// reconnect) are caught by the check above before the goroutine has
+	// had a chance to complete and store the key itself.
+	// Also persist to the KV store so the dedup survives a bridge restart.
+	c.statusKitPresence.Store(user, modeKey)
+	c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), modeKey)
+
+	// Dispatch ALL blocking work — ghost lookup, portal resolution, IDS
+	// fallback, and Matrix send — to a goroutine so this callback returns
+	// to Rust immediately and does not block the APNs receive loop.
+	go func() {
+		ctx := context.Background()
+
+		// Apple sends available=true for both DND-on and DND-off; the mode
+		// field is the real signal. mode non-nil/non-empty = DND/Focus active.
+		silenced := modeCopy != nil && *modeCopy != ""
+		presence := event.PresenceOnline
+		statusMsg := ""
+		if silenced {
+			presence = event.PresenceUnavailable
+			statusMsg = *modeCopy
+		}
+
+		// findPortal returns an existing, active portal or nil.
+		findPortal := func(id networkid.PortalID) *bridgev2.Portal {
+			p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+				ID:       id,
+				Receiver: c.UserLogin.ID,
+			})
+			if err != nil || p == nil || p.MXID == "" {
+				return nil
+			}
+			return p
+		}
+
+		normalizedUser := normalizeIdentifierForPortalID(user)
+
+		// Resolve the portal AND the ghost handle to use for sending.
+		//
+		// For mailto: handles the ghost often has no MXID (never joined a
+		// Matrix room) so ghost.Intent is nil. We must use the tel: ghost
+		// instead — it IS in the portal and has a valid MXID. portal.ID is
+		// the tel: handle, so we derive the ghost from the resolved portal.
+		//
+		// Resolution order for mailto: handles:
+		//   (0) statusKitPortalCache — learned from inbound message traffic,
+		//       covers any peer who has ever messaged bridge regardless of
+		//       whether they appear in iCloud contacts.
+		//   (1) address-book phones (fast, no network)
+		//   (2) IDS correlation — self-bounding 5s tokio timeout in Rust
+		//   (3) mailto: portal itself as absolute last resort
+		var portal *bridgev2.Portal
+
+		// (0) Fast path: check the learned sender→portal cache first. This
+		// is populated from every inbound message, so any peer who has
+		// messaged bridge has a direct mapping here that doesn't depend on
+		// iCloud CardDAV contact completeness (the common failure mode for
+		// reshare correlation).
+		for _, key := range [2]string{user, normalizedUser} {
+			if key == "" {
+				continue
+			}
+			if cached, ok := c.statusKitPortalCache.Load(key); ok {
+				if p := findPortal(cached.(networkid.PortalID)); p != nil {
+					portal = p
+					log.Info().Str("user", user).Str("portal_id", string(p.ID)).Msg("StatusKit: resolved via learned sender cache")
+					break
+				}
+			}
+		}
+
+		if portal == nil && strings.HasPrefix(normalizedUser, "mailto:") {
+			// (1) Address-book.
+			contact := c.lookupContact(user)
+			if contact != nil {
+				for _, altID := range contactPortalIDs(contact) {
+					if !strings.HasPrefix(altID, "tel:") {
+						continue
+					}
+					if p := findPortal(networkid.PortalID(altID)); p != nil {
+						log.Info().Str("tel_handle", altID).Msg("StatusKit: resolved mailto→tel via address book")
+						portal = p
+						break
+					}
+				}
+			}
+
+			// (2) IDS correlation (self-bounding, safe to call from goroutine).
+			if portal == nil {
+				if altPortal := c.resolveStatusPortalViaIDS(ctx, log, user); altPortal != nil {
+					log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
+					portal = altPortal
+				}
+			}
+
+			// (3) mailto: portal as last resort.
+			if portal == nil {
+				if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
+					log.Info().Str("portal_id", normalizedUser).Msg("StatusKit: using mailto: portal as last resort")
+					portal = p
+				}
+			}
+		} else if portal == nil {
+			portalID := c.resolveContactPortalID(normalizedUser)
+			portalID = c.resolveExistingDMPortalID(string(portalID))
+			portal = findPortal(portalID)
+
+			if portal == nil {
+				contact := c.lookupContact(user)
+				if contact != nil {
+					for _, altID := range contactPortalIDs(contact) {
+						if altID == normalizedUser {
+							continue
+						}
+						altPortalID := c.resolveContactPortalID(altID)
+						altPortalID = c.resolveExistingDMPortalID(string(altPortalID))
+						if p := findPortal(altPortalID); p != nil {
+							log.Info().Str("alt_handle", altID).Msg("StatusKit: resolved DM portal via contact store")
+							portal = p
+							break
+						}
+					}
+				}
+			}
+		}
+
+		if portal == nil || portal.MXID == "" {
+			log.Warn().
+				Str("user", normalizedUser).
+				Msg("StatusKit: no DM portal found for presence notice")
+			return
+		}
+
+		// Canonical (portal-keyed) dedup. The early dedup at the top of
+		// OnStatusUpdate keys by raw alias, so a peer with N registered
+		// handles produces N goroutines that all reach this point and
+		// resolve to the same portal. Collapse them here using portal ID
+		// as the canonical key so only the first alias of each state
+		// change actually sends the notice. Persisted to KV under a
+		// distinct prefix so the dedup survives bridge restarts.
+		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
+		if prev, loaded := c.statusKitPresenceByPortal.Load(portal.ID); loaded {
+			if prev.(string) == modeKey {
+				log.Debug().
+					Str("portal_id", string(portal.ID)).
+					Str("alias", user).
+					Str("mode", modeKey).
+					Msg("StatusKit: presence unchanged for canonical portal, skipping duplicate alias notice")
+				return
+			}
+		} else if c.Main.Bridge.DB.KV.Get(ctx, portalKey) == modeKey {
+			c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
+			log.Debug().
+				Str("portal_id", string(portal.ID)).
+				Str("alias", user).
+				Str("mode", modeKey).
+				Msg("StatusKit: presence unchanged for canonical portal (restored from DB), skipping duplicate alias notice")
+			return
+		}
+		c.statusKitPresenceByPortal.Store(portal.ID, modeKey)
+		c.Main.Bridge.DB.KV.Set(ctx, portalKey, modeKey)
+
+		// Use the ghost keyed to the portal's handle — for a tel: portal this
+		// is the tel: ghost which has an MXID and is a member of the room.
+		// The mailto: ghost typically has no MXID (never joined a room) so
+		// ghost.Intent would be nil. Prefer portal ghost; fall back to the
+		// mailto: ghost if the portal ghost is unavailable.
+		ghostHandle := string(portal.ID)
+		ghost, err := c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(ghostHandle))
+		if err != nil || ghost == nil || ghost.Intent == nil {
+			// Fallback: try the original mailto: ghost.
+			ghost, err = c.Main.Bridge.GetGhostByID(ctx, networkid.UserID(user))
+			if err != nil || ghost == nil || ghost.Intent == nil {
+				log.Warn().Err(err).Str("portal_handle", ghostHandle).Str("mailto_handle", user).
+					Msg("StatusKit: no usable ghost found — skipping notice")
+				return
+			}
+			log.Debug().Str("ghost", user).Msg("StatusKit: using mailto: ghost as fallback")
+		} else {
+			log.Debug().Str("ghost", ghostHandle).Msg("StatusKit: using portal ghost (tel:)")
+		}
+
+		// Set Matrix presence using whichever ghost we resolved.
+		if asIntent, ok := ghost.Intent.(*matrixfmt.ASIntent); ok {
+			if err := asIntent.Matrix.SetPresence(ctx, mautrix.ReqPresence{
+				Presence:  presence,
+				StatusMsg: statusMsg,
+			}); err != nil {
+				log.Warn().Err(err).Msg("StatusKit: failed to set Matrix presence for ghost")
+			}
+		}
+
+		log.Info().
+			Str("normalized_user", normalizedUser).
+			Str("portal_id", string(portal.ID)).
+			Str("ghost_handle", ghostHandle).
+			Msg("StatusKit: sending presence notice to active conversations")
+
+		name := ghost.Name
+		if name == "" {
+			name = ghostHandle
+		}
+		var notice string
+		if silenced {
+			label := statusKitModeLabel(modeCopy)
+			if label != "" {
+				notice = "🔕 " + name + " has notifications silenced (" + label + ")."
+			} else {
+				notice = "🔕 " + name + " has notifications silenced."
+			}
+		} else {
+			notice = name + " has notifications turned on."
+		}
+
+		targetPortals := map[networkid.PortalID]*bridgev2.Portal{
+			portal.ID: portal,
+		}
+		candidateHandles := map[string]bool{
+			normalizedUser: true,
+			ghostHandle:    true,
+		}
+		if contact := c.lookupContact(user); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				candidateHandles[altID] = true
+			}
+		}
+		for handleID := range candidateHandles {
+			if handleID == "" {
+				continue
+			}
+			c.lastGroupForMemberMu.RLock()
+			groupKey, ok := c.lastGroupForMember[handleID]
+			c.lastGroupForMemberMu.RUnlock()
+			if !ok || groupKey.ID == "" {
+				continue
+			}
+			groupPortal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, groupKey)
+			if err == nil && groupPortal != nil && groupPortal.MXID != "" {
+				targetPortals[groupPortal.ID] = groupPortal
+			}
+		}
+
+		sendStatusNotice := func(targetPortal *bridgev2.Portal) error {
+			if targetPortal == nil || targetPortal.MXID == "" {
+				return fmt.Errorf("invalid target portal")
+			}
+
+			// Anchor each notice timestamp 1ms before the last real iMessage in
+			// the target room so room ordering doesn't jump on passive status updates.
+			noticeTS := time.Now().Add(-1 * time.Millisecond)
+			if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
+				ctx, targetPortal.PortalKey, time.Now(),
+			); dbErr != nil {
+				log.Warn().Err(dbErr).Str("portal_id", string(targetPortal.ID)).
+					Msg("StatusKit: failed to query last message timestamp, using now-1ms")
+			} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() &&
+				time.Since(lastMsg.Timestamp) < 24*time.Hour {
+				noticeTS = lastMsg.Timestamp.Add(-1 * time.Millisecond)
+			}
+
+			if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
+				batchEvt := &event.Event{
+					Type:      event.EventMessage,
+					Sender:    c.Main.Bridge.Bot.GetMXID(),
+					RoomID:    targetPortal.MXID,
+					Timestamp: noticeTS.UnixMilli(),
+					Content: event.Content{
+						Parsed: &event.MessageEventContent{
+							MsgType:  event.MsgNotice,
+							Body:     notice,
+							Mentions: &event.Mentions{},
+						},
+						Raw: map[string]any{
+							"com.beeper.action_message": map[string]any{
+								"type": "presence_update",
+							},
+						},
+					},
+				}
+				batchReq := &mautrix.ReqBeeperBatchSend{
+					Forward:          true,
+					SendNotification: false,
+					Events:           []*event.Event{batchEvt},
+				}
+				if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+					batchReq.MarkReadBy = dp.GetMXID()
+				}
+				_, sendErr := c.Main.Bridge.Matrix.BatchSend(ctx, targetPortal.MXID, batchReq, nil)
+				return sendErr
+			}
+
+			_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, targetPortal.MXID, event.EventMessage, &event.Content{
+				Parsed: &event.MessageEventContent{
+					MsgType:  event.MsgNotice,
+					Body:     notice,
+					Mentions: &event.Mentions{},
+				},
+				Raw: map[string]any{
+					"com.beeper.action_message": map[string]any{
+						"type": "presence_update",
+					},
+				},
+			}, &bridgev2.MatrixSendExtra{Timestamp: noticeTS})
+			return sendErr
+		}
+
+		sent := 0
+		for _, targetPortal := range targetPortals {
+			if err := sendStatusNotice(targetPortal); err != nil {
+				log.Warn().Err(err).Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: failed to send presence notice")
+				continue
+			}
+			sent++
+			log.Info().Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: sent silent presence notice")
+		}
+		if sent == 0 {
+			log.Warn().Msg("StatusKit: failed to send presence notice to any conversation")
+		}
+	}()
+}
+
+// ensureBotPushRuleSilenced installs push rules via the double puppet so
+// that homeservers that respect Matrix push rules suppress notifications from
+// the bridge bot. Called eagerly at Connect() time as a one-shot install.
+//
+// Note: on Beeper/Hungry this is a no-op in practice — Hungry's proprietary
+// push gateway ignores Matrix push rules for DM rooms. Push suppression for
+// Hungry is instead achieved via ReqBeeperBatchSend.SendNotification:false
+// in the OnStatusUpdate send path.
+//
+// Two rules are installed for belt-and-suspenders coverage:
+//   - An override rule (evaluated first, before any DM-room override rules)
+//     with an event_match condition on the sender field.
+//   - A sender rule (evaluated last) as a secondary catch-all.
+//
+// Both rules are durable on the homeserver and persist across restarts.
+// statusKitBotRulePushed guards against redundant API calls within a session.
+// A no-op if the double puppet is not available or the assertion fails.
+func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
+	if c.statusKitBotRulePushed.Load() {
+		return
+	}
+	dp := c.UserLogin.User.DoublePuppet(ctx)
+	if dp == nil {
+		return
+	}
+	asIntent, ok := dp.(*matrixfmt.ASIntent)
+	if !ok {
+		return
+	}
+	log := c.UserLogin.Log.With().Str("component", "statuskit").Logger()
+	botMXID := c.Main.Bridge.Bot.GetMXID().String()
+
+	// Override rule (highest priority — evaluated before DM override rules).
+	overrideRuleID := botMXID + ".dont_notify"
+	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.OverrideRule, overrideRuleID,
+		&mautrix.ReqPutPushRule{
+			Conditions: []pushrules.PushCondition{
+				{
+					Kind:    pushrules.KindEventMatch,
+					Key:     "sender",
+					Pattern: botMXID,
+				},
+			},
+			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+		})
+	if err != nil {
+		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot override push rule")
+		return
+	}
+
+	// Sender rule (secondary catch-all for homeservers without override support).
+	err = asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
+		&mautrix.ReqPutPushRule{
+			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+		})
+	if err != nil {
+		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot sender push rule")
+		// Override rule succeeded; treat as partial success.
+	}
+
+	c.statusKitBotRulePushed.Store(true)
+	log.Debug().Str("bot_mxid", botMXID).Msg("Bot push rules installed — bridge bot messages will not notify")
+}
+
+// resolveStatusPortalViaIDS is the last-resort portal resolver for StatusKit
+// presence. When a contact's iCloud Apple ID (e.g. mailto:aap724@icloud.com)
+// doesn't appear in the contact store but still shares a person with a handle
+// we do have a portal for (e.g. tel:+12012337620), the only link between them
+// lives in IDS — specifically the sender_correlation_identifier returned by a
+// Madrid lookup. We batch-lookup the incoming handle plus every known ghost in
+// a single IDS query, then match on correlation ID to find the aliased portal.
+// Results are memoized in statusKitPortalCache so we only pay the IDS round
+// trip once per unresolved handle per session.
+func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Logger, user string) *bridgev2.Portal {
+	if c.client == nil {
+		return nil
+	}
+	if cached, ok := c.statusKitPortalCache.Load(user); ok {
+		portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       cached.(networkid.PortalID),
+			Receiver: c.UserLogin.ID,
+		})
+		if err == nil && portal != nil && portal.MXID != "" {
+			return portal
+		}
+	}
+
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit IDS fallback: failed to query ghosts")
+		return nil
+	}
+	var knownHandles []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			continue
+		}
+		if id == user {
+			continue
+		}
+		knownHandles = append(knownHandles, id)
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("StatusKit IDS fallback: ghost row iteration error")
+	}
+	rows.Close()
+	if len(knownHandles) == 0 {
+		return nil
+	}
+
+	// Fast path: check the in-memory IDS cache populated from message
+	// processing. No network call, no blocking. If the correlation ID is
+	// already cached (common when the contact has sent messages before),
+	// this resolves instantly and we skip the slow validate_targets call.
+	if aliases := c.client.ResolveHandleCached(user, knownHandles); len(aliases) > 0 {
+		log.Info().Str("user", user).Int("aliases", len(aliases)).Msg("StatusKit IDS fallback: resolved from cache (no network)")
+		if portal := c.findPortalForAliases(ctx, log, user, aliases); portal != nil {
+			return portal
+		}
+	}
+
+	// Slow path: validate_targets queries Apple IDS. Can block or hang;
+	// caller is responsible for applying a timeout.
+	aliases, err := c.client.ResolveHandle(user, knownHandles)
+	if err != nil {
+		log.Warn().Err(err).Str("user", user).Msg("StatusKit IDS fallback: ResolveHandle failed")
+		return nil
+	}
+	return c.findPortalForAliases(ctx, log, user, aliases)
+}
+
+// findPortalForAliases iterates aliases returned by IDS correlation and
+// returns the first portal found. Prefers tel: aliases over mailto: so the
+// presence notice lands in the phone portal rather than the email portal.
+func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger, user string, aliases []string) *bridgev2.Portal {
+	// Two-pass: tel: first, then anything else.
+	for _, preferTel := range []bool{true, false} {
+		for _, alias := range aliases {
+			if alias == user {
+				continue
+			}
+			if preferTel != strings.HasPrefix(alias, "tel:") {
+				continue
+			}
+			aliasPortalID := c.resolveContactPortalID(alias)
+			aliasPortalID = c.resolveExistingDMPortalID(string(aliasPortalID))
+			altPortal, altErr := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+				ID:       aliasPortalID,
+				Receiver: c.UserLogin.ID,
+			})
+			if altErr == nil && altPortal != nil && altPortal.MXID != "" {
+				log.Info().
+					Str("original", user).
+					Str("alias", alias).
+					Str("resolved_portal_id", string(aliasPortalID)).
+					Msg("StatusKit: resolved DM portal via IDS correlation")
+				c.statusKitPortalCache.Store(user, aliasPortalID)
+				return altPortal
+			}
+		}
+	}
+	return nil
+}
+
+// OnKeysReceived is called by StatusKit when a key-sharing message arrives.
+// New encryption keys mean we can now subscribe to APNs presence channels
+// for handles that previously had no keys. Re-subscribe to pick them up,
+// and reciprocate by sending our key to any handle that keyed us but hasn't
+// received our invite yet (iOS does this automatically; the bridge must do
+// it explicitly or the exchange stays one-sided).
+func (c *IMClient) OnKeysReceived() {
+	log := c.UserLogin.Log.With().
+		Str("component", "statuskit").
+		Logger()
+	log.Info().Msg("StatusKit: key-sharing message received — re-subscribing to presence")
+	go c.subscribeToContactPresence(log)
+}
+
+// OnReshareSender is called once per reshare with the peer handle that sent
+// it. Peer iOS fans a reshare across every alias of our account (tel: + each
+// mailto:) with the same channel id but a different `from` handle on each
+// copy. Upstream state keys by channel, so every reshare overwrites the
+// previous `from` — only the last sender survives in state.keys. Without this
+// hook the bridge learns just one alias per peer and presence updates on the
+// others have no portal mapping. Eagerly resolving the sender's portal here
+// and stamping it into statusKitPortalCache preserves the mapping across
+// overwrites so OnStatusUpdate's cache lookup always hits regardless of which
+// alias Apple routes the next presence message to.
+func (c *IMClient) OnReshareSender(sender string) {
+	if sender == "" {
+		return
+	}
+	// Stamp reshare_seen for both raw and normalized sender forms before any
+	// cache short-circuit. The soft-latch in inviteContactsToStatusSharingOpts
+	// reads these to distinguish "invite dispatched and peer reciprocated"
+	// (permanent latch) from "dispatched but no reshare ever observed"
+	// (TTL'd latch — re-invite after statusKitInvitedOkTTL).
+	normalized := normalizeIdentifierForPortalID(sender)
+	ctx := context.Background()
+	now := time.Now().UTC().Format(time.RFC3339)
+	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+sender), now)
+	if normalized != sender {
+		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized), now)
+	}
+	if _, ok := c.statusKitPortalCache.Load(sender); ok {
+		return
+	}
+	if normalized != sender {
+		if _, ok := c.statusKitPortalCache.Load(normalized); ok {
+			return
+		}
+	}
+	log := c.UserLogin.Log.With().
+		Str("component", "statuskit").
+		Str("sender", sender).
+		Logger()
+	go c.eagerResolveReshareSender(sender, normalized, log)
+}
+
+// eagerResolveReshareSender runs the same resolution chain OnStatusUpdate uses
+// (learned cache → address-book mailto→tel → IDS correlation → direct portal)
+// and populates statusKitPortalCache on success. Idempotent; cheap no-op on
+// cache hit. Runs in a goroutine to avoid blocking the Rust FFI caller.
+func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log zerolog.Logger) {
+	ctx := context.Background()
+
+	findPortal := func(id networkid.PortalID) *bridgev2.Portal {
+		p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+			ID:       id,
+			Receiver: c.UserLogin.ID,
+		})
+		if err != nil || p == nil || p.MXID == "" {
+			return nil
+		}
+		return p
+	}
+
+	if strings.HasPrefix(normalizedUser, "mailto:") {
+		if contact := c.lookupContact(sender); contact != nil {
+			for _, altID := range contactPortalIDs(contact) {
+				if !strings.HasPrefix(altID, "tel:") {
+					continue
+				}
+				if p := findPortal(networkid.PortalID(altID)); p != nil {
+					c.statusKitPortalCache.Store(sender, p.ID)
+					log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via address book")
+					return
+				}
+			}
+		}
+		if altPortal := c.resolveStatusPortalViaIDS(ctx, log, sender); altPortal != nil {
+			log.Info().Str("resolved_portal_id", string(altPortal.ID)).Msg("StatusKit: eager-resolved reshare sender via IDS correlation")
+			return
+		}
+		if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
+			c.statusKitPortalCache.Store(sender, p.ID)
+			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via direct mailto: portal")
+			return
+		}
+	} else {
+		portalID := c.resolveContactPortalID(normalizedUser)
+		portalID = c.resolveExistingDMPortalID(string(portalID))
+		if p := findPortal(portalID); p != nil {
+			c.statusKitPortalCache.Store(sender, p.ID)
+			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender (tel: direct)")
+			return
+		}
+	}
+	log.Debug().Msg("StatusKit: eager-resolve found no portal for reshare sender — will retry when presence arrives")
+}
 
 // OnMessage is called by rustpush when a message is received via APNs.
 func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
@@ -1006,6 +2115,76 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 	if msg.IsIconChange {
 		go c.handleIconChange(log, msg)
+		return
+	}
+	if msg.IsShareProfile && msg.Sender != nil && *msg.Sender != "" {
+		go c.handleSharedProfile(log, msg)
+		// Only swallow the message when it's a standalone profile-sharing
+		// control event (Message::ShareProfile / Message::UpdateProfile).
+		// iOS also piggybacks profile keys on regular text messages and
+		// reactions via the embedded_profile field — those still need to
+		// flow through the buffer so the user actually sees the message.
+		isStandalone := msg.Text == nil && !msg.IsTapback && !msg.IsEdit && !msg.IsUnsend
+		if isStandalone {
+			return
+		}
+	}
+	// Profile-sharing control messages without an embedded CloudKit record:
+	// log only so we can see whether peers are flipping share_contacts /
+	// updating their dismissed list. No state to apply on the bridge side.
+	if msg.IsUpdateProfile && !msg.IsShareProfile {
+		sender := ""
+		if msg.Sender != nil {
+			sender = *msg.Sender
+		}
+		shareContacts := false
+		if msg.UpdateProfileShareContacts != nil {
+			shareContacts = *msg.UpdateProfileShareContacts
+		}
+		log.Info().
+			Str("sender", sender).
+			Bool("share_contacts", shareContacts).
+			Msg("Received UpdateProfile without embedded CloudKit record")
+		return
+	}
+	if msg.IsUpdateProfileSharing {
+		sender := ""
+		if msg.Sender != nil {
+			sender = *msg.Sender
+		}
+		log.Info().
+			Str("sender", sender).
+			Int("dismissed", len(msg.UpdateProfileSharingDismissed)).
+			Int("all", len(msg.UpdateProfileSharingAll)).
+			Msg("Received UpdateProfileSharing")
+		return
+	}
+
+	// "Notify Anyway" — sender deliberately broke through our Focus/DND.
+	// Post a silent bot notice in the relevant room so the user can see it.
+	if msg.IsNotifyAnyways {
+		if c.cloudStore != nil {
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+				return
+			}
+			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
+				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist NotifyAnyway UUID; duplicates possible on restart")
+			}
+		}
+		go c.handleNotifyAnyways(log, msg)
+		return
+	}
+	// Transcript background — someone set or cleared the iMessage chat wallpaper.
+	if msg.IsSetTranscriptBackground {
+		if c.cloudStore != nil {
+			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
+				return
+			}
+			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
+				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist SetTranscriptBackground UUID; duplicates possible on restart")
+			}
+		}
+		go c.handleTranscriptBackground(log, msg)
 		return
 	}
 
@@ -1171,6 +2350,18 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	sender := c.makeEventSender(msg.Sender)
 	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
 	sender = c.canonicalizeDMSender(portalKey, sender)
+
+	// Eagerly learn sender-handle → portal mapping for StatusKit presence
+	// correlation. A peer iPhone that reshares Focus keys addresses the APS
+	// payload to whichever of the user's handles they use to reach them — so
+	// a reshare can arrive at bridge with a sender handle that has no matching
+	// portal ID (e.g. mailto:x@y.com when the portal is tel:+X). The iCloud
+	// CardDAV-based resolver often fails for peers missing from contacts. By
+	// stamping the cache on every inbound 1:1 message, we ensure any peer
+	// who's ever messaged bridge has a direct lookup path for presence.
+	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) && portalKey.ID != "unknown" {
+		c.statusKitPortalCache.Store(*msg.Sender, portalKey.ID)
+	}
 
 	// Drop messages that couldn't be resolved to a real portal.
 	// makePortalKey returns ID:"unknown" when participants and sender are both
@@ -1409,6 +2600,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
 		}
 	}
+	c.maybeNotifyIncomingFaceTimeInvite(log, &msg, portalKey, sender.IsFromMe, createPortal)
 	if createPortal || sender.IsFromMe {
 		log.Info().
 			Bool("create_portal", createPortal).
@@ -1469,6 +2661,18 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			Data: attMsg,
 			ID:   makeMessageID(attID),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *attachmentMessage) (*bridgev2.ConvertedMessage, error) {
+				// Layer-2 MMCS retry enqueue: when download_mmcs_attachments
+				// (pkg/rustpushgo/src/lib.rs) exhausts the Layer-1 retries,
+				// it leaves the attachment non-inline with no bytes but
+				// keeps the MMCS descriptor JSON. Record that shape so the
+				// background retrier can replay the download later and edit
+				// the notice placeholder into the real m.image/m.video.
+				if data.Attachment != nil && !data.Attachment.IsInline &&
+					data.Attachment.InlineData == nil &&
+					data.Attachment.MmcsDescriptorJson != nil &&
+					*data.Attachment.MmcsDescriptorJson != "" {
+					c.enqueuePendingMMCSRecovery(ctx, portal, data)
+				}
 				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
 			},
 		})
@@ -1528,6 +2732,35 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		if err := c.cloudStore.persistTapbackUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe, storedType); err != nil {
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist tapback UUID; duplicates may occur on restart")
 		}
+	}
+
+	// Sticker tapbacks (type 7) carry an image placed on top of a message
+	// bubble. Matrix reactions are text-only, so bridge the sticker as an
+	// image message replying to the target instead.
+	if msg.TapbackType != nil && *msg.TapbackType == 7 && msg.StickerData != nil && len(*msg.StickerData) > 0 {
+		stickerData := *msg.StickerData
+		stickerMime := "image/png"
+		if msg.StickerMime != nil && *msg.StickerMime != "" {
+			stickerMime = *msg.StickerMime
+		}
+		c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.Message[*stickerTapbackData]{
+			EventMeta: simplevent.EventMeta{
+				Type:      bridgev2.RemoteEventMessage,
+				PortalKey: portalKey,
+				Sender:    c.canonicalizeDMSender(portalKey, c.makeEventSender(msg.Sender)),
+				Timestamp: time.UnixMilli(int64(msg.TimestampMs)),
+			},
+			Data: &stickerTapbackData{
+				ImageData: stickerData,
+				MimeType:  stickerMime,
+				TargetID:  targetGUID,
+			},
+			ID: makeMessageID(msg.Uuid),
+			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data *stickerTapbackData) (*bridgev2.ConvertedMessage, error) {
+				return convertStickerTapback(ctx, intent, data)
+			},
+		})
+		return
 	}
 
 	emoji := tapbackTypeToEmoji(msg.TapbackType, msg.TapbackEmoji)
@@ -1962,6 +3195,341 @@ func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMe
 	})
 }
 
+const faceTimeRingMarker = "[[FACETIME_RING]]"
+const faceTimeMissedMarker = "[[FACETIME_MISSED]]"
+const faceTimeAnsweredElsewhereMarker = "[[FACETIME_ANSWERED_ELSEWHERE]]"
+
+// handleNotifyAnyways posts a silent bot notice when a contact deliberately
+// breaks through our Focus / Do Not Disturb by tapping "Notify Anyway" on their
+// device. The notice is delivered to the portal that corresponds to this chat so
+// the user can see who sent it. Stored messages are silently dropped.
+func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	if msg.IsStoredMessage {
+		log.Debug().Msg("Skipping stored NotifyAnyways message")
+		return
+	}
+
+	rawText := strings.TrimSpace(ptrStringOr(msg.Text, ""))
+	if strings.HasPrefix(rawText, faceTimeRingMarker) ||
+		strings.HasPrefix(rawText, faceTimeMissedMarker) ||
+		strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker) {
+		if c.Main.Config.DisableFaceTime {
+			return
+		}
+		switch {
+		case strings.HasPrefix(rawText, faceTimeRingMarker):
+			c.handleFaceTimeRingNotice(log, msg, rawText)
+		case strings.HasPrefix(rawText, faceTimeMissedMarker):
+			c.handleFaceTimeMissedNotice(log, msg)
+		case strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker):
+			c.handleFaceTimeAnsweredElsewhereNotice(log, msg)
+		}
+		return
+	}
+
+	ctx := context.Background()
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().Err(err).Msg("NotifyAnyways: no portal found, skipping notice")
+		return
+	}
+
+	// Resolve a friendly name from the ghost (same as StatusKit notices).
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := senderHandle
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+
+	notice := "🔔 " + name + " sent a Notify Anyway (tapped through Focus / Do Not Disturb)."
+	log.Info().
+		Str("sender", senderHandle).
+		Str("portal_mxid", string(portal.MXID)).
+		Msg("NotifyAnyways: posting notice")
+
+	_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+		Parsed: &event.MessageEventContent{
+			MsgType:  event.MsgNotice,
+			Body:     notice,
+			Mentions: &event.Mentions{},
+		},
+	}, nil)
+	if sendErr != nil {
+		log.Warn().Err(sendErr).Msg("NotifyAnyways: failed to send notice")
+	}
+}
+
+func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage, rawText string) {
+	ctx := context.Background()
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := stripIdentifierPrefix(senderHandle)
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+	if name == "" {
+		name = "someone"
+	}
+
+	link := firstFaceTimeLinkInText(rawText)
+	if link == "" {
+		// Native FaceTime ring — no link embedded. Use the persistent
+		// bridge link + pin its session_link to this inbound session guid.
+		//
+		// Why not GetSessionLink: upstream's get_session_link calls
+		// message_session, which sends a LinkCreated wire message to
+		// every member of the session — including the peer whose call
+		// is currently ringing our handle. Injecting a LinkCreated into
+		// peer's active ring disrupts their FT UI and empirically
+		// downgrades peer's display to audio-mode ("peer sees avatar,
+		// hears audio, no video") even when the user answers natively
+		// on a video-capable device. GetSessionLink only avoids this
+		// when session.link is already set, which it isn't for native
+		// FT calls (no web link embedded in peer's Invitation).
+		//
+		// Use the pre-minted "nextincomingcall" link slot (mirroring
+		// OpenBubbles' rotateIncomingLink pattern at
+		// rustpush_service.dart:2699-2702). The pseud has been on
+		// Apple's FT server since startup (or since the last inbound
+		// call's rotation), giving identity resolution time to fully
+		// propagate the pseud↔handle binding before the webview joins.
+		// The binding is pinned pre-rotation (while the link is still
+		// in "nextincomingcall" slot); rotation below renames it to
+		// "incomingcall" while preserving session_link.
+		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
+			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.handle, ftLinkUsageNextIncomingCall); genErr == nil {
+				link = generated
+				if guid := extractFaceTimeGuid(rawText); guid != "" {
+					if bindErr := ft.BindBridgeLinkToSession(c.handle, ftLinkUsageNextIncomingCall, guid); bindErr != nil {
+						log.Warn().Err(bindErr).Str("guid", guid).Msg("FaceTimeRing: failed to pin bridge link to inbound session; web answer may route incorrectly")
+					}
+				}
+				// Rotate asynchronously: nextincomingcall → incomingcall,
+				// mint fresh nextincomingcall for the next inbound ring.
+				// The rotation renames the bound link's slot to
+				// "incomingcall" while preserving its session_link.
+				go func() {
+					_ = rotateIncomingLink(ft, c.handle)
+				}()
+				// Pre-fill the web page's display-name prompt with the
+				// user's own handle so tapping Answer lands in the call
+				// without the guest-name typing step (which otherwise
+				// creates a second participant distinct from the pseud
+				// bound to the user's handle).
+				link = appendFaceTimeLinkName(link, c.resolveFaceTimeDisplayName(ctx))
+			} else {
+				log.Warn().Err(genErr).Msg("FaceTimeRing: failed to generate bridge FaceTime link")
+			}
+		}
+	}
+
+	// Build the notice as markdown so the join link renders as a tappable
+	// anchor in the formatted_body. Plain-URL notices aren't autolinked by
+	// every Matrix client; wrapping the URL in [text](url) guarantees an
+	// <a> tag reaches the client.
+	noticeMarkdown := "📞 **Incoming FaceTime call from " + name + ".**"
+	if link != "" {
+		noticeMarkdown += "\n\n[**Answer FaceTime call**](" + link + ")"
+		noticeMarkdown += "\n\nRaw link (if the button above doesn't open): " + link
+	}
+
+	sendNotice := func(roomID id.RoomID) error {
+		content := format.RenderMarkdown(noticeMarkdown, true, false)
+		content.MsgType = event.MsgNotice
+		content.Mentions = &event.Mentions{}
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+			Parsed: &content,
+		}, nil)
+		return sendErr
+	}
+
+	if err == nil && portal != nil && portal.MXID != "" {
+		if sendErr := sendNotice(portal.MXID); sendErr == nil {
+			log.Info().
+				Str("sender", senderHandle).
+				Str("portal_mxid", string(portal.MXID)).
+				Msg("FaceTimeRing: posted incoming call notice to portal")
+			return
+		} else {
+			log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send portal notice")
+		}
+	}
+
+	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
+	if mgmtErr != nil {
+		log.Warn().Err(mgmtErr).Msg("FaceTimeRing: failed to get management room for fallback notice")
+		return
+	}
+	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
+		log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send management room notice")
+		return
+	}
+	log.Info().
+		Str("sender", senderHandle).
+		Str("management_room", string(mgmtRoom)).
+		Msg("FaceTimeRing: posted incoming call notice to management room")
+}
+
+func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	ctx := context.Background()
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := stripIdentifierPrefix(senderHandle)
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+	if name == "" {
+		name = "someone"
+	}
+
+	// Build a call-back button that uses the bridge's pending-ring flow,
+	// same mechanism as the outbound `!im facetime` command. Tap → letmein
+	// approve adds the user to a pre-armed session → JoinEvent fires
+	// maybe_fire_pending_ring → ft.ring() against the original caller.
+	// By the time their phone rings the user is already a live participant
+	// so the callee's answer connects cleanly.
+	//
+	// No facetime:// fallback: that scheme only worked on native iOS/macOS
+	// and provided no bridge integration. If the bridge-link arm fails we
+	// still post the notice with no callback button; the user can always
+	// `!im facetime` in the portal manually.
+	noticeMarkdown := "📞 **Missed FaceTime call from " + name + ".**"
+	if senderHandle != "" && c.handle != "" {
+		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
+			if webLink, _, armErr := armBridgeFaceTimeCall(ft, c.handle, senderHandle, 3600, c.resolveFaceTimeDisplayName(ctx)); armErr == nil {
+				noticeMarkdown += "\n\n[**📞 Call back " + name + "**](" + webLink + ")"
+				noticeMarkdown += "\n\n⚠️ **Tapping this link will ring " + name + "'s phone.** The ring fires the moment you join — open the link when you're ready to be on camera. Works on iOS, macOS, Android, Windows, and Linux.\n\nRaw URL: " + webLink
+			} else {
+				log.Warn().Err(armErr).Str("caller", senderHandle).Msg("FaceTimeMissed: bridge-link callback arm failed; notice posted without callback button")
+			}
+		}
+	}
+
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	sendNotice := func(roomID id.RoomID) error {
+		content := format.RenderMarkdown(noticeMarkdown, true, false)
+		content.MsgType = event.MsgNotice
+		content.Mentions = &event.Mentions{}
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+			Parsed: &content,
+		}, nil)
+		return sendErr
+	}
+	if err == nil && portal != nil && portal.MXID != "" {
+		if sendErr := sendNotice(portal.MXID); sendErr == nil {
+			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
+			return
+		}
+	}
+	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
+	if mgmtErr != nil {
+		log.Warn().Err(mgmtErr).Msg("FaceTimeMissed: failed to get management room for fallback notice")
+		return
+	}
+	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
+		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
+		return
+	}
+	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
+}
+
+func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	ctx := context.Background()
+	notice := "📞 Incoming FaceTime call was answered on another device."
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	sendNotice := func(roomID id.RoomID) error {
+		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
+			Parsed: &event.MessageEventContent{
+				MsgType:  event.MsgNotice,
+				Body:     notice,
+				Mentions: &event.Mentions{},
+			},
+		}, nil)
+		return sendErr
+	}
+	senderHandle := ptrStringOr(msg.Sender, "")
+	if err == nil && portal != nil && portal.MXID != "" {
+		if sendErr := sendNotice(portal.MXID); sendErr == nil {
+			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
+			return
+		}
+	}
+	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
+	if mgmtErr != nil {
+		log.Warn().Err(mgmtErr).Msg("FaceTimeAnsweredElsewhere: failed to get management room for fallback notice")
+		return
+	}
+	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
+		log.Warn().Err(sendErr).Msg("FaceTimeAnsweredElsewhere: failed to send management room notice")
+		return
+	}
+	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
+}
+
+// handleTranscriptBackground posts a silent bot notice when a participant sets
+// or removes the custom iMessage chat wallpaper (transcript background).
+// Stored messages are silently dropped.
+func (c *IMClient) handleTranscriptBackground(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
+	if msg.IsStoredMessage {
+		log.Debug().Msg("Skipping stored SetTranscriptBackground message")
+		return
+	}
+	ctx := context.Background()
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().Err(err).Msg("SetTranscriptBackground: no portal found, skipping notice")
+		return
+	}
+
+	senderHandle := ptrStringOr(msg.Sender, "")
+	name := senderHandle
+	if senderHandle != "" {
+		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
+		if ghostErr == nil && ghost != nil && ghost.Name != "" {
+			name = ghost.Name
+		}
+	}
+
+	var notice string
+	isRemove := msg.TranscriptBackgroundRemove != nil && *msg.TranscriptBackgroundRemove
+	if isRemove {
+		notice = "🖼️ " + name + " removed the chat background."
+	} else {
+		notice = "🖼️ " + name + " set a new chat background."
+	}
+
+	log.Info().
+		Str("sender", senderHandle).
+		Bool("remove", isRemove).
+		Str("portal_mxid", string(portal.MXID)).
+		Msg("SetTranscriptBackground: posting notice")
+
+	_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
+		Parsed: &event.MessageEventContent{
+			MsgType:  event.MsgNotice,
+			Body:     notice,
+			Mentions: &event.Mentions{},
+		},
+	}, nil)
+	if sendErr != nil {
+		log.Warn().Err(sendErr).Msg("SetTranscriptBackground: failed to send notice")
+	}
+}
+
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
 // fields in a WrappedMessage. Delete and recover APNs messages populate
 // DeleteChatGuid, DeleteChatGroupId, and DeleteChatParticipants instead of
@@ -2326,7 +3894,6 @@ func restoreRetryDelay(attempt int) time.Duration {
 	}
 }
 
-
 func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 	defer c.finishRestoreBackfillPipeline(opts.PortalID)
 
@@ -2561,6 +4128,15 @@ func (c *IMClient) refreshRecoveredChatMetadata(log zerolog.Logger, portalID str
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	// Guard the CloudKit FFI calls below (upstream cloudkit.rs has
+	// reachable panic sites via type assertions). Missing one metadata
+	// refresh is strictly safer than crashing the bridge.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Str("portal_id", portalID).
+				Msg("refreshRecoveredChatMetadata panicked — skipped")
+		}
+	}()
 
 	ctx := context.Background()
 	targetGroupID := ""
@@ -2799,6 +4375,14 @@ func (c *IMClient) recoverMessagesFromRecycleBin(log zerolog.Logger, portalID st
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	// CloudKit FFI path — guard against upstream panics (cloudkit.rs type
+	// assertions). Dropping one restore pass is safer than crashing.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Str("portal_id", portalID).
+				Msg("recoverMessagesFromRecycleBin panicked — skipped")
+		}
+	}()
 
 	ctx := context.Background()
 
@@ -3150,7 +4734,7 @@ func (c *IMClient) fetchRecoveredMessagesFromCloudKit(ctx context.Context, log z
 			Msg("Unfiltered scan complete")
 		diag = &restoreFetchDiagnostic{
 			UnfilteredTotal: len(unfiltered),
-			SampleChatIDs:  sampleIDs,
+			SampleChatIDs:   sampleIDs,
 		}
 	}
 
@@ -3343,6 +4927,17 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		}
 	}
 resolved:
+	if msg.Uuid != "" {
+		if msgPortal := c.resolvePortalByTargetMessage(log, msg.Uuid); msgPortal.ID != "" &&
+			(msgPortal.ID != portalKey.ID || msgPortal.Receiver != portalKey.Receiver) {
+			log.Debug().
+				Str("uuid", msg.Uuid).
+				Str("old_portal", string(portalKey.ID)).
+				Str("resolved_portal", string(msgPortal.ID)).
+				Msg("Resolved read receipt portal via target message UUID")
+			portalKey = msgPortal
+		}
+	}
 
 	readTime := time.UnixMilli(int64(msg.TimestampMs))
 	sender := c.makeEventSender(msg.Sender)
@@ -3386,30 +4981,150 @@ resolved:
 }
 
 func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	if msg.IsStoredMessage {
-		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored delivery receipt")
-		return
-	}
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	// Don't gate on IsStoredMessage. Delivery receipts arrive within seconds
+	// of a send — almost always inside the 30s post-reconnect window — and
+	// SendMessageStatus is idempotent, so dropping them only erases the
+	// "delivered" tick from genuinely live messages. Read receipts naturally
+	// land later (after the user actually reads), which is why the same gate
+	// on handleReadReceipt didn't have the same visible regression.
 	ctx := context.Background()
 
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	if (err != nil || portal == nil || portal.MXID == "") && msg.Uuid != "" {
-		// Group delivery receipts may lack conversation data. Try message UUID lookup.
-		msgID := makeMessageID(msg.Uuid)
-		if dbMsgs, err2 := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, c.UserLogin.ID, msgID); err2 == nil && len(dbMsgs) > 0 {
-			portalKey = dbMsgs[0].Room
-			portal, err = c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	// Mirror handleReadReceipt's portal-resolution chain. Without these
+	// fallbacks, any drift in makeReceiptPortalKey output (e.g. sender_guid
+	// format churn) silently drops every delivery receipt while read receipts
+	// keep working via their fallback chain — which manifests as "Beeper
+	// shows read but never delivered" with zero log signal.
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	resolved := false
+
+	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
+		gidPortalKey := networkid.PortalKey{ID: networkid.PortalID("gid:" + *msg.SenderGuid), Receiver: c.UserLogin.ID}
+		if gidPortal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, gidPortalKey); gidPortal != nil && gidPortal.MXID != "" {
+			portalKey = gidPortalKey
+			log.Debug().
+				Str("sender_guid", *msg.SenderGuid).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved delivery receipt portal via gid: lookup")
+			resolved = true
+		}
+		if !resolved {
+			c.imGroupGuidsMu.RLock()
+			for portalIDStr, guid := range c.imGroupGuids {
+				if strings.EqualFold(guid, *msg.SenderGuid) {
+					if c.guidCacheMatchIsStale(portalIDStr, msg.Participants) {
+						continue
+					}
+					portalKey = networkid.PortalKey{ID: networkid.PortalID(portalIDStr), Receiver: c.UserLogin.ID}
+					log.Debug().
+						Str("sender_guid", *msg.SenderGuid).
+						Str("resolved_portal", string(portalKey.ID)).
+						Msg("Resolved delivery receipt portal via sender_guid cache lookup")
+					resolved = true
+					break
+				}
+			}
+			c.imGroupGuidsMu.RUnlock()
 		}
 	}
+
+	if !resolved && msg.Sender != nil {
+		if groupKey, ok := c.findGroupPortalForMember(*msg.Sender); ok {
+			portalKey = groupKey
+			log.Debug().
+				Str("sender", *msg.Sender).
+				Str("resolved_portal", string(portalKey.ID)).
+				Msg("Resolved delivery receipt portal via group member lookup")
+			resolved = true
+		}
+	}
+
+	if !resolved {
+		if portal, _ := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey); portal != nil && portal.MXID != "" {
+			resolved = true
+		}
+	}
+
+	if msg.Uuid != "" {
+		if msgPortal := c.resolvePortalByTargetMessage(log, msg.Uuid); msgPortal.ID != "" &&
+			(msgPortal.ID != portalKey.ID || msgPortal.Receiver != portalKey.Receiver) {
+			log.Debug().
+				Str("uuid", msg.Uuid).
+				Str("old_portal", string(portalKey.ID)).
+				Str("resolved_portal", string(msgPortal.ID)).
+				Msg("Resolved delivery receipt portal via target message UUID")
+			portalKey = msgPortal
+			resolved = true
+		}
+	}
+
+	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil || portal == nil || portal.MXID == "" {
+		log.Debug().
+			Err(err).
+			Bool("resolved", resolved).
+			Str("uuid", msg.Uuid).
+			Str("portal_key", string(portalKey.ID)).
+			Str("sender_guid", ptrStringOr(msg.SenderGuid, "")).
+			Msg("Dropping delivery receipt: no portal found after fallback chain")
 		return
 	}
 
+	// Race window: after we send an outgoing message, bridgev2's framework
+	// inserts the Message row into the DB AFTER HandleMatrixMessage returns,
+	// but on APNs-flap retry the stored-message echo can trigger this handler
+	// within ~2ms of the FFI returning — before the framework has committed
+	// the insert. Retry with a short backoff so the insert has time to land.
+	// On the non-race path the first query succeeds immediately; overhead
+	// only pays when the miss is real.
 	msgID := makeMessageID(msg.Uuid)
-	dbMessages, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
-	if err != nil || len(dbMessages) == 0 {
+	altUUID := strings.ToUpper(msg.Uuid)
+	if altUUID == msg.Uuid {
+		altUUID = strings.ToLower(msg.Uuid)
+	}
+	altMsgID := makeMessageID(altUUID)
+	tryLookup := func() ([]*database.Message, bool, error) {
+		dbM, err := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, msgID)
+		if err == nil && len(dbM) > 0 {
+			return dbM, false, nil
+		}
+		dbAlt, altErr := c.Main.Bridge.DB.Message.GetAllPartsByID(ctx, portal.Receiver, altMsgID)
+		if altErr == nil && len(dbAlt) > 0 {
+			return dbAlt, true, nil
+		}
+		// Propagate the case-sensitive error (primary path); alt is just a fallback.
+		return nil, false, err
+	}
+
+	var dbMessages []*database.Message
+	var lookupErr error
+	var matchedAlt bool
+	backoff := []time.Duration{0, 100 * time.Millisecond, 300 * time.Millisecond, 700 * time.Millisecond, 1500 * time.Millisecond}
+	for _, d := range backoff {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		dbMessages, matchedAlt, lookupErr = tryLookup()
+		if lookupErr == nil && len(dbMessages) > 0 {
+			break
+		}
+	}
+
+	if lookupErr != nil || len(dbMessages) == 0 {
+		log.Debug().
+			Err(lookupErr).
+			Str("uuid", msg.Uuid).
+			Str("portal_id", string(portalKey.ID)).
+			Str("receiver", string(portal.Receiver)).
+			Msg("Dropping delivery receipt: target message not in bridge DB")
 		return
+	}
+
+	if matchedAlt {
+		log.Info().
+			Str("uuid", msg.Uuid).
+			Str("alt_uuid", altUUID).
+			Str("portal_id", string(portalKey.ID)).
+			Msg("Delivery receipt matched via case-insensitive UUID fallback")
 	}
 
 	normalizedSender := normalizeIdentifierForPortalID(ptrStringOr(msg.Sender, ""))
@@ -3422,6 +5137,12 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 	senderUserID := makeUserID(normalizedSender)
 	ghost, err := c.Main.Bridge.GetGhostByID(ctx, senderUserID)
 	if err != nil || ghost == nil {
+		log.Debug().
+			Err(err).
+			Str("uuid", msg.Uuid).
+			Str("portal_id", portalID).
+			Str("sender_user_id", string(senderUserID)).
+			Msg("Dropping delivery receipt: ghost not found for sender")
 		return
 	}
 
@@ -3558,6 +5279,25 @@ func (c *IMClient) convertURLPreviewToIMessage(ctx context.Context, content *eve
 	return body
 }
 
+// retrySendOnAPNsFlap retries an APNs-dependent send up to three times across
+// 3s total when a transient APNs flap manifests as "Send timeout; try again".
+// APNs reconnect grace is 30s on our side, so a short retry almost always
+// lands on the restored connection.
+func retrySendOnAPNsFlap(op func() error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		if msg := strings.ToLower(err.Error()); !strings.Contains(msg, "send timeout; try again") && !strings.Contains(msg, "sendtimedout") {
+			return err
+		}
+		time.Sleep(time.Duration(1+attempt) * time.Second)
+	}
+	return err
+}
+
 func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
@@ -3573,10 +5313,18 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
+	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
+	// fresh MessageInst and orphan delivery receipts for the first attempt.
 	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
+	zerolog.Ctx(ctx).Info().
+		Str("uuid", uuid).
+		Str("portal_id", string(msg.Portal.ID)).
+		Bool("is_sms", c.isPortalSMS(string(msg.Portal.ID))).
+		Msg("Message sent, storing UUID in bridge DB")
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
@@ -3774,6 +5522,8 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		caption = &msg.Content.Body
 	}
 
+	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
+	// UUID — no Go-side retry here (would orphan delivery receipts).
 	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
@@ -3804,7 +5554,9 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 	if conv.IsSms {
 		return nil
 	}
-	return c.client.SendTyping(conv, msg.IsTyping, c.handle)
+	return retrySendOnAPNsFlap(func() error {
+		return c.client.SendTyping(conv, msg.IsTyping, c.handle)
+	})
 }
 
 func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
@@ -3824,7 +5576,9 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		}
 		forUuid = &uuid
 	}
-	err := c.client.SendReadReceipt(conv, c.handle, forUuid)
+	err := retrySendOnAPNsFlap(func() error {
+		return c.client.SendReadReceipt(conv, c.handle, forUuid)
+	})
 	if err != nil {
 		errStr := err.Error()
 		// Suppress non-actionable failures: IDS lookup errors (6001) for
@@ -3853,6 +5607,7 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	}
 	targetGUID := string(msg.EditTarget.ID)
 
+	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
@@ -3873,6 +5628,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
+	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
@@ -3921,6 +5677,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, false)
 			}
 		}
+		// Rust-side retry handles SendTimedOut with stable UUID.
 		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
@@ -3934,6 +5691,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
+	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
@@ -3968,6 +5726,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 				reactionText = formatSMSReactionTextWithBody(reaction, emoji, origText, true)
 			}
 		}
+		// Rust-side retry handles SendTimedOut with stable UUID.
 		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
 		if err != nil {
 			return err
@@ -3977,6 +5736,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
+	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
 	return err
 }
@@ -4548,14 +6308,24 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		}
 	}
 
-	if contact != nil && contact.HasName() {
-		name := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
-			ID:        localID,
-		})
-		ui.Name = &name
+	// User-provided contacts (CardDAV / iCloud) always win. Any match from
+	// c.contacts fully overrides the shared iMessage profile, regardless of
+	// whether the contact has a name or photo: the user adding an entry is
+	// itself the signal that they want their own data used. Shared profiles
+	// only fill the gap when the identifier is unknown to the address book.
+	if contact != nil {
+		if contact.HasName() {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: contact.FirstName,
+				LastName:  contact.LastName,
+				Nickname:  contact.Nickname,
+				ID:        localID,
+			})
+			ui.Name = &name
+		} else {
+			name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
+			ui.Name = &name
+		}
 		for _, phone := range contact.Phones {
 			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
 		}
@@ -4575,16 +6345,54 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 		return ui, nil
 	}
 
-	// Fallback: format from identifier
+	// No user-provided contact — fall back to a shared iMessage profile
+	// (Name & Photo Sharing / Me card) if one was received and cached.
+	if profile := c.lookupSharedProfile(identifier); profile != nil {
+		if profile.FirstName != "" || profile.LastName != "" || profile.DisplayName != "" {
+			name := c.Main.Config.FormatDisplayname(DisplaynameParams{
+				FirstName: profile.FirstName,
+				LastName:  profile.LastName,
+				ID:        localID,
+			})
+			ui.Name = &name
+		}
+		if profile.Avatar != nil && len(*profile.Avatar) > 0 {
+			avatarData := *profile.Avatar
+			avatarHash := sha256.Sum256(avatarData)
+			ui.Avatar = &bridgev2.Avatar{
+				ID: networkid.AvatarID(fmt.Sprintf("improfile:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
+				Get: func(ctx context.Context) ([]byte, error) {
+					return avatarData, nil
+				},
+			}
+		}
+		if ui.Name != nil {
+			return ui, nil
+		}
+	}
+
+	// Final fallback: format from identifier
 	name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 	ui.Name = &name
 	return ui, nil
 }
 
-func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (*bridgev2.ResolveIdentifierResponse, error) {
+func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, createChat bool) (resp *bridgev2.ResolveIdentifierResponse, err error) {
 	if c.client == nil {
 		return nil, bridgev2.ErrNotLoggedIn
 	}
+	// ValidateTargets crosses into the identity-manager FFI path, which has
+	// reachable panic sites upstream (identity_manager.rs:249/335/542/555).
+	// This is a user-triggered call (start-chat flow), so a panic here
+	// would crash the bridge on a normal user action. Convert to error.
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).Str("identifier", identifier).
+				Msg("ResolveIdentifier panicked in FFI path")
+			resp = nil
+			err = fmt.Errorf("identity lookup panicked: %v", r)
+		}
+	}()
 
 	valid := c.client.ValidateTargets([]string{identifier}, c.handle)
 	if len(valid) == 0 {
@@ -4961,6 +6769,17 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 			if hasMessages {
 				log.Info().Str("portal_id", portalID).
 					Msg("Backward backfill: no anchor yet, forward backfill still in progress — deferring")
+				// Sleep before returning HasMore=true so the bridgev2 backfill
+				// queue doesn't tight-loop on this task and steal scheduler
+				// time from forward backfill (which we're waiting on). Each
+				// tight-loop iteration was ~1s of pure no-op — with 30+
+				// deferred portals, that's 30+ CPU-seconds per second burned
+				// waiting for a state change that takes minutes to happen.
+				select {
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				case <-time.After(30 * time.Second):
+				}
 				return &bridgev2.FetchMessagesResponse{HasMore: true, Forward: false}, nil
 			}
 			log.Info().Str("portal_id", portalID).
@@ -5329,6 +7148,14 @@ func (c *IMClient) cloudTapbackToBackfill(row cloudMessageRow, sender bridgev2.E
 	return nil
 }
 
+// isPluginPayloadAttachment reports whether the row is a rich-link plugin
+// payload sideband (the binary plist Apple stores alongside a URL-bubble
+// message). Filename-based because that's the only signal CloudKit reliably
+// preserves; the plist always uses the .pluginPayloadAttachment extension.
+func isPluginPayloadAttachment(att cloudAttachmentRow) bool {
+	return strings.HasSuffix(att.Filename, ".pluginPayloadAttachment")
+}
+
 // cloudAttachmentResult holds the result of a concurrent attachment download+upload.
 type cloudAttachmentResult struct {
 	Index   int
@@ -5356,9 +7183,18 @@ func (c *IMClient) cloudAttachmentsToBackfill(ctx context.Context, row cloudMess
 	}
 	var downloadable []indexedAtt
 	for i, att := range atts {
-		if att.RecordName != "" {
-			downloadable = append(downloadable, indexedAtt{index: i, att: att})
+		if att.RecordName == "" {
+			continue
 		}
+		// Skip rich-link plugin payload sidebands. The URL itself is in the
+		// message text and the preview card renders from it; bridging the
+		// plist as a file is noise. We deliberately do NOT filter on
+		// HideAttachment broadly because Live Photo MOV companions also
+		// carry that flag and we intentionally bridge them.
+		if isPluginPayloadAttachment(att) {
+			continue
+		}
+		downloadable = append(downloadable, indexedAtt{index: i, att: att})
 	}
 
 	// Live Photo handling: when HasAvid is true on an attachment, the download
@@ -5712,15 +7548,26 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 	}
 
+	parts := make([]*bridgev2.ConvertedMessagePart, 0, 2)
+	if isVCardAttachment(mimeType, fileName, att.UTIType) {
+		if vcardPreview := makeVCardPreviewContent(data); vcardPreview != nil {
+			parts = append(parts, &bridgev2.ConvertedMessagePart{
+				Type:    event.EventMessage,
+				Content: vcardPreview,
+			})
+		}
+	}
+	parts = append(parts, &bridgev2.ConvertedMessagePart{
+		Type:    event.EventMessage,
+		Content: content,
+	})
+
 	messages := []*bridgev2.BackfillMessage{{
 		Sender:    sender,
 		ID:        makeMessageID(attID),
 		Timestamp: ts,
 		ConvertedMessage: &bridgev2.ConvertedMessage{
-			Parts: []*bridgev2.ConvertedMessagePart{{
-				Type:    event.EventMessage,
-				Content: content,
-			}},
+			Parts: parts,
 		},
 	}}
 
@@ -5903,6 +7750,11 @@ func (c *IMClient) preUploadCloudAttachments(ctx context.Context) {
 		hasText := strings.TrimSpace(strings.Trim(row.Text, "\ufffc \n")) != ""
 		for i, att := range atts {
 			if att.RecordName == "" {
+				continue
+			}
+			// Mirror the filter in cloudAttachmentsToBackfill — don't waste a
+			// CloudKit download on rich-link plugin payloads we'll never bridge.
+			if isPluginPayloadAttachment(att) {
 				continue
 			}
 			if _, ok := c.attachmentContentCache.Load(att.RecordName); ok {
@@ -6111,6 +7963,15 @@ func decodeCloudBackfillCursor(cursor networkid.PaginationCursor) (*cloudBackfil
 // ============================================================================
 
 func (c *IMClient) persistState(log zerolog.Logger) {
+	// Guard against panics crossing the FFI boundary from any of the four
+	// rustpushgo calls below. A panic here would otherwise kill the bridge
+	// on a non-essential periodic persist; skipping one cycle is strictly
+	// safer than crashing the process.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
+		}
+	}()
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
 	if c.connection != nil {
 		meta.APSState = c.connection.State().ToString()
@@ -6145,7 +8006,126 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 	}
 }
 
-// periodicCloudContactSync re-fetches contacts from iCloud CardDAV every 15 minutes.
+// petRefreshMinInterval throttles startup/on-demand PET refreshes to protect
+// against restart-loop-induced Apple rate limiting. login_email_pass is
+// per-user-expected but bridges in a crash-restart loop could stack several
+// per minute, which is the one failure mode that reliably trips 429s or a
+// temporary account lock. 5 min gives a comfortable margin (max 12/hour vs
+// the ~30/hour threshold where Apple's fraud systems start reacting) while
+// still allowing legitimate manual restarts close together during debugging.
+const petRefreshMinInterval = 5 * time.Minute
+
+// petRefreshKVKey is the KV key used to persist the last PET refresh time.
+// Persistent (not in-memory) so the throttle survives the exact failure mode
+// it's protecting against — a crash-restart loop that wipes in-memory state
+// between each attempt.
+const petRefreshKVKey = database.Key("gsa.pet_last_refresh")
+
+// safeRefreshPetTokenThrottled is safeRefreshPetToken with a persistent
+// timestamp guard. Returns an error without hitting GSA if a refresh
+// completed within petRefreshMinInterval. Callers on hot startup paths
+// (share_status prime, announce, command handlers) should use this variant;
+// the 12h periodicPetRefresh is already self-throttled and uses the raw
+// function.
+func (c *IMClient) safeRefreshPetTokenThrottled() error {
+	if c.tokenProvider == nil || *c.tokenProvider == nil {
+		return fmt.Errorf("no token provider")
+	}
+	ctx := context.Background()
+	now := time.Now()
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, petRefreshKVKey); raw != "" {
+		if ts, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
+			if elapsed := now.Sub(time.Unix(ts, 0)); elapsed < petRefreshMinInterval {
+				return fmt.Errorf("PET refresh throttled: last refresh %s ago (min %s)",
+					elapsed.Round(time.Second), petRefreshMinInterval)
+			}
+		}
+	}
+	if err := safeRefreshPetToken(*c.tokenProvider); err != nil {
+		return err
+	}
+	c.Main.Bridge.DB.KV.Set(ctx, petRefreshKVKey, strconv.FormatInt(now.Unix(), 10))
+	return nil
+}
+
+// safeRefreshPetToken wraps RefreshPetToken with panic recovery and a 60s
+// timeout. Uniffi turns Rust panics into Go panics; without recovery a single
+// anisette or network hiccup could crash the bridge from a best-effort
+// background refresh. The timeout prevents an anisette-poisoned tokio mutex
+// (see project memory) from blocking the goroutine indefinitely.
+//
+// For hot startup paths (announce, share_status prime, etc.) prefer
+// safeRefreshPetTokenThrottled to avoid stacking GSA logins across
+// restart loops. This raw variant is appropriate only for self-throttled
+// paths like the 12h periodic refresh.
+func safeRefreshPetToken(tp *rustpushgo.WrappedTokenProvider) error {
+	done := make(chan error, 1)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				done <- fmt.Errorf("RefreshPetToken panicked: %v", r)
+			}
+		}()
+		done <- tp.RefreshPetToken()
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(60 * time.Second):
+		return fmt.Errorf("RefreshPetToken timed out after 60s")
+	}
+}
+
+// periodicPetRefresh proactively re-runs login_email_pass every 12h so the
+// GSA/PET session never ages past Apple's ~24h lifetime. Closes the gap that
+// restore_token_provider only covers at startup: a bridge running continuously
+// for >24h would otherwise rely on upstream's on-demand auto-refresh, which
+// fails with NeedsDevice2FA once Apple has aged out the session.
+func (c *IMClient) periodicPetRefresh(log zerolog.Logger) {
+	ticker := time.NewTicker(12 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if c.tokenProvider == nil || *c.tokenProvider == nil {
+				continue
+			}
+			if err := safeRefreshPetToken(*c.tokenProvider); err != nil {
+				log.Warn().Err(err).Msg("Periodic PET refresh failed")
+			} else {
+				log.Debug().Msg("Periodic PET refresh completed")
+			}
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// periodicStatusSharingReinvite re-runs the pending-only StatusKit invite
+// sweep every 4h. Peers who've already keyed us are skipped inside the
+// sweep. The periodic path sets respectSpacing=true so per-handle KV
+// timestamps bound worst-case re-invite rate for unresponsive peers.
+// Startup and post-backfill paths pass respectSpacing=false: a restart
+// is intentional and should always re-initiate invites regardless of
+// KV state from the prior session.
+func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
+	ticker := time.NewTicker(4 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.inviteContactsToStatusSharingOpts(log, true, false)
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// periodicCloudContactSync re-fetches contacts from iCloud CardDAV every
+// 15 minutes. Also re-runs the shared iMessage profile re-fetch on the
+// same tick so we keep one ticker but don't gate the share-profile path
+// behind CardDAV success — refreshAllSharedProfiles only needs CloudKit
+// (ProfilesClient) and runs independently even if SyncContacts errors.
 func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
@@ -6158,6 +8138,7 @@ func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
 				c.setContactsReady(log)
 				c.persistMmeDelegate(log)
 			}
+			c.refreshAllSharedProfiles(log)
 		case <-c.stopChan:
 			return
 		}
@@ -6412,10 +8393,42 @@ func (c *IMClient) ensureDoublePuppet() {
 
 // resolveExistingDMPortalID prefers an already-created DM portal key variant
 // (e.g. legacy tel:1415... vs canonical tel:+1415...) to avoid splitting rooms
-// when normalization rules change.
+// when normalization rules change. For mailto: identifiers, it also tries
+// the contact's phone-based portal IDs (since StatusKit may report the email
+// handle while the DM portal was created under the phone handle).
 func (c *IMClient) resolveExistingDMPortalID(identifier string) networkid.PortalID {
 	defaultID := networkid.PortalID(identifier)
-	if identifier == "" || strings.Contains(identifier, ",") || !strings.HasPrefix(identifier, "tel:") {
+	if identifier == "" || strings.Contains(identifier, ",") {
+		return defaultID
+	}
+
+	// For mailto: identifiers, try the contact's other handles (phone numbers)
+	// since the DM portal may have been created under a tel: handle.
+	if strings.HasPrefix(identifier, "mailto:") {
+		contact := c.lookupContact(identifier)
+		if contact != nil {
+			ctx := context.Background()
+			for _, altID := range contactPortalIDs(contact) {
+				if altID == identifier {
+					continue
+				}
+				portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, networkid.PortalKey{
+					ID:       networkid.PortalID(altID),
+					Receiver: c.UserLogin.ID,
+				})
+				if err == nil && portal != nil && portal.MXID != "" {
+					c.UserLogin.Log.Debug().
+						Str("original", identifier).
+						Str("resolved", altID).
+						Msg("Resolved mailto: DM portal to existing contact portal")
+					return networkid.PortalID(altID)
+				}
+			}
+		}
+		return defaultID
+	}
+
+	if !strings.HasPrefix(identifier, "tel:") {
 		return defaultID
 	}
 
@@ -7532,6 +9545,47 @@ type attachmentMessage struct {
 	Index      int
 }
 
+// stickerTapbackData carries the image bytes for a sticker placed on a
+// message bubble (iMessage sticker tapback, type 7). Bridged as an image
+// message replying to the target since Matrix reactions are text-only.
+type stickerTapbackData struct {
+	ImageData []byte
+	MimeType  string
+	TargetID  string // UUID of the message the sticker was placed on
+}
+
+func convertStickerTapback(ctx context.Context, intent bridgev2.MatrixAPI, data *stickerTapbackData) (*bridgev2.ConvertedMessage, error) {
+	content := &event.MessageEventContent{
+		MsgType: event.MsgImage,
+		Body:    "sticker.png",
+		Info: &event.FileInfo{
+			MimeType: data.MimeType,
+			Size:     len(data.ImageData),
+		},
+	}
+	if intent != nil {
+		url, encFile, err := intent.UploadMedia(ctx, "", data.ImageData, "sticker.png", data.MimeType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload sticker: %w", err)
+		}
+		if encFile != nil {
+			content.File = encFile
+		} else {
+			content.URL = url
+		}
+	}
+	cm := &bridgev2.ConvertedMessage{
+		Parts: []*bridgev2.ConvertedMessagePart{{
+			Type:    event.EventMessage,
+			Content: content,
+		}},
+	}
+	if data.TargetID != "" {
+		cm.ReplyTo = &networkid.MessageOptionalPartID{MessageID: makeMessageID(data.TargetID)}
+	}
+	return cm, nil
+}
+
 // convertURLPreviewToBeeper parses rich link sideband attachments from an
 // inbound iMessage and returns Beeper link previews. Follows the pattern
 // from mautrix-whatsapp's urlpreview.go.
@@ -7628,7 +9682,7 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 }
 
 func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := strings.Trim(ptrStringOr(msg.Text, ""), "\ufffc \n")
+	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
 	content := &event.MessageEventContent{
 		MsgType: event.MsgText,
 		Body:    text,
@@ -7663,6 +9717,66 @@ func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev
 	return cm, nil
 }
 
+func isVCardAttachment(mimeType, fileName, utiType string) bool {
+	if strings.EqualFold(utiType, "public.vcard") {
+		return true
+	}
+	if strings.EqualFold(mimeType, "text/vcard") ||
+		strings.EqualFold(mimeType, "text/x-vcard") ||
+		strings.EqualFold(mimeType, "text/directory") {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(fileName), ".vcf")
+}
+
+func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
+	contact := parseVCard(string(data))
+	if contact == nil {
+		return nil
+	}
+	name := strings.TrimSpace(contact.Name())
+	if name == "" && len(contact.Phones) == 0 && len(contact.Emails) == 0 {
+		return nil
+	}
+
+	bodyLines := []string{"Shared contact"}
+	htmlLines := []string{"<strong>Shared contact</strong>"}
+	if name != "" {
+		bodyLines = append(bodyLines, name)
+		htmlLines = append(htmlLines, html.EscapeString(name))
+	}
+	for i, phone := range contact.Phones {
+		if i >= 3 {
+			break
+		}
+		phone = strings.TrimSpace(phone)
+		if phone == "" {
+			continue
+		}
+		bodyLines = append(bodyLines, "Phone: "+phone)
+		htmlLines = append(htmlLines, "Phone: "+html.EscapeString(phone))
+	}
+	for i, email := range contact.Emails {
+		if i >= 3 {
+			break
+		}
+		email = strings.TrimSpace(email)
+		if email == "" {
+			continue
+		}
+		bodyLines = append(bodyLines, "Email: "+email)
+		htmlLines = append(htmlLines, "Email: "+html.EscapeString(email))
+	}
+
+	return &event.MessageEventContent{
+		MsgType:       event.MsgNotice,
+		Body:          strings.Join(bodyLines, "\n"),
+		Format:        event.FormatHTML,
+		FormattedBody: strings.Join(htmlLines, "<br/>"),
+		Mentions:      &event.Mentions{},
+	}
+}
+
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {
 	att := attMsg.Attachment
 	mimeType := att.MimeType
@@ -7677,6 +9791,36 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
 			inlineData, mimeType, fileName, durationMs = convertAudioForMatrix(inlineData, mimeType, fileName)
 		}
+	}
+
+	// Guard: no payload means the MMCS download failed upstream after the
+	// rustpushgo retry exhausted (download_one_mmcs_attachment at
+	// pkg/rustpushgo/src/lib.rs logs the specific error). Without this guard
+	// we'd fall through to build an m.image/m.video/m.file event with no
+	// url/file field, and clients render that as "Unsupported attachment
+	// type: IMAGE (<body>)". Emit an m.notice placeholder instead — mirrors
+	// the CloudKit backfill fallback a few thousand lines up in this file.
+	if inlineData == nil {
+		zerolog.Ctx(ctx).Warn().
+			Str("file", fileName).
+			Str("mime", mimeType).
+			Uint64("size", att.Size).
+			Msg("Attachment has no payload — MMCS download failed; emitting notice placeholder")
+		return &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{{
+				ID:   networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+				Type: event.EventMessage,
+				Content: &event.MessageEventContent{
+					MsgType: event.MsgNotice,
+					Body:    fmt.Sprintf("Attachment could not be downloaded (%s).", fileName),
+				},
+			}},
+		}, nil
+	}
+
+	var vcardPreview *event.MessageEventContent
+	if inlineData != nil && isVCardAttachment(mimeType, fileName, att.UtiType) {
+		vcardPreview = makeVCardPreviewContent(inlineData)
 	}
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
@@ -7821,12 +9965,22 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		}
 	}
 
-	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			ID:      networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+	parts := make([]*bridgev2.ConvertedMessagePart, 0, 2)
+	if vcardPreview != nil {
+		parts = append(parts, &bridgev2.ConvertedMessagePart{
+			ID:      networkid.PartID(fmt.Sprintf("att%d-preview", attMsg.Index)),
 			Type:    event.EventMessage,
-			Content: content,
-		}},
+			Content: vcardPreview,
+		})
+	}
+	parts = append(parts, &bridgev2.ConvertedMessagePart{
+		ID:      networkid.PartID(fmt.Sprintf("att%d", attMsg.Index)),
+		Type:    event.EventMessage,
+		Content: content,
+	})
+
+	cm := &bridgev2.ConvertedMessage{
+		Parts: parts,
 	}
 
 	if attMsg.WrappedMessage.ReplyGuid != nil && *attMsg.WrappedMessage.ReplyGuid != "" {
@@ -8124,6 +10278,8 @@ func mimeToUTI(mime string) string {
 		return "public.aac-audio"
 	case mime == "audio/x-caf":
 		return "com.apple.coreaudio-format"
+	case mime == "text/vcard", mime == "text/x-vcard", mime == "text/directory":
+		return "public.vcard"
 	case strings.HasPrefix(mime, "image/"):
 		return "public.image"
 	case strings.HasPrefix(mime, "video/"):
@@ -8163,6 +10319,8 @@ func utiToMIME(uti string) string {
 		return "audio/aac"
 	case "com.apple.coreaudio-format":
 		return "audio/x-caf"
+	case "public.vcard":
+		return "text/vcard"
 	default:
 		return ""
 	}

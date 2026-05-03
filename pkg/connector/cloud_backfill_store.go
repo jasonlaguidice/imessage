@@ -465,6 +465,21 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 	if len(rows) == 0 {
 		return nil
 	}
+	// CloudKit can occasionally return duplicate GUID entries within a fetch
+	// window; keep only the newest row per GUID to make batch inserts idempotent.
+	rowsByGUID := make(map[string]cloudMessageRow, len(rows))
+	order := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.GUID == "" {
+			continue
+		}
+		if prev, ok := rowsByGUID[row.GUID]; !ok {
+			rowsByGUID[row.GUID] = row
+			order = append(order, row.GUID)
+		} else if row.TimestampMS >= prev.TimestampMS {
+			rowsByGUID[row.GUID] = row
+		}
+	}
 	tx, err := s.beginTx(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -504,7 +519,8 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 	defer stmt.Close()
 
 	nowMS := time.Now().UnixMilli()
-	for _, row := range rows {
+	for _, guid := range order {
+		row := rowsByGUID[guid]
 		_, err = stmt.ExecContext(ctx,
 			s.loginID, row.GUID, row.RecordName, row.CloudChatID, row.PortalID, row.TimestampMS,
 			row.Sender, row.IsFromMe, row.Text, row.Subject, row.Service, row.Deleted,
@@ -513,11 +529,22 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			nowMS, nowMS,
 		)
 		if err != nil {
+			if isUniqueConstraintErr(err) {
+				continue
+			}
 			return fmt.Errorf("failed to insert message %s: %w", row.GUID, err)
 		}
 	}
 
 	return tx.Commit()
+}
+
+func isUniqueConstraintErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "unique constraint") || strings.Contains(errText, "primary key")
 }
 
 // deleteMessageBatch soft-deletes individual messages by GUID (sets deleted=TRUE).
@@ -640,6 +667,9 @@ func (s *cloudBackfillStore) lookupPortalIDsByRecordNames(ctx context.Context, r
 			result[rn] = pid
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
 	}
 	return result, nil
 }
@@ -1391,6 +1421,38 @@ func (s *cloudBackfillStore) hasChatBatch(ctx context.Context, chatIDs []string)
 		}
 	}
 	return existing, nil
+}
+
+// getAttachmentRecordName returns the CloudKit record_name for a single
+// attachment of a message, looked up by (message_guid, att_index). Returns
+// empty string + nil error if the cloud_message row or its attachments_json
+// hasn't been ingested yet (CloudKit sync may still be catching up on the
+// live APNs-delivered message). Used by the AttachmentRetrier as a fallback
+// when the MMCS URL retry exhausts — if CloudKit has the record, the retrier
+// can download via safeCloudDownloadAttachment instead.
+func (s *cloudBackfillStore) getAttachmentRecordName(ctx context.Context, msgGUID string, attIndex int) (string, error) {
+	var attsJSON string
+	err := s.db.QueryRow(ctx,
+		`SELECT COALESCE(attachments_json, '') FROM cloud_message WHERE login_id=$1 AND guid=$2`,
+		s.loginID, msgGUID,
+	).Scan(&attsJSON)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", err
+	}
+	if attsJSON == "" {
+		return "", nil
+	}
+	var atts []cloudAttachmentRow
+	if err := json.Unmarshal([]byte(attsJSON), &atts); err != nil {
+		return "", fmt.Errorf("unmarshal attachments_json for %s: %w", msgGUID, err)
+	}
+	if attIndex < 0 || attIndex >= len(atts) {
+		return "", nil
+	}
+	return atts[attIndex].RecordName, nil
 }
 
 func (s *cloudBackfillStore) getChatParticipantsByPortalID(ctx context.Context, portalID string) ([]string, error) {

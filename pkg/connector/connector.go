@@ -37,12 +37,13 @@ var _ bridgev2.NetworkConnector = (*IMConnector)(nil)
 
 func (c *IMConnector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
-		DisplayName:      "iMessage",
-		NetworkURL:       "https://support.apple.com/messages",
-		NetworkIcon:      "mxc://maunium.net/tManJEpANASZvDVzvRvhILdl",
-		NetworkID:        "imessage",
-		BeeperBridgeType: "imessagego",
-		DefaultPort:      29332,
+		DisplayName:          "iMessage",
+		NetworkURL:           "https://support.apple.com/messages",
+		NetworkIcon:          "mxc://maunium.net/tManJEpANASZvDVzvRvhILdl",
+		NetworkID:            "imessage",
+		BeeperBridgeType:     "imessagego",
+		DefaultPort:          29332,
+		DefaultCommandPrefix: "!im",
 	}
 }
 
@@ -281,22 +282,33 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	apsStateStr := &meta.APSState
 
 	// Eagerly persist full session state to the backup file so it survives DB resets.
-	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:              meta.IDSIdentity,
-		APSState:                 meta.APSState,
-		IDSUsers:                 meta.IDSUsers,
-		PreferredHandle:          meta.PreferredHandle,
-		Platform:                 meta.Platform,
-		HardwareKey:              meta.HardwareKey,
-		DeviceID:                 meta.DeviceID,
-		AccountUsername:          meta.AccountUsername,
-		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-		AccountPET:               meta.AccountPET,
-		AccountADSID:             meta.AccountADSID,
-		AccountDSID:              meta.AccountDSID,
-		AccountSPDBase64:         meta.AccountSPDBase64,
-		MmeDelegateJSON:          meta.MmeDelegateJSON,
-	})
+	//
+	// Guard against overwriting a good backup with empty state. client.Connect
+	// (client.go ValidateKeystore path) wipes meta.IDSUsers/IDSIdentity/APSState
+	// from the DB when the keystore is missing and flips to StateBadCredentials;
+	// on the NEXT LoadUserLogin the meta is empty here, and without this guard
+	// we'd blow away session.json — escalating a recoverable key-loss into a
+	// full re-auth because tryAutoRestore on a future boot now finds no backup.
+	if meta.IDSUsers == "" && meta.IDSIdentity == "" && meta.APSState == "" {
+		log.Warn().Msg("LoadUserLogin: meta has no IDSUsers/IDSIdentity/APSState; skipping session.json overwrite to preserve existing backup")
+	} else {
+		saveSessionState(log, PersistedSessionState{
+			IDSIdentity:              meta.IDSIdentity,
+			APSState:                 meta.APSState,
+			IDSUsers:                 meta.IDSUsers,
+			PreferredHandle:          meta.PreferredHandle,
+			Platform:                 meta.Platform,
+			HardwareKey:              meta.HardwareKey,
+			DeviceID:                 meta.DeviceID,
+			AccountUsername:          meta.AccountUsername,
+			AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
+			AccountPET:               meta.AccountPET,
+			AccountADSID:             meta.AccountADSID,
+			AccountDSID:              meta.AccountDSID,
+			AccountSPDBase64:         meta.AccountSPDBase64,
+			MmeDelegateJSON:          meta.MmeDelegateJSON,
+		})
+	}
 
 	client := &IMClient{
 		Main:                    c,
@@ -308,10 +320,15 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		contactsReady:           false,
 		contactsReadyCh:         make(chan struct{}),
 		cloudStore:              newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
+		sharedProfileStore:      newSharedProfileStore(c.Bridge.DB.Database, login.ID),
+		pendingAttachments:      newPendingAttachmentStore(c.Bridge.DB.Database, login.ID),
+		fordCache:               NewFordKeyCache(),
 		recentUnsends:           make(map[string]time.Time),
 		recentOutboundUnsends:   make(map[string]time.Time),
 		recentSmsReactionEchoes: make(map[string]time.Time),
 		smsPortals:              make(map[string]bool),
+		sharedStreamAssetCache:  make(map[string]map[string]struct{}),
+		sharedAlbumRooms:        make(map[string]id.RoomID),
 		imGroupNames:            make(map[string]string),
 		imGroupGuids:            make(map[string]string),
 		imGroupParticipants:     make(map[string][]string),

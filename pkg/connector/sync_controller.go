@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"regexp"
 	"runtime/debug"
+	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -36,6 +38,51 @@ const cloudSyncVersion = 4
 // Each CloudKit zone sync (messages, chats, attachments) breaks after this many
 // pages so a runaway response can never loop forever.
 const maxCloudSyncPages = 10000
+
+// cloudKitRetryAfterRegex extracts the server-provided retry hint that
+// CloudKit includes on transient errors (ZoneBusy, "Blobification error",
+// etc). Upstream surfaces the hint via PushError's {:?} Debug formatter
+// embedded in the FFI error string; no structured field reaches Go.
+var cloudKitRetryAfterRegex = regexp.MustCompile(`retry_after_seconds:\s*Some\((\d+)\)`)
+
+// cloudKitRetryDelay returns the delay to wait before retrying a failed
+// CloudKit sync page. Uses the larger of: (a) Apple's explicit
+// retry_after_seconds hint parsed from the error string, (b) an
+// exponential backoff ramp keyed on consecutive errors (500ms, 1s, 2s,
+// 4s, 8s). Clamped to 30s so a malformed hint or long error streak can't
+// stall a pagination pass indefinitely — the outer sync controller will
+// retry the whole zone after cloudSyncRetryInterval anyway.
+func cloudKitRetryDelay(err error, consecutiveErrors int) time.Duration {
+	// Exponential fallback: 500ms * 2^(n-1), capped at 30s.
+	// n=1 → 500ms, n=2 → 1s, n=3 → 2s, n=4 → 4s, n=5 → 8s.
+	fallback := 500 * time.Millisecond
+	if consecutiveErrors > 1 {
+		shift := consecutiveErrors - 1
+		if shift > 6 {
+			shift = 6 // cap the multiplier so we don't overflow the Duration math
+		}
+		fallback = fallback << shift
+	}
+	if fallback > 30*time.Second {
+		fallback = 30 * time.Second
+	}
+
+	delay := fallback
+	if err != nil {
+		if m := cloudKitRetryAfterRegex.FindStringSubmatch(err.Error()); len(m) >= 2 {
+			if secs, parseErr := strconv.Atoi(m[1]); parseErr == nil && secs > 0 {
+				hint := time.Duration(secs) * time.Second
+				if hint > 30*time.Second {
+					hint = 30 * time.Second
+				}
+				if hint > delay {
+					delay = hint
+				}
+			}
+		}
+	}
+	return delay
+}
 
 // cloudChatSyncVersion is bumped when chat-specific sync logic changes in a
 // way that requires a one-time full re-download of the chatManateeZone only
@@ -199,6 +246,17 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 	if c.client == nil || c.cloudStore == nil {
 		return
 	}
+	// ListRecoverableChats / ListRecoverableMessageGuids cross into the
+	// CloudKit FFI path, which has reachable panic sites upstream
+	// (cloudkit.rs type assertions). A leaf-level recover here lets the
+	// sync controller goroutine continue to setCloudSyncDone() even if one
+	// seed pass panics — unblocking the APNs buffer is more important than
+	// crashing the whole process over a seed-pass failure.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error().Interface("panic", r).Msg("seedDeletedChatsFromRecycleBin panicked — skipped this pass")
+		}
+	}()
 
 	ctx := context.Background()
 	candidateMap := make(map[string]recycleBinCandidate)
@@ -670,11 +728,11 @@ func (c *IMClient) notifyRecycleBinCandidates(log zerolog.Logger) {
 	var sb strings.Builder
 	sb.WriteString("**Chats blocked from Apple's recycle bin:**\n\n")
 	sb.WriteString("These chats have messages in Apple's \"Recently Deleted\" and were not created during backfill. ")
-	sb.WriteString("If any were restored on your iPhone and should appear here, use `!restore-chat` to bring them back.\n\n")
+	sb.WriteString("If any were restored on your iPhone and should appear here, use `restore-chat` to bring them back.\n\n")
 	for i, c := range candidates {
 		sb.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, c.displayName))
 	}
-	sb.WriteString(fmt.Sprintf("\nUse `!restore-chat` to restore any of these chats."))
+	sb.WriteString(fmt.Sprintf("\nUse `restore-chat` to restore any of these chats."))
 
 	content := format.RenderMarkdown(sb.String(), true, false)
 	content.MsgType = event.MsgNotice
@@ -713,6 +771,348 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	}
 	go c.refreshGhostNamesFromContacts(log)
 	go c.refreshGroupPortalNamesFromContacts(log)
+	// Presence subscription only needs to run on first-ready and whenever new
+	// StatusKit keys arrive (via OnKeysReceived). The ghost set doesn't change
+	// per periodic contact-sync tick; re-subscribing every 15 minutes just
+	// churns APS interest tokens for no gain and spams the journal. Leave
+	// incremental updates to OnKeysReceived.
+	if firstTime {
+		go c.subscribeToContactPresence(log)
+	}
+}
+
+// subscribeToContactPresence subscribes to iMessage presence updates for all
+// known ghosts via StatusKit. Presence changes are delivered via
+// OnStatusUpdate and mapped to Matrix ghost presence.
+func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
+	if c.client == nil {
+		return
+	}
+	// Guard against panics inside the SubscribeToStatus FFI call (upstream
+	// StatusKit path has several panic sites, e.g. statuskit.rs:736).
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("subscribeToContactPresence panicked — skipped")
+		}
+	}()
+	// Serialize concurrent calls so each one reads the freshest state.keys
+	// snapshot from the Rust side. A previous leading-edge debounce was
+	// swallowing re-subscriptions fired by OnKeysReceived: startup ran an
+	// initial subscribe with zero keys in state, then the key-sharing
+	// response arrived within the debounce window and the follow-up
+	// subscribe (which would have picked up the new channel) was skipped.
+	// No further key-sharing arrives for a contact who already shared, so
+	// the channel stayed unsubscribed until the next restart.
+	c.lastPresenceSubscribeLock.Lock()
+	defer c.lastPresenceSubscribeLock.Unlock()
+	c.lastPresenceSubscribe = time.Now()
+
+	ctx := context.Background()
+	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx, "SELECT id FROM ghost WHERE bridge_id=$1", c.Main.Bridge.ID)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to query ghosts for presence subscription")
+		return
+	}
+	defer rows.Close()
+
+	selfHandles := make(map[string]struct{}, len(c.allHandles))
+	for _, h := range c.allHandles {
+		selfHandles[h] = struct{}{}
+	}
+	var handles []string
+	for rows.Next() {
+		var ghostID string
+		if err := rows.Scan(&ghostID); err != nil {
+			continue
+		}
+		if _, isSelf := selfHandles[ghostID]; isSelf {
+			continue
+		}
+		handles = append(handles, ghostID)
+	}
+	if err := rows.Err(); err != nil {
+		log.Warn().Err(err).Msg("Ghost row iteration error during presence subscription — subscription may be incomplete")
+		return
+	}
+	if len(handles) == 0 {
+		return
+	}
+	if err := c.client.SubscribeToStatus(handles); err != nil {
+		log.Warn().Err(err).Int("count", len(handles)).Msg("Failed to subscribe to presence")
+	} else {
+		log.Info().Int("count", len(handles)).Msg("Subscribed to iMessage presence for known ghosts")
+	}
+}
+
+// statusKitInterInviteDelay paces per-handle StatusKit keysharing invites.
+// OB-Android's pattern is one invite per chat activation — implicitly
+// one-handle-at-a-time as the user opens chats. We approximate with a
+// paced sweep (startup + periodic), one handle per IDS send, with this
+// delay between sends so we don't recreate the all-at-once batch shape
+// that appears to trigger peer-side filtering / spam heuristics.
+const statusKitInterInviteDelay = 1500 * time.Millisecond
+
+// statusKitLastInviteKeyPrefix is the KV store prefix for per-handle
+// last-ATTEMPT timestamps (RFC3339). Used only on the periodic tick path
+// to bound failed-retry cadence; successful sends are latched separately
+// and never re-attempted.
+const statusKitLastInviteKeyPrefix = "statuskit.last_invite."
+
+// statusKitInvitedOkKeyPrefix marks handles that received a StatusKit
+// invite which IDS accepted (no error, targets > 0). Soft-latched: if a
+// reshare from the peer has been observed (statusKitReshareSeenKeyPrefix),
+// the latch is permanent (matches OB-Android one-invite-per-chat-activation;
+// peer has our keys, repeat invites trip spam heuristics). If no reshare has
+// been observed and the latch is older than statusKitInvitedOkTTL, it is
+// treated as expired — IDS-accepted dispatch is not the same as peer
+// reciprocation, and a peer that never reshared probably never got the
+// invite (cert-stale, ratchet, transient IDS issue).
+const statusKitInvitedOkKeyPrefix = "statuskit.invited_ok."
+
+// statusKitReshareSeenKeyPrefix marks handles whose StatusKit reshare we have
+// actually observed (proof of reciprocation, written by OnReshareSender).
+// Used by the soft-latch logic to distinguish "invite dispatched and peer
+// replied" (permanent latch) from "invite dispatched but peer never replied"
+// (TTL'd latch).
+const statusKitReshareSeenKeyPrefix = "statuskit.reshare_seen."
+
+// statusKitInvitedOkTTL is how long the dispatch latch holds before being
+// treated as expired in the absence of an observed reshare. Long enough that
+// repeat-invite spam heuristics on peer iOS don't fire on healthy peers, short
+// enough that a stuck-on-dispatch peer recovers within a week.
+const statusKitInvitedOkTTL = 7 * 24 * time.Hour
+
+// statusKitPerHandleMinSpacing is the minimum time between failed-retry
+// invites. Only applies on the periodic tick path to handles that did NOT
+// succeed; successful sends are latched and never retried.
+const statusKitPerHandleMinSpacing = 4 * time.Hour
+
+// inviteContactsToStatusSharing sends our StatusKit key to the peer
+// handles of every 1:1 iMessage portal that has not yet keyed us back,
+// one handle per IDS message, with a short delay between sends. See
+// inviteContactsToStatusSharingOpts for the spacing-gate flag.
+//
+// Uses 1:1 portal participants — NOT the ghost table — as the source set,
+// matching OB-Android's `chat.participants.length == 1` gate
+// (chat_manager.dart:70). Ghosts include group-chat-only contacts whose
+// iOS devices have no 1:1 keysharing relationship with us; peer iOS
+// appears to filter invites from devices it hasn't had 1:1 iMessage
+// interaction with, so inviting group-only ghosts is spam that produces
+// zero reshares and likely contributes to peer-side throttling.
+func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
+	c.inviteContactsToStatusSharingOpts(log, false, false)
+}
+
+// inviteContactsToStatusSharingOpts is the core invite sweep.
+//
+//   - respectSpacing (periodic tick path): skip handles invited within
+//     statusKitPerHandleMinSpacing — bounds worst-case re-invite rate for
+//     an unresponsive peer. Startup / post-backfill paths pass false.
+//   - bypassLatch (user-invoked retry): ignore the invited_ok one-shot
+//     latch so every pending 1:1 portal target is re-invited, even peers
+//     that previously got an accepted invite. Use for !statuskit-invite-all;
+//     automatic paths leave it false to preserve the "invite once per peer"
+//     contract with peer iOS.
+func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
+	if c.client == nil || c.handle == "" {
+		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit invite: skipped (client or handle not ready)")
+		return
+	}
+	log.Info().Str("handle", c.handle).Msg("StatusKit invite: starting")
+	defer func() {
+		if r := recover(); r != nil {
+			log.Warn().Interface("panic", r).Msg("inviteContactsToStatusSharing panicked — skipped")
+		}
+	}()
+
+	ctx := context.Background()
+	portals, err := c.Main.Bridge.GetAllPortalsWithMXID(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("StatusKit invite: failed to query portals")
+		return
+	}
+	selfHandles := make(map[string]struct{}, len(c.allHandles))
+	for _, h := range c.allHandles {
+		selfHandles[h] = struct{}{}
+	}
+
+	// Iterate 1:1 DM portals only. Portal.ID for a DM IS the peer's handle
+	// (tel:+1... or mailto:...). Group portals have `gid:` prefix or a
+	// comma-joined participant ID; both are rejected by isGroupPortalID.
+	// De-dupe via a set in case two portals ever share a handle.
+	targetSet := make(map[string]struct{})
+	var rawCount, groupSkipped, selfSkipped int
+	for _, portal := range portals {
+		if portal == nil {
+			continue
+		}
+		// Only consider portals owned by this login.
+		if portal.Receiver != c.UserLogin.ID {
+			continue
+		}
+		rawCount++
+		id := string(portal.ID)
+		if isGroupPortalID(id) {
+			groupSkipped++
+			continue
+		}
+		if _, isSelf := selfHandles[id]; isSelf {
+			selfSkipped++
+			continue
+		}
+		targetSet[id] = struct{}{}
+	}
+	allGhosts := make([]string, 0, len(targetSet))
+	for h := range targetSet {
+		allGhosts = append(allGhosts, h)
+	}
+	log.Info().
+		Int("portals_raw", rawCount).
+		Int("group_skipped", groupSkipped).
+		Int("self_skipped", selfSkipped).
+		Int("one_to_one_targets", len(allGhosts)).
+		Msg("StatusKit invite: portal sweep")
+	if len(allGhosts) == 0 {
+		log.Warn().Msg("StatusKit invite: no 1:1 portal targets — nothing to invite")
+		return
+	}
+
+	// Subtract peers who've already keyed us back. GetKnownHandles reads
+	// from the in-memory StatusKit state, which is hydrated from
+	// statuskit-state.plist at startup.
+	knownSet := make(map[string]struct{})
+	if sk, skErr := c.client.GetStatuskitClient(); skErr == nil && sk != nil {
+		for _, h := range sk.GetKnownHandles() {
+			knownSet[h] = struct{}{}
+		}
+	}
+
+	now := time.Now()
+	var pending []string
+	var skippedKnown, skippedSpacing, skippedAlreadySent, softExpired int
+	for _, h := range allGhosts {
+		if _, known := knownSet[h]; known {
+			skippedKnown++
+			continue
+		}
+		// Soft latch: if we've previously dispatched an invite to this handle
+		// AND we've observed a reshare from them, never re-send (matches OB's
+		// one-invite-per-chat-activation; peer iOS treats repeat invites from
+		// a peer they already have keys for as spam).
+		//
+		// If the dispatch latch is set but no reshare has been observed AND
+		// the latch is older than statusKitInvitedOkTTL, treat it as expired:
+		// IDS-accept ≠ peer-receipt, and a peer that never reciprocated
+		// probably never received the invite (cert-stale, ratchet drift,
+		// transient IDS issue). Re-invite on the next sweep.
+		//
+		// User-invoked retry (bypassLatch) ignores both layers.
+		if !bypassLatch {
+			latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+h))
+			if latchedAt != "" {
+				reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+h)) != ""
+				if !reshareSeen {
+					if normalized := normalizeIdentifierForPortalID(h); normalized != h {
+						reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized)) != ""
+					}
+				}
+				if reshareSeen {
+					skippedAlreadySent++
+					continue
+				}
+				if ts, parseErr := time.Parse(time.RFC3339, latchedAt); parseErr == nil && now.Sub(ts) < statusKitInvitedOkTTL {
+					skippedAlreadySent++
+					continue
+				}
+				// Latch present but no reshare observed and TTL elapsed —
+				// re-invite. Don't clear the latch yet; the next successful
+				// dispatch will refresh the timestamp via the existing Set.
+				softExpired++
+			}
+		}
+		if respectSpacing {
+			last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastInviteKeyPrefix+h))
+			if last != "" {
+				if ts, parseErr := time.Parse(time.RFC3339, last); parseErr == nil && now.Sub(ts) < statusKitPerHandleMinSpacing {
+					skippedSpacing++
+					continue
+				}
+			}
+		}
+		pending = append(pending, h)
+	}
+
+	log.Info().
+		Int("total_targets", len(allGhosts)).
+		Int("already_keyed", skippedKnown).
+		Int("already_invited_ok", skippedAlreadySent).
+		Int("soft_expired_retrying", softExpired).
+		Int("spacing_skip", skippedSpacing).
+		Int("pending", len(pending)).
+		Bool("respect_spacing", respectSpacing).
+		Msg("StatusKit invite: plan")
+
+	if len(pending) == 0 {
+		return
+	}
+
+	// One sender only — OB calls invite_to_channel with a single
+	// `ensureHandle()` result per chat, not with every registered handle.
+	sender := c.handle
+	var okCount, failCount, timeoutCount int
+	nowStr := now.Format(time.RFC3339)
+
+	// Per-invite timeout. An invite_to_channel call that blocks (e.g. on a
+	// poisoned anisette mutex, or an IDS cache lock held by another task)
+	// used to freeze the whole sweep — one bad handle and the remaining
+	// 20 never got invited, summary log never fired. Run each invite in a
+	// goroutine and race it against a 30s deadline; on timeout, log and
+	// move on. Rust side keeps running in the background and will finish
+	// or fail at its own pace; we just don't wait on it.
+	const perInviteTimeout = 30 * time.Second
+
+	for i, h := range pending {
+		inviteDone := make(chan error, 1)
+		go func(handle string) {
+			inviteDone <- c.client.InviteToStatusSharing(sender, []string{handle})
+		}(h)
+
+		select {
+		case err := <-inviteDone:
+			if err != nil {
+				failCount++
+				log.Warn().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
+			} else {
+				okCount++
+				// Write both keys:
+				// - invited_ok: one-shot latch, never re-invite this peer
+				// - last_invite: periodic-tick spacing timestamp (no effect
+				//   because invited_ok is checked first, but harmless and
+				//   useful for debug timelines)
+				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+h), nowStr)
+				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
+				log.Info().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
+				log.Info().Str("handle", h).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
+			}
+		case <-time.After(perInviteTimeout):
+			timeoutCount++
+			log.Warn().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Dur("timeout", perInviteTimeout).Msg("StatusKit invite: timed out for handle — abandoning this handle, continuing sweep")
+		case <-c.stopChan:
+			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
+			return
+		}
+
+		// Skip the delay after the last handle.
+		if i < len(pending)-1 {
+			select {
+			case <-time.After(statusKitInterInviteDelay):
+			case <-c.stopChan:
+				log.Info().Int("done", i+1).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
+				return
+			}
+		}
+	}
+	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", sender).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
 }
 
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
@@ -1279,16 +1679,14 @@ func (c *IMClient) runCloudSyncOnce(ctx context.Context, log zerolog.Logger, isB
 		log.Warn().
 			Int("sync_version", cloudSyncVersion).
 			Msg("CloudKit sync returned 0 records — NOT saving version (will retry on next restart)")
-		// Diagnostic: run a separate full-count sync to check if CloudKit
-		// actually has records. This paginates from scratch independently
-		// and helps identify whether the changes feed is empty vs. data exists.
-		go func() {
-			if diagResult, diagErr := c.client.CloudDiagFullCount(); diagErr != nil {
-				log.Warn().Err(diagErr).Msg("CloudKit diagnostic full count failed")
-			} else {
-				log.Info().Str("diag_result", diagResult).Msg("CloudKit diagnostic full count (post-sync check)")
-			}
-		}()
+		// (Previously ran CloudDiagFullCount here as a diagnostic. Removed:
+		// it spans hundreds of anisette-authed pages and tripped an
+		// upstream `panic!()` in omnisette's remote_anisette_v3 that, when
+		// unwound across the FFI boundary, left the shared anisette
+		// tokio::sync::Mutex in an inconsistent state and deadlocked every
+		// subsequent operation that needed anisette — including message
+		// send. The diagnostic was non-essential; dropping it entirely
+		// avoids the trigger.)
 	}
 
 	return nil
@@ -1419,10 +1817,12 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 		resp, syncErr := safeCloudSyncAttachments(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
+			retryDelay := cloudKitRetryDelay(syncErr, consecutiveErrors)
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", len(attMap)).
 				Int("consecutive_errors", consecutiveErrors).
+				Dur("retry_after", retryDelay).
 				Msg("CloudKit attachment sync page failed (FFI error)")
 			if consecutiveErrors >= maxConsecutiveAttErrors {
 				log.Error().
@@ -1431,6 +1831,7 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 					Msg("CloudKit attachment sync: too many consecutive FFI errors, stopping pagination")
 				break
 			}
+			time.Sleep(retryDelay)
 			continue
 		}
 		consecutiveErrors = 0
@@ -1457,6 +1858,28 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 				RecordName: att.RecordName,
 				HasAvid:    att.HasAvid,
 			}
+
+			// Populate the Ford key cache from this record's
+			// PCS-decrypted protection_info. Mirrors the sync-side
+			// half of the 94f7b8e Ford dedup fix — every video's
+			// Ford key is available for future cross-batch lookup,
+			// regardless of upload order. Registered on BOTH the
+			// Go cache (used by Go-side lookups and tests) AND the
+			// wrapper's process-wide cache (used by the Ford
+			// recovery path inside cloud_download_attachment when
+			// an SIV panic is caught).
+			if att.FordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.FordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.FordKey)
+			}
+			if att.AvidFordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.AvidFordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.AvidFordKey)
+			}
 		}
 
 		prev := ptrStringOr(token, "")
@@ -1471,6 +1894,56 @@ func (c *IMClient) syncCloudAttachments(ctx context.Context) (map[string]cloudAt
 
 		if resp.Done || (page > 0 && prev == ptrStringOr(token, "")) {
 			break
+		}
+	}
+
+	// QueryRecords fallback: query attachmentManateeZone directly for records
+	// the FetchRecordChanges feed missed. Pass all record_names already in attMap
+	// so Rust only returns genuinely new records.
+	knownNames := make([]string, 0, len(attMap))
+	for _, row := range attMap {
+		knownNames = append(knownNames, row.RecordName)
+	}
+	if fallback, fallbackErr := safeCloudQueryAttachmentsFallback(c.client, knownNames); fallbackErr != nil {
+		log.Warn().Err(fallbackErr).Msg("CloudKit attachment QueryRecords fallback failed")
+	} else {
+		for _, att := range fallback.Attachments {
+			mime := ""
+			if att.MimeType != nil {
+				mime = *att.MimeType
+			}
+			uti := ""
+			if att.UtiType != nil {
+				uti = *att.UtiType
+			}
+			filename := ""
+			if att.Filename != nil {
+				filename = *att.Filename
+			}
+			attMap[att.Guid] = cloudAttachmentRow{
+				GUID:       att.Guid,
+				MimeType:   mime,
+				UTIType:    uti,
+				Filename:   filename,
+				FileSize:   att.FileSize,
+				RecordName: att.RecordName,
+				HasAvid:    att.HasAvid,
+			}
+			if att.FordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.FordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.FordKey)
+			}
+			if att.AvidFordKey != nil {
+				if c.fordCache != nil {
+					c.fordCache.Register(*att.AvidFordKey)
+				}
+				rustpushgo.RegisterFordKey(*att.AvidFordKey)
+			}
+		}
+		if len(fallback.Attachments) > 0 {
+			log.Info().Int("count", len(fallback.Attachments)).Msg("CloudKit attachment QueryRecords fallback added records")
 		}
 	}
 
@@ -1492,10 +1965,12 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 		resp, syncErr := safeCloudSyncChats(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
+			retryDelay := cloudKitRetryDelay(syncErr, consecutiveErrors)
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", counts.Imported).
 				Int("consecutive_errors", consecutiveErrors).
+				Dur("retry_after", retryDelay).
 				Msg("CloudKit chat sync page failed (FFI error)")
 			if consecutiveErrors >= maxConsecutiveChatErrors {
 				log.Error().
@@ -1504,7 +1979,7 @@ func (c *IMClient) syncCloudChats(ctx context.Context) (cloudSyncCounters, *stri
 					Msg("CloudKit chat sync: too many consecutive FFI errors, stopping pagination")
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(retryDelay)
 			continue
 		}
 		consecutiveErrors = 0
@@ -1577,6 +2052,12 @@ func safeCloudSyncAttachments(client *rustpushgo.Client, token *string) (rustpus
 	})
 }
 
+func safeCloudQueryAttachmentsFallback(client *rustpushgo.Client, knownRecordNames []string) (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+	return safeFFICall("CloudQueryAttachmentsFallback", func() (rustpushgo.WrappedCloudSyncAttachmentsPage, error) {
+		return client.CloudQueryAttachmentsFallback(knownRecordNames)
+	})
+}
+
 func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]cloudAttachmentRow) (cloudSyncCounters, *string, error) {
 	var counts cloudSyncCounters
 	token, err := c.cloudStore.getSyncState(ctx, cloudZoneMessages)
@@ -1596,10 +2077,12 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 		resp, syncErr := safeCloudSyncMessages(c.client, token)
 		if syncErr != nil {
 			consecutiveErrors++
+			retryDelay := cloudKitRetryDelay(syncErr, consecutiveErrors)
 			log.Warn().Err(syncErr).
 				Int("page", page).
 				Int("imported_so_far", counts.Imported).
 				Int("consecutive_errors", consecutiveErrors).
+				Dur("retry_after", retryDelay).
 				Msg("CloudKit message sync page failed (FFI error)")
 			if consecutiveErrors >= maxConsecutiveErrors {
 				log.Error().
@@ -1610,7 +2093,7 @@ func (c *IMClient) syncCloudMessages(ctx context.Context, attMap map[string]clou
 			}
 			// Skip this page and retry with the same token on next iteration.
 			// The server may return different records on retry.
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(retryDelay)
 			continue
 		}
 		consecutiveErrors = 0
@@ -2081,6 +2564,58 @@ func (c *IMClient) ingestCloudMessages(
 		return fmt.Errorf("batch existence check failed: %w", err)
 	}
 
+	// Reverse index: message_guid -> []attachment_guid, derived from attMap.
+	//
+	// CloudAttachment.AttachmentMeta.guid (aguid) is always shaped
+	// `at_<index>_<MESSAGE_GUID>` (see upstream rustpush
+	// imessage/cloud_messages.rs:445, serde rename "aguid"), so we can
+	// recover which message owns an attachment purely from the attachment
+	// record's own metadata, without relying on the parent message's
+	// attributedBody parse.
+	//
+	// This is the load-bearing fix for a class of silently-dropped
+	// attachments: when the wrapper's extract_attachment_guids_from_attributed_body
+	// returns [] (either because the body is in a format the
+	// NSAttributedString decoder doesn't understand, or because
+	// coder_decode_flattened panicked and got swallowed by catch_unwind),
+	// the pre-fix code path skipped the entire enrichment block below and
+	// wrote `attachments_json=""` into the DB — resulting in a Matrix event
+	// with just a space character where an image should have been. By
+	// merging in any attachments the aguid-suffix lookup finds, we recover
+	// every attachment we actually have in attMap regardless of what the
+	// NSAttributedString parser could see.
+	attachmentsByMessage := make(map[string][]string, len(attMap))
+	// Case-insensitive companion index for attMap lookups. Rust's
+	// plist/serde decode preserves whatever casing Apple's backend wrote
+	// into `cm.aguid`, while extract_attachment_guids_from_attributed_body
+	// preserves whatever casing the NSAttributedString recorded. On some
+	// records these diverge (upper-case UUID in the message, lower-case in
+	// the attachment record, or vice versa), so a direct map lookup
+	// misses even though both sides refer to the same attachment. Keyed
+	// by strings.ToLower(aguid) → original aguid string used as attMap
+	// key, so the fallback below can resolve either casing.
+	attMapLowercased := make(map[string]string, len(attMap))
+	for attGUID := range attMap {
+		if !strings.HasPrefix(attGUID, "at_") {
+			continue
+		}
+		attMapLowercased[strings.ToLower(attGUID)] = attGUID
+		// Split at_<index>_<message_guid> by finding the second underscore.
+		rest := attGUID[len("at_"):]
+		underscore := strings.IndexByte(rest, '_')
+		if underscore <= 0 || underscore == len(rest)-1 {
+			continue
+		}
+		msgGUID := rest[underscore+1:]
+		attachmentsByMessage[msgGUID] = append(attachmentsByMessage[msgGUID], attGUID)
+		// ALSO index by the lowercased msg_guid suffix so attributedBody
+		// parses that extract the UUID in the opposite case still hit.
+		msgGUIDLower := strings.ToLower(msgGUID)
+		if msgGUIDLower != msgGUID {
+			attachmentsByMessage[msgGUIDLower] = append(attachmentsByMessage[msgGUIDLower], attGUID)
+		}
+	}
+
 	batch := make([]cloudMessageRow, 0, len(liveMessages))
 	for _, msg := range liveMessages {
 		if msg.Guid == "" {
@@ -2183,23 +2718,97 @@ func (c *IMClient) ingestCloudMessages(
 		}
 
 		// Enrich and serialize attachment metadata.
+		//
+		// Merge two sources of attachment GUIDs so we don't silently drop
+		// any attachment the account actually has:
+		//   1. msg.AttachmentGuids — from the wrapper's NSAttributedString
+		//      parse of the message proto's attributedBody. Authoritative
+		//      for ORDER and may include guids for which the attachment
+		//      record itself didn't sync (e.g. inline/tiny blobs).
+		//   2. attachmentsByMessage[msg.Guid] — from the attachment zone's
+		//      own aguid field (`at_<N>_<msg.Guid>`). Load-bearing fallback
+		//      for messages where the attributedBody parse returned []:
+		//      without this, those messages ship to Matrix as an empty
+		//      " " text event and the attachment is silently lost.
+		//
+		// Dedup by guid, preserving attributedBody order first.
 		attachmentsJSON := ""
-		if len(msg.AttachmentGuids) > 0 && attMap != nil {
-			var attRows []cloudAttachmentRow
-			for _, guid := range msg.AttachmentGuids {
-				if guid == "" {
+		if attMap != nil {
+			seen := make(map[string]struct{}, len(msg.AttachmentGuids)+4)
+			mergedGuids := make([]string, 0, len(msg.AttachmentGuids)+4)
+			for _, g := range msg.AttachmentGuids {
+				if g == "" {
 					continue
 				}
-				if enriched, ok := attMap[guid]; ok {
-					attRows = append(attRows, enriched)
-				} else {
-					log.Warn().Str("msg_guid", msg.Guid).Str("att_guid", guid).
-						Msg("Attachment GUID not found in attachment zone")
+				if _, ok := seen[g]; ok {
+					continue
+				}
+				seen[g] = struct{}{}
+				mergedGuids = append(mergedGuids, g)
+			}
+			fallback := attachmentsByMessage[msg.Guid]
+			if len(fallback) > 0 {
+				// Deterministic order for the fallback set — sorting by
+				// the aguid string (which starts with `at_<index>_`) keeps
+				// the original attachment order for messages that have
+				// more than one attachment.
+				sort.Strings(fallback)
+				for _, g := range fallback {
+					if _, ok := seen[g]; ok {
+						continue
+					}
+					seen[g] = struct{}{}
+					mergedGuids = append(mergedGuids, g)
+					log.Info().
+						Str("msg_guid", msg.Guid).
+						Str("att_guid", g).
+						Msg("Recovered attachment via aguid suffix match (attributedBody parse missed it)")
 				}
 			}
-			if len(attRows) > 0 {
-				if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
-					attachmentsJSON = string(attJSON)
+
+			// Also probe attachmentsByMessage by the lowercased msg.Guid
+			// suffix. Fresh reverse-index entries created during the
+			// case-insensitive indexing pass above pick up aguids that
+			// differ from the message's casing.
+			msgGuidLower := strings.ToLower(msg.Guid)
+			if msgGuidLower != msg.Guid {
+				for _, g := range attachmentsByMessage[msgGuidLower] {
+					if _, ok := seen[g]; ok {
+						continue
+					}
+					seen[g] = struct{}{}
+					mergedGuids = append(mergedGuids, g)
+					log.Info().
+						Str("msg_guid", msg.Guid).
+						Str("att_guid", g).
+						Msg("Recovered attachment via case-insensitive aguid suffix match")
+				}
+			}
+
+			if len(mergedGuids) > 0 {
+				var attRows []cloudAttachmentRow
+				for _, guid := range mergedGuids {
+					if enriched, ok := attMap[guid]; ok {
+						attRows = append(attRows, enriched)
+					} else if origKey, ok := attMapLowercased[strings.ToLower(guid)]; ok {
+						// Case mismatch: the message's attributedBody has one
+						// casing, the attachment record has the other. Look up
+						// the actual attMap entry under its original key.
+						log.Info().
+							Str("msg_guid", msg.Guid).
+							Str("att_guid_from_message", guid).
+							Str("att_guid_in_attmap", origKey).
+							Msg("Recovered attachment via case-insensitive attMap lookup")
+						attRows = append(attRows, attMap[origKey])
+					} else {
+						log.Warn().Str("msg_guid", msg.Guid).Str("att_guid", guid).
+							Msg("Attachment GUID not found in attachment zone")
+					}
+				}
+				if len(attRows) > 0 {
+					if attJSON, jsonErr := json.Marshal(attRows); jsonErr == nil {
+						attachmentsJSON = string(attJSON)
+					}
 				}
 			}
 		}
@@ -2356,6 +2965,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 	ordered := make([]string, 0, len(portalInfos))
 	newestTSByPortal := make(map[string]int64, len(portalInfos))
+	forwardBackfillPortals := 0
 	alreadyQueued := 0
 	pendingDeleteSkipped := 0
 	groupDedupSkipped := 0
@@ -2423,6 +3033,11 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 			alreadyQueued++
 			continue
 		}
+		portalKey := networkid.PortalKey{ID: networkid.PortalID(p.PortalID), Receiver: c.UserLogin.ID}
+		existingPortal, _ := c.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+		if p.MessageCount > 0 && (existingPortal == nil || existingPortal.MXID == "") {
+			forwardBackfillPortals++
+		}
 		ordered = append(ordered, p.PortalID)
 	}
 	if pendingDeleteSkipped > 0 {
@@ -2447,11 +3062,19 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	// If we set the counter AFTER the loop (StoreInt64 at the end), early
 	// decrements land on 0 (making it negative), then the Store overwrites
 	// those decrements with N, leaving the counter stuck at the number of
-	// early completions rather than reaching 0.  Setting it up-front to
-	// len(ordered) ensures every decrement is counted correctly.
+	// early completions rather than reaching 0. Setting it up-front ensures
+	// every decrement is counted correctly.
+	//
+	// Count ONLY portals that actually have message history. Chat-only portals
+	// still get ChatResync events so rooms are created, but GetChatInfo sets
+	// CanBackfill=false for them, so bridgev2 never calls FetchMessages(Forward)
+	// and they must not hold the APNs buffer open.
 	if !c.isCloudSyncDone() {
-		atomic.StoreInt64(&c.pendingInitialBackfills, int64(len(ordered)))
-		log.Debug().Int("count", len(ordered)).Msg("Set pendingInitialBackfills for APNs buffer hold")
+		atomic.StoreInt64(&c.pendingInitialBackfills, int64(forwardBackfillPortals))
+		log.Debug().
+			Int("count", forwardBackfillPortals).
+			Int("chat_only_or_existing", len(ordered)-forwardBackfillPortals).
+			Msg("Set pendingInitialBackfills for APNs buffer hold")
 	}
 
 	created := 0
@@ -2508,7 +3131,7 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 		Dur("elapsed", time.Since(portalStart)).
 		Msg("Finished queuing portals from cloud sync")
 
-	// pendingInitialBackfills was already set to len(ordered) BEFORE the loop
+	// pendingInitialBackfills was already set BEFORE the loop
 	// so that early-completing FetchMessages(Forward=true) calls are counted
 	// correctly (see comment above the loop).  Nothing more to do here.
 
