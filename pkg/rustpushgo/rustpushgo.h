@@ -73,6 +73,13 @@ void uniffi_rustpushgo_fn_free_client(
 	RustCallStatus* out_status
 );
 
+void* uniffi_rustpushgo_fn_method_client_batch_resolve_handles(
+	void* ptr,
+	RustBuffer unknowns,
+	RustBuffer known_handles,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_client_cloud_diag_full_count(
 	void* ptr,
 	RustCallStatus* out_status
@@ -136,6 +143,13 @@ void* uniffi_rustpushgo_fn_method_client_cloud_sync_chats(
 void* uniffi_rustpushgo_fn_method_client_cloud_sync_messages(
 	void* ptr,
 	RustBuffer continuation_token,
+	RustCallStatus* out_status
+);
+
+void* uniffi_rustpushgo_fn_method_client_cloud_sync_statuskit_peers(
+	void* ptr,
+	RustBuffer cached_zone,
+	RustBuffer since_token,
 	RustCallStatus* out_status
 );
 
@@ -1523,6 +1537,10 @@ uint16_t uniffi_rustpushgo_checksum_func_restore_token_provider(
 	RustCallStatus* out_status
 );
 
+uint16_t uniffi_rustpushgo_checksum_method_client_batch_resolve_handles(
+	RustCallStatus* out_status
+);
+
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_diag_full_count(
 	RustCallStatus* out_status
 );
@@ -1564,6 +1582,10 @@ uint16_t uniffi_rustpushgo_checksum_method_client_cloud_sync_chats(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_client_cloud_sync_messages(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_client_cloud_sync_statuskit_peers(
 	RustCallStatus* out_status
 );
 

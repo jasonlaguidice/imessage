@@ -4,6 +4,7 @@ pub mod local_config;
 #[cfg(not(target_os = "macos"))]
 pub mod anisette;
 mod statuskitgo;
+mod statuskit_cloudkit;
 #[cfg(test)]
 mod test_hwinfo;
 
@@ -4756,7 +4757,15 @@ pub trait StatusCallback: Send + Sync {
     /// the Go side only learns ONE alias per peer and cannot resolve presence
     /// updates that arrive on any of the others. Stamping each sender into the
     /// learned-sender cache preserves all aliases across overwrites.
-    fn on_reshare_sender(&self, sender: String);
+    ///
+    /// `channel_id` is the StatusKit channel the reshare carried. Pairing it
+    /// with the sender handle lets the Go side build a (channel_id ↔ aliases)
+    /// cluster across all reshare events: two senders observed on the same
+    /// channel id are aliases of the same peer. The cluster powers a
+    /// transitive resolver that maps presence updates from a previously-
+    /// unknown alias to the DM portal of any sibling alias that does
+    /// resolve via the standard chain.
+    fn on_reshare_sender(&self, sender: String, channel_id: String);
 }
 
 // ============================================================================
@@ -4893,13 +4902,13 @@ fn resolve_xdg_data_dir() -> String {
     "state".to_string()
 }
 
-fn subsystem_state_path(file_name: &str) -> String {
+pub(crate) fn subsystem_state_path(file_name: &str) -> String {
     let xdg_dir = resolve_xdg_data_dir();
     let _ = std::fs::create_dir_all(&xdg_dir);
     format!("{}/{}", xdg_dir, file_name)
 }
 
-fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+pub(crate) fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     match std::fs::read(path) {
         Ok(data) => match plist::from_bytes(&data) {
             Ok(state) => Some(state),
@@ -4916,7 +4925,7 @@ fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
     }
 }
 
-fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
+pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
     // Write to a sibling tmp file, then atomic-rename. Sidesteps EACCES
     // when the existing file at `path` is owned by a UID different from
     // the current bridge process (stranded from a prior deploy under a
@@ -6274,7 +6283,7 @@ impl WrappedPasswordsClient {
 
 #[derive(uniffi::Object)]
 pub struct WrappedStatusKitClient {
-    inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
+    pub(crate) inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
     interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
 }
 
@@ -7050,8 +7059,10 @@ pub async fn new_client(
                                     // upstream's HashMap only keeps the last
                                     // `from`, so without this, presence
                                     // updates for overwritten aliases have
-                                    // no portal mapping.
-                                    cb.on_reshare_sender(sender.clone());
+                                    // no portal mapping. Channel id is
+                                    // forwarded so the Go side can cluster
+                                    // (channel_id ↔ aliases) across reshares.
+                                    cb.on_reshare_sender(sender.clone(), parsed.channel.clone());
                                     cb.on_keys_received();
                                 }
                                 Ok(true)
@@ -7255,7 +7266,16 @@ pub async fn new_client(
                                         info!("StatusKit key-sharing message received — state.keys gained {} new channel(s), sender={:?}", new_channels.len(), upstream_sender);
                                         if let Some(cb) = status_cb_for_recv.read().await.as_ref() {
                                             if let Some(sender) = upstream_sender {
-                                                cb.on_reshare_sender(sender);
+                                                // Fire one callback per newly-added
+                                                // channel so the Go-side cluster
+                                                // captures (channel_id, sender) for
+                                                // each. A single keysharing message
+                                                // typically adds exactly one channel,
+                                                // but iterating handles the rare
+                                                // multi-channel case correctly.
+                                                for channel_id in &new_channels {
+                                                    cb.on_reshare_sender(sender.clone(), (*channel_id).clone());
+                                                }
                                             }
                                             cb.on_keys_received();
                                         } else {
@@ -7537,7 +7557,7 @@ pub async fn new_client(
 }
 
 impl Client {
-    async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
+    pub(crate) async fn get_or_init_cloud_messages_client(&self) -> Result<Arc<rustpush::cloud_messages::CloudMessagesClient<BridgeDefaultAnisetteProvider>>, WrappedError> {
         // Fast path: return cached client without doing any slow work.
         // IMPORTANT: the lock is released before any network calls so that
         // tokio timeouts can fire and concurrent callers are never blocked by
@@ -7803,7 +7823,7 @@ impl Client {
         Ok(wrapped)
     }
 
-    async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
+    pub(crate) async fn get_or_init_statuskit_client(&self) -> Result<Arc<WrappedStatusKitClient>, WrappedError> {
         // Fast path: return cached client without holding the lock during init.
         {
             let locked = self.statuskit_client.lock().await;
@@ -8276,37 +8296,71 @@ impl Client {
     /// database — we check each one against the IDS cache for a matching
     /// correlation ID.
     pub async fn resolve_handle(&self, handle: String, known_handles: Vec<String>) -> Result<Vec<String>, WrappedError> {
+        use rustpush::ids::user::QueryOptions;
+
         let my_handles = self.client.identity.get_handles().await;
         let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
             msg: "no handle available".into(),
         })?.clone();
 
-        // Try two IDS services in order:
-        //   1. com.apple.madrid (iMessage) — the normal path
-        //   2. com.apple.private.alloy.status.keysharing (StatusKit) — fallback
+        // Try IDS services in order. Each service's lookup may return zero
+        // keys for a hidden alias (e.g. an Apple-ID-linked mailto: that
+        // isn't registered for iMessage), so we walk down the list until
+        // one returns a correlation_id, then scan known_handles in that
+        // same service for matching ids.
         //
-        // Contacts who use iMessage only via their phone number have zero
-        // Madrid keys for their Apple ID (mailto:) — IDS reports "zero keys".
-        // However, they DO have StatusKit-keysharing keys because their device
-        // sent us a key-sharing message using their Apple ID. The keysharing
-        // service uses the same sender_correlation_identifier as Madrid, so
-        // the same correlation-ID scan works; we just need the right service.
-        //
-        // Each validate_targets call is bounded to 5 s via tokio timeout so
-        // a single-handle IDS query cannot block the goroutine indefinitely.
+        // Only services that are actually registered in the bridge's
+        // IDS service list are valid here — passing a topic that
+        // isn't registered makes IdentityManager::get_main_service
+        // panic via .expect("Topic ... not found!"). The bridge
+        // registers MADRID + MULTIPLEX (which sub_serves status.keysharing
+        // and status.personal); presence.mode.status is APNs-interest
+        // only, not an IDS service, so we cannot validate_targets it.
         const SERVICES: &[&str] = &[
             "com.apple.madrid",
             "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
         ];
 
-        for &service in SERVICES {
+        for (idx, &service) in SERVICES.iter().enumerate() {
+            // Madrid (first service) gets a batched lookup — the unknown
+            // handle plus every known ghost in one query. This matters
+            // for hidden Apple-ID aliases (e.g. mailto:aap724@…) that
+            // return LookupFailed (6001) when queried alone but get their
+            // correlation_id populated alongside successful sibling
+            // lookups in a batch.
+            let (targets, timeout_secs): (Vec<String>, u64) = if idx == 0 {
+                let mut t = Vec::with_capacity(known_handles.len() + 1);
+                t.push(handle.clone());
+                for k in &known_handles {
+                    if k != &handle {
+                        t.push(k.clone());
+                    }
+                }
+                (t, 15)
+            } else {
+                (vec![handle.clone()], 5)
+            };
+
+            // Bypass the EMPTY_REFRESH (1h) freshness filter via refresh=true.
+            // Why: validate_targets uses refresh=false, which keeps stale empty
+            // results "fresh" for an hour — so a handle Apple previously returned
+            // empty for is filtered out of the HTTP fetch and never re-queried.
+            // refresh=true drops the cutoff to REFRESH_MIN (60s). The resolver's
+            // rate gate caps how often this runs, so we don't pound Apple.
             match tokio::time::timeout(
-                Duration::from_secs(5),
-                self.client.identity.validate_targets(&[handle.clone()], service, &my_handle),
+                Duration::from_secs(timeout_secs),
+                self.client.identity.cache_keys(
+                    service,
+                    &targets,
+                    &my_handle,
+                    true,
+                    &QueryOptions::default(),
+                ),
             ).await {
                 Ok(Ok(_)) => {}
-                Ok(Err(e)) => info!("resolve_handle: validate_targets({}) failed for {}: {:?}", service, handle, e),
-                Err(_) => info!("resolve_handle: validate_targets({}) timed out after 5s for {}", service, handle),
+                Ok(Err(e)) => info!("resolve_handle: cache_keys({}, n={}) failed: {:?}", service, targets.len(), e),
+                Err(_) => info!("resolve_handle: cache_keys({}, n={}) timed out after {}s", service, targets.len(), timeout_secs),
             }
 
             let cache = self.client.identity.cache.lock().await;
@@ -8319,8 +8373,9 @@ impl Client {
             };
 
             // Scan known handles for matching correlation IDs in this service.
-            // known_handles are pre-populated from message processing (tel:) and
-            // StatusKit invite responses (mailto:), so no extra IDS calls needed.
+            // The Madrid batch above populates correlation_ids for every
+            // known_handle that resolves; later services rely on the cache
+            // from prior message processing / StatusKit invite traffic.
             let mut aliases = vec![];
             for known_handle in &known_handles {
                 if known_handle == &handle {
@@ -8354,9 +8409,11 @@ impl Client {
     /// invite_to_channel runs. Falling through to keysharing lets the
     /// periodic re-invite path find aliases on subsequent ticks.
     pub async fn resolve_handle_cached(&self, handle: String, known_handles: Vec<String>) -> Vec<String> {
+        // Mirror resolve_handle's services list — see comment there.
         const SERVICES: &[&str] = &[
             "com.apple.madrid",
             "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
         ];
 
         let my_handles = self.client.identity.get_handles().await;
@@ -8389,6 +8446,154 @@ impl Client {
 
         info!("resolve_handle_cached: {} not in IDS cache", handle);
         vec![]
+    }
+
+    /// Vectorized resolve_handle: takes many unknown handles plus the full set
+    /// of known portal-bearing handles, makes ONE batched IDS call per service
+    /// covering all of them at once, then walks the cache to match each
+    /// unknown's correlation_id against the known handles.
+    ///
+    /// Returns a map of unknown_handle → list of sibling known_handles. Only
+    /// handles that resolved to at least one sibling appear in the map.
+    /// Unknowns Apple has nothing for are silently absent.
+    ///
+    /// Designed to back the per-sync alias-link pass: 12-hour cadence, called
+    /// after the StatusKit-CloudKit pull when state.keys is freshly populated.
+    /// Pays one network round-trip total regardless of how many unknowns —
+    /// the rate gate that protects per-presence resolution doesn't apply
+    /// here because the call is bounded and infrequent by design.
+    pub async fn batch_resolve_handles(
+        &self,
+        unknowns: Vec<String>,
+        known_handles: Vec<String>,
+    ) -> Result<HashMap<String, Vec<String>>, WrappedError> {
+        use rustpush::ids::user::QueryOptions;
+
+        if unknowns.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let my_handles = self.client.identity.get_handles().await;
+        let my_handle = my_handles.first().ok_or(WrappedError::GenericError {
+            msg: "no handle available".into(),
+        })?.clone();
+
+        const SERVICES: &[&str] = &[
+            "com.apple.madrid",
+            "com.apple.private.alloy.status.keysharing",
+            "com.apple.private.alloy.status.personal",
+        ];
+
+        // Dedup unknowns and known siblings into separate vectors so we can
+        // apply different refresh policies. Unknowns get refresh=true (force
+        // Apple to re-query, bypassing EMPTY_REFRESH). Known siblings get
+        // refresh=false (cache-only when warm; only fetched if their entry
+        // is missing or genuinely stale per session_token_refresh_seconds).
+        // This is the difference between ~4 Apple lookups per cycle and ~28.
+        let mut unknown_targets: Vec<String> = Vec::with_capacity(unknowns.len());
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for h in &unknowns {
+            if seen.insert(h.clone()) {
+                unknown_targets.push(h.clone());
+            }
+        }
+        let mut sibling_targets: Vec<String> = Vec::with_capacity(known_handles.len());
+        for h in &known_handles {
+            if seen.insert(h.clone()) {
+                sibling_targets.push(h.clone());
+            }
+        }
+
+        // Timeouts scale with each list's size separately. Unknowns are the
+        // small set (the ones we actually need fresh data for); known siblings
+        // are mostly cache hits, so this call is fast in steady state.
+        let unknown_timeout: u64 = ((unknown_targets.len() as u64 / 18) * 4 + 15).min(90);
+        let sibling_timeout: u64 = ((sibling_targets.len() as u64 / 18) * 4 + 15).min(90);
+
+        let mut results: HashMap<String, Vec<String>> = HashMap::new();
+
+        for &service in SERVICES {
+            // 1. Force-fresh fetch for the unknowns. refresh=true bypasses the
+            //    EMPTY_REFRESH cache filter so Apple is re-queried even if a
+            //    prior empty result is cached within the 1h window.
+            match tokio::time::timeout(
+                Duration::from_secs(unknown_timeout),
+                self.client.identity.cache_keys(
+                    service,
+                    &unknown_targets,
+                    &my_handle,
+                    true,
+                    &QueryOptions::default(),
+                ),
+            ).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) failed: {:?}", service, unknown_targets.len(), e);
+                    continue;
+                }
+                Err(_) => {
+                    info!("batch_resolve_handles: cache_keys(unknowns, {}, n={}) timed out after {}s", service, unknown_targets.len(), unknown_timeout);
+                    continue;
+                }
+            }
+
+            // 2. Cache-only top-up for known siblings. refresh=false means each
+            //    sibling is filtered out if its cache entry is fresh — typical
+            //    case is cache hit for everyone (siblings have been queried
+            //    during normal message traffic). Only siblings with truly
+            //    missing/stale entries hit Apple.
+            if !sibling_targets.is_empty() {
+                match tokio::time::timeout(
+                    Duration::from_secs(sibling_timeout),
+                    self.client.identity.cache_keys(
+                        service,
+                        &sibling_targets,
+                        &my_handle,
+                        false,
+                        &QueryOptions::default(),
+                    ),
+                ).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) failed (continuing with cached entries): {:?}", service, sibling_targets.len(), e);
+                    }
+                    Err(_) => {
+                        info!("batch_resolve_handles: cache_keys(siblings, {}, n={}) timed out after {}s (continuing with cached entries)", service, sibling_targets.len(), sibling_timeout);
+                    }
+                }
+            }
+
+            let cache = self.client.identity.cache.lock().await;
+            for unknown in &unknowns {
+                if results.contains_key(unknown) {
+                    continue;
+                }
+                let cid = match cache.get_correlation_id(service, &my_handle, unknown) {
+                    Some(c) if !c.is_empty() => c,
+                    _ => continue,
+                };
+                let mut aliases = vec![];
+                for known in &known_handles {
+                    if known == unknown {
+                        continue;
+                    }
+                    if let Some(other_cid) = cache.get_correlation_id(service, &my_handle, known) {
+                        if other_cid == cid {
+                            aliases.push(known.clone());
+                        }
+                    }
+                }
+                if !aliases.is_empty() {
+                    results.insert(unknown.clone(), aliases);
+                }
+            }
+        }
+
+        info!(
+            "batch_resolve_handles: resolved {}/{} unknowns (forced-fresh n={}, sibling cache-top-up n={})",
+            results.len(), unknowns.len(), unknown_targets.len(), sibling_targets.len()
+        );
+        Ok(results)
     }
 
     /// Reset all StatusKit APNs channel cursors (last_msg_ns) to 1 in the

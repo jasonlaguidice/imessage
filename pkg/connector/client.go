@@ -166,6 +166,14 @@ type IMClient struct {
 	// per unresolved handle per session. Values are networkid.PortalID.
 	statusKitPortalCache sync.Map // map[string]networkid.PortalID
 
+	// statusKitIDSGate paces and adaptively backs off batch IDS lookups
+	// driven by StatusKit alias resolution. Per-handle 6h negative cache
+	// (statusKitIDSAttemptKeyPrefix) prevents re-querying the same handle;
+	// this gate prevents a *burst* of distinct unknown handles from firing
+	// validate_targets in parallel — keeping the bridge's IDS traffic
+	// indistinguishable from a single user catching up on chats.
+	statusKitIDSGate idsRateGate
+
 	// sharedStreamAssetCache tracks the last observed asset GUID set per shared
 	// album for this session. The Shared Streams watcher uses it to suppress
 	// false-positive "new content" notices from Apple's getchanges endpoint,
@@ -183,6 +191,40 @@ type IMClient struct {
 	// from the bridge bot. Done once per session; the rule is durable on the
 	// homeserver so re-installs across sessions are harmless but redundant.
 	statusKitBotRulePushed atomic.Bool
+
+	// inviteInFlight tracks handles with an in-flight StatusKit invite.
+	// The DB-side dispatch latch (statusKitInvitedOkKeyPrefix) is written
+	// *after* the FFI returns, so two concurrent paths (sweep + new-portal
+	// hook + post-backfill hook) can both miss the latch at startup and
+	// double-invoke InviteToStatusSharing for the same peer. Peer iOS
+	// treats repeat invites as spam, so LoadOrStore-then-skip provides
+	// in-memory single-flight per handle. Entry is deleted in a defer.
+	inviteInFlight sync.Map // map[string]struct{}
+
+	// statusKitSweepRunning is true while inviteContactsToStatusSharingOpts
+	// is iterating its paced loop. The new-portal hook checks this and
+	// skips during a sweep so a burst of fresh portals doesn't spawn
+	// unpaced concurrent FFI calls alongside the sweep's 1.5s-paced ones.
+	// The next sweep (or the soft-expired re-invite path) picks up the
+	// missed handles, so skipping is safe.
+	statusKitSweepRunning atomic.Bool
+
+	// statusKitCloudPassFirstCallDone gates the inter-pass-backoff bypass
+	// for the first StatusKit-CloudKit pass after process startup. If a
+	// prior session left the persistent backoff state in "in-failure"
+	// (e.g. the bridge was kicked from the iCloud trust circle), the user
+	// would otherwise be locked out for up to statusKitPassMaxBackoff
+	// even after fixing trust on another Apple device and restarting the
+	// bridge. Letting one pass through per process start gives restart
+	// its natural "let me try again" semantics; if that pass also fails,
+	// the persisted backoff resumes and steady-state behavior takes over.
+	statusKitCloudPassFirstCallDone atomic.Bool
+
+	// statusKitShareMu serializes the cooldown-check / publish /
+	// cooldown-write sequence in publishStatusKitAvailableAfterInvite.
+	// Without it two concurrent callers can both pass the cooldown check
+	// and double-publish ShareStatus.
+	statusKitShareMu sync.Mutex
 
 	// lastPresenceSubscribe timestamps the most recent call to
 	// subscribeToContactPresence. OnKeysReceived triggers re-subscription
@@ -681,6 +723,32 @@ func (c *IMClient) onForwardBackfillDone() {
 		// per-handle invite is idempotent on peer's side (re-delivery just
 		// hits the server-side retry loop).
 		go c.inviteContactsToStatusSharing(log.Logger)
+
+		// StatusKit-CloudKit drain: the cloud-sync controller's three
+		// delayed re-syncs (15s/75s/4m15s after bootstrap) all fire well
+		// before forward backfill completes on accounts with substantial
+		// history — backfill regularly takes 20+ minutes. Without an
+		// explicit post-backfill trigger, syncCloudStatusKitPeers' internal
+		// settle-window gate would skip every delayed re-sync and the next
+		// trigger wouldn't arrive until the next bridge restart, leaving
+		// peer keys un-pulled.
+		//
+		// Sleep slightly longer than the gate's settle window so when the
+		// gate runs it definitely sees ">60s elapsed since backfill done".
+		// On warm restart with a fast/empty backfill, the 12h success floor
+		// will short-circuit the call — no redundant CKKS round-trip.
+		go func() {
+			select {
+			case <-time.After(75 * time.Second):
+			case <-c.stopChan:
+				return
+			}
+			ctx := context.Background()
+			skLog := c.UserLogin.Log.With().Str("component", "cloud_sync").Str("source", "post_backfill").Logger()
+			if err := c.syncCloudStatusKitPeers(ctx, skLog); err != nil {
+				skLog.Info().Err(err).Msg("StatusKit-CloudKit post-backfill pass: errored (continuing)")
+			}
+		}()
 	}
 }
 
@@ -877,6 +945,21 @@ func (c *IMClient) Connect(ctx context.Context) {
 		return
 	}
 	c.client = client
+
+	// Hydrate the persistent alias→portal cache and pre-warm from the ghost
+	// table so the first StatusKit presence update after a restart can
+	// resolve previously-known aliases without IDS round-trips. Both
+	// helpers are read-only and safe to run before StatusKit init.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Warn().Interface("panic", r).Msg("StatusKit alias-resolver init panicked")
+			}
+		}()
+		bgCtx := context.Background()
+		c.hydrateAliasPortalCacheFromKV(bgCtx, log)
+		c.prewarmAliasPortalCache(bgCtx, log)
+	}()
 
 	// GSA /circle "Apple Device" announce intentionally DISABLED.
 	//
@@ -1092,6 +1175,14 @@ func (c *IMClient) Connect(ctx context.Context) {
 						log.Warn().Err(err).Msg("StatusKit startup share_status failed")
 						return
 					}
+					// Stamp the post-invite cooldown key so the sweep's
+					// publishStatusKitAvailableAfterInvite (which fires
+					// seconds later when the bootstrap sweep finishes
+					// invites) coalesces with this publish instead of
+					// firing a redundant ShareStatus. Restart-within-5min
+					// is the only case that "loses" a publish; the next
+					// state change or sweep republishes.
+					c.Main.Bridge.DB.KV.Set(context.Background(), database.Key(statusKitLastPostInviteShareKey), time.Now().Format(time.RFC3339))
 					log.Info().Msg("StatusKit startup share_status(available) published")
 				}()
 			} else {
@@ -1535,10 +1626,26 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			}
 
 			// (2) IDS correlation (self-bounding, safe to call from goroutine).
+			// Cached wrapper: skips repeat round-trips against handles
+			// that recently returned no result (negative cooldown), and
+			// short-circuits via the persistent alias_portal store on
+			// previously-resolved handles.
 			if portal == nil {
-				if altPortal := c.resolveStatusPortalViaIDS(ctx, log, user); altPortal != nil {
+				if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, user); altPortal != nil {
 					log.Info().Str("user", user).Msg("StatusKit: resolved mailto→tel via IDS correlation")
 					portal = altPortal
+				}
+			}
+
+			// (2.5) Cluster transitive lookup. Fires when contacts and IDS
+			// both came up empty — common for hidden-alias mailto:s where
+			// Apple's IDS returns LookupFailed (6001). Looks for sibling
+			// handles on the same StatusKit channel id; the first one that
+			// resolves via the live chain (or persisted alias→portal) hands
+			// the unknown handle its portal.
+			if portal == nil {
+				if p := c.resolveViaCluster(ctx, log, user); p != nil {
+					portal = p
 				}
 			}
 
@@ -1569,6 +1676,15 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 							break
 						}
 					}
+				}
+			}
+
+			// Cluster transitive lookup for the tel: branch too — covers
+			// peers who publish from a tel: alias the bridge has not seen
+			// before but who share a channel id with a known sibling.
+			if portal == nil {
+				if p := c.resolveViaCluster(ctx, log, user); p != nil {
+					portal = p
 				}
 			}
 		}
@@ -1694,17 +1810,25 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 				return fmt.Errorf("invalid target portal")
 			}
 
-			// Anchor each notice timestamp 1ms before the last real iMessage in
-			// the target room so room ordering doesn't jump on passive status updates.
+			// Stamp each notice at exactly the previous message's timestamp
+			// so room ordering doesn't change. The m.notice +
+			// com.beeper.action_message=presence_update extension already
+			// signals "do not reorder" at the client level; matching the
+			// last message's timestamp is the bridge-side belt that
+			// doesn't depend on every client honoring the extension.
+			//
+			// A portal without any prior message shouldn't exist in
+			// practice (no messages = nothing to backfill = no portal),
+			// so the fallback below is defensive — keep the original
+			// now-1ms shape for that path.
 			noticeTS := time.Now().Add(-1 * time.Millisecond)
 			if lastMsg, dbErr := c.Main.Bridge.DB.Message.GetLastNonFakePartAtOrBeforeTime(
 				ctx, targetPortal.PortalKey, time.Now(),
 			); dbErr != nil {
 				log.Warn().Err(dbErr).Str("portal_id", string(targetPortal.ID)).
 					Msg("StatusKit: failed to query last message timestamp, using now-1ms")
-			} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() &&
-				time.Since(lastMsg.Timestamp) < 24*time.Hour {
-				noticeTS = lastMsg.Timestamp.Add(-1 * time.Millisecond)
+			} else if lastMsg != nil && !lastMsg.Timestamp.IsZero() {
+				noticeTS = lastMsg.Timestamp
 			}
 
 			if c.Main.Bridge.Matrix.GetCapabilities().BatchSending {
@@ -1925,7 +2049,7 @@ func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger,
 					Str("alias", alias).
 					Str("resolved_portal_id", string(aliasPortalID)).
 					Msg("StatusKit: resolved DM portal via IDS correlation")
-				c.statusKitPortalCache.Store(user, aliasPortalID)
+				c.rememberAliasPortal(ctx, user, aliasPortalID)
 				return altPortal
 			}
 		}
@@ -1957,7 +2081,7 @@ func (c *IMClient) OnKeysReceived() {
 // and stamping it into statusKitPortalCache preserves the mapping across
 // overwrites so OnStatusUpdate's cache lookup always hits regardless of which
 // alias Apple routes the next presence message to.
-func (c *IMClient) OnReshareSender(sender string) {
+func (c *IMClient) OnReshareSender(sender string, channelId string) {
 	if sender == "" {
 		return
 	}
@@ -1972,6 +2096,18 @@ func (c *IMClient) OnReshareSender(sender string) {
 	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+sender), now)
 	if normalized != sender {
 		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized), now)
+	}
+	clusterLog := c.UserLogin.Log.With().
+		Str("component", "statuskit").
+		Str("sender", sender).
+		Str("channel_id", channelId).
+		Logger()
+	// Persist the cluster observation regardless of whether the sender is
+	// already cached as resolved — alias correlation feeds off the full
+	// observation history, not just first sightings.
+	c.recordReshareObservation(ctx, clusterLog, channelId, sender)
+	if normalized != sender {
+		c.recordReshareObservation(ctx, clusterLog, channelId, normalized)
 	}
 	if _, ok := c.statusKitPortalCache.Load(sender); ok {
 		return
@@ -2013,18 +2149,19 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 					continue
 				}
 				if p := findPortal(networkid.PortalID(altID)); p != nil {
-					c.statusKitPortalCache.Store(sender, p.ID)
+					c.rememberAliasPortal(ctx, sender, p.ID)
 					log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via address book")
 					return
 				}
 			}
 		}
-		if altPortal := c.resolveStatusPortalViaIDS(ctx, log, sender); altPortal != nil {
+		if altPortal := c.resolveStatusPortalViaIDSCached(ctx, log, sender); altPortal != nil {
+			c.rememberAliasPortal(ctx, sender, altPortal.ID)
 			log.Info().Str("resolved_portal_id", string(altPortal.ID)).Msg("StatusKit: eager-resolved reshare sender via IDS correlation")
 			return
 		}
 		if p := findPortal(networkid.PortalID(normalizedUser)); p != nil {
-			c.statusKitPortalCache.Store(sender, p.ID)
+			c.rememberAliasPortal(ctx, sender, p.ID)
 			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender via direct mailto: portal")
 			return
 		}
@@ -2032,10 +2169,17 @@ func (c *IMClient) eagerResolveReshareSender(sender, normalizedUser string, log 
 		portalID := c.resolveContactPortalID(normalizedUser)
 		portalID = c.resolveExistingDMPortalID(string(portalID))
 		if p := findPortal(portalID); p != nil {
-			c.statusKitPortalCache.Store(sender, p.ID)
+			c.rememberAliasPortal(ctx, sender, p.ID)
 			log.Info().Str("resolved_portal_id", string(p.ID)).Msg("StatusKit: eager-resolved reshare sender (tel: direct)")
 			return
 		}
+	}
+	// No live chain hit. The cluster transitive resolver may still find a
+	// portal via a sibling alias once another sender on the same channel
+	// has been resolved.
+	if portal := c.resolveViaCluster(ctx, log, sender); portal != nil {
+		log.Info().Str("resolved_portal_id", string(portal.ID)).Msg("StatusKit: eager-resolved reshare sender via cluster transitive lookup")
+		return
 	}
 	log.Debug().Msg("StatusKit: eager-resolve found no portal for reshare sender — will retry when presence arrives")
 }
@@ -2360,7 +2504,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// stamping the cache on every inbound 1:1 message, we ensure any peer
 	// who's ever messaged bridge has a direct lookup path for presence.
 	if msg.Sender != nil && *msg.Sender != "" && !isGroupPortalID(string(portalKey.ID)) && portalKey.ID != "unknown" {
-		c.statusKitPortalCache.Store(*msg.Sender, portalKey.ID)
+		c.rememberAliasPortal(context.Background(), *msg.Sender, portalKey.ID)
 	}
 
 	// Drop messages that couldn't be resolved to a real portal.
@@ -6242,6 +6386,26 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// private_chat_portal_meta, the framework derives it from the ghost's
 		// display name, which auto-updates when contacts are edited.
 		chatInfo.Members = members
+
+		// New-portal-creation StatusKit invite hook. When bridgev2 materializes
+		// a fresh DM portal mid-uptime (incoming iMessage from a contact whose
+		// 1:1 portal didn't exist yet), fire a single-handle invite immediately
+		// so the peer gets our key without waiting up to 4h for the periodic
+		// tick. subscribeAfterInit only catches portals that existed at connect
+		// time; the post-backfill hook (onForwardBackfillDone) only fires once
+		// at initial bootstrap. Without this hook, mid-uptime new peers had no
+		// automatic invite path between sweeps.
+		//
+		// Mirrors OB's setActiveChat trigger (chat_manager.dart:64-78). OB
+		// invites on chat-open; the bridge's non-UI analog is "portal
+		// materialized for the first time." MXID empty distinguishes a brand
+		// new portal from a refresh of an existing one. Self-chat skipped
+		// (peer == self). Helper applies the same latch / known-keys / spacing
+		// guards as the periodic sweep.
+		if !isSelfChat && portal.MXID == "" {
+			statuskitLog := c.Main.Bridge.Log.With().Str("hook", "new-portal-statuskit").Str("portal_id", portalID).Logger()
+			go c.inviteSingleHandleToStatusSharing(statuskitLog, portalID)
+		}
 
 		// Persist IsSms so CloudKit-created portals (no suffix, no live APNs
 		// message yet) survive restarts. Mirrors the group ExtraUpdates pattern.
