@@ -304,7 +304,9 @@ When a contact toggles a Focus mode (Do Not Disturb, Sleep, Work, etc.) on iOS 1
 
 - A quiet `m.notice` ("🔕 Name has notifications silenced (Do Not Disturb).") posts when DND turns on, and clears when it turns off.
 - The contact's Matrix ghost gets a presence update so clients that show presence reflect the same state.
-
+- This will unarchive a chat in Beeper, if this tradeoff is undesirable please disable the feature. This is an issue external to the bridge.
+- Focus is a global on/off and not per contact.
+  
 This is the same affordance Apple's Messages app shows in-conversation. The bridge announces itself as "available" once after startup so peer iPhones reciprocate with the key material needed to decrypt their subsequent presence updates — leave `statuskit_share_on_startup: true` for the best chance of seeing contacts' Focus state.
 
 If you find the notices noisy or already see Focus state on another Apple device, the install scripts ask "Enable StatusKit notifications?" on first install and on every subsequent re-run, so you can flip it at any time. (Or set `statuskit_notifications: false` in `~/.local/share/mautrix-imessage/config.yaml`.) Disabling suppresses the user-visible notices and presence updates while keeping the underlying StatusKit registration intact.
