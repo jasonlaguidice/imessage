@@ -6422,6 +6422,7 @@ pub struct SharedAlbumInfo {
     pub name: Option<String>,
     pub fullname: Option<String>,
     pub email: Option<String>,
+    pub subscriptiondate: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -6494,6 +6495,7 @@ impl WrappedSharedStreamsClient {
             name: a.name.clone(),
             fullname: a.fullname.clone(),
             email: a.email.clone(),
+            subscriptiondate: a.subscriptiondate.clone(),
         }).collect()
     }
 

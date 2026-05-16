@@ -166,6 +166,98 @@ func fnDeleteRoom(ce *commands.Event) {
 }
 
 // ---------------------------------------------------------------------------
+// Album metadata helpers
+// ---------------------------------------------------------------------------
+
+// albumDisplayName returns the album's human-readable name, falling back to its
+// GUID when no name has been synced yet.
+func albumDisplayName(a rustpushgo.SharedAlbumInfo) string {
+	if a.Name != nil && strings.TrimSpace(*a.Name) != "" {
+		return strings.TrimSpace(*a.Name)
+	}
+	return a.Albumguid
+}
+
+// albumSharer renders the person who shared the album as "Full Name (email)",
+// degrading gracefully when only one of the two is known.
+func albumSharer(a rustpushgo.SharedAlbumInfo) string {
+	name, email := "", ""
+	if a.Fullname != nil {
+		name = strings.TrimSpace(*a.Fullname)
+	}
+	if a.Email != nil {
+		email = strings.TrimSpace(*a.Email)
+	}
+	switch {
+	case name != "" && email != "":
+		return fmt.Sprintf("%s (%s)", name, email)
+	case name != "":
+		return name
+	default:
+		return email
+	}
+}
+
+// parseAppleDate parses the assorted date encodings Apple's Shared Streams
+// webservice may return for subscriptiondate (ISO 8601, or a numeric Unix /
+// Cocoa-reference epoch). Returns ok=false when the string can't be recognised.
+func parseAppleDate(s string) (time.Time, bool) {
+	for _, layout := range []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05Z0700",
+		"2006-01-02 15:04:05 -0700",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	// Numeric epoch: Unix seconds, or Cocoa reference date (since 2001-01-01).
+	if f, err := strconv.ParseFloat(s, 64); err == nil && f > 0 {
+		const cocoaEpochOffset = 978307200 // 2001-01-01 UTC, in Unix seconds
+		if f > 1e11 {                      // milliseconds
+			f /= 1000
+		}
+		secs := int64(f)
+		if secs < cocoaEpochOffset {
+			secs += cocoaEpochOffset
+		}
+		return time.Unix(secs, 0).UTC(), true
+	}
+	return time.Time{}, false
+}
+
+// albumSharedDate returns a YYYY-MM-DD date for when the album was added, or
+// the raw subscriptiondate string when it can't be parsed, or "" when absent.
+func albumSharedDate(a rustpushgo.SharedAlbumInfo) string {
+	if a.Subscriptiondate == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(*a.Subscriptiondate)
+	if raw == "" {
+		return ""
+	}
+	if t, ok := parseAppleDate(raw); ok {
+		return t.Format("2006-01-02")
+	}
+	return raw
+}
+
+// albumProvenance builds the "shared by … , added …" suffix for an album, or
+// returns "" when no provenance metadata is available.
+func albumProvenance(a rustpushgo.SharedAlbumInfo) string {
+	var parts []string
+	if sharer := albumSharer(a); sharer != "" {
+		parts = append(parts, "shared by "+sharer)
+	}
+	if when := albumSharedDate(a); when != "" {
+		parts = append(parts, "added "+when)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ---------------------------------------------------------------------------
 // Step 1: !shared-albums — numbered album picker
 // ---------------------------------------------------------------------------
 
@@ -210,15 +302,11 @@ func fnSharedAlbums(ce *commands.Event) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("**Shared Albums (%d)**\n\n", len(albums)))
 	for i, a := range albums {
-		label := a.Albumguid
-		if a.Name != nil && *a.Name != "" {
-			label = *a.Name
+		line := fmt.Sprintf("%d. **%s**", i+1, albumDisplayName(a))
+		if prov := albumProvenance(a); prov != "" {
+			line += " — " + prov
 		}
-		extra := ""
-		if a.Email != nil && *a.Email != "" {
-			extra = fmt.Sprintf(" (shared by %s)", *a.Email)
-		}
-		sb.WriteString(fmt.Sprintf("%d. **%s**%s\n", i+1, label, extra))
+		sb.WriteString(line + "\n")
 	}
 	sb.WriteString("\nReply with a number to browse, or `$cmdprefix cancel` to cancel.")
 	ce.Reply(sb.String())
@@ -247,10 +335,7 @@ func handleAlbumSelection(ce *commands.Event, client *IMClient, albums []rustpus
 
 	chosen := albums[n-1]
 	albumGUID := chosen.Albumguid
-	albumName := chosen.Albumguid
-	if chosen.Name != nil && *chosen.Name != "" {
-		albumName = *chosen.Name
-	}
+	albumName := albumDisplayName(chosen)
 
 	ss, ssOk := sharedStreamsClientFromEvent(ce)
 	if !ssOk {
@@ -353,6 +438,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 
 	selectedGUIDs := make([]string, 0, len(indices))
 	selectedNames := make([]string, 0, len(indices))
+	selectedDates := make([]string, 0, len(indices))
 	for _, idx := range indices {
 		selectedGUIDs = append(selectedGUIDs, assets[idx].Assetguid)
 		name := assets[idx].Filename
@@ -360,6 +446,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 			name = assets[idx].Assetguid
 		}
 		selectedNames = append(selectedNames, name)
+		selectedDates = append(selectedDates, assets[idx].DateCreated)
 	}
 
 	roomID, err := client.getOrCreateAlbumRoom(ce.Ctx, albumGUID, albumName)
@@ -371,7 +458,7 @@ func handleAssetSelection(ce *commands.Event, client *IMClient, ss *rustpushgo.W
 	ce.Reply("Downloading %d asset(s) from **%s** \u2014 check the dedicated room for progress.", len(selectedGUIDs), albumName)
 
 	// Use background context — ce.Ctx is cancelled when the command handler returns.
-	go client.downloadSharedAlbumAssets(context.Background(), ss, albumGUID, albumName, selectedGUIDs, selectedNames, roomID)
+	go client.downloadSharedAlbumAssets(context.Background(), ss, albumGUID, albumName, selectedGUIDs, selectedNames, selectedDates, roomID)
 }
 
 // parseAssetSelection parses user input like "1", "1,3,5", "1-5", or "all"
@@ -466,7 +553,7 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 // Background download loop
 // ---------------------------------------------------------------------------
 
-func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assetGUIDs, assetNames []string, roomID id.RoomID) {
+func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo.WrappedSharedStreamsClient, albumGUID, albumName string, assetGUIDs, assetNames, assetDates []string, roomID id.RoomID) {
 	intent := c.Main.Bridge.Bot
 	logger := c.Main.Bridge.Log.With().
 		Str("component", "shared_album_download").
@@ -502,7 +589,7 @@ func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo
 			continue
 		}
 
-		content := c.processSharedAlbumAsset(ctx, logger, intent, data, name)
+		content := c.processSharedAlbumAsset(ctx, logger, intent, data, name, assetDates[i])
 		if content == nil {
 			failed++
 			continue
@@ -568,12 +655,26 @@ func safeSharedAlbumDownload(ss *rustpushgo.WrappedSharedStreamsClient, albumGUI
 	}
 }
 
+// sharedAssetCaption builds a "<date> — <filename>" caption when the asset has
+// a parseable creation date, so a room full of photos is easy to scan. Returns
+// "" when no usable date is available.
+func sharedAssetCaption(fileName, dateCreated string) string {
+	if strings.TrimSpace(dateCreated) == "" {
+		return ""
+	}
+	t, ok := parseAppleDate(strings.TrimSpace(dateCreated))
+	if !ok || t.IsZero() {
+		return ""
+	}
+	return fmt.Sprintf("%s — %s", t.Format("2006-01-02"), fileName)
+}
+
 // processSharedAlbumAsset runs the bridge's standard media pipeline on raw
 // downloaded bytes: HEIC→JPEG, video transcoding, thumbnail generation, and
 // Matrix upload.
 func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.Logger, intent interface {
 	UploadMedia(ctx context.Context, roomID id.RoomID, data []byte, fileName, mimeType string) (id.ContentURIString, *event.EncryptedFileInfo, error)
-}, data []byte, fileName string) *event.MessageEventContent {
+}, data []byte, fileName, dateCreated string) *event.MessageEventContent {
 	if fileName == "" {
 		fileName = "attachment"
 	}
@@ -650,14 +751,20 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 
 	msgType := mimeToMsgType(mimeType)
 	content := &event.MessageEventContent{
-		MsgType: msgType,
-		Body:    fileName,
+		MsgType:  msgType,
+		Body:     fileName,
+		FileName: fileName,
 		Info: &event.FileInfo{
 			MimeType: mimeType,
 			Size:     len(data),
 			Width:    imgWidth,
 			Height:   imgHeight,
 		},
+	}
+	// Surface each asset's capture date as a caption so a room full of
+	// photos is easy to scan; the real filename stays in content.FileName.
+	if caption := sharedAssetCaption(fileName, dateCreated); caption != "" {
+		content.Body = caption
 	}
 
 	if durationMs > 0 {
@@ -820,13 +927,27 @@ func (c *IMClient) pollSharedStreams(log zerolog.Logger) (retErr error) {
 		return fmt.Errorf("get management room: %w", err)
 	}
 
+	// Resolve album GUIDs to human-readable names for the notice.
+	albumNames := make(map[string]string)
+	for _, a := range ss.ListAlbums() {
+		if a.Name != nil && strings.TrimSpace(*a.Name) != "" {
+			albumNames[a.Albumguid] = strings.TrimSpace(*a.Name)
+		}
+	}
+	displayAlbum := func(id string) string {
+		if name, ok := albumNames[id]; ok {
+			return name
+		}
+		return id
+	}
+
 	var sb strings.Builder
 	if len(notifyAlbums) == 1 {
-		sb.WriteString(fmt.Sprintf("\U0001f4f8 New content in shared album `%s`.", notifyAlbums[0]))
+		sb.WriteString(fmt.Sprintf("\U0001f4f8 New content in shared album **%s**.", displayAlbum(notifyAlbums[0])))
 	} else {
 		sb.WriteString(fmt.Sprintf("\U0001f4f8 New content in %d shared albums:\n\n", len(notifyAlbums)))
 		for _, id := range notifyAlbums {
-			sb.WriteString(fmt.Sprintf("- `%s`\n", id))
+			sb.WriteString(fmt.Sprintf("- **%s**\n", displayAlbum(id)))
 		}
 	}
 	sb.WriteString("\n\nUse `shared-albums` to browse and download.")

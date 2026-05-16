@@ -6464,10 +6464,11 @@ func (_ FfiDestroyerTypeIdsUsersWithIdentityRecord) Destroy(value IdsUsersWithId
 }
 
 type SharedAlbumInfo struct {
-	Albumguid string
-	Name      *string
-	Fullname  *string
-	Email     *string
+	Albumguid        string
+	Name             *string
+	Fullname         *string
+	Email            *string
+	Subscriptiondate *string
 }
 
 func (r *SharedAlbumInfo) Destroy() {
@@ -6475,6 +6476,7 @@ func (r *SharedAlbumInfo) Destroy() {
 	FfiDestroyerOptionalString{}.Destroy(r.Name)
 	FfiDestroyerOptionalString{}.Destroy(r.Fullname)
 	FfiDestroyerOptionalString{}.Destroy(r.Email)
+	FfiDestroyerOptionalString{}.Destroy(r.Subscriptiondate)
 }
 
 type FfiConverterTypeSharedAlbumInfo struct{}
@@ -6491,6 +6493,7 @@ func (c FfiConverterTypeSharedAlbumInfo) Read(reader io.Reader) SharedAlbumInfo 
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
 		FfiConverterOptionalStringINSTANCE.Read(reader),
+		FfiConverterOptionalStringINSTANCE.Read(reader),
 	}
 }
 
@@ -6503,6 +6506,7 @@ func (c FfiConverterTypeSharedAlbumInfo) Write(writer io.Writer, value SharedAlb
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.Name)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.Fullname)
 	FfiConverterOptionalStringINSTANCE.Write(writer, value.Email)
+	FfiConverterOptionalStringINSTANCE.Write(writer, value.Subscriptiondate)
 }
 
 type FfiDestroyerTypeSharedAlbumInfo struct{}
