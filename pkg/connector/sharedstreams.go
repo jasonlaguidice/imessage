@@ -373,12 +373,13 @@ func handleAlbumSelection(ce *commands.Event, client *IMClient, albums []rustpus
 		withTimes[i].t, _ = time.Parse(time.RFC3339, a.DateCreated)
 	}
 
-	sort.SliceStable(withTimes, func(i, j int) bool { return withTimes[i].t.Before(withTimes[j].t) })
+	// Newest first so the most recent additions are at the top of the list.
+	sort.SliceStable(withTimes, func(i, j int) bool { return withTimes[i].t.After(withTimes[j].t) })
 
 	shown := withTimes
 	truncated := false
 	if len(shown) > 50 {
-		shown = shown[len(shown)-50:]
+		shown = shown[:50]
 		truncated = true
 	}
 
