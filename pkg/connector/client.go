@@ -2329,17 +2329,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 		go c.handleNotifyAnyways(log, msg)
 		return
 	}
-	// Transcript background — someone set or cleared the iMessage chat wallpaper.
 	if msg.IsSetTranscriptBackground {
-		if c.cloudStore != nil {
-			if known, _ := c.cloudStore.hasMessageUUID(context.Background(), msg.Uuid); known {
-				return
-			}
-			if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, "", int64(msg.TimestampMs), false); err != nil {
-				log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist SetTranscriptBackground UUID; duplicates possible on restart")
-			}
-		}
-		go c.handleTranscriptBackground(log, msg)
 		return
 	}
 
@@ -3632,57 +3622,6 @@ func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg
 		return
 	}
 	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
-}
-
-// handleTranscriptBackground posts a silent bot notice when a participant sets
-// or removes the custom iMessage chat wallpaper (transcript background).
-// Stored messages are silently dropped.
-func (c *IMClient) handleTranscriptBackground(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	if msg.IsStoredMessage {
-		log.Debug().Msg("Skipping stored SetTranscriptBackground message")
-		return
-	}
-	ctx := context.Background()
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	if err != nil || portal == nil || portal.MXID == "" {
-		log.Debug().Err(err).Msg("SetTranscriptBackground: no portal found, skipping notice")
-		return
-	}
-
-	senderHandle := ptrStringOr(msg.Sender, "")
-	name := senderHandle
-	if senderHandle != "" {
-		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
-		if ghostErr == nil && ghost != nil && ghost.Name != "" {
-			name = ghost.Name
-		}
-	}
-
-	var notice string
-	isRemove := msg.TranscriptBackgroundRemove != nil && *msg.TranscriptBackgroundRemove
-	if isRemove {
-		notice = "🖼️ " + name + " removed the chat background."
-	} else {
-		notice = "🖼️ " + name + " set a new chat background."
-	}
-
-	log.Info().
-		Str("sender", senderHandle).
-		Bool("remove", isRemove).
-		Str("portal_mxid", string(portal.MXID)).
-		Msg("SetTranscriptBackground: posting notice")
-
-	_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventMessage, &event.Content{
-		Parsed: &event.MessageEventContent{
-			MsgType:  event.MsgNotice,
-			Body:     notice,
-			Mentions: &event.Mentions{},
-		},
-	}, nil)
-	if sendErr != nil {
-		log.Warn().Err(sendErr).Msg("SetTranscriptBackground: failed to send notice")
-	}
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
