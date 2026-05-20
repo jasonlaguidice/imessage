@@ -5798,6 +5798,34 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
 	}
 
+	// If this Matrix event was bridged as two iMessages (attachment + caption text),
+	// unsend the sibling first. The attachment was sent before the text on the wire,
+	// so unsend it first to keep the same wire ordering — some peers ignore unsends
+	// that arrive out of timeline order for an attachment.
+	var siblingUUID string
+	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil {
+		siblingUUID = meta.SiblingUUID
+	}
+
+	if siblingUUID != "" {
+		c.trackOutboundUnsend(siblingUUID)
+		_, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle)
+		if sibErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(sibErr).
+				Str("primary_uuid", string(msg.TargetMessage.ID)).
+				Str("sibling_uuid", siblingUUID).
+				Msg("Failed to unsend sibling iMessage (attachment)")
+		} else {
+			zerolog.Ctx(ctx).Info().
+				Str("primary_uuid", string(msg.TargetMessage.ID)).
+				Str("sibling_uuid", siblingUUID).
+				Msg("Unsent sibling iMessage (attachment) for split image+caption redaction")
+			if c.cloudStore != nil {
+				c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
+			}
+		}
+	}
+
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
 	// Rust-side retry handles SendTimedOut with stable UUID.
@@ -5807,20 +5835,6 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// while preserving the UUID for echo detection.
 	if c.cloudStore != nil {
 		c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID))
-	}
-
-	// If this Matrix event was bridged as two iMessages (attachment + caption text),
-	// unsend the sibling so both halves disappear from the iMessage peer.
-	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil && meta.SiblingUUID != "" {
-		c.trackOutboundUnsend(meta.SiblingUUID)
-		if _, sibErr := c.client.SendUnsend(conv, meta.SiblingUUID, 0, c.handle); sibErr != nil {
-			zerolog.Ctx(ctx).Warn().Err(sibErr).
-				Str("primary_uuid", string(msg.TargetMessage.ID)).
-				Str("sibling_uuid", meta.SiblingUUID).
-				Msg("Failed to unsend sibling iMessage; primary may have been removed")
-		} else if c.cloudStore != nil {
-			c.cloudStore.softDeleteMessageByGUID(ctx, meta.SiblingUUID)
-		}
 	}
 
 	return err
