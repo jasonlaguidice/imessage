@@ -5689,14 +5689,17 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// Skip when the body just duplicates the filename (no real caption).
 	finalUUID := uuid
 	hasAttachments := true
+	siblingUUID := ""
 	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
 		textUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
 		if textErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
 		} else {
-			// Route Matrix edits to the text message (the attachment isn't editable).
+			// Route Matrix edits to the text (the attachment isn't editable) and
+			// stash the attachment UUID as sibling so redact can unsend both.
 			finalUUID = textUUID
 			hasAttachments = false
+			siblingUUID = uuid
 			if c.cloudStore != nil {
 				if err := c.cloudStore.persistMessageUUID(ctx, textUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
 					zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", textUUID).Msg("Failed to persist sent text UUID; echo may be delivered as duplicate")
@@ -5710,7 +5713,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 			ID:        makeMessageID(finalUUID),
 			SenderID:  makeUserID(c.handle),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{HasAttachments: hasAttachments},
+			Metadata:  &MessageMetadata{HasAttachments: hasAttachments, SiblingUUID: siblingUUID},
 		},
 	}, nil
 }
@@ -5804,6 +5807,20 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// while preserving the UUID for echo detection.
 	if c.cloudStore != nil {
 		c.cloudStore.softDeleteMessageByGUID(ctx, string(msg.TargetMessage.ID))
+	}
+
+	// If this Matrix event was bridged as two iMessages (attachment + caption text),
+	// unsend the sibling so both halves disappear from the iMessage peer.
+	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil && meta.SiblingUUID != "" {
+		c.trackOutboundUnsend(meta.SiblingUUID)
+		if _, sibErr := c.client.SendUnsend(conv, meta.SiblingUUID, 0, c.handle); sibErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(sibErr).
+				Str("primary_uuid", string(msg.TargetMessage.ID)).
+				Str("sibling_uuid", meta.SiblingUUID).
+				Msg("Failed to unsend sibling iMessage; primary may have been removed")
+		} else if c.cloudStore != nil {
+			c.cloudStore.softDeleteMessageByGUID(ctx, meta.SiblingUUID)
+		}
 	}
 
 	return err

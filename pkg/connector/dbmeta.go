@@ -23,6 +23,11 @@ type GhostMetadata struct{}
 
 type MessageMetadata struct {
 	HasAttachments bool `json:"has_attachments,omitempty"`
+
+	// SiblingUUID is set when a Matrix m.image with caption was split into two
+	// iMessages (attachment + follow-up text). Stored on the primary DB row so
+	// redact/unsend can remove both halves together.
+	SiblingUUID string `json:"sibling_uuid,omitempty"`
 }
 
 type UserLoginMetadata struct {
