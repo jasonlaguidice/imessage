@@ -5684,30 +5684,99 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	}
 
 	// If the Matrix event has body text alongside the attachment, send it as a
-	// separate iMessage instead of stuffing it into the subject field. This makes
-	// it behave like other chat apps — the text is editable, reactable, etc.
-	// Skip when the body just duplicates the filename (no real caption).
-	finalUUID := uuid
-	hasAttachments := true
+	// separate iMessage so the text is editable, reactable, etc. — like every
+	// other chat app. Skip when body duplicates the filename (no real caption).
+	textUUID := ""
+	textMXID := id.EventID("")
 	siblingUUID := ""
 	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
-		textUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
+		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
 		if textErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
 		} else {
-			// Route Matrix edits to the text (the attachment isn't editable) and
-			// stash the attachment UUID as sibling so redact can unsend both.
-			finalUUID = textUUID
-			hasAttachments = false
+			textUUID = tUUID
 			siblingUUID = uuid
 			if c.cloudStore != nil {
-				if err := c.cloudStore.persistMessageUUID(ctx, textUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
-					zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", textUUID).Msg("Failed to persist sent text UUID; echo may be delivered as duplicate")
+				if err := c.cloudStore.persistMessageUUID(ctx, tUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", tUUID).Msg("Failed to persist sent text UUID; echo may be delivered as duplicate")
+				}
+			}
+
+			// Surface the caption as a standalone Matrix m.text event (via the
+			// user's double puppet) so the user's Matrix client treats it like
+			// any other text message — editable, reactable, etc. Also edit the
+			// original m.image to drop the caption body so the text doesn't
+			// appear twice in the room.
+			if dp := c.UserLogin.User.DoublePuppet(ctx); dp != nil {
+				textContent := &event.MessageEventContent{
+					MsgType: event.MsgText,
+					Body:    msg.Content.Body,
+				}
+				resp, err := dp.SendMessage(ctx, msg.Portal.MXID, event.EventMessage, &event.Content{Parsed: textContent}, nil)
+				if err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to bridge caption as standalone Matrix text event")
+				} else if resp != nil {
+					textMXID = resp.EventID
+					// Edit the original m.image to drop the caption body so it doesn't render twice.
+					editContent := &event.MessageEventContent{
+						MsgType:  event.MsgImage,
+						Body:     msg.Content.FileName,
+						FileName: msg.Content.FileName,
+						Info:     msg.Content.Info,
+						URL:      msg.Content.URL,
+						File:     msg.Content.File,
+					}
+					editContent.SetEdit(msg.Event.ID)
+					if _, err := dp.SendMessage(ctx, msg.Portal.MXID, event.EventMessage, &event.Content{Parsed: editContent}, nil); err != nil {
+						zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to clear caption from original m.image event")
+					}
 				}
 			}
 		}
 	}
 
+	// If we bridged the caption as its own m.text Matrix event, the attachment
+	// and the text live on separate Matrix events. Each gets its own DB row so
+	// edits/redacts/reactions on either route to the right iMessage.
+	if textUUID != "" && textMXID != "" {
+		bridgeRef := c.Main.Bridge
+		userLogin := c.UserLogin
+		portalKey := msg.Portal.PortalKey
+		senderID := makeUserID(c.handle)
+		now := time.Now()
+		return &bridgev2.MatrixMessageResponse{
+			DB: &database.Message{
+				ID:        makeMessageID(uuid),
+				SenderID:  senderID,
+				Timestamp: now,
+				Metadata:  &MessageMetadata{HasAttachments: true},
+			},
+			PostSave: func(ctx context.Context, primary *database.Message) {
+				textRow := &database.Message{
+					Room:       portalKey,
+					ID:         makeMessageID(textUUID),
+					MXID:       textMXID,
+					SenderID:   senderID,
+					SenderMXID: userLogin.UserMXID,
+					Timestamp:  now,
+					Metadata:   &MessageMetadata{},
+				}
+				if err := bridgeRef.DB.Message.Insert(ctx, textRow); err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Str("text_uuid", textUUID).Msg("Failed to insert DB row for bridged caption text")
+				}
+			},
+		}, nil
+	}
+
+	// Fallback when the double puppet isn't available: keep the attachment
+	// as the primary Matrix-side event and rely on sibling-UUID metadata so
+	// at least redact unsends both halves on iMessage.
+	finalUUID := uuid
+	hasAttachments := true
+	if textUUID != "" {
+		finalUUID = textUUID
+		hasAttachments = false
+	}
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(finalUUID),
@@ -5809,20 +5878,12 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
-		_, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle)
-		if sibErr != nil {
+		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(sibErr).
-				Str("primary_uuid", string(msg.TargetMessage.ID)).
 				Str("sibling_uuid", siblingUUID).
-				Msg("Failed to unsend sibling iMessage (attachment)")
-		} else {
-			zerolog.Ctx(ctx).Info().
-				Str("primary_uuid", string(msg.TargetMessage.ID)).
-				Str("sibling_uuid", siblingUUID).
-				Msg("Unsent sibling iMessage (attachment) for split image+caption redaction")
-			if c.cloudStore != nil {
-				c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
-			}
+				Msg("Failed to unsend sibling iMessage on split image+caption redact")
+		} else if c.cloudStore != nil {
+			c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
 		}
 	}
 
