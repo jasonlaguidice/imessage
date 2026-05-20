@@ -5669,17 +5669,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
 
-	// Per MSC2530, when FileName is set and differs from Body, Body is the caption.
-	// Some clients duplicate the filename into Body (no real caption) — treating that
-	// as a caption would land in the iMessage subject field and show to iPhone users.
-	var caption *string
-	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
-		caption = &msg.Content.Body
-	}
-
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID — no Go-side retry here (would orphan delivery receipts).
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, caption)
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -5691,12 +5683,34 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		}
 	}
 
+	// If the Matrix event has body text alongside the attachment, send it as a
+	// separate iMessage instead of stuffing it into the subject field. This makes
+	// it behave like other chat apps — the text is editable, reactable, etc.
+	// Skip when the body just duplicates the filename (no real caption).
+	finalUUID := uuid
+	hasAttachments := true
+	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
+		textUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
+		if textErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
+		} else {
+			// Route Matrix edits to the text message (the attachment isn't editable).
+			finalUUID = textUUID
+			hasAttachments = false
+			if c.cloudStore != nil {
+				if err := c.cloudStore.persistMessageUUID(ctx, textUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+					zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", textUUID).Msg("Failed to persist sent text UUID; echo may be delivered as duplicate")
+				}
+			}
+		}
+	}
+
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
-			ID:        makeMessageID(uuid),
+			ID:        makeMessageID(finalUUID),
 			SenderID:  makeUserID(c.handle),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{HasAttachments: true},
+			Metadata:  &MessageMetadata{HasAttachments: hasAttachments},
 		},
 	}, nil
 }
