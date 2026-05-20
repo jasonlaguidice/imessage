@@ -2209,7 +2209,18 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 	}
 
 	if msg.IsDelivered {
-		c.handleDeliveryReceipt(log, msg)
+		// Delivery receipts for our own outgoing sends can arrive while the
+		// rustpush send call is still unwinding. Handle them asynchronously so
+		// bridgev2 can commit the outgoing message row before the receipt lookup
+		// retry loop runs.
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Error().Interface("panic", r).Str("stack", string(debug.Stack())).Msg("Panic in handleDeliveryReceipt")
+				}
+			}()
+			c.handleDeliveryReceipt(log, msg)
+		}()
 		return
 	}
 
