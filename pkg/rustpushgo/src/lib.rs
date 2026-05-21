@@ -1510,7 +1510,7 @@ async fn create_keychain_clients(
         config: os_config.clone(),
         token_provider: token_provider.clone(),
     });
-    let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+    let keychain_state_path = format!("{}/trustedpeers_{}.plist", resolve_xdg_data_dir(), dsid);
     let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
         Ok(data) => match plist::from_bytes(&data) {
             Ok(state) => Some(state),
@@ -2301,7 +2301,7 @@ pub async fn restore_token_provider(
     // broken `ProvisionInput` enum entirely (see src/anisette.rs). On
     // macOS this is upstream's native AOSKit path, unchanged.
     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
-    let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
+    let anisette_state_path = PathBuf::from(format!("{}/anisette_{}", resolve_xdg_data_dir(), config.get_device_id()));
     let anisette = bridge_default_provider(client_info.clone(), anisette_state_path);
 
     // Create a new AppleAccount and populate it with persisted state
@@ -5262,7 +5262,7 @@ pub async fn login_start(
     info!("login_start: akd_user_agent={}", client_info.akd_user_agent);
     info!("login_start: hardware_headers={:?}", client_info.hardware_headers);
     info!("login_start: push_token={:?}", client_info.push_token);
-    let anisette_state_path = PathBuf::from_str("state/anisette").unwrap();
+    let anisette_state_path = PathBuf::from(format!("{}/anisette_{}", resolve_xdg_data_dir(), config.get_device_id()));
     let state_plist = anisette_state_path.join("state.plist");
     info!("login_start: anisette state path={:?} exists={}", state_plist, state_plist.exists());
 
@@ -6584,7 +6584,15 @@ pub async fn new_client(
     let identity_clone = identity.inner.clone();
     let config_clone = config.config.clone();
 
-    let _ = std::fs::create_dir_all("state");
+    let xdg_data_dir = resolve_xdg_data_dir();
+    let _ = std::fs::create_dir_all(&xdg_data_dir);
+    let cache_key = users_clone
+        .first()
+        .map(|u| u.user_id.chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>())
+        .unwrap_or_else(|| "default".to_string());
+    let cache_path = format!("{}/id_cache_{}.plist", xdg_data_dir, cache_key);
 
     // FACETIME + VIDEO are in the bundle so the IdentityResource's `services`
     // slice contains them. Without that, upstream's `get_main_service` (called
@@ -6605,7 +6613,7 @@ pub async fn new_client(
             users_clone,
             identity_clone,
             &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
-            "state/id_cache.plist".into(),
+            cache_path.into(),
             config_clone.clone(),
             Box::new(move |updated_keys| {
                 update_users_callback.update_users(Arc::new(WrappedIDSUsers {
@@ -7621,7 +7629,7 @@ impl Client {
             token_provider: tp.inner.clone(),
         });
 
-        let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+        let keychain_state_path = format!("{}/trustedpeers_{}.plist", resolve_xdg_data_dir(), dsid);
         let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
             Ok(data) => match plist::from_bytes(&data) {
                 Ok(state) => Some(state),

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -435,14 +436,9 @@ func clearLocalSessionBackup(log *zerolog.Logger) int {
 	pathFns := []func() (string, error){
 		sessionFilePath,
 		legacyIdentityFilePath,
-		trustedPeersFilePath,
 	}
 	removed := 0
-	for _, fn := range pathFns {
-		p, err := fn()
-		if err != nil {
-			continue
-		}
+	removeFile := func(p string) {
 		if err := os.Remove(p); err == nil {
 			removed++
 			if log != nil {
@@ -450,6 +446,28 @@ func clearLocalSessionBackup(log *zerolog.Logger) int {
 			}
 		} else if !os.IsNotExist(err) && log != nil {
 			log.Warn().Err(err).Str("path", p).Msg("Failed to remove session backup file during logout")
+		}
+	}
+	for _, fn := range pathFns {
+		p, err := fn()
+		if err != nil {
+			continue
+		}
+		removeFile(p)
+	}
+	// Remove all per-user trustedpeers_*.plist files (one per DSID).
+	dataDir := os.Getenv("XDG_DATA_HOME")
+	if dataDir == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			dataDir = filepath.Join(home, ".local", "share")
+		}
+	}
+	if dataDir != "" {
+		pattern := filepath.Join(dataDir, "mautrix-imessage", "trustedpeers_*.plist")
+		if matches, err := filepath.Glob(pattern); err == nil {
+			for _, p := range matches {
+				removeFile(p)
+			}
 		}
 	}
 	return removed

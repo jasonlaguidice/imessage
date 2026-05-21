@@ -1,0 +1,11 @@
+services:
+  bridge:
+    image: ghcr.io/jasonlaguidice/imessage:latest
+    restart: unless-stopped
+    ports:
+      - "29332:29332"
+    environment:
+      XDG_DATA_HOME: /state
+    volumes:
+      - ./data:/data          # config.yaml, registration.yaml, bridge.db
+      - ./state:/state        # session.json, per-user anisette/trustedpeers/id_cache

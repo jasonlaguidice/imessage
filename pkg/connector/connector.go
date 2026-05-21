@@ -133,7 +133,7 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 	// Chat.db mode doesn't join the keychain clique (no CloudKit), so
 	// trustedpeers.plist is never written. Only require clique state
 	// when CloudKit backfill is active.
-	if c.Config.UseCloudKitBackfill() && !hasKeychainCliqueState(log) {
+	if c.Config.UseCloudKitBackfill() && !hasKeychainCliqueState(log, state.AccountDSID) {
 		log.Info().Msg("Skipping auto-restore: keychain trust circle not initialized (will require interactive login)")
 		return
 	}

@@ -1,0 +1,42 @@
+# Git history
+.git/
+
+# Upstream rustpush clone — built dynamically via ensure-rustpush-source
+third_party/rustpush-upstream/
+
+# Rust build artifacts
+pkg/rustpushgo/target/
+librustpushgo.a
+
+# Go build outputs
+mautrix-imessage-v2
+mautrix-imessage
+bbctl
+
+# macOS app bundles
+*.app/
+
+# Runtime / install-generated configs (keep example-config.yaml for go:embed)
+/config.yaml
+/registration.yaml
+state/
+data/
+*.log
+*.db
+*.db-wal
+*.db-shm
+*.session
+
+# Tools not needed for the bridge build
+tools/
+scripts/
+docs/
+dev/
+
+# IDE / editor / misc
+.idea/
+.vscode/
+.DS_Store
+.build-commit
+prompts/
+_todo/

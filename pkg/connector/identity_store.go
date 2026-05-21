@@ -81,9 +81,9 @@ func legacyIdentityFilePath() (string, error) {
 	return filepath.Join(dataDir, "mautrix-imessage", "identity.plist"), nil
 }
 
-// trustedPeersFilePath returns the keychain trust state path:
-// ~/.local/share/mautrix-imessage/trustedpeers.plist
-func trustedPeersFilePath() (string, error) {
+// trustedPeersFilePath returns the per-user keychain trust state path:
+// ~/.local/share/mautrix-imessage/trustedpeers_<dsid>.plist
+func trustedPeersFilePath(dsid string) (string, error) {
 	dataDir := os.Getenv("XDG_DATA_HOME")
 	if dataDir == "" {
 		home, err := os.UserHomeDir()
@@ -92,13 +92,13 @@ func trustedPeersFilePath() (string, error) {
 		}
 		dataDir = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dataDir, "mautrix-imessage", "trustedpeers.plist"), nil
+	return filepath.Join(dataDir, "mautrix-imessage", "trustedpeers_"+dsid+".plist"), nil
 }
 
-// hasKeychainCliqueState returns true if trustedpeers.plist appears to contain
-// a keychain user identity (i.e. trust circle has been joined).
-func hasKeychainCliqueState(log zerolog.Logger) bool {
-	path, err := trustedPeersFilePath()
+// hasKeychainCliqueState returns true if the per-user trustedpeers.plist appears
+// to contain a keychain user identity (i.e. trust circle has been joined).
+func hasKeychainCliqueState(log zerolog.Logger, dsid string) bool {
+	path, err := trustedPeersFilePath(dsid)
 	if err != nil {
 		log.Debug().Err(err).Msg("Failed to determine trusted peers file path")
 		return false
@@ -238,7 +238,7 @@ func CheckSessionRestore() bool {
 	if !session.validate(log) {
 		return false
 	}
-	if !hasKeychainCliqueState(log) {
+	if !hasKeychainCliqueState(log, state.AccountDSID) {
 		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
 		return false
 	}
