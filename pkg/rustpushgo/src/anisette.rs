@@ -31,11 +31,9 @@
 //! accept the one-time 2FA prompt on next auth.
 
 use std::collections::HashMap;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use futures::FutureExt;
 use log::{error, info, warn};
 use omnisette::remote_anisette_v3::RemoteAnisetteProviderV3;
 use omnisette::{AnisetteError, AnisetteProvider, LoginClientInfo};
@@ -81,18 +79,26 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                     self.state_path.clone(),
                 );
 
-                // AssertUnwindSafe + catch_unwind turns upstream's bare
-                // `panic!()` into a caught panic payload. Without this the
-                // panic unwinds into the caller's critical section and can
-                // leave shared mutexes locked.
-                let inner = AssertUnwindSafe(upstream.get_anisette_headers()).catch_unwind();
+                // Move the upstream provider onto a blocking thread so the OS can
+                // preempt its non-yielding provisioning loop (upstream bug #2).
+                // We drive it with a fresh single-threaded runtime on that thread.
+                // Panics from the blocking thread surface as Err(JoinError) below,
+                // so AssertUnwindSafe/catch_unwind is no longer needed.
+                let result = tokio::task::spawn_blocking(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("failed to build anisette runtime")
+                        .block_on(upstream.get_anisette_headers())
+                });
+
                 // Preserve state.plist across every failure mode — wiping it
                 // mid-retry generates a fresh device identity on the next
                 // attempt, which Apple sees as a brand-new device and rejects
                 // the next login_email_pass with NeedsDevice2FA. The transient
                 // upstream errors below don't correlate with genuine state
                 // corruption, so we leave state alone and just retry.
-                match tokio::time::timeout(PROVISION_TIMEOUT, inner).await {
+                match tokio::time::timeout(PROVISION_TIMEOUT, result).await {
                     Ok(Ok(Ok(headers))) => {
                         info!(
                             "anisette: attempt {}/{} succeeded in {:?} (total {:?})",
@@ -103,67 +109,46 @@ impl AnisetteProvider for BridgeAnisetteProvider {
                         );
                         return Ok(headers);
                     }
-                    Ok(Ok(Err(AnisetteError::SerdeError(ref e)))) => {
+                    Ok(Ok(Err(AnisetteError::SerdeError(e)))) => {
                         warn!(
-                            "anisette: upstream serde error on attempt {}/{} (state preserved): {}",
+                            "anisette: serde error on attempt {}/{}: {}",
                             attempt + 1,
                             MAX_RETRIES,
                             e
                         );
-                        last_err = Some(AnisetteError::InvalidArgument(format!(
-                            "Anisette provisioning was rejected by the server \
-                             (attempt {}/{}). Error: {}",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            e
-                        )));
+                        last_err = Some(AnisetteError::SerdeError(e));
                     }
                     Ok(Ok(Err(e))) => {
                         // Non-serde error — don't retry blindly.
                         return Err(e);
                     }
-                    Ok(Err(panic_payload)) => {
+                    Ok(Err(join_err)) => {
                         // Upstream `RemoteAnisetteProviderV3::get_anisette_headers`
                         // contains `panic!()` for non-`AnisetteNotProvisioned`
-                        // errors. Convert to a retryable error so the panic
-                        // doesn't unwind past this point. State preserved —
-                        // the panic is a control-flow bug in upstream, not a
-                        // sign that our identity is invalid.
-                        let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
-                            (*s).to_string()
-                        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                            s.clone()
-                        } else {
-                            "unknown panic payload".into()
-                        };
+                        // errors. The panic is caught by spawn_blocking as a
+                        // JoinError. State preserved — the panic is a
+                        // control-flow bug in upstream, not a sign that our
+                        // identity is invalid.
                         warn!(
-                            "anisette: upstream panicked on attempt {}/{} (state preserved): {}",
+                            "anisette: task panicked on attempt {}/{}: {:?}",
                             attempt + 1,
                             MAX_RETRIES,
-                            msg
+                            join_err
                         );
-                        last_err = Some(AnisetteError::InvalidArgument(format!(
-                            "Anisette call panicked (attempt {}/{}): {}",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            msg
-                        )));
+                        last_err = Some(AnisetteError::InvalidArgument("anisette task panicked".to_string()));
                     }
-                    Err(_) => {
+                    Err(_timeout) => {
                         // Timeout — upstream's infinite-loop bug on WS drop.
+                        // Because the future runs on a blocking thread, the OS
+                        // can preempt it, so this timeout now fires reliably.
                         // Network-layer issue, not state corruption.
                         warn!(
-                            "anisette: upstream timed out on attempt {}/{} (state preserved, likely infinite loop on WS drop)",
+                            "anisette: timed out on attempt {}/{}",
                             attempt + 1,
                             MAX_RETRIES,
                         );
                         last_err = Some(AnisetteError::InvalidArgument(
-                            format!(
-                                "Anisette provisioning timed out (attempt {}/{}). \
-                                 The anisette server (ani.sidestore.io) may be down.",
-                                attempt + 1,
-                                MAX_RETRIES,
-                            ),
+                            "anisette provisioning timed out".to_string(),
                         ));
                     }
                 }

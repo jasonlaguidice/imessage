@@ -246,8 +246,8 @@ func (r *attachmentRetrier) deliverAsEdit(ctx context.Context, row *pendingAttac
 		Index:          row.AttIndex,
 	}
 
-	videoTranscoding := r.Client.Main.Config.VideoTranscoding
-	heicConversion := r.Client.Main.Config.HEICConversion
+	videoTranscoding := r.Client.videoTranscoding()
+	heicConversion := r.Client.heicConversion()
 	heicQuality := r.Client.Main.Config.HEICJPEGQuality
 
 	sender := r.Client.canonicalizeDMSender(portalKey, r.Client.makeEventSender(&senderCopy))

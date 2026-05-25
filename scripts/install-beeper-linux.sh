@@ -29,7 +29,7 @@ if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
     systemctl --user stop mautrix-imessage
     echo "✓ Stopped running bridge"
 elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-    sudo systemctl stop mautrix-imessage
+    systemctl stop mautrix-imessage
     echo "✓ Stopped running bridge"
 fi
 
@@ -367,190 +367,6 @@ if [ "$CURRENT_BACKFILL" = "true" ]; then
     fi
 fi
 
-# ── Restore CardDAV config from backup ────────────────────────
-CARDDAV_BACKUP="$DATA_DIR/.carddav-config"
-if [ -f "$CARDDAV_BACKUP" ]; then
-    CHECK_EMAIL=$(grep 'email:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*email: *//;s/['\"]//g" | tr -d ' ' || true)
-    if [ -z "$CHECK_EMAIL" ]; then
-        source "$CARDDAV_BACKUP"
-        if [ -n "${SAVED_CARDDAV_EMAIL:-}" ] && [ -n "${SAVED_CARDDAV_ENC:-}" ]; then
-            python3 -c "
-import re
-text = open('$CONFIG').read()
-if 'carddav:' not in text:
-    lines = text.split('\\n')
-    insert_at = len(lines)
-    in_network = False
-    for i, line in enumerate(lines):
-        if line.startswith('network:'):
-            in_network = True
-            continue
-        if in_network and line and not line[0].isspace() and not line.startswith('#'):
-            insert_at = i
-            break
-    carddav = ['    carddav:', '        email: \"\"', '        url: \"\"', '        username: \"\"', '        password_encrypted: \"\"']
-    lines = lines[:insert_at] + carddav + lines[insert_at:]
-    text = '\\n'.join(lines)
-def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"$SAVED_CARDDAV_EMAIL\"')
-text = patch(text, 'url', '\"$SAVED_CARDDAV_URL\"')
-text = patch(text, 'username', '\"$SAVED_CARDDAV_USERNAME\"')
-text = patch(text, 'password_encrypted', '\"$SAVED_CARDDAV_ENC\"')
-open('$CONFIG', 'w').write(text)
-"
-            echo "✓ Restored CardDAV config: $SAVED_CARDDAV_EMAIL"
-        fi
-    fi
-fi
-
-# ── Contact source (runs every time, can reconfigure) ─────────
-if [ -t 0 ]; then
-    CURRENT_CARDDAV_EMAIL=$(grep 'email:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*email: *//;s/['\"]//g" | tr -d ' ' || true)
-    CONFIGURE_CARDDAV=false
-
-    if [ -n "$CURRENT_CARDDAV_EMAIL" ] && [ "$CURRENT_CARDDAV_EMAIL" != '""' ]; then
-        echo ""
-        echo "Contact source: External CardDAV ($CURRENT_CARDDAV_EMAIL)"
-        read -p "Change contact provider? [y/N]: " CHANGE_CONTACTS
-        case "$CHANGE_CONTACTS" in
-            [yY]*) CONFIGURE_CARDDAV=true ;;
-        esac
-    else
-        echo ""
-        echo "Contact source (for resolving names in chats):"
-        echo "  1) iCloud (default — uses your Apple ID)"
-        echo "  2) Google Contacts (requires app password)"
-        echo "  3) Fastmail"
-        echo "  4) Nextcloud"
-        echo "  5) Other CardDAV server"
-        read -p "Choice [1]: " CONTACT_CHOICE
-        CONTACT_CHOICE="${CONTACT_CHOICE:-1}"
-        if [ "$CONTACT_CHOICE" != "1" ]; then
-            CONFIGURE_CARDDAV=true
-        fi
-    fi
-
-    if [ "$CONFIGURE_CARDDAV" = true ]; then
-        # Show menu if we're changing from an existing provider
-        if [ -n "$CURRENT_CARDDAV_EMAIL" ] && [ "$CURRENT_CARDDAV_EMAIL" != '""' ]; then
-            echo ""
-            echo "  1) iCloud (remove external CardDAV)"
-            echo "  2) Google Contacts (requires app password)"
-            echo "  3) Fastmail"
-            echo "  4) Nextcloud"
-            echo "  5) Other CardDAV server"
-            read -p "Choice: " CONTACT_CHOICE
-        fi
-
-        CARDDAV_EMAIL=""
-        CARDDAV_PASSWORD=""
-        CARDDAV_USERNAME=""
-        CARDDAV_URL=""
-
-        if [ "${CONTACT_CHOICE:-}" = "1" ]; then
-            # Remove external CardDAV — clear the config fields
-            python3 -c "
-import re
-text = open('$CONFIG').read()
-def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"\"')
-text = patch(text, 'url', '\"\"')
-text = patch(text, 'username', '\"\"')
-text = patch(text, 'password_encrypted', '\"\"')
-open('$CONFIG', 'w').write(text)
-"
-            rm -f "$CARDDAV_BACKUP"
-            echo "✓ Switched to iCloud contacts"
-        elif [ -n "${CONTACT_CHOICE:-}" ]; then
-            read -p "Email address: " CARDDAV_EMAIL
-            if [ -z "$CARDDAV_EMAIL" ]; then
-                echo "ERROR: Email is required." >&2
-                exit 1
-            fi
-
-            case "$CONTACT_CHOICE" in
-                2)
-                    CARDDAV_URL="https://www.googleapis.com/carddav/v1/principals/$CARDDAV_EMAIL/lists/default/"
-                    echo "  Note: Use a Google App Password, without spaces (https://myaccount.google.com/apppasswords)"
-                    ;;
-                3)
-                    CARDDAV_URL="https://carddav.fastmail.com/dav/addressbooks/user/$CARDDAV_EMAIL/Default/"
-                    echo "  Note: Use a Fastmail App Password (Settings → Privacy & Security → App Passwords)"
-                    ;;
-                4)
-                    read -p "Nextcloud server URL (e.g. https://cloud.example.com): " NC_SERVER
-                    NC_SERVER="${NC_SERVER%/}"
-                    CARDDAV_URL="$NC_SERVER/remote.php/dav"
-                    ;;
-                5)
-                    read -p "CardDAV server URL: " CARDDAV_URL
-                    if [ -z "$CARDDAV_URL" ]; then
-                        echo "ERROR: URL is required." >&2
-                        exit 1
-                    fi
-                    ;;
-            esac
-
-            read -p "Username (leave empty to use email): " CARDDAV_USERNAME
-            read -s -p "App password: " CARDDAV_PASSWORD
-            echo ""
-            if [ -z "$CARDDAV_PASSWORD" ]; then
-                echo "ERROR: Password is required." >&2
-                exit 1
-            fi
-
-            # Encrypt password and patch config
-            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
-            if [ -n "$CARDDAV_USERNAME" ]; then
-                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
-            fi
-            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
-
-            if [ -z "$CARDDAV_JSON" ]; then
-                echo "⚠  CardDAV setup failed. You can configure it manually in $CONFIG"
-            else
-                CARDDAV_RESOLVED_URL=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
-                CARDDAV_ENC=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password_encrypted'])")
-                EFFECTIVE_USERNAME="${CARDDAV_USERNAME:-$CARDDAV_EMAIL}"
-                python3 -c "
-import re
-text = open('$CONFIG').read()
-if 'carddav:' not in text:
-    lines = text.split('\\n')
-    insert_at = len(lines)
-    in_network = False
-    for i, line in enumerate(lines):
-        if line.startswith('network:'):
-            in_network = True
-            continue
-        if in_network and line and not line[0].isspace() and not line.startswith('#'):
-            insert_at = i
-            break
-    carddav = ['    carddav:', '        email: \"\"', '        url: \"\"', '        username: \"\"', '        password_encrypted: \"\"']
-    lines = lines[:insert_at] + carddav + lines[insert_at:]
-    text = '\\n'.join(lines)
-def patch(text, key, val):
-    return re.sub(r'^(\s+' + re.escape(key) + r'\s*:)\s*.*$', r'\1 ' + val, text, count=1, flags=re.MULTILINE)
-text = patch(text, 'email', '\"$CARDDAV_EMAIL\"')
-text = patch(text, 'url', '\"$CARDDAV_RESOLVED_URL\"')
-text = patch(text, 'username', '\"$EFFECTIVE_USERNAME\"')
-text = patch(text, 'password_encrypted', '\"$CARDDAV_ENC\"')
-open('$CONFIG', 'w').write(text)
-"
-                echo "✓ CardDAV configured: $CARDDAV_EMAIL → $CARDDAV_RESOLVED_URL"
-                cat > "$CARDDAV_BACKUP" << BKEOF
-SAVED_CARDDAV_EMAIL="$CARDDAV_EMAIL"
-SAVED_CARDDAV_URL="$CARDDAV_RESOLVED_URL"
-SAVED_CARDDAV_USERNAME="$EFFECTIVE_USERNAME"
-SAVED_CARDDAV_ENC="$CARDDAV_ENC"
-BKEOF
-            fi
-        fi
-    fi
-fi
-
 # ── Brief init start (fresh install only) ────────────────────
 # On a fresh install with no prior session, start the bridge briefly so it
 # creates the DB schema and appears in Beeper as "stopped" during setup.
@@ -575,7 +391,7 @@ fi
 if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
     systemctl --user stop mautrix-imessage
 elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-    sudo systemctl stop mautrix-imessage
+    systemctl stop mautrix-imessage
 fi
 
 # ── Check for existing login / prompt if needed ──────────────
@@ -611,15 +427,15 @@ fi
 # This catches upgrades from pre-keychain versions where the device-passcode
 # step was never run. If trustedpeers.plist exists with a user_identity, the
 # keychain was joined successfully and any transient PCS errors are harmless.
-TRUSTEDPEERS_FILE="$SESSION_DIR/trustedpeers.plist"
 FORCE_CLEAR_STATE=false
 if [ "$NEEDS_LOGIN" = "false" ]; then
     HAS_CLIQUE=false
-    if [ -f "$TRUSTEDPEERS_FILE" ]; then
-        if grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$TRUSTEDPEERS_FILE" 2>/dev/null; then
+    for _tp in "$SESSION_DIR"/trustedpeers*.plist; do
+        if [ -f "$_tp" ] && grep -q "<key>userIdentity</key>\|<key>user_identity</key>" "$_tp" 2>/dev/null; then
             HAS_CLIQUE=true
+            break
         fi
-    fi
+    done
 
     if [ "$HAS_CLIQUE" != "true" ]; then
         echo "⚠ Existing login found, but keychain trust-circle is not initialized."
@@ -629,80 +445,9 @@ if [ "$NEEDS_LOGIN" = "false" ]; then
     fi
 fi
 
-# ── Ensure video_transcoding key exists in config ──────────────
-if ! grep -q 'video_transcoding:' "$CONFIG" 2>/dev/null; then
-    sed -i '/cloudkit_backfill:/i\    video_transcoding: false' "$CONFIG"
-fi
-
-# ── Video transcoding (ffmpeg) ─────────────────────────────────
-CURRENT_VIDEO_TRANSCODING=$(grep 'video_transcoding:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*video_transcoding: *//' || true)
-if [ -t 0 ]; then
-    echo ""
-    echo "Video Transcoding:"
-    echo "  When enabled, non-MP4 videos (e.g. QuickTime .mov) are automatically"
-    echo "  converted to MP4 for broad Matrix client compatibility."
-    echo "  Requires ffmpeg."
-    echo ""
-    if [ "$CURRENT_VIDEO_TRANSCODING" = "true" ]; then
-        read -p "Enable video transcoding/remuxing? [Y/n]: " ENABLE_VT
-        case "$ENABLE_VT" in
-            [nN]*)
-                sed -i "s/video_transcoding: .*/video_transcoding: false/" "$CONFIG"
-                echo "✓ Video transcoding disabled"
-                ;;
-            *)
-                if ! command -v ffmpeg >/dev/null 2>&1; then
-                    echo "  ffmpeg not found — installing..."
-                    if command -v apt >/dev/null 2>&1; then
-                        sudo apt install -y ffmpeg
-                    elif command -v dnf >/dev/null 2>&1; then
-                        sudo dnf install -y ffmpeg
-                    elif command -v pacman >/dev/null 2>&1; then
-                        sudo pacman -S --noconfirm ffmpeg
-                    elif command -v zypper >/dev/null 2>&1; then
-                        sudo zypper install -y ffmpeg
-                    elif command -v apk >/dev/null 2>&1; then
-                        sudo apk add ffmpeg
-                    else
-                        echo "  ⚠ Could not detect package manager — please install ffmpeg manually"
-                    fi
-                fi
-                echo "✓ Video transcoding enabled"
-                ;;
-        esac
-    else
-        read -p "Enable video transcoding/remuxing? [y/N]: " ENABLE_VT
-        case "$ENABLE_VT" in
-            [yY]*)
-                sed -i "s/video_transcoding: .*/video_transcoding: true/" "$CONFIG"
-                if ! command -v ffmpeg >/dev/null 2>&1; then
-                    echo "  ffmpeg not found — installing..."
-                    if command -v apt >/dev/null 2>&1; then
-                        sudo apt install -y ffmpeg
-                    elif command -v dnf >/dev/null 2>&1; then
-                        sudo dnf install -y ffmpeg
-                    elif command -v pacman >/dev/null 2>&1; then
-                        sudo pacman -S --noconfirm ffmpeg
-                    elif command -v zypper >/dev/null 2>&1; then
-                        sudo zypper install -y ffmpeg
-                    elif command -v apk >/dev/null 2>&1; then
-                        sudo apk add ffmpeg
-                    else
-                        echo "  ⚠ Could not detect package manager — please install ffmpeg manually"
-                    fi
-                fi
-                echo "✓ Video transcoding enabled"
-                ;;
-            *)
-                echo "✓ Video transcoding disabled"
-                ;;
-        esac
-    fi
-fi
-
 # ── Ensure disable_facetime key exists in config ──────────────
 if ! grep -q 'disable_facetime:' "$CONFIG" 2>/dev/null; then
-    sed -i '/video_transcoding:/a\    disable_facetime: false' "$CONFIG"
+    sed -i '/cloudkit_backfill:/a\    disable_facetime: false' "$CONFIG"
 fi
 
 # ── Disable FaceTime Bridge (use native Apple FT instead) ────────
@@ -803,97 +548,6 @@ elif [ -t 0 ]; then
                 echo "✓ StatusKit notifications enabled"
                 ;;
         esac
-    fi
-fi
-
-# ── Ensure heic_conversion key exists in config ──────────────
-if ! grep -q 'heic_conversion:' "$CONFIG" 2>/dev/null; then
-    sed -i '/video_transcoding:/a\    heic_conversion: false' "$CONFIG"
-fi
-
-# ── HEIC conversion (libheif) ─────────────────────────────────
-CURRENT_HEIC_CONVERSION=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
-if [ -t 0 ]; then
-    echo ""
-    echo "HEIC Conversion:"
-    echo "  When enabled, HEIC/HEIF images are automatically converted to JPEG"
-    echo "  for broad Matrix client compatibility."
-    echo "  Requires libheif."
-    echo ""
-    if [ "$CURRENT_HEIC_CONVERSION" = "true" ]; then
-        read -p "Enable HEIC to JPEG conversion? [Y/n]: " ENABLE_HC
-        case "$ENABLE_HC" in
-            [nN]*)
-                sed -i "s/heic_conversion: .*/heic_conversion: false/" "$CONFIG"
-                echo "✓ HEIC conversion disabled"
-                ;;
-            *)
-                if command -v apt >/dev/null 2>&1; then
-                    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
-                elif command -v dnf >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
-                elif command -v pacman >/dev/null 2>&1; then
-                    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
-                elif command -v zypper >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
-                elif command -v apk >/dev/null 2>&1; then
-                    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
-                else
-                    echo "  ⚠ Could not detect package manager — please install libheif manually"
-                fi
-                echo "✓ HEIC conversion enabled"
-                ;;
-        esac
-    else
-        read -p "Enable HEIC to JPEG conversion? [y/N]: " ENABLE_HC
-        case "$ENABLE_HC" in
-            [yY]*)
-                sed -i "s/heic_conversion: .*/heic_conversion: true/" "$CONFIG"
-                if command -v apt >/dev/null 2>&1; then
-                    dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev
-                elif command -v dnf >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel
-                elif command -v pacman >/dev/null 2>&1; then
-                    pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif
-                elif command -v zypper >/dev/null 2>&1; then
-                    rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel
-                elif command -v apk >/dev/null 2>&1; then
-                    apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev
-                else
-                    echo "  ⚠ Could not detect package manager — please install libheif manually"
-                fi
-                echo "✓ HEIC conversion enabled"
-                ;;
-            *)
-                echo "✓ HEIC conversion disabled"
-                ;;
-        esac
-    fi
-fi
-
-# ── HEIC JPEG quality (only if HEIC conversion is enabled) ───
-HEIC_ENABLED=$(grep 'heic_conversion:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_conversion: *//' || true)
-if [ "$HEIC_ENABLED" = "true" ]; then
-    if ! grep -q 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null; then
-        sed -i '/heic_conversion:/a\    heic_jpeg_quality: 95' "$CONFIG"
-    fi
-else
-    sed -i '/heic_jpeg_quality:/d' "$CONFIG"
-fi
-if [ "$HEIC_ENABLED" = "true" ] && [ -t 0 ]; then
-    CURRENT_QUALITY=$(grep 'heic_jpeg_quality:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*heic_jpeg_quality: *//' || echo "95")
-    [ -z "$CURRENT_QUALITY" ] && CURRENT_QUALITY=95
-    echo ""
-    read -p "JPEG quality for HEIC conversion (1–100) [$CURRENT_QUALITY]: " NEW_QUALITY
-    if [ -n "$NEW_QUALITY" ]; then
-        if [ "$NEW_QUALITY" -ge 1 ] 2>/dev/null && [ "$NEW_QUALITY" -le 100 ] 2>/dev/null; then
-            sed -i "s/heic_jpeg_quality: .*/heic_jpeg_quality: $NEW_QUALITY/" "$CONFIG"
-            echo "✓ JPEG quality set to $NEW_QUALITY"
-        else
-            echo "  ⚠ Invalid quality '$NEW_QUALITY' — keeping $CURRENT_QUALITY"
-        fi
-    else
-        echo "✓ JPEG quality: $CURRENT_QUALITY"
     fi
 fi
 
@@ -1028,13 +682,13 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
         systemctl --user stop mautrix-imessage
     elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-        sudo systemctl stop mautrix-imessage
+        systemctl stop mautrix-imessage
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
         echo "Clearing stale local state before login..."
         rm -f "$DB_URI" "$DB_URI-wal" "$DB_URI-shm"
-        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR/trustedpeers.plist"
+        rm -f "$SESSION_DIR/session.json" "$SESSION_DIR/identity.plist" "$SESSION_DIR"/trustedpeers*.plist
     fi
 
     # Run login from DATA_DIR so that relative paths (state/anisette/)
@@ -1057,7 +711,113 @@ fi
 if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
     systemctl --user stop mautrix-imessage
 elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-    sudo systemctl stop mautrix-imessage
+    systemctl stop mautrix-imessage
+fi
+
+# ── Contact source / CardDAV setup ───────────────────────────
+# Skip if login just ran — the login flow already asked about contact source.
+# On re-runs with an existing session, allow reconfiguration.
+# Reads and writes per-user metadata in the bridge DB (not config.yaml).
+if [ -t 0 ] && [ "${LOGIN_RAN:-false}" = "false" ] && command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
+    CURRENT_CARDDAV_EMAIL=$(sqlite3 "$DB_URI" "SELECT coalesce(json_extract(metadata, '$.CardDAVEmail'), '') FROM user_login LIMIT 1;" 2>/dev/null || true)
+    CONFIGURE_CARDDAV=false
+
+    if [ -n "$CURRENT_CARDDAV_EMAIL" ]; then
+        echo ""
+        echo "Contact source: External CardDAV ($CURRENT_CARDDAV_EMAIL)"
+        read -p "Change contact provider? [y/N]: " CHANGE_CONTACTS
+        case "$CHANGE_CONTACTS" in
+            [yY]*) CONFIGURE_CARDDAV=true ;;
+        esac
+    else
+        echo ""
+        echo "Contact source (for resolving names in chats):"
+        echo "  1) iCloud (default — uses your Apple ID)"
+        echo "  2) Google Contacts (requires app password)"
+        echo "  3) Fastmail"
+        echo "  4) Nextcloud"
+        echo "  5) Other CardDAV server"
+        read -p "Choice [1]: " CONTACT_CHOICE
+        CONTACT_CHOICE="${CONTACT_CHOICE:-1}"
+        if [ "$CONTACT_CHOICE" != "1" ]; then
+            CONFIGURE_CARDDAV=true
+        fi
+    fi
+
+    if [ "$CONFIGURE_CARDDAV" = true ]; then
+        if [ -n "$CURRENT_CARDDAV_EMAIL" ]; then
+            echo ""
+            echo "  1) iCloud (remove external CardDAV)"
+            echo "  2) Google Contacts (requires app password)"
+            echo "  3) Fastmail"
+            echo "  4) Nextcloud"
+            echo "  5) Other CardDAV server"
+            read -p "Choice: " CONTACT_CHOICE
+        fi
+
+        CARDDAV_EMAIL=""
+        CARDDAV_PASSWORD=""
+        CARDDAV_USERNAME=""
+        CARDDAV_URL=""
+
+        if [ "${CONTACT_CHOICE:-}" = "1" ]; then
+            sqlite3 "$DB_URI" "UPDATE user_login SET metadata = json_set(metadata, '$.CardDAVEmail', '', '$.CardDAVURL', '', '$.CardDAVUsername', '', '$.CardDAVPasswordEncrypted', '');"
+            echo "✓ Switched to iCloud contacts"
+        elif [ -n "${CONTACT_CHOICE:-}" ]; then
+            read -p "Email address: " CARDDAV_EMAIL
+            if [ -z "$CARDDAV_EMAIL" ]; then
+                echo "ERROR: Email is required." >&2
+                exit 1
+            fi
+
+            case "$CONTACT_CHOICE" in
+                2)
+                    CARDDAV_URL="https://www.googleapis.com/carddav/v1/principals/$CARDDAV_EMAIL/lists/default/"
+                    echo "  Note: Use a Google App Password, without spaces (https://myaccount.google.com/apppasswords)"
+                    ;;
+                3)
+                    CARDDAV_URL="https://carddav.fastmail.com/dav/addressbooks/user/$CARDDAV_EMAIL/Default/"
+                    echo "  Note: Use a Fastmail App Password (Settings → Privacy & Security → App Passwords)"
+                    ;;
+                4)
+                    read -p "Nextcloud server URL (e.g. https://cloud.example.com): " NC_SERVER
+                    NC_SERVER="${NC_SERVER%/}"
+                    CARDDAV_URL="$NC_SERVER/remote.php/dav"
+                    ;;
+                5)
+                    read -p "CardDAV server URL: " CARDDAV_URL
+                    if [ -z "$CARDDAV_URL" ]; then
+                        echo "ERROR: URL is required." >&2
+                        exit 1
+                    fi
+                    ;;
+            esac
+
+            read -p "Username (leave empty to use email): " CARDDAV_USERNAME
+            read -s -p "App password: " CARDDAV_PASSWORD
+            echo ""
+            if [ -z "$CARDDAV_PASSWORD" ]; then
+                echo "ERROR: Password is required." >&2
+                exit 1
+            fi
+
+            CARDDAV_ARGS="--email $CARDDAV_EMAIL --password $CARDDAV_PASSWORD --url $CARDDAV_URL"
+            if [ -n "$CARDDAV_USERNAME" ]; then
+                CARDDAV_ARGS="$CARDDAV_ARGS --username $CARDDAV_USERNAME"
+            fi
+            CARDDAV_JSON=$("$BINARY" carddav-setup $CARDDAV_ARGS 2>/dev/null) || CARDDAV_JSON=""
+
+            if [ -z "$CARDDAV_JSON" ]; then
+                echo "⚠  CardDAV setup failed. You can reconfigure with 'set-carddav' in the bridge bot."
+            else
+                CARDDAV_RESOLVED_URL=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['url'])")
+                CARDDAV_ENC=$(echo "$CARDDAV_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['password_encrypted'])")
+                EFFECTIVE_USERNAME="${CARDDAV_USERNAME:-$CARDDAV_EMAIL}"
+                sqlite3 "$DB_URI" "UPDATE user_login SET metadata = json_set(metadata, '$.CardDAVEmail', '$CARDDAV_EMAIL', '$.CardDAVURL', '$CARDDAV_RESOLVED_URL', '$.CardDAVUsername', '$EFFECTIVE_USERNAME', '$.CardDAVPasswordEncrypted', '$CARDDAV_ENC');"
+                echo "✓ CardDAV configured: $CARDDAV_EMAIL → $CARDDAV_RESOLVED_URL"
+            fi
+        fi
+    fi
 fi
 
 # ── Optional shell shortcuts (asked before preferred handle so the
@@ -1071,8 +831,8 @@ if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep 
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
 elif systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
-    _SHORTCUT_SYSCTL="sudo systemctl"
-    _SHORTCUT_JCTL="sudo journalctl"
+    _SHORTCUT_SYSCTL="systemctl"
+    _SHORTCUT_JCTL="journalctl"
 else
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
@@ -1138,7 +898,6 @@ esac
 echo ""
 
 # ── Preferred handle (runs every time, can reconfigure) ────────
-HANDLE_BACKUP="$DATA_DIR/.preferred-handle"
 # Re-read in case login just set it
 CURRENT_HANDLE=$(grep 'preferred_handle:' "$CONFIG" 2>/dev/null | head -1 | sed "s/.*preferred_handle: *//;s/['\"]//g" | tr -d ' ' || true)
 
@@ -1149,9 +908,6 @@ if [ -z "$CURRENT_HANDLE" ]; then
     fi
     if [ -z "$CURRENT_HANDLE" ] && [ -f "$SESSION_DIR/session.json" ] && command -v python3 >/dev/null 2>&1; then
         CURRENT_HANDLE=$(python3 -c "import json; print(json.load(open('$SESSION_DIR/session.json')).get('preferred_handle',''))" 2>/dev/null || true)
-    fi
-    if [ -z "$CURRENT_HANDLE" ] && [ -f "$HANDLE_BACKUP" ]; then
-        CURRENT_HANDLE=$(cat "$HANDLE_BACKUP")
     fi
 fi
 
@@ -1204,15 +960,12 @@ if [ -t 0 ] && { [ "$LOGIN_RAN" != "true" ] || [ -z "$CURRENT_HANDLE" ]; }; then
     fi
 fi
 
-# Write preferred handle to config (add key if missing, patch if present)
+# Write preferred handle to DB
 if [ -n "${CURRENT_HANDLE:-}" ]; then
-    if grep -q 'preferred_handle:' "$CONFIG" 2>/dev/null; then
-        sed -i "s|preferred_handle: .*|preferred_handle: '$CURRENT_HANDLE'|" "$CONFIG"
-    else
-        sed -i "/^network:/a\\    preferred_handle: '$CURRENT_HANDLE'" "$CONFIG"
+    if command -v sqlite3 >/dev/null 2>&1 && [ -n "${DB_URI:-}" ] && [ -f "${DB_URI:-}" ]; then
+        sqlite3 "$DB_URI" "UPDATE user_login SET metadata = json_set(metadata, '$.preferred_handle', '$CURRENT_HANDLE');"
     fi
     echo "✓ Preferred handle: $CURRENT_HANDLE"
-    echo "$CURRENT_HANDLE" > "$HANDLE_BACKUP"
 fi
 
 # ── Install / update systemd service ─────────────────────────
@@ -1238,7 +991,7 @@ fi
 install_systemd_user() {
     # Enable lingering so user services survive SSH session closures
     if command -v loginctl >/dev/null 2>&1 && [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
-        sudo loginctl enable-linger "$USER" 2>/dev/null || true
+        loginctl enable-linger "$USER" 2>/dev/null || true
     fi
     mkdir -p "$(dirname "$USER_SERVICE_FILE")"
     cat > "$USER_SERVICE_FILE" << EOF

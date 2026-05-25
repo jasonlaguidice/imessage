@@ -49,6 +49,21 @@ type UserLoginMetadata struct {
 	// (e.g. "tel:+15551234567" or "mailto:user@example.com").
 	PreferredHandle string `json:"preferred_handle,omitempty"`
 
+	// Per-user feature toggles — overrides the global config when non-nil.
+	// Set during the login flow; nil means "use global config default".
+	VideoTranscoding       *bool `json:"video_transcoding,omitempty"`
+	HEICConversion         *bool `json:"heic_conversion,omitempty"`
+	CloudKitBackfill       *bool `json:"cloudkit_backfill,omitempty"`
+	DisableFaceTime        *bool `json:"disable_facetime,omitempty"`
+	StatusKitNotifications *bool `json:"statuskit_notifications,omitempty"`
+
+	// Per-user external CardDAV configuration (optional).
+	// When set, used instead of iCloud contacts and the global config.yaml carddav section.
+	CardDAVEmail             string `json:"carddav_email,omitempty"`
+	CardDAVURL               string `json:"carddav_url,omitempty"`
+	CardDAVUsername          string `json:"carddav_username,omitempty"`
+	CardDAVPasswordEncrypted string `json:"carddav_password_encrypted,omitempty"`
+
 	// iCloud account persist data for TokenProvider restoration.
 	// Allows CardDAV contacts and CloudKit to work across restarts.
 	AccountUsername          string `json:"account_username,omitempty"`
@@ -62,6 +77,8 @@ type UserLoginMetadata struct {
 	// without needing to refresh (which requires a still-valid PET).
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
 }
+
+func boolPtr(b bool) *bool { return &b }
 
 func (c *IMConnector) GetDBMetaTypes() database.MetaTypes {
 	return database.MetaTypes{

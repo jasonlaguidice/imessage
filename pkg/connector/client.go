@@ -107,6 +107,56 @@ type restorePipelineOptions struct {
 
 const maxAttachmentRetries = 3
 
+func (c *IMClient) videoTranscoding() bool {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.VideoTranscoding != nil {
+		return *meta.VideoTranscoding
+	}
+	return c.Main.Config.VideoTranscoding
+}
+
+func (c *IMClient) heicConversion() bool {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.HEICConversion != nil {
+		return *meta.HEICConversion
+	}
+	return c.Main.Config.HEICConversion
+}
+
+func (c *IMClient) useCloudKitBackfill() bool {
+	if !c.Main.Config.UseCloudKitBackfill() {
+		return false
+	}
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.CloudKitBackfill != nil {
+		return *meta.CloudKitBackfill
+	}
+	return true
+}
+
+func (c *IMClient) externalCardDAVConfig() CardDAVConfig {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.CardDAVEmail != "" && meta.CardDAVPasswordEncrypted != "" {
+		return CardDAVConfig{
+			Email:             meta.CardDAVEmail,
+			URL:               meta.CardDAVURL,
+			Username:          meta.CardDAVUsername,
+			PasswordEncrypted: meta.CardDAVPasswordEncrypted,
+		}
+	}
+	return c.Main.Config.CardDAV
+}
+
+func (c *IMClient) disableFaceTime() bool {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.DisableFaceTime != nil {
+		return *meta.DisableFaceTime
+	}
+	return c.Main.Config.DisableFaceTime
+}
+
+func (c *IMClient) statusKitNotifications() bool {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.StatusKitNotifications != nil {
+		return *meta.StatusKitNotifications
+	}
+	return c.Main.Config.StatusKitNotifications
+}
+
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
 func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
@@ -1042,7 +1092,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}(c.handle)
 	}
 
-	if c.Main.Config.VideoTranscoding {
+	if c.videoTranscoding() {
 		if ffmpeg.Supported() {
 			log.Info().Msg("Video transcoding enabled (ffmpeg found)")
 		} else {
@@ -1050,7 +1100,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 
-	if c.Main.Config.HEICConversion {
+	if c.heicConversion() {
 		log.Info().Msg("HEIC conversion enabled (libheif)")
 	}
 
@@ -1274,12 +1324,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	go c.maybeSendManagementRoomWelcome(context.Background(), log)
 
-	// Set up contact source: external CardDAV > local macOS > iCloud CardDAV
-	if c.Main.Config.CardDAV.IsConfigured() {
-		extContacts := newExternalCardDAVClient(c.Main.Config.CardDAV, log)
+	// Set up contact source: external CardDAV (per-user or global) > local macOS > iCloud CardDAV
+	cardDAVCfg := c.externalCardDAVConfig()
+	if cardDAVCfg.IsConfigured() {
+		extContacts := newExternalCardDAVClient(cardDAVCfg, log)
 		if extContacts != nil {
 			c.contacts = extContacts
-			log.Info().Str("email", c.Main.Config.CardDAV.Email).Msg("Using external CardDAV for contacts")
+			log.Info().Str("email", cardDAVCfg.Email).Msg("Using external CardDAV for contacts")
 			if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
 				log.Warn().Err(syncErr).Msg("Initial external CardDAV sync failed")
 			} else {
@@ -1333,7 +1384,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 		// No CloudKit gate needed — open immediately
 		c.setCloudSyncDone()
-	} else if cloudStoreReady && c.Main.Config.UseCloudKitBackfill() {
+	} else if cloudStoreReady && c.useCloudKitBackfill() {
 		c.startCloudSyncController(log)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
@@ -1488,7 +1539,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		Str("user", user).
 		Logger()
 
-	if !c.Main.Config.StatusKitNotifications {
+	if !c.statusKitNotifications() {
 		log.Debug().Msg("StatusKit notifications disabled in config — dropping update")
 		return
 	}
@@ -2818,7 +2869,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 					*data.Attachment.MmcsDescriptorJson != "" {
 					c.enqueuePendingMMCSRecovery(ctx, portal, data)
 				}
-				return convertAttachment(ctx, portal, intent, data, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
+				return convertAttachment(ctx, portal, intent, data, c.videoTranscoding(), c.heicConversion(), c.Main.Config.HEICJPEGQuality)
 			},
 		})
 	}
@@ -3358,7 +3409,7 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 	if strings.HasPrefix(rawText, faceTimeRingMarker) ||
 		strings.HasPrefix(rawText, faceTimeMissedMarker) ||
 		strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker) {
-		if c.Main.Config.DisableFaceTime {
+		if c.disableFaceTime() {
 			return
 		}
 		switch {
@@ -3773,7 +3824,7 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 	}
 
 	// chatdb backend: preserve master behavior — ignore Apple-initiated deletes.
-	if !c.Main.Config.UseCloudKitBackfill() {
+	if !c.useCloudKitBackfill() {
 		log.Info().Str("delete_type", deleteType).Msg("Ignoring incoming Apple chat delete (chatdb backend)")
 		return
 	}
@@ -3827,7 +3878,7 @@ func (c *IMClient) handleChatDelete(log zerolog.Logger, msg rustpushgo.WrappedMe
 
 func (c *IMClient) handleChatRecover(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
 	// chatdb backend: no-op. Recovery is CloudKit-only.
-	if !c.Main.Config.UseCloudKitBackfill() {
+	if !c.useCloudKitBackfill() {
 		log.Debug().Msg("Ignoring RecoverChat (chatdb backend)")
 		return
 	}
@@ -4008,7 +4059,7 @@ func (c *IMClient) runRestoreBackfillPipeline(opts restorePipelineOptions) {
 		Str("source", opts.Source).
 		Logger()
 
-	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
+	if !c.useCloudKitBackfill() || c.cloudStore == nil {
 		log.Warn().Msg("Restore pipeline started without CloudKit backfill; queueing plain ChatResync")
 		c.refreshRecoveredPortalAfterCloudSync(log, portalKey, opts.Source)
 		c.notifyRestoreStatus(opts, "Restore of **%s** queued.", displayName)
@@ -6004,7 +6055,7 @@ func (c *IMClient) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.Mat
 
 	// Delete from Apple — CloudKit backend only. chatdb users should not have
 	// Apple-side chats deleted when they remove a portal from Beeper.
-	if c.Main.Config.UseCloudKitBackfill() {
+	if c.useCloudKitBackfill() {
 		c.deleteFromApple(portalID, conv, chatGuid, chatRecordNames, msgRecordNames)
 	}
 
@@ -6697,7 +6748,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		return c.chatDB.FetchMessages(ctx, params, c)
 	}
 
-	if !c.Main.Config.UseCloudKitBackfill() || c.cloudStore == nil {
+	if !c.useCloudKitBackfill() || c.cloudStore == nil {
 		log.Debug().Bool("forward", params.Forward).Bool("backfill_enabled", c.Main.Config.CloudKitBackfill).
 			Msg("FetchMessages: backfill disabled or no cloud store, returning empty")
 		return &bridgev2.FetchMessagesResponse{HasMore: false, Forward: params.Forward}, nil
@@ -7633,7 +7684,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 	}
 
 	// Remux/transcode non-MP4 videos to MP4 for broad Matrix client compatibility.
-	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+	if c.videoTranscoding() && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
 		method := "remux"
@@ -7663,7 +7714,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 
 	// Convert HEIC/HEIF images to JPEG since most Matrix clients can't display HEIC.
 	var heicImg image.Image
-	data, mimeType, fileName, heicImg = maybeConvertHEIC(&log, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.Main.Config.HEICConversion)
+	data, mimeType, fileName, heicImg = maybeConvertHEIC(&log, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.heicConversion())
 
 	// Convert non-JPEG images to JPEG and extract dimensions/thumbnail
 	var imgWidth, imgHeight int
@@ -7813,7 +7864,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		}
 
 		// Remux/transcode the avid video if enabled.
-		if c.Main.Config.VideoTranscoding && ffmpeg.Supported() {
+		if c.videoTranscoding() && ffmpeg.Supported() {
 			origSize := len(avidData)
 			method := "remux"
 			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,

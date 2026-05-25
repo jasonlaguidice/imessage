@@ -233,7 +233,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			if att == nil {
 				continue
 			}
-			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
+			attCm, err := convertChatDBAttachment(ctx, params.Portal, intent, msg, att, c.videoTranscoding(), c.heicConversion(), c.Main.Config.HEICJPEGQuality)
 			if err != nil {
 				log.Warn().Err(err).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert attachment, skipping")
 				continue
@@ -254,7 +254,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			// If there's a Live Photo MOV companion on disk, bridge it too.
 			movAtt := chatDBResolveLivePhoto(att, log)
 			if movAtt.PathOnDisk != att.PathOnDisk {
-				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.Main.Config.VideoTranscoding, c.Main.Config.HEICConversion, c.Main.Config.HEICJPEGQuality)
+				movCm, movErr := convertChatDBAttachment(ctx, params.Portal, intent, msg, movAtt, c.videoTranscoding(), c.heicConversion(), c.Main.Config.HEICJPEGQuality)
 				if movErr != nil {
 					log.Warn().Err(movErr).Str("guid", msg.GUID).Int("att_index", i).Msg("Failed to convert Live Photo MOV companion, skipping")
 				} else {

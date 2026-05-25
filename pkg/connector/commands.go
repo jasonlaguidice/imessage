@@ -74,6 +74,7 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdContacts,
+		cmdSetCardDAV,
 	}
 	if !disableFaceTime {
 		cmds = append(cmds,
@@ -511,7 +512,7 @@ func fnRestoreChat(ce *commands.Event) {
 	}
 
 	// CloudKit backend: use delete-aware CloudKit restore.
-	if client.Main.Config.UseCloudKitBackfill() && client.cloudStore != nil {
+	if client.useCloudKitBackfill() && client.cloudStore != nil {
 		fnRestoreChatFromCloudKit(ce, login, client)
 		return
 	}
@@ -1063,7 +1064,7 @@ func (c *IMClient) restorePortalByID(_ context.Context, portalID string) error {
 		Receiver: c.UserLogin.ID,
 	}
 
-	if c.Main.Config.UseCloudKitBackfill() && c.cloudStore != nil {
+	if c.useCloudKitBackfill() && c.cloudStore != nil {
 		return c.startRestoreBackfillPipeline(restorePipelineOptions{
 			PortalID:       portalID,
 			PortalKey:      portalKey,
@@ -1115,7 +1116,7 @@ func fnRestoreDebug(ce *commands.Event) {
 		return
 	}
 
-	if !client.Main.Config.UseCloudKitBackfill() || client.cloudStore == nil {
+	if !client.useCloudKitBackfill() || client.cloudStore == nil {
 		ce.Reply("CloudKit backfill is not enabled.")
 		return
 	}
@@ -1236,7 +1237,7 @@ func fnMsgDebug(ce *commands.Event) {
 		ce.Reply("Bridge client not available.")
 		return
 	}
-	if !client.Main.Config.UseCloudKitBackfill() || client.cloudStore == nil {
+	if !client.useCloudKitBackfill() || client.cloudStore == nil {
 		ce.Reply("CloudKit backfill not enabled.")
 		return
 	}
@@ -1398,4 +1399,265 @@ func fnMsgDebug(ce *commands.Event) {
 	}
 
 	ce.Reply(sb.String())
+}
+
+
+// ============================================================================
+// set-carddav command
+// ============================================================================
+
+var cmdSetCardDAV = &commands.FullHandler{
+	Name:    "set-carddav",
+	Aliases: []string{"carddav"},
+	Func:    fnSetCardDAV,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionChats,
+		Description: "Change your contact sync source (iCloud, Google, Fastmail, Nextcloud, or other CardDAV)",
+	},
+	RequiresLogin: true,
+}
+
+func fnSetCardDAV(ce *commands.Event) {
+	ce.Reply("**Contact source**\n\n" +
+		"1. iCloud Contacts (uses your Apple ID — no setup needed)\n" +
+		"2. Google Contacts (requires a Google App Password)\n" +
+		"3. Fastmail (requires a Fastmail App Password)\n" +
+		"4. Nextcloud\n" +
+		"5. Other CardDAV server\n\n" +
+		"Reply with a number, or `$cmdprefix cancel` to cancel.")
+
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "set contact source",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			switch parseContactSource(strings.TrimSpace(ce.RawArgs)) {
+			case "1":
+				setCardDAVApplyConfig(ce, "", "", "", "")
+			case "2":
+				setCardDAVAskEmail(ce, "google")
+			case "3":
+				setCardDAVAskEmail(ce, "fastmail")
+			case "4":
+				setCardDAVAskNextcloudEmail(ce)
+			case "5":
+				setCardDAVAskOtherEmail(ce)
+			default:
+				ce.Reply("Invalid choice. Run `$cmdprefix set-carddav` to try again.")
+			}
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskEmail(ce *commands.Event, provider string) {
+	if provider == "google" {
+		ce.Reply("Enter your Google account email address:")
+	} else {
+		ce.Reply("Enter your Fastmail email address:")
+	}
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter email",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			email := strings.TrimSpace(ce.RawArgs)
+			if email == "" {
+				ce.Reply("Email cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVAskPassword(ce, provider, email)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskPassword(ce *commands.Event, provider, email string) {
+	if provider == "google" {
+		ce.Reply("Enter your Google App Password (not your regular Google password).\n\n" +
+			"Create one at myaccount.google.com/apppasswords — remove all spaces from the generated password.")
+	} else {
+		ce.Reply("Enter your Fastmail App Password (not your regular Fastmail password).\n\n" +
+			"Create one at Settings → Privacy & Security → App Passwords.")
+	}
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter password",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			password := strings.TrimSpace(ce.RawArgs)
+			if password == "" {
+				ce.Reply("Password cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			var url string
+			if provider == "google" {
+				url = "https://www.googleapis.com/carddav/v1/principals/" + email + "/lists/default/"
+			} else {
+				url = "https://carddav.fastmail.com/dav/addressbooks/user/" + email + "/Default/"
+			}
+			setCardDAVApplyConfig(ce, email, url, email, password)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskNextcloudEmail(ce *commands.Event) {
+	ce.Reply("Enter your Nextcloud username or email address:")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter nextcloud email",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			email := strings.TrimSpace(ce.RawArgs)
+			if email == "" {
+				ce.Reply("Email cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVAskNextcloudServerURL(ce, email)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskNextcloudServerURL(ce *commands.Event, email string) {
+	ce.Reply("Enter your Nextcloud server URL (e.g. https://cloud.example.com):")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter nextcloud server url",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			serverURL := strings.TrimSpace(ce.RawArgs)
+			if serverURL == "" {
+				ce.Reply("Server URL cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVAskNextcloudPassword(ce, email, serverURL)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskNextcloudPassword(ce *commands.Event, email, serverURL string) {
+	ce.Reply("Enter your Nextcloud password:")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter nextcloud password",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			password := strings.TrimSpace(ce.RawArgs)
+			if password == "" {
+				ce.Reply("Password cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			url := strings.TrimRight(serverURL, "/") + "/remote.php/dav"
+			setCardDAVApplyConfig(ce, email, url, email, password)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskOtherEmail(ce *commands.Event) {
+	ce.Reply("Enter your email address:")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter carddav email",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			email := strings.TrimSpace(ce.RawArgs)
+			if email == "" {
+				ce.Reply("Email cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVAskOtherURL(ce, email)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskOtherURL(ce *commands.Event, email string) {
+	ce.Reply("Enter your CardDAV server URL:")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter carddav url",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			url := strings.TrimSpace(ce.RawArgs)
+			if url == "" {
+				ce.Reply("URL cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVAskOtherUsername(ce, email, url)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskOtherUsername(ce *commands.Event, email, url string) {
+	ce.Reply("Enter your username (enter your email address if it is the same as your login):")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter carddav username",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			username := strings.TrimSpace(ce.RawArgs)
+			if username == "" {
+				ce.Reply("Username cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVAskOtherPassword(ce, email, url, username)
+		}),
+		Cancel: func() {},
+	})
+}
+
+func setCardDAVAskOtherPassword(ce *commands.Event, email, url, username string) {
+	ce.Reply("Enter your CardDAV password:")
+	commands.StoreCommandState(ce.User, &commands.CommandState{
+		Action: "enter carddav password",
+		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			commands.StoreCommandState(ce.User, nil)
+			password := strings.TrimSpace(ce.RawArgs)
+			if password == "" {
+				ce.Reply("Password cannot be empty. Run `$cmdprefix set-carddav` to try again.")
+				return
+			}
+			setCardDAVApplyConfig(ce, email, url, username, password)
+		}),
+		Cancel: func() {},
+	})
+}
+
+// setCardDAVApplyConfig encrypts the password, updates UserLoginMetadata, saves,
+// and tells the user to restart. Pass empty email to switch back to iCloud.
+func setCardDAVApplyConfig(ce *commands.Event, email, url, username, plainPassword string) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	meta, ok := login.Metadata.(*UserLoginMetadata)
+	if !ok || meta == nil {
+		ce.Reply("Login metadata unavailable.")
+		return
+	}
+
+	if email == "" {
+		meta.CardDAVEmail = ""
+		meta.CardDAVURL = ""
+		meta.CardDAVUsername = ""
+		meta.CardDAVPasswordEncrypted = ""
+		if err := login.Save(ce.Ctx); err != nil {
+			ce.Reply("Failed to save settings: %v", err)
+			return
+		}
+		ce.Reply("Switched to iCloud contacts. **Restart the bridge to apply.**")
+		return
+	}
+
+	encrypted, err := EncryptCardDAVPassword(plainPassword)
+	if err != nil {
+		ce.Reply("Failed to encrypt password: %v", err)
+		return
+	}
+	meta.CardDAVEmail = email
+	meta.CardDAVURL = url
+	meta.CardDAVUsername = username
+	meta.CardDAVPasswordEncrypted = encrypted
+	if err := login.Save(ce.Ctx); err != nil {
+		ce.Reply("Failed to save settings: %v", err)
+		return
+	}
+	ce.Reply("CardDAV configured for **%s**. **Restart the bridge to apply.**", email)
 }

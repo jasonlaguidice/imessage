@@ -36,8 +36,8 @@ APT_PACKAGES=$(echo "$APT_PACKAGES" | tr ' ' '\n' | sort -u | tr '\n' ' ')
 
 if [ -n "$APT_PACKAGES" ]; then
     echo "Installing system packages:$APT_PACKAGES"
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq $APT_PACKAGES
+    apt-get update -qq
+    apt-get install -y -qq $APT_PACKAGES
     echo "✓ System packages installed"
 else
     echo "✓ System packages already installed"
@@ -92,8 +92,8 @@ install_go() {
     esac
     echo "  Downloading $GO_VERSION (linux/$ARCH)..."
     curl -sSL "https://go.dev/dl/${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz
-    sudo rm -rf /usr/local/go
-    sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+    rm -rf /usr/local/go
+    tar -C /usr/local -xzf /tmp/go.tar.gz
     rm -f /tmp/go.tar.gz
     export PATH="/usr/local/go/bin:$PATH"
     # Persist for future shells
@@ -126,9 +126,9 @@ if openssl s_client -connect identity.ess.apple.com:443 </dev/null 2>&1 | grep -
 else
     echo "Installing Apple Root CA..."
     wget -qO /tmp/AppleRootCA.cer 'https://www.apple.com/appleca/AppleIncRootCertificate.cer'
-    sudo openssl x509 -inform DER -in /tmp/AppleRootCA.cer \
+    openssl x509 -inform DER -in /tmp/AppleRootCA.cer \
         -out /usr/local/share/ca-certificates/AppleRootCA.crt
-    sudo update-ca-certificates --fresh >/dev/null 2>&1
+    update-ca-certificates --fresh >/dev/null 2>&1
     rm -f /tmp/AppleRootCA.cer
     echo "✓ Apple Root CA installed"
 fi

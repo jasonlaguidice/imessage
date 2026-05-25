@@ -693,7 +693,7 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 	}
 
 	// Video transcoding: non-MP4 → MP4
-	if c.Main.Config.VideoTranscoding && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
+	if c.videoTranscoding() && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
@@ -716,7 +716,7 @@ func (c *IMClient) processSharedAlbumAsset(ctx context.Context, logger zerolog.L
 
 	// HEIC → JPEG
 	var heicImg image.Image
-	data, mimeType, fileName, heicImg = maybeConvertHEIC(&logger, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.Main.Config.HEICConversion)
+	data, mimeType, fileName, heicImg = maybeConvertHEIC(&logger, data, mimeType, fileName, c.Main.Config.HEICJPEGQuality, c.heicConversion())
 
 	// Image dimension extraction and thumbnail generation
 	var imgWidth, imgHeight int

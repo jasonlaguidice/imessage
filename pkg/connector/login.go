@@ -35,6 +35,16 @@ const (
 	LoginStepDevicePasscode  = "fi.mau.imessage.login.device_passcode"
 	LoginStepSelectHandle    = "fi.mau.imessage.login.select_handle"
 	LoginStepComplete        = "fi.mau.imessage.login.complete"
+	LoginStepCloudKitBackfill = "fi.mau.imessage.login.cloudkit_backfill"
+	LoginStepVideoTranscoding = "fi.mau.imessage.login.video_transcoding"
+	LoginStepHEICConversion   = "fi.mau.imessage.login.heic_conversion"
+	LoginStepContactSource    = "fi.mau.imessage.login.contact_source"
+	LoginStepCardDAVGoogle    = "fi.mau.imessage.login.carddav_google"
+	LoginStepCardDAVFastmail  = "fi.mau.imessage.login.carddav_fastmail"
+	LoginStepCardDAVNextcloud = "fi.mau.imessage.login.carddav_nextcloud"
+	LoginStepCardDAVOther     = "fi.mau.imessage.login.carddav_other"
+	LoginStepFaceTime         = "fi.mau.imessage.login.facetime"
+	LoginStepStatusKit        = "fi.mau.imessage.login.statuskit"
 )
 
 // AppleIDLogin implements the multi-step login flow:
@@ -50,6 +60,16 @@ type AppleIDLogin struct {
 	handle         string                                 // chosen handle
 	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
 	selectedDevice int                                    // index into devices (-1 = not yet selected)
+	cloudKitBackfill         bool
+	videoTranscoding         bool
+	heicConversion           bool
+	disableFaceTime          bool
+	statusKitNotifications   bool
+	handleSelected           bool
+	cardDAVEmail             string
+	cardDAVURL               string
+	cardDAVUsername          string
+	cardDAVPasswordEncrypted string
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -94,6 +114,97 @@ func (l *AppleIDLogin) Start(ctx context.Context) (*bridgev2.LoginStep, error) {
 }
 
 func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	// Post-handle steps (video transcoding, HEIC conversion, CardDAV setup, FaceTime, StatusKit)
+	if l.handleSelected {
+		// Other CardDAV: has carddav_url field (all 4 required)
+		if url, ok := input["carddav_url"]; ok {
+			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			l.cardDAVEmail = input["carddav_email"]
+			l.cardDAVURL = url
+			l.cardDAVUsername = input["carddav_username"]
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Nextcloud: has nextcloud_server_url field; derive CardDAV URL
+		if serverURL, ok := input["nextcloud_server_url"]; ok {
+			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			email := input["carddav_email"]
+			l.cardDAVEmail = email
+			l.cardDAVURL = strings.TrimRight(serverURL, "/") + "/remote.php/dav"
+			l.cardDAVUsername = email
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Fastmail: has fastmail_app_password field; derive CardDAV URL
+		if pw, ok := input["fastmail_app_password"]; ok {
+			encrypted, err := EncryptCardDAVPassword(pw)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			email := input["carddav_email"]
+			l.cardDAVEmail = email
+			l.cardDAVURL = "https://carddav.fastmail.com/dav/addressbooks/user/" + email + "/Default/"
+			l.cardDAVUsername = email
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Google: has google_app_password field; derive CardDAV URL
+		if pw, ok := input["google_app_password"]; ok {
+			encrypted, err := EncryptCardDAVPassword(pw)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			email := input["carddav_email"]
+			l.cardDAVEmail = email
+			l.cardDAVURL = "https://www.googleapis.com/carddav/v1/principals/" + email + "/lists/default/"
+			l.cardDAVUsername = email
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Contact source picker response
+		if raw, ok := input["contact_source"]; ok {
+			source := parseContactSource(raw)
+			switch source {
+			case "1": // iCloud — no external CardDAV needed
+				return l.askFaceTimeStep()
+			case "2":
+				return l.askCardDAVGoogleStep()
+			case "3":
+				return l.askCardDAVFastmailStep()
+			case "4":
+				return l.askCardDAVNextcloudStep()
+			case "5":
+				return l.askCardDAVOtherStep()
+			}
+			return l.askFaceTimeStep()
+		}
+		if ft, ok := input["facetime_bridge"]; ok {
+			disabled := ft == "no"
+			l.disableFaceTime = disabled
+			return l.askStatusKitStep()
+		}
+		if sk, ok := input["statuskit_notifications"]; ok {
+			enabled := sk == "yes"
+			l.statusKitNotifications = enabled
+			return l.completeLogin(ctx)
+		}
+		if hc, ok := input["heic_conversion"]; ok {
+			l.heicConversion = hc == "yes"
+			return l.askContactSourceStep()
+		}
+		if vt, ok := input["video_transcoding"]; ok {
+			l.videoTranscoding = vt == "yes"
+			return l.askHEICConversionStep()
+		}
+		return l.completeLogin(ctx)
+	}
+
 	// Device passcode step (after device selection, before handle selection)
 	if passcode, ok := input["passcode"]; ok && l.result != nil {
 		return l.handlePasscodeAndContinue(ctx, passcode)
@@ -104,10 +215,16 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		return l.handleDeviceSelection(device)
 	}
 
-	// Handle selection step (after device passcode)
+	// CloudKit backfill preference (only when globally enabled, before device steps)
+	if ck, ok := input["cloudkit_backfill"]; ok && l.result != nil {
+		return l.handleCloudKitBackfillChoice(ctx, ck)
+	}
+
+	// Handle selection step (catch-all when IDS registration is done)
 	if l.result != nil {
 		l.handle = parseHandleSelection(input["handle"], l.result.Users.GetHandles())
-		return l.completeLogin(ctx)
+		l.handleSelected = true
+		return l.askVideoTranscodingStep()
 	}
 
 	// Step 1: Apple ID + password
@@ -203,10 +320,9 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 	l.result = &result
 	l.selectedDevice = -1
 
-	// Skip device selection and passcode when CloudKit backfill is disabled —
-	// iCloud Keychain is only needed for decrypting CloudKit message records.
+	// When CloudKit is globally disabled, skip device/passcode and CloudKit question.
 	if !l.Main.Config.UseCloudKitBackfill() {
-		log.Info().Msg("CloudKit backfill disabled, skipping device selection and passcode")
+		log.Info().Msg("CloudKit backfill not available, skipping device selection and passcode")
 		handles := l.result.Users.GetHandles()
 		if step := handleSelectionStep(handles); step != nil {
 			return step, nil
@@ -214,10 +330,12 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		if len(handles) > 0 {
 			l.handle = handles[0]
 		}
-		return l.completeLogin(ctx)
+		l.handleSelected = true
+		return l.askVideoTranscodingStep()
 	}
 
-	return fetchDevicesAndPrompt(log, l.result.TokenProvider, &l.devices, &l.selectedDevice)
+	// Ask the user whether they want CloudKit backfill before showing device steps.
+	return l.askCloudKitBackfillStep()
 }
 
 func (l *AppleIDLogin) handleDeviceSelection(device string) (*bridgev2.LoginStep, error) {
@@ -238,20 +356,120 @@ func (l *AppleIDLogin) handlePasscodeAndContinue(ctx context.Context, passcode s
 	if len(handles) > 0 {
 		l.handle = handles[0]
 	}
-	return l.completeLogin(ctx)
+	l.handleSelected = true
+	return l.askVideoTranscodingStep()
 }
 
 func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
+	var cloudKitPref *bool
+	if l.Main.Config.UseCloudKitBackfill() {
+		cloudKitPref = boolPtr(l.cloudKitBackfill)
+	}
 	meta := &UserLoginMetadata{
-		Platform:        "rustpush-local",
-		APSState:        l.conn.State().ToString(),
-		IDSUsers:        l.result.Users.ToString(),
-		IDSIdentity:     l.result.Identity.ToString(),
-		DeviceID:        l.cfg.GetDeviceId(),
-		PreferredHandle: l.handle,
+		Platform:                 "rustpush-local",
+		APSState:                 l.conn.State().ToString(),
+		IDSUsers:                 l.result.Users.ToString(),
+		IDSIdentity:              l.result.Identity.ToString(),
+		DeviceID:                 l.cfg.GetDeviceId(),
+		PreferredHandle:          l.handle,
+		VideoTranscoding:         boolPtr(l.videoTranscoding),
+		HEICConversion:           boolPtr(l.heicConversion),
+		CloudKitBackfill:         cloudKitPref,
+		DisableFaceTime:          boolPtr(l.disableFaceTime),
+		StatusKitNotifications:   boolPtr(l.statusKitNotifications),
+		CardDAVEmail:             l.cardDAVEmail,
+		CardDAVURL:               l.cardDAVURL,
+		CardDAVUsername:          l.cardDAVUsername,
+		CardDAVPasswordEncrypted: l.cardDAVPasswordEncrypted,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
+}
+
+func (l *AppleIDLogin) askContactSourceStep() (*bridgev2.LoginStep, error) {
+	return askContactSourceStep()
+}
+
+func (l *AppleIDLogin) askFaceTimeStep() (*bridgev2.LoginStep, error)  { return askFaceTimeStep() }
+func (l *AppleIDLogin) askStatusKitStep() (*bridgev2.LoginStep, error) { return askStatusKitStep() }
+
+func (l *AppleIDLogin) askCardDAVGoogleStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVGoogleStep()
+}
+
+func (l *AppleIDLogin) askCardDAVFastmailStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVFastmailStep()
+}
+
+func (l *AppleIDLogin) askCardDAVNextcloudStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVNextcloudStep()
+}
+
+func (l *AppleIDLogin) askCardDAVOtherStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVOtherStep()
+}
+
+func (l *AppleIDLogin) askCloudKitBackfillStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepCloudKitBackfill,
+		Instructions: "Enable CloudKit history backfill? (yes/no)\n\n" +
+			"Syncs your full iMessage history from iCloud. " +
+			"If enabled, you will be asked for a device passcode to join your iCloud Keychain.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "cloudkit_backfill",
+				Name: "Enable CloudKit backfill? (yes/no)",
+			}},
+		},
+	}, nil
+}
+
+func (l *AppleIDLogin) handleCloudKitBackfillChoice(ctx context.Context, choice string) (*bridgev2.LoginStep, error) {
+	l.cloudKitBackfill = choice == "yes"
+	if l.cloudKitBackfill {
+		log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+		return fetchDevicesAndPrompt(log, l.result.TokenProvider, &l.devices, &l.selectedDevice)
+	}
+	handles := l.result.Users.GetHandles()
+	if step := handleSelectionStep(handles); step != nil {
+		return step, nil
+	}
+	if len(handles) > 0 {
+		l.handle = handles[0]
+	}
+	l.handleSelected = true
+	return l.askVideoTranscodingStep()
+}
+
+func (l *AppleIDLogin) askVideoTranscodingStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepVideoTranscoding,
+		Instructions: "Enable video transcoding? (yes/no)\n\n" +
+			"Automatically remux incompatible video formats (e.g. MOV → MP4) before bridging to Matrix. Requires ffmpeg.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "video_transcoding",
+				Name: "Enable video transcoding? (yes/no)",
+			}},
+		},
+	}, nil
+}
+
+func (l *AppleIDLogin) askHEICConversionStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepHEICConversion,
+		Instructions: "Enable HEIC→JPEG conversion? (yes/no)\n\n" +
+			"Automatically convert Apple HEIC images to JPEG for better Matrix client compatibility. Requires libheif.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "heic_conversion",
+				Name: "Enable HEIC conversion? (yes/no)",
+			}},
+		},
+	}, nil
 }
 
 // ============================================================================
@@ -272,6 +490,16 @@ type ExternalKeyLogin struct {
 	handle         string                                 // chosen handle
 	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
 	selectedDevice int                                    // index into devices (-1 = not yet selected)
+	cloudKitBackfill         bool
+	videoTranscoding         bool
+	heicConversion           bool
+	disableFaceTime          bool
+	statusKitNotifications   bool
+	handleSelected           bool
+	cardDAVEmail             string
+	cardDAVURL               string
+	cardDAVUsername          string
+	cardDAVPasswordEncrypted string
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -296,6 +524,97 @@ func (l *ExternalKeyLogin) Start(ctx context.Context) (*bridgev2.LoginStep, erro
 }
 
 func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string]string) (*bridgev2.LoginStep, error) {
+	// Post-handle steps (video transcoding, HEIC conversion, CardDAV setup, FaceTime, StatusKit)
+	if l.handleSelected {
+		// Other CardDAV: has carddav_url field (all 4 required)
+		if url, ok := input["carddav_url"]; ok {
+			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			l.cardDAVEmail = input["carddav_email"]
+			l.cardDAVURL = url
+			l.cardDAVUsername = input["carddav_username"]
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Nextcloud: has nextcloud_server_url field; derive CardDAV URL
+		if serverURL, ok := input["nextcloud_server_url"]; ok {
+			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			email := input["carddav_email"]
+			l.cardDAVEmail = email
+			l.cardDAVURL = strings.TrimRight(serverURL, "/") + "/remote.php/dav"
+			l.cardDAVUsername = email
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Fastmail: has fastmail_app_password field; derive CardDAV URL
+		if pw, ok := input["fastmail_app_password"]; ok {
+			encrypted, err := EncryptCardDAVPassword(pw)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			email := input["carddav_email"]
+			l.cardDAVEmail = email
+			l.cardDAVURL = "https://carddav.fastmail.com/dav/addressbooks/user/" + email + "/Default/"
+			l.cardDAVUsername = email
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Google: has google_app_password field; derive CardDAV URL
+		if pw, ok := input["google_app_password"]; ok {
+			encrypted, err := EncryptCardDAVPassword(pw)
+			if err != nil {
+				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
+			}
+			email := input["carddav_email"]
+			l.cardDAVEmail = email
+			l.cardDAVURL = "https://www.googleapis.com/carddav/v1/principals/" + email + "/lists/default/"
+			l.cardDAVUsername = email
+			l.cardDAVPasswordEncrypted = encrypted
+			return l.askFaceTimeStep()
+		}
+		// Contact source picker response
+		if raw, ok := input["contact_source"]; ok {
+			source := parseContactSource(raw)
+			switch source {
+			case "1": // iCloud — no external CardDAV needed
+				return l.askFaceTimeStep()
+			case "2":
+				return l.askCardDAVGoogleStep()
+			case "3":
+				return l.askCardDAVFastmailStep()
+			case "4":
+				return l.askCardDAVNextcloudStep()
+			case "5":
+				return l.askCardDAVOtherStep()
+			}
+			return l.askFaceTimeStep()
+		}
+		if ft, ok := input["facetime_bridge"]; ok {
+			disabled := ft == "no"
+			l.disableFaceTime = disabled
+			return l.askStatusKitStep()
+		}
+		if sk, ok := input["statuskit_notifications"]; ok {
+			enabled := sk == "yes"
+			l.statusKitNotifications = enabled
+			return l.completeLogin(ctx)
+		}
+		if hc, ok := input["heic_conversion"]; ok {
+			l.heicConversion = hc == "yes"
+			return l.askContactSourceStep()
+		}
+		if vt, ok := input["video_transcoding"]; ok {
+			l.videoTranscoding = vt == "yes"
+			return l.askHEICConversionStep()
+		}
+		return l.completeLogin(ctx)
+	}
+
 	// Device passcode step (after device selection, before handle selection)
 	if passcode, ok := input["passcode"]; ok && l.result != nil {
 		return l.handlePasscodeAndContinue(ctx, passcode)
@@ -306,10 +625,16 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		return l.handleDeviceSelection(device)
 	}
 
-	// Handle selection step (after device passcode)
+	// CloudKit backfill preference (only when globally enabled, before device steps)
+	if ck, ok := input["cloudkit_backfill"]; ok && l.result != nil {
+		return l.handleCloudKitBackfillChoice(ctx, ck)
+	}
+
+	// Handle selection step (catch-all when IDS registration is done)
 	if l.result != nil {
 		l.handle = parseHandleSelection(input["handle"], l.result.Users.GetHandles())
-		return l.completeLogin(ctx)
+		l.handleSelected = true
+		return l.askVideoTranscodingStep()
 	}
 
 	// Step 1: Hardware key
@@ -450,10 +775,9 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 	l.result = &result
 	l.selectedDevice = -1
 
-	// Skip device selection and passcode when CloudKit backfill is disabled —
-	// iCloud Keychain is only needed for decrypting CloudKit message records.
+	// When CloudKit is globally disabled, skip device/passcode and CloudKit question.
 	if !l.Main.Config.UseCloudKitBackfill() {
-		log.Info().Msg("CloudKit backfill disabled, skipping device selection and passcode")
+		log.Info().Msg("CloudKit backfill not available, skipping device selection and passcode")
 		handles := l.result.Users.GetHandles()
 		if step := handleSelectionStep(handles); step != nil {
 			return step, nil
@@ -461,10 +785,12 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		if len(handles) > 0 {
 			l.handle = handles[0]
 		}
-		return l.completeLogin(ctx)
+		l.handleSelected = true
+		return l.askVideoTranscodingStep()
 	}
 
-	return fetchDevicesAndPrompt(log, l.result.TokenProvider, &l.devices, &l.selectedDevice)
+	// Ask the user whether they want CloudKit backfill before showing device steps.
+	return l.askCloudKitBackfillStep()
 }
 
 func (l *ExternalKeyLogin) handleDeviceSelection(device string) (*bridgev2.LoginStep, error) {
@@ -485,21 +811,264 @@ func (l *ExternalKeyLogin) handlePasscodeAndContinue(ctx context.Context, passco
 	if len(handles) > 0 {
 		l.handle = handles[0]
 	}
-	return l.completeLogin(ctx)
+	l.handleSelected = true
+	return l.askVideoTranscodingStep()
 }
 
 func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, error) {
+	var cloudKitPref *bool
+	if l.Main.Config.UseCloudKitBackfill() {
+		cloudKitPref = boolPtr(l.cloudKitBackfill)
+	}
 	meta := &UserLoginMetadata{
-		Platform:        "rustpush-external-key",
-		APSState:        l.conn.State().ToString(),
-		IDSUsers:        l.result.Users.ToString(),
-		IDSIdentity:     l.result.Identity.ToString(),
-		DeviceID:        l.cfg.GetDeviceId(),
-		HardwareKey:     l.hardwareKey,
-		PreferredHandle: l.handle,
+		Platform:                 "rustpush-external-key",
+		APSState:                 l.conn.State().ToString(),
+		IDSUsers:                 l.result.Users.ToString(),
+		IDSIdentity:              l.result.Identity.ToString(),
+		DeviceID:                 l.cfg.GetDeviceId(),
+		HardwareKey:              l.hardwareKey,
+		PreferredHandle:          l.handle,
+		VideoTranscoding:         boolPtr(l.videoTranscoding),
+		HEICConversion:           boolPtr(l.heicConversion),
+		CloudKitBackfill:         cloudKitPref,
+		DisableFaceTime:          boolPtr(l.disableFaceTime),
+		StatusKitNotifications:   boolPtr(l.statusKitNotifications),
+		CardDAVEmail:             l.cardDAVEmail,
+		CardDAVURL:               l.cardDAVURL,
+		CardDAVUsername:          l.cardDAVUsername,
+		CardDAVPasswordEncrypted: l.cardDAVPasswordEncrypted,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
+}
+
+func (l *ExternalKeyLogin) askContactSourceStep() (*bridgev2.LoginStep, error) {
+	return askContactSourceStep()
+}
+
+func (l *ExternalKeyLogin) askFaceTimeStep() (*bridgev2.LoginStep, error)  { return askFaceTimeStep() }
+func (l *ExternalKeyLogin) askStatusKitStep() (*bridgev2.LoginStep, error) { return askStatusKitStep() }
+
+func (l *ExternalKeyLogin) askCardDAVGoogleStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVGoogleStep()
+}
+
+func (l *ExternalKeyLogin) askCardDAVFastmailStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVFastmailStep()
+}
+
+func (l *ExternalKeyLogin) askCardDAVNextcloudStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVNextcloudStep()
+}
+
+func (l *ExternalKeyLogin) askCardDAVOtherStep() (*bridgev2.LoginStep, error) {
+	return askCardDAVOtherStep()
+}
+
+func (l *ExternalKeyLogin) askCloudKitBackfillStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepCloudKitBackfill,
+		Instructions: "Enable CloudKit history backfill? (yes/no)\n\n" +
+			"Syncs your full iMessage history from iCloud. " +
+			"If enabled, you will be asked for a device passcode to join your iCloud Keychain.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "cloudkit_backfill",
+				Name: "Enable CloudKit backfill? (yes/no)",
+			}},
+		},
+	}, nil
+}
+
+func (l *ExternalKeyLogin) handleCloudKitBackfillChoice(ctx context.Context, choice string) (*bridgev2.LoginStep, error) {
+	l.cloudKitBackfill = choice == "yes"
+	if l.cloudKitBackfill {
+		log := l.Main.Bridge.Log.With().Str("component", "imessage").Logger()
+		return fetchDevicesAndPrompt(log, l.result.TokenProvider, &l.devices, &l.selectedDevice)
+	}
+	handles := l.result.Users.GetHandles()
+	if step := handleSelectionStep(handles); step != nil {
+		return step, nil
+	}
+	if len(handles) > 0 {
+		l.handle = handles[0]
+	}
+	l.handleSelected = true
+	return l.askVideoTranscodingStep()
+}
+
+func (l *ExternalKeyLogin) askVideoTranscodingStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepVideoTranscoding,
+		Instructions: "Enable video transcoding? (yes/no)\n\n" +
+			"Automatically remux incompatible video formats (e.g. MOV → MP4) before bridging to Matrix. Requires ffmpeg.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "video_transcoding",
+				Name: "Enable video transcoding? (yes/no)",
+			}},
+		},
+	}, nil
+}
+
+func (l *ExternalKeyLogin) askHEICConversionStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepHEICConversion,
+		Instructions: "Enable HEIC→JPEG conversion? (yes/no)\n\n" +
+			"Automatically convert Apple HEIC images to JPEG for better Matrix client compatibility. Requires libheif.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				ID:   "heic_conversion",
+				Name: "Enable HEIC conversion? (yes/no)",
+			}},
+		},
+	}, nil
+}
+
+// ============================================================================
+// FaceTime and StatusKit login step constructors (shared between login types)
+// ============================================================================
+
+func askFaceTimeStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeUserInput,
+		StepID:       LoginStepFaceTime,
+		Instructions: "FaceTime Bridge: if you have an Apple device that already handles FaceTime natively, disabling this removes the !im facetime command and suppresses inbound FaceTime notices in bridge chats.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{
+					Type:    bridgev2.LoginInputFieldTypeSelect,
+					ID:      "facetime_bridge",
+					Name:    "Enable FaceTime Bridge",
+					Options: []string{"yes", "no"},
+				},
+			},
+		},
+	}, nil
+}
+
+func askStatusKitStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeUserInput,
+		StepID:       LoginStepStatusKit,
+		Instructions: "StatusKit notifications: when enabled, the bridge posts a notice when a contact enables Focus or Do Not Disturb on their iPhone (the same indicator Apple's Messages app shows). Note: posting a notice will unarchive the destination chat.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{
+					Type:    bridgev2.LoginInputFieldTypeSelect,
+					ID:      "statuskit_notifications",
+					Name:    "Enable StatusKit notifications",
+					Options: []string{"yes", "no"},
+				},
+			},
+		},
+	}, nil
+}
+
+// ============================================================================
+// CardDAV login step constructors (shared between AppleIDLogin and ExternalKeyLogin)
+// ============================================================================
+
+// parseContactSource normalises the contact_source value to a bare digit ("1"–"5").
+// Accepts a bare digit, "N. label", or "N) label" as the bot may submit the full option text.
+func parseContactSource(raw string) string {
+	s := strings.TrimSpace(raw)
+	if len(s) > 0 && s[0] >= '1' && s[0] <= '5' {
+		return string(s[0])
+	}
+	return s
+}
+
+func askContactSourceStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepContactSource,
+		Instructions: "Choose a contact source for syncing contact names.\n\n" +
+			"1) iCloud Contacts (uses your Apple ID — no setup needed)\n" +
+			"2) Google Contacts (requires a Google App Password)\n" +
+			"3) Fastmail (requires a Fastmail App Password)\n" +
+			"4) Nextcloud\n" +
+			"5) Other CardDAV server\n\n" +
+			"Reply with the number.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{{
+				Type:    bridgev2.LoginInputFieldTypeSelect,
+				ID:      "contact_source",
+				Name:    "Contact source",
+				Options: []string{"1) iCloud Contacts", "2) Google Contacts", "3) Fastmail", "4) Nextcloud", "5) Other CardDAV server"},
+			}},
+		},
+	}, nil
+}
+
+func askCardDAVGoogleStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepCardDAVGoogle,
+		Instructions: "Enter your Google Contacts credentials.\n\n" +
+			"You must use a Google App Password — your regular Google password will not work.\n" +
+			"Create one at: myaccount.google.com → Security → App Passwords\n" +
+			"Remove any spaces from the app password before entering it.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{Type: bridgev2.LoginInputFieldTypeEmail, ID: "carddav_email", Name: "Google account email"},
+				{Type: bridgev2.LoginInputFieldTypePassword, ID: "google_app_password", Name: "App Password (no spaces)"},
+			},
+		},
+	}, nil
+}
+
+func askCardDAVFastmailStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepCardDAVFastmail,
+		Instructions: "Enter your Fastmail credentials.\n\n" +
+			"You must use a Fastmail App Password — your regular Fastmail password will not work.\n" +
+			"Create one at: Settings → Privacy & Security → App Passwords",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{Type: bridgev2.LoginInputFieldTypeEmail, ID: "carddav_email", Name: "Fastmail email"},
+				{Type: bridgev2.LoginInputFieldTypePassword, ID: "fastmail_app_password", Name: "App Password"},
+			},
+		},
+	}, nil
+}
+
+func askCardDAVNextcloudStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepCardDAVNextcloud,
+		Instructions: "Enter your Nextcloud credentials.\n\n" +
+			"Server URL should be the base URL of your Nextcloud instance (e.g. https://cloud.example.com).\n" +
+			"The CardDAV path will be derived automatically.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{Type: bridgev2.LoginInputFieldTypeEmail, ID: "carddav_email", Name: "Nextcloud username / email"},
+				{ID: "nextcloud_server_url", Name: "Nextcloud server URL (e.g. https://cloud.example.com)"},
+				{Type: bridgev2.LoginInputFieldTypePassword, ID: "carddav_password", Name: "Password"},
+			},
+		},
+	}, nil
+}
+
+func askCardDAVOtherStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:   bridgev2.LoginStepTypeUserInput,
+		StepID: LoginStepCardDAVOther,
+		Instructions: "Enter your CardDAV server credentials.\n\n" +
+			"All fields are required. For username, enter your email address if it is the same as your login.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{Type: bridgev2.LoginInputFieldTypeEmail, ID: "carddav_email", Name: "Email address"},
+				{ID: "carddav_url", Name: "CardDAV URL"},
+				{ID: "carddav_username", Name: "Username (enter your email if it is your login)"},
+				{Type: bridgev2.LoginInputFieldTypePassword, ID: "carddav_password", Name: "Password"},
+			},
+		},
+	}, nil
 }
 
 // ============================================================================

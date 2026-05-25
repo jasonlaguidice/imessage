@@ -932,7 +932,7 @@ func (c *IMClient) maybeNotifyIncomingFaceTimeInvite(log zerolog.Logger, msg *ru
 	if msg == nil || senderIsFromMe || msg.IsStoredMessage {
 		return
 	}
-	if c.Main.Config.DisableFaceTime {
+	if c.disableFaceTime() {
 		return
 	}
 
