@@ -91,8 +91,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         -out /usr/local/share/ca-certificates/AppleRootCA.crt \
     && update-ca-certificates \
     && rm /tmp/AppleRootCA.cer \
-    && apt-get purge -y openssl curl \
-    && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/mautrix-imessage-v2 /usr/local/bin/mautrix-imessage-v2
