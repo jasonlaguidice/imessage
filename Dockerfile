@@ -95,6 +95,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/mautrix-imessage-v2 /usr/local/bin/mautrix-imessage-v2
 
+WORKDIR /data
 VOLUME /data
 EXPOSE 29332
 
