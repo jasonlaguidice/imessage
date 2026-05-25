@@ -176,7 +176,7 @@ if [ "$NEEDS_LOGIN" = "true" ]; then
     if systemctl --user is-active mautrix-imessage >/dev/null 2>&1; then
         systemctl --user stop mautrix-imessage
     elif systemctl is-active mautrix-imessage >/dev/null 2>&1; then
-        systemctl stop mautrix-imessage
+        sudo systemctl stop mautrix-imessage
     fi
 
     if [ "${FORCE_CLEAR_STATE:-false}" = "true" ]; then
@@ -308,8 +308,8 @@ if systemctl --user list-unit-files mautrix-imessage.service 2>/dev/null | grep 
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
 elif systemctl list-unit-files mautrix-imessage.service 2>/dev/null | grep -q mautrix-imessage; then
-    _SHORTCUT_SYSCTL="systemctl"
-    _SHORTCUT_JCTL="journalctl"
+    _SHORTCUT_SYSCTL="sudo systemctl"
+    _SHORTCUT_JCTL="sudo journalctl"
 else
     _SHORTCUT_SYSCTL="systemctl --user"
     _SHORTCUT_JCTL="journalctl --user"
@@ -441,15 +441,15 @@ fi
 echo "Checking for ffmpeg..."
 if ! command -v ffmpeg >/dev/null 2>&1; then
     if command -v apt >/dev/null 2>&1; then
-        apt install -y ffmpeg 2>/dev/null || true
+        sudo apt install -y ffmpeg 2>/dev/null || true
     elif command -v dnf >/dev/null 2>&1; then
-        dnf install -y ffmpeg 2>/dev/null || true
+        sudo dnf install -y ffmpeg 2>/dev/null || true
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -S --noconfirm ffmpeg 2>/dev/null || true
+        sudo pacman -S --noconfirm ffmpeg 2>/dev/null || true
     elif command -v zypper >/dev/null 2>&1; then
-        zypper install -y ffmpeg 2>/dev/null || true
+        sudo zypper install -y ffmpeg 2>/dev/null || true
     elif command -v apk >/dev/null 2>&1; then
-        apk add ffmpeg 2>/dev/null || true
+        sudo apk add ffmpeg 2>/dev/null || true
     fi
 fi
 
@@ -563,15 +563,15 @@ fi
 echo "Checking for libheif..."
 if ! ldconfig -p 2>/dev/null | grep -q libheif || ! command -v heif-convert >/dev/null 2>&1; then
     if command -v apt >/dev/null 2>&1; then
-        dpkg -s libheif-dev >/dev/null 2>&1 || apt install -y libheif-dev 2>/dev/null || true
+        dpkg -s libheif-dev >/dev/null 2>&1 || sudo apt install -y libheif-dev 2>/dev/null || true
     elif command -v dnf >/dev/null 2>&1; then
-        rpm -q libheif-devel >/dev/null 2>&1 || dnf install -y libheif-devel 2>/dev/null || true
+        rpm -q libheif-devel >/dev/null 2>&1 || sudo dnf install -y libheif-devel 2>/dev/null || true
     elif command -v pacman >/dev/null 2>&1; then
-        pacman -Qi libheif >/dev/null 2>&1 || pacman -S --noconfirm libheif 2>/dev/null || true
+        pacman -Qi libheif >/dev/null 2>&1 || sudo pacman -S --noconfirm libheif 2>/dev/null || true
     elif command -v zypper >/dev/null 2>&1; then
-        rpm -q libheif-devel >/dev/null 2>&1 || zypper install -y libheif-devel 2>/dev/null || true
+        rpm -q libheif-devel >/dev/null 2>&1 || sudo zypper install -y libheif-devel 2>/dev/null || true
     elif command -v apk >/dev/null 2>&1; then
-        apk info -e libheif-dev >/dev/null 2>&1 || apk add libheif-dev 2>/dev/null || true
+        apk info -e libheif-dev >/dev/null 2>&1 || sudo apk add libheif-dev 2>/dev/null || true
     fi
 fi
 
@@ -598,7 +598,7 @@ fi
 install_systemd_user() {
     # Enable lingering so user services survive SSH session closures
     if command -v loginctl >/dev/null 2>&1 && [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
-        loginctl enable-linger "$USER" 2>/dev/null || true
+        sudo loginctl enable-linger "$USER" 2>/dev/null || true
     fi
     mkdir -p "$(dirname "$USER_SERVICE_FILE")"
     cat > "$USER_SERVICE_FILE" << EOF
