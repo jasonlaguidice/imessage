@@ -2,10 +2,11 @@ name: Docker
 
 on:
   push:
-    branches: [master]
+    branches: [master, multi-user]
     tags: ["v*"]
   pull_request:
-    branches: [master]
+    branches: [master, multi-user]
+  workflow_dispatch: {}
 
 env:
   IMAGE: ghcr.io/jasonlaguidice/imessage
