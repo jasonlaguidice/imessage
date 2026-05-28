@@ -69,8 +69,8 @@ RUN BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ) && \
     CGO_LDFLAGS="-L/build" \
     go build \
     -ldflags "-X main.Tag=${BUILD_VERSION} -X main.Commit=${BUILD_COMMIT} -X main.BuildTime=${BUILD_TIME}" \
-    -o /build/mautrix-imessage-v2 \
-    ./cmd/mautrix-imessage/
+    -o /build/matrix-rustpush \
+    ./cmd/matrix-rustpush/
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 FROM ubuntu:24.04
@@ -84,7 +84,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # libssl3      — OpenSSL (rustpush openssl crate dynamic link)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libunicorn2 libheif1 libolm3 libssl3 \
-    ca-certificates openssl curl \
+    ca-certificates openssl curl ffmpeg \
     && curl -fsSL 'https://www.apple.com/appleca/AppleIncRootCertificate.cer' \
         -o /tmp/AppleRootCA.cer \
     && openssl x509 -inform DER -in /tmp/AppleRootCA.cer \
@@ -93,11 +93,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm /tmp/AppleRootCA.cer \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /build/mautrix-imessage-v2 /usr/local/bin/mautrix-imessage-v2
+COPY --from=builder /build/matrix-rustpush /usr/local/bin/matrix-rustpush
 
 WORKDIR /data
 VOLUME /data
 EXPOSE 29332
 
-ENTRYPOINT ["mautrix-imessage-v2"]
+ENTRYPOINT ["matrix-rustpush"]
 CMD ["-c", "/data/config.yaml"]

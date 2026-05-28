@@ -1,10 +1,10 @@
-APP_NAME    := mautrix-imessage-v2
-CMD_PKG     := mautrix-imessage
-BUNDLE_ID   := com.lrhodin.mautrix-imessage
+APP_NAME    := matrix-rustpush
+CMD_PKG     := matrix-rustpush
+BUNDLE_ID   := com.jasonlaguidice.matrix-rustpush
 VERSION     := 0.1.0
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-DATA_DIR    ?= $(HOME)/.local/share/mautrix-imessage
+DATA_DIR    ?= $(HOME)/.local/share/matrix-rustpush
 UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
