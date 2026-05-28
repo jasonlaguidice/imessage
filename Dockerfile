@@ -99,4 +99,5 @@ WORKDIR /data
 VOLUME /data
 EXPOSE 29332
 
-ENTRYPOINT ["mautrix-imessage-v2", "-c", "/data/config.yaml"]
+ENTRYPOINT ["mautrix-imessage-v2"]
+CMD ["-c", "/data/config.yaml"]
