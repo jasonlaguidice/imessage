@@ -6285,6 +6285,7 @@ impl WrappedPasswordsClient {
 pub struct WrappedStatusKitClient {
     pub(crate) inner: Arc<rustpush::statuskit::StatusKitClient<BridgeDefaultAnisetteProvider>>,
     interests: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
+    user_state_key: String,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -6363,7 +6364,7 @@ impl WrappedStatusKitClient {
     /// Since upstream's StatusKitSharedDevice::from is private, this reads
     /// the plist file directly.
     pub async fn get_known_handles(&self) -> Vec<String> {
-        let state_path = subsystem_state_path("statuskit-state.plist");
+        let state_path = subsystem_state_path(&format!("statuskit-state_{}.plist", self.user_state_key));
         let data = match std::fs::read(&state_path) {
             Ok(d) => d,
             Err(_) => return Vec::new(),
@@ -6566,6 +6567,7 @@ pub struct Client {
     /// Subscription tokens held to keep presence channels open. Cleared by
     /// `unsubscribe_all_status()`.
     statuskit_interest_tokens: tokio::sync::Mutex<Vec<rustpush::statuskit::ChannelInterestToken>>,
+    user_state_key: String,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -6646,7 +6648,7 @@ pub async fn new_client(
 
     // Pre-warm FaceTime so incoming FT APNs notifications are consumed even
     // before any explicit !facetime command initializes the subsystem.
-    let facetime_state_path = subsystem_state_path("facetime-state.plist");
+    let facetime_state_path = subsystem_state_path(&format!("facetime-state_{}.plist", cache_key));
     let facetime_state = read_plist_state::<rustpush::facetime::FTState>(&facetime_state_path).unwrap_or_default();
     let facetime_state_path_for_closure = facetime_state_path.clone();
     let prewarmed_facetime = Arc::new(WrappedFaceTimeClient {
@@ -6698,6 +6700,7 @@ pub async fn new_client(
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         let identity_for_reregister = client.identity.clone();
+        let user_state_key = cache_key.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
@@ -7072,7 +7075,7 @@ pub async fn new_client(
 
                                 let action = if prev.is_some() { "replaced" } else { "added" };
                                 let state_path =
-                                    subsystem_state_path("statuskit-state.plist");
+                                    subsystem_state_path(&format!("statuskit-state_{}.plist", user_state_key));
                                 persist_plist_state(
                                     &state_path,
                                     &*sk.state.read().await,
@@ -7583,6 +7586,7 @@ pub async fn new_client(
         shared_statuskit: shared_statuskit_for_recv,
         status_callback: status_callback_for_recv,
         statuskit_interest_tokens: tokio::sync::Mutex::new(Vec::new()),
+        user_state_key: cache_key,
     });
     // Hand the receive loop a Weak<Client> so it can call back into
     // populate_inline_share_profile without preventing Client drop.
@@ -7809,7 +7813,7 @@ impl Client {
             return Ok(client.clone());
         }
 
-        let state_path = subsystem_state_path("facetime-state.plist");
+        let state_path = subsystem_state_path(&format!("facetime-state_{}.plist", self.user_state_key));
         let state = read_plist_state::<rustpush::facetime::FTState>(&state_path).unwrap_or_default();
         let state_path_for_closure = state_path.clone();
 
@@ -7872,7 +7876,7 @@ impl Client {
         let tp = self.token_provider.as_ref().ok_or(WrappedError::GenericError {
             msg: "No TokenProvider available".into(),
         })?;
-        let state_path = subsystem_state_path("statuskit-state.plist");
+        let state_path = subsystem_state_path(&format!("statuskit-state_{}.plist", self.user_state_key));
         let state = match read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path) {
             Some(s) => {
                 info!(
@@ -7904,6 +7908,7 @@ impl Client {
             )
             .await,
             interests: tokio::sync::Mutex::new(Vec::new()),
+            user_state_key: self.user_state_key.clone(),
         });
 
         // Write path: re-acquire briefly to store result; handle race.
@@ -7928,7 +7933,7 @@ impl Client {
         let mme_delegate = tp.parse_mme_delegate().await?;
         let account = tp.get_account();
         let anisette = account.lock().await.anisette.clone();
-        let state_path = subsystem_state_path("sharedstreams-state.plist");
+        let state_path = subsystem_state_path(&format!("sharedstreams-state_{}.plist", self.user_state_key));
         let state = read_plist_state::<rustpush::sharedstreams::SharedStreamsState>(&state_path)
             .or_else(|| rustpush::sharedstreams::SharedStreamsState::new(dsid, &mme_delegate))
             .ok_or(WrappedError::GenericError {
@@ -8261,7 +8266,7 @@ impl Client {
         let mut augmented = handles;
         {
             let mut extra: Vec<String> = Vec::new();
-            let state_path = subsystem_state_path("statuskit-state.plist");
+            let state_path = subsystem_state_path(&format!("statuskit-state_{}.plist", self.user_state_key));
             if let Ok(data) = std::fs::read(&state_path) {
                 if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
                     if let Some(dict) = value.as_dictionary() {
@@ -8638,7 +8643,7 @@ impl Client {
     /// bridge to learn the current presence of contacts on startup instead of
     /// waiting for the next change. Keys and channel identifiers are preserved.
     pub fn reset_statuskit_cursors(&self) {
-        let state_path = subsystem_state_path("statuskit-state.plist");
+        let state_path = subsystem_state_path(&format!("statuskit-state_{}.plist", self.user_state_key));
         let mut state = read_plist_state::<rustpush::statuskit::StatusKitState>(&state_path)
             .unwrap_or_default();
         let count = state.recent_channels.len();
