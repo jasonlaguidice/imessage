@@ -7687,6 +7687,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 	if c.videoTranscoding() && ffmpeg.Supported() && strings.HasPrefix(mimeType, "video/") && mimeType != "video/mp4" {
 		origMime := mimeType
 		origSize := len(data)
+		log.Info().Str("guid", row.GUID).Str("mime", origMime).Int("bytes", origSize).
+		Msg("Starting video transcoding")
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -7694,6 +7696,8 @@ func (c *IMClient) downloadAndUploadAttachment(
 		if convertErr != nil {
 			// Remux failed — try full re-encode
 			method = "re-encode"
+			log.Info().Str("guid", row.GUID).Str("mime", origMime).Int("bytes", origSize).
+			Msg("Video remux failed, falling back to re-encode")
 			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},
@@ -7866,12 +7870,16 @@ func (c *IMClient) downloadAndUploadAttachment(
 		// Remux/transcode the avid video if enabled.
 		if c.videoTranscoding() && ffmpeg.Supported() {
 			origSize := len(avidData)
+			log.Info().Str("guid", row.GUID).Str("mime", avidMime).Int("bytes", origSize).
+			Msg("Starting Live Photo avid video transcoding")
 			method := "remux"
 			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
 				[]string{"-c", "copy", "-movflags", "+faststart"},
 				avidMime)
 			if convertErr != nil {
 				method = "re-encode"
+				log.Info().Str("guid", row.GUID).Str("mime", avidMime).Int("bytes", origSize).
+				Msg("Live Photo remux failed, falling back to re-encode")
 				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
 					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 						"-c:a", "aac", "-movflags", "+faststart"},
@@ -10099,6 +10107,8 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		log := zerolog.Ctx(ctx)
 		origMime := mimeType
 		origSize := len(inlineData)
+		log.Info().Str("file", fileName).Str("mime", origMime).Int("bytes", origSize).
+		Msg("Starting video transcoding")
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -10106,6 +10116,8 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		if convertErr != nil {
 			// Remux failed — try full re-encode
 			method = "re-encode"
+			log.Info().Str("file", fileName).Str("mime", origMime).Int("bytes", origSize).
+			Msg("Video remux failed, falling back to re-encode")
 			converted, convertErr = ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},

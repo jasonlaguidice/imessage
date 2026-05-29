@@ -550,6 +550,7 @@ func maybeConvertHEIC(log *zerolog.Logger, data []byte, mimeType, fileName strin
 			Msg("Animated/multi-frame HEIC detected, only primary image will be converted")
 	}
 
+	log.Info().Str("file", fileName).Str("mime", mimeType).Int("bytes", len(data)).Msg("Starting HEIC to JPEG conversion")
 	jpegData, newMime, newName, decodedImg, err := convertHEICToJPEG(data, mimeType, fileName, quality, log)
 	if err != nil {
 		log.Warn().Err(err).Msg("HEIC to JPEG conversion failed, uploading original")
