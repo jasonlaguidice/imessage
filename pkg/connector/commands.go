@@ -75,6 +75,8 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdMsgDebug,
 		cmdContacts,
 		cmdSetCardDAV,
+		cmdSetVideoTranscoding,
+		cmdSetHEICConversion,
 	}
 	if !disableFaceTime {
 		cmds = append(cmds,
@@ -1660,4 +1662,103 @@ func setCardDAVApplyConfig(ce *commands.Event, email, url, username, plainPasswo
 		return
 	}
 	ce.Reply("CardDAV configured for **%s**. **Restart the bridge to apply.**", email)
+}
+
+// ============================================================================
+// set-video-transcoding / set-heic-conversion commands
+// ============================================================================
+
+var cmdSetVideoTranscoding = &commands.FullHandler{
+	Name:    "set-video-transcoding",
+	Aliases: []string{"video-transcoding"},
+	Func:    fnSetVideoTranscoding,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionChats,
+		Description: "Enable or disable automatic video transcoding to H.264. Usage: `$cmdprefix set-video-transcoding on|off`",
+	},
+	RequiresLogin: true,
+}
+
+var cmdSetHEICConversion = &commands.FullHandler{
+	Name:    "set-heic-conversion",
+	Aliases: []string{"heic-conversion"},
+	Func:    fnSetHEICConversion,
+	Help: commands.HelpMeta{
+		Section:     commands.HelpSectionChats,
+		Description: "Enable or disable automatic HEIC→JPEG conversion. Usage: `$cmdprefix set-heic-conversion on|off`",
+	},
+	RequiresLogin: true,
+}
+
+func fnSetVideoTranscoding(ce *commands.Event) {
+	setBoolSetting(ce, "video transcoding",
+		func(meta *UserLoginMetadata, val *bool) { meta.VideoTranscoding = val },
+		func(meta *UserLoginMetadata) *bool { return meta.VideoTranscoding },
+	)
+}
+
+func fnSetHEICConversion(ce *commands.Event) {
+	setBoolSetting(ce, "HEIC conversion",
+		func(meta *UserLoginMetadata, val *bool) { meta.HEICConversion = val },
+		func(meta *UserLoginMetadata) *bool { return meta.HEICConversion },
+	)
+}
+
+func setBoolSetting(
+	ce *commands.Event,
+	name string,
+	set func(*UserLoginMetadata, *bool),
+	get func(*UserLoginMetadata) *bool,
+) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("No active login found.")
+		return
+	}
+	meta, ok := login.Metadata.(*UserLoginMetadata)
+	if !ok || meta == nil {
+		ce.Reply("Login metadata unavailable.")
+		return
+	}
+
+	arg := strings.ToLower(strings.TrimSpace(ce.RawArgs))
+	if arg == "" {
+		cur := get(meta)
+		if cur == nil {
+			ce.Reply("%s is using the global config default. Use `$cmdprefix %s on` or `off` to override.", name, ce.Command)
+		} else if *cur {
+			ce.Reply("%s is **on** (per-user override). Use `$cmdprefix %s off` to disable.", name, ce.Command)
+		} else {
+			ce.Reply("%s is **off** (per-user override). Use `$cmdprefix %s on` to enable.", name, ce.Command)
+		}
+		return
+	}
+
+	switch arg {
+	case "on", "yes", "enable", "true", "1":
+		v := true
+		set(meta, &v)
+	case "off", "no", "disable", "false", "0":
+		v := false
+		set(meta, &v)
+	case "reset", "default", "unset":
+		set(meta, nil)
+	default:
+		ce.Reply("Unknown value %q — use `on`, `off`, or `reset` (to use global config default).", arg)
+		return
+	}
+
+	if err := login.Save(ce.Ctx); err != nil {
+		ce.Reply("Failed to save settings: %v", err)
+		return
+	}
+
+	cur := get(meta)
+	if cur == nil {
+		ce.Reply("%s reset to global config default.", name)
+	} else if *cur {
+		ce.Reply("%s enabled.", name)
+	} else {
+		ce.Reply("%s disabled.", name)
+	}
 }
