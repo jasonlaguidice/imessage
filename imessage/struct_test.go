@@ -465,6 +465,9 @@ func TestTempDir_MkdirAllError(t *testing.T) {
 }
 
 func TestTempDir_MkdirTempError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission enforcement unavailable when running as root")
+	}
 	origPerm := TempDirPermissions
 	TempDirPermissions = 0400
 	t.Cleanup(func() { TempDirPermissions = origPerm })
