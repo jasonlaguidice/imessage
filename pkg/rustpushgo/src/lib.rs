@@ -7783,8 +7783,17 @@ impl Client {
                 return;
             }
         };
-        match profiles.get_record(&share_msg).await {
-            Ok(record) => {
+        // Upstream cloudkit.rs `FetchedRecords::get_record` panics with
+        // `.expect("No record found?")` when the CloudKit response contains no
+        // matching record id — a normal outcome when the peer rotated or deleted
+        // their shared-profile since we cached the key. Without catch_unwind this
+        // panic propagates through the receive task and kills all future message
+        // processing. The Go-callable `fetch_profile` already wraps the same call
+        // with catch_unwind; mirror that here.
+        use futures::FutureExt;
+        let fetch_fut = profiles.get_record(&share_msg);
+        match std::panic::AssertUnwindSafe(fetch_fut).catch_unwind().await {
+            Ok(Ok(record)) => {
                 info!(
                     "inline ShareProfile fetch ok (record_key={}…, name='{}', avatar_bytes={})",
                     key_prefix,
@@ -7796,12 +7805,19 @@ impl Client {
                 wrapped.share_profile_last_name = Some(record.name.last);
                 wrapped.share_profile_avatar = record.image;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(
                     "inline ShareProfile fetch failed (record_key={}…, has_poster={}): {:?}",
                     key_prefix,
                     share_msg.poster.is_some(),
                     e
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "inline ShareProfile fetch panicked (record_key={}…, has_poster={}) — record likely rotated/deleted in CloudKit",
+                    key_prefix,
+                    share_msg.poster.is_some(),
                 );
             }
         }
