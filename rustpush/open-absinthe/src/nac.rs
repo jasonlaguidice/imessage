@@ -194,6 +194,16 @@ fn encrypt_io_property(data: &[u8]) -> Result<Vec<u8>, AbsintheError> {
     uc.mem_write(DATA_ADDR, ENCRYPT_DATA)
         .map_err(|e| AbsintheError::Other(format!("encrypt write data: {:?}", e)))?;
 
+    // The function accesses kernel globals in the gap between .data and .text
+    // (e.g. lock words at __bss_start + 0x1F9082).  Map the gap as zeroed so
+    // those reads succeed and return 0 (unlocked / default state).
+    let data_end = DATA_ADDR + page(ENCRYPT_DATA.len());
+    let gap = TEXT_ADDR - data_end;
+    if gap > 0 {
+        uc.mem_map(data_end, gap, Prot::ALL)
+            .map_err(|e| AbsintheError::Other(format!("encrypt map gap: {:?}", e)))?;
+    }
+
     uc.mem_map(TEXT_ADDR, page(ENCRYPT_TEXT.len()), Prot::ALL)
         .map_err(|e| AbsintheError::Other(format!("encrypt map code: {:?}", e)))?;
     uc.mem_write(TEXT_ADDR, ENCRYPT_TEXT)
