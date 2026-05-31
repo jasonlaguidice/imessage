@@ -138,26 +138,103 @@ fn relay_agent(cfg: &RelayConfig) -> Result<ureq::Agent, AbsintheError> {
 // JSON protocol.
 
 // ============================================================================
-// XNU IOKit property encryption (x86_64 Linux only)
+// XNU IOKit property encryption (Linux: x86_64 native, arm64 via unicorn)
 // ============================================================================
 
 /// FFI binding to the XNU kernel encryption function extracted from the macOS
-/// kernel.  Only available when compiled on x86_64-linux (cfg `has_xnu_encrypt`
-/// is set by build.rs).
-#[cfg(has_xnu_encrypt)]
+/// kernel.  Native x86_64 path only — on arm64 we execute the same function
+/// through the unicorn x86-64 emulator instead.
+#[cfg(all(has_xnu_encrypt, target_arch = "x86_64"))]
 extern "C" {
     fn sub_ffffff8000ec7320(data: *const u8, size: u64, output: *mut u8);
 }
 
-/// Encrypt a plaintext IOKit property value using the XNU kernel function.
-/// Returns 17 bytes of encrypted output, or an error if the function is not
-/// available on this platform.
-#[cfg(has_xnu_encrypt)]
+/// x86_64 native path: call the XNU encrypt function directly via FFI.
+#[cfg(all(has_xnu_encrypt, target_arch = "x86_64"))]
 fn encrypt_io_property(data: &[u8]) -> Result<Vec<u8>, AbsintheError> {
     let mut output = vec![0u8; 17];
     unsafe {
         sub_ffffff8000ec7320(data.as_ptr(), data.len() as u64, output.as_mut_ptr());
     }
+    Ok(output)
+}
+
+/// arm64 path: run the pre-compiled x86_64 XNU encrypt function through the
+/// unicorn emulator.
+///
+/// The binary blobs (encrypt_x86_64_text.bin / encrypt_x86_64_data.bin) are
+/// the .text and .data sections of encrypt.s linked at fixed VMAs:
+///   .data  @ 0x200000   (27 272 bytes — encryption key tables)
+///   .text  @ 0x400000   (67 819 bytes — code; function entry at +0x10000)
+///
+/// Calling convention: SysV AMD64 (rdi=data, rsi=size, rdx=output_ptr).
+#[cfg(all(has_xnu_encrypt, target_arch = "aarch64"))]
+fn encrypt_io_property(data: &[u8]) -> Result<Vec<u8>, AbsintheError> {
+    const TEXT_ADDR: u64 = 0x0040_0000;
+    const DATA_ADDR: u64 = 0x0020_0000;
+    const FUNC_ADDR: u64 = TEXT_ADDR + 0x10000; // sub_ffffff8000ec7320 offset
+    const STACK_BASE: u64 = 0x1000_0000;
+    const STACK_SIZE: u64 = 0x10000;
+    const INPUT_ADDR: u64 = 0x2000_0000;
+    const OUTPUT_ADDR: u64 = 0x2001_0000;
+    const SENTINEL: u64 = 0xDEAD_0000; // ret will jump here; emu_start stops
+
+    static ENCRYPT_TEXT: &[u8] =
+        include_bytes!("asm/encrypt_x86_64_text.bin");
+    static ENCRYPT_DATA: &[u8] =
+        include_bytes!("asm/encrypt_x86_64_data.bin");
+
+    let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64)
+        .map_err(|e| AbsintheError::Other(format!("encrypt unicorn init: {:?}", e)))?;
+
+    let page = |n: usize| (n + 0xFFF) & !0xFFF;
+
+    uc.mem_map(DATA_ADDR, page(ENCRYPT_DATA.len()), Prot::ALL)
+        .map_err(|e| AbsintheError::Other(format!("encrypt map data: {:?}", e)))?;
+    uc.mem_write(DATA_ADDR, ENCRYPT_DATA)
+        .map_err(|e| AbsintheError::Other(format!("encrypt write data: {:?}", e)))?;
+
+    uc.mem_map(TEXT_ADDR, page(ENCRYPT_TEXT.len()), Prot::ALL)
+        .map_err(|e| AbsintheError::Other(format!("encrypt map code: {:?}", e)))?;
+    uc.mem_write(TEXT_ADDR, ENCRYPT_TEXT)
+        .map_err(|e| AbsintheError::Other(format!("encrypt write code: {:?}", e)))?;
+
+    uc.mem_map(STACK_BASE, STACK_SIZE as usize, Prot::ALL)
+        .map_err(|e| AbsintheError::Other(format!("encrypt map stack: {:?}", e)))?;
+
+    uc.mem_map(INPUT_ADDR, page(data.len().max(1)), Prot::ALL)
+        .map_err(|e| AbsintheError::Other(format!("encrypt map input: {:?}", e)))?;
+    uc.mem_write(INPUT_ADDR, data)
+        .map_err(|e| AbsintheError::Other(format!("encrypt write input: {:?}", e)))?;
+
+    uc.mem_map(OUTPUT_ADDR, 0x1000, Prot::ALL)
+        .map_err(|e| AbsintheError::Other(format!("encrypt map output: {:?}", e)))?;
+
+    // Map a page at SENTINEL so unicorn doesn't fault when PC lands there.
+    uc.mem_map(SENTINEL & !0xFFF, 0x1000, Prot::ALL)
+        .map_err(|e| AbsintheError::Other(format!("encrypt map sentinel: {:?}", e)))?;
+
+    // Push SENTINEL as the return address; RSP points at it.
+    let rsp = STACK_BASE + STACK_SIZE - 8;
+    uc.mem_write(rsp, &SENTINEL.to_le_bytes())
+        .map_err(|e| AbsintheError::Other(format!("encrypt push sentinel: {:?}", e)))?;
+
+    uc.reg_write(RegisterX86::RSP, rsp)
+        .map_err(|e| AbsintheError::Other(format!("encrypt set RSP: {:?}", e)))?;
+    uc.reg_write(RegisterX86::RDI, INPUT_ADDR)
+        .map_err(|e| AbsintheError::Other(format!("encrypt set RDI: {:?}", e)))?;
+    uc.reg_write(RegisterX86::RSI, data.len() as u64)
+        .map_err(|e| AbsintheError::Other(format!("encrypt set RSI: {:?}", e)))?;
+    uc.reg_write(RegisterX86::RDX, OUTPUT_ADDR)
+        .map_err(|e| AbsintheError::Other(format!("encrypt set RDX: {:?}", e)))?;
+
+    uc.emu_start(FUNC_ADDR, SENTINEL, 0, 0)
+        .map_err(|e| AbsintheError::Other(format!("encrypt unicorn exec: {:?}", e)))?;
+
+    let mut output = vec![0u8; 17];
+    uc.mem_read(OUTPUT_ADDR, &mut output)
+        .map_err(|e| AbsintheError::Other(format!("encrypt read output: {:?}", e)))?;
+
     Ok(output)
 }
 
