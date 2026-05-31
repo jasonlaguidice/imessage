@@ -187,7 +187,7 @@ fn encrypt_io_property(data: &[u8]) -> Result<Vec<u8>, AbsintheError> {
     let mut uc = Unicorn::new(Arch::X86, Mode::MODE_64)
         .map_err(|e| AbsintheError::Other(format!("encrypt unicorn init: {:?}", e)))?;
 
-    let page = |n: usize| (n + 0xFFF) & !0xFFF;
+    let page = |n: usize| ((n + 0xFFF) & !0xFFF) as u64;
 
     uc.mem_map(DATA_ADDR, page(ENCRYPT_DATA.len()), Prot::ALL)
         .map_err(|e| AbsintheError::Other(format!("encrypt map data: {:?}", e)))?;
@@ -199,7 +199,7 @@ fn encrypt_io_property(data: &[u8]) -> Result<Vec<u8>, AbsintheError> {
     uc.mem_write(TEXT_ADDR, ENCRYPT_TEXT)
         .map_err(|e| AbsintheError::Other(format!("encrypt write code: {:?}", e)))?;
 
-    uc.mem_map(STACK_BASE, STACK_SIZE as usize, Prot::ALL)
+    uc.mem_map(STACK_BASE, STACK_SIZE, Prot::ALL)
         .map_err(|e| AbsintheError::Other(format!("encrypt map stack: {:?}", e)))?;
 
     uc.mem_map(INPUT_ADDR, page(data.len().max(1)), Prot::ALL)
