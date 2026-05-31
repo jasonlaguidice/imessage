@@ -4793,7 +4793,7 @@ pub fn init_logger() {
         //   RUST_LOG=debug                       # everything
         std::env::set_var(
             "RUST_LOG",
-            "warn,rustpush=warn,rustpushgo=info",
+            "warn,rustpush=warn,rustpushgo=info,open_absinthe=info",
         );
     }
     let _ = pretty_env_logger::try_init();
