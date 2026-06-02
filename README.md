@@ -8,6 +8,12 @@ This is the **v2** rewrite using [rustpush](https://github.com/OpenBubbles/rustp
 
 **Platforms**: macOS (full features) and Linux (via hardware key extracted from a Mac once). Please note, Contact Key Verification must be disabled for the bridge to function.
 
+## This README Under Construction
+
+If you have questions please feel free to join the Matrix room at:
+
+[#matrix-rustpush-bridge:shadowdrake.org](https://matrix.to/#/#matrix-rustpush-bridge:shadowdrake.org)
+
 ## Quick Start (macOS)
 
 macOS 13+ required (Ventura or later). Sign into iCloud on the Mac running the bridge (Settings → Apple ID) — this lets Apple recognize the device so login works without 2FA prompts.
@@ -700,7 +706,7 @@ dev/
 
 ## Chat With Us
 
-**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#imessage-rustpush:beeper.com)
+**Chat with us on Matrix**: [Join our Room Here](https://matrix.to/#/#matrix-rustpush-bridge:shadowdrake.org)
 
 ## License
 
