@@ -79,11 +79,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Runtime shared libraries the bridge binary needs at startup.
 # libunicorn2  — unicorn-engine x86 NAC emulator (hardware-key feature)
-# libheif1     — HEIC/HEIF conversion (linked at compile time even when disabled)
+# libheif1 + libheif-plugin-libde265 — HEIC/HEIF conversion (plugin provides HEVC decoder)
 # libolm3      — Matrix OLM encryption (mautrix bridgev2 framework)
 # libssl3      — OpenSSL (rustpush openssl crate dynamic link)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libunicorn2 libheif1 libolm3 libssl3 \
+    libunicorn2 libheif1 libheif-plugin-libde265 libolm3 libssl3 \
     ca-certificates openssl curl ffmpeg \
     && curl -fsSL 'https://www.apple.com/appleca/AppleIncRootCertificate.cer' \
         -o /tmp/AppleRootCA.cer \
