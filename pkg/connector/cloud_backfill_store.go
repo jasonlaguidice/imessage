@@ -72,6 +72,28 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 	return &cloudBackfillStore{db: db, loginID: loginID}
 }
 
+// migrateColumns adds missing columns to the given table. Postgres supports
+// ADD COLUMN IF NOT EXISTS natively; SQLite requires a pragma existence check
+// first since it has no IF NOT EXISTS on ALTER TABLE.
+func (s *cloudBackfillStore) migrateColumns(ctx context.Context, table string, cols []struct{ name, def string }) error {
+	for _, col := range cols {
+		var err error
+		if s.db.Dialect == dbutil.Postgres {
+			_, err = s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s`, table, col.name, col.def))
+		} else {
+			var exists int
+			_ = s.db.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=$1`, table), col.name).Scan(&exists)
+			if exists == 0 {
+				_, err = s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col.name, col.def))
+			}
+		}
+		if err != nil {
+			return fmt.Errorf("failed to add %s column to %s: %w", col.name, table, err)
+		}
+	}
+	return nil
+}
+
 func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	queries := []string{
 		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
@@ -121,7 +143,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 			login_id TEXT NOT NULL,
 			portal_id TEXT NOT NULL,
 			ts BIGINT NOT NULL,
-			data BLOB NOT NULL,
+			data BYTEA NOT NULL,
 			PRIMARY KEY (login_id, portal_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS restore_override (
@@ -145,30 +167,20 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		}
 	}
 
-	// Migrations: add missing columns to cloud_chat (SQLite doesn't support IF NOT EXISTS on ALTER).
-	// fwd_backfill_done: set to 1 when FetchMessages(forward) completes for a portal so that
-	// preUploadCloudAttachments skips those portals on restart. Default 0 means "not yet done".
-	// deleted: soft-deletes cloud_chat rows alongside cloud_message rows so restore-chat can
-	// recover group name and participants.
-	for _, col := range []struct{ name, def string }{
+	// Migrations: add missing columns to cloud_chat and cloud_message.
+	// Postgres supports ADD COLUMN IF NOT EXISTS; SQLite does not, so we check
+	// pragma_table_info first on that dialect.
+	if err := s.migrateColumns(ctx, "cloud_chat", []struct{ name, def string }{
 		{"record_name", "TEXT NOT NULL DEFAULT ''"},
 		{"group_id", "TEXT NOT NULL DEFAULT ''"},
 		{"group_photo_guid", "TEXT"},
 		{"deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
 		{"is_filtered", "INTEGER NOT NULL DEFAULT 0"},
-		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT 0"},
-	} {
-		var exists int
-		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_chat') WHERE name=$1`, col.name).Scan(&exists)
-		if exists == 0 {
-			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_chat ADD COLUMN %s %s`, col.name, col.def)); err != nil {
-				return fmt.Errorf("failed to add %s column to cloud_chat: %w", col.name, err)
-			}
-		}
+		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT FALSE"},
+	}); err != nil {
+		return err
 	}
-
-	// Migrations: add missing columns to cloud_message.
-	for _, col := range []struct{ name, def string }{
+	if err := s.migrateColumns(ctx, "cloud_message", []struct{ name, def string }{
 		{"subject", "TEXT"},
 		{"tapback_type", "INTEGER"},
 		{"tapback_target_guid", "TEXT"},
@@ -177,14 +189,8 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 		{"date_read_ms", "BIGINT NOT NULL DEFAULT 0"},
 		{"record_name", "TEXT NOT NULL DEFAULT ''"},
 		{"has_body", "BOOLEAN NOT NULL DEFAULT TRUE"},
-	} {
-		var exists int
-		_ = s.db.QueryRow(ctx, `SELECT COUNT(*) FROM pragma_table_info('cloud_message') WHERE name=$1`, col.name).Scan(&exists)
-		if exists == 0 {
-			if _, err := s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE cloud_message ADD COLUMN %s %s`, col.name, col.def)); err != nil {
-				return fmt.Errorf("failed to add %s column to cloud_message: %w", col.name, err)
-			}
-		}
+	}); err != nil {
+		return err
 	}
 
 	// Cleanup: permanently delete system/rename message rows that slipped into
@@ -226,7 +232,7 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_attachment_cache (
 		login_id    TEXT    NOT NULL,
 		record_name TEXT    NOT NULL,
-		content_json BLOB   NOT NULL,
+		content_json BYTEA   NOT NULL,
 		created_ts  BIGINT  NOT NULL,
 		PRIMARY KEY (login_id, record_name)
 	)`); err != nil {
@@ -1918,7 +1924,7 @@ func (s *cloudBackfillStore) deleteLocalChatByPortalID(ctx context.Context, port
 func (s *cloudBackfillStore) undeleteCloudChatByPortalID(ctx context.Context, portalID string) error {
 	if _, err := s.db.Exec(ctx,
 		`UPDATE cloud_chat
-		 SET deleted=FALSE, updated_ts=$3, fwd_backfill_done=0
+		 SET deleted=FALSE, updated_ts=$3, fwd_backfill_done=FALSE
 		 WHERE login_id=$1 AND portal_id=$2 AND deleted=TRUE`,
 		s.loginID, portalID, time.Now().UnixMilli(),
 	); err != nil {
@@ -1949,7 +1955,7 @@ func (s *cloudBackfillStore) hardDeleteMessagesByPortalID(ctx context.Context, p
 // recovery where the cloud_chat may or may not be soft-deleted.
 func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, portalID string) error {
 	_, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET fwd_backfill_done=0 WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET fwd_backfill_done=FALSE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	)
 	return err
@@ -1958,12 +1964,13 @@ func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, porta
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
 // APNs message so the UUID survives restarts. CloudKit-synced messages are
 // already stored via upsertMessageBatch; this covers the realtime path.
-// Uses INSERT OR IGNORE so it's safe to call even if the message already exists.
+// Uses ON CONFLICT DO NOTHING so it's safe to call even if the message already exists.
 func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
-		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT DO NOTHING
 	`, s.loginID, uuid, portalID, timestampMS, isFromMe, nowMS, nowMS)
 	return err
 }
@@ -1976,8 +1983,9 @@ func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, porta
 func (s *cloudBackfillStore) persistTapbackUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool, tapbackType uint32) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
-		INSERT OR IGNORE INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, tapback_type, created_ts, updated_ts)
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, tapback_type, created_ts, updated_ts)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT DO NOTHING
 	`, s.loginID, uuid, portalID, timestampMS, isFromMe, tapbackType, nowMS, nowMS)
 	return err
 }
@@ -2240,27 +2248,30 @@ func (s *cloudBackfillStore) getNewestBackfillableMessageTimestamp(ctx context.C
 // Returns the number of rows fixed.
 func (s *cloudBackfillStore) healMisroutedGroupMessages(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
-	result, err := s.db.Exec(ctx, `
+	// INSTR is SQLite-only; Postgres uses STRPOS (same semantics: 1-based position).
+	substringFn := "INSTR"
+	if s.db.Dialect == dbutil.Postgres {
+		substringFn = "STRPOS"
+	}
+	result, err := s.db.Exec(ctx, fmt.Sprintf(`
 		UPDATE cloud_message AS m
 		SET portal_id = cc.portal_id,
 		    updated_ts = $2
 		FROM cloud_chat cc
 		WHERE m.login_id = $1
 		  AND cc.login_id = $1
-		  AND m.chat_id LIKE '%;+;%'
+		  AND m.chat_id LIKE '%%;+;%%'
 		  AND (
-		    -- Strategy 1: cloud_chat_id matches the hex suffix after ";+;"
 		    (cc.cloud_chat_id <> '' AND
-		     LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(m.chat_id, INSTR(m.chat_id, ';+;') + 3)))
+		     LOWER(cc.cloud_chat_id) = LOWER(SUBSTR(m.chat_id, %s(m.chat_id, ';+;') + 3)))
 		    OR
-		    -- Strategy 2: portal_id is "gid:<uuid>" and uuid matches hex suffix
-		    (cc.portal_id LIKE 'gid:%' AND
-		     LOWER(SUBSTR(cc.portal_id, 5)) = LOWER(SUBSTR(m.chat_id, INSTR(m.chat_id, ';+;') + 3)))
+		    (cc.portal_id LIKE 'gid:%%' AND
+		     LOWER(SUBSTR(cc.portal_id, 5)) = LOWER(SUBSTR(m.chat_id, %s(m.chat_id, ';+;') + 3)))
 		  )
 		  AND m.portal_id <> cc.portal_id
 		  AND cc.portal_id IS NOT NULL
 		  AND cc.portal_id <> ''
-	`, s.loginID, now)
+	`, substringFn, substringFn), s.loginID, now)
 	if err != nil {
 		return 0, err
 	}
@@ -2839,7 +2850,7 @@ func (s *cloudBackfillStore) undeleteCloudMessagesByPortalID(ctx context.Context
 	// row wasn't soft-deleted (e.g., recover arrived before delete was persisted,
 	// or the row was only tracked in-memory via recentlyDeletedPortals).
 	if _, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET fwd_backfill_done=0 WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET fwd_backfill_done=FALSE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	); err != nil {
 		return 0, fmt.Errorf("failed to reset fwd_backfill_done for portal %s: %w", portalID, err)
@@ -2881,7 +2892,7 @@ func (s *cloudBackfillStore) seedChatFromRecycleBin(ctx context.Context, portalI
 	}
 	_, _ = s.db.Exec(ctx, `
 		INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, group_id, display_name, group_photo_guid, participants_json, created_ts, updated_ts, deleted, fwd_backfill_done)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, FALSE, 0)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8, FALSE, FALSE)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			portal_id=EXCLUDED.portal_id,
 			display_name=COALESCE(EXCLUDED.display_name, cloud_chat.display_name),
@@ -2940,7 +2951,7 @@ func (s *cloudBackfillStore) saveAttachmentCacheEntry(ctx context.Context, recor
 // corresponding cloud_chat row.
 func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portalID string) {
 	res, err := s.db.Exec(ctx,
-		`UPDATE cloud_chat SET fwd_backfill_done=1 WHERE login_id=$1 AND portal_id=$2`,
+		`UPDATE cloud_chat SET fwd_backfill_done=TRUE WHERE login_id=$1 AND portal_id=$2`,
 		s.loginID, portalID,
 	)
 
@@ -2955,8 +2966,9 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 	}
 	if needsInsert {
 		_, _ = s.db.Exec(context.Background(), `
-			INSERT OR IGNORE INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
-			VALUES ($1, $2, $3, $4, 1)`,
+			INSERT INTO cloud_chat (login_id, cloud_chat_id, portal_id, created_ts, fwd_backfill_done)
+			VALUES ($1, $2, $3, $4, TRUE)
+			ON CONFLICT DO NOTHING`,
 			s.loginID, "synthetic:"+portalID, portalID, time.Now().UnixMilli(),
 		)
 	}
@@ -2968,7 +2980,7 @@ func (s *cloudBackfillStore) markForwardBackfillDone(ctx context.Context, portal
 func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID string) bool {
 	var done bool
 	err := s.db.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=1)`,
+		`SELECT EXISTS(SELECT 1 FROM cloud_chat WHERE login_id=$1 AND portal_id=$2 AND fwd_backfill_done=TRUE)`,
 		s.loginID, portalID,
 	).Scan(&done)
 	if err != nil {
@@ -2982,7 +2994,7 @@ func (s *cloudBackfillStore) isForwardBackfillDone(ctx context.Context, portalID
 // to skip portals that don't need pre-upload on restart.
 func (s *cloudBackfillStore) getForwardBackfillDonePortals(ctx context.Context) (map[string]bool, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1 AND fwd_backfill_done=1`,
+		`SELECT DISTINCT portal_id FROM cloud_chat WHERE login_id=$1 AND fwd_backfill_done=TRUE`,
 		s.loginID,
 	)
 	if err != nil {
