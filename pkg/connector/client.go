@@ -107,6 +107,37 @@ type restorePipelineOptions struct {
 
 const maxAttachmentRetries = 3
 
+// defaultMaxAttachmentSizeMB is the fallback ceiling when max_attachment_size_mb
+// is unset or invalid. 100 MB matches Beeper's upload limit and is safe on small
+// hosts. See the config doc (IMConfig.MaxAttachmentSizeMB) for the full rationale.
+const defaultMaxAttachmentSizeMB = 100
+
+// maxAttachmentBytes is the configured attachment-size ceiling in bytes.
+// Attachments larger than this are skipped outright — never downloaded,
+// transcoded, or uploaded. The homeserver rejects anything over its upload cap,
+// so bridging it just burns a download buffer, a doomed transcode, and disk for
+// a guaranteed rejection. Operators with a homeserver that accepts larger uploads
+// (and the RAM to spare) can raise max_attachment_size_mb.
+func (c *IMClient) maxAttachmentBytes() int64 {
+	mb := c.Main.Config.MaxAttachmentSizeMB
+	if mb <= 0 {
+		mb = defaultMaxAttachmentSizeMB
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+// recoverAttachmentSize returns an attachment's real byte size from its
+// reported file_size. CloudKit stores file_size as a wrapped i32, so a blob in
+// [2 GiB, 4 GiB) surfaces as a NEGATIVE value; add 2^32 to recover it. This lets
+// the size gate compare correctly against any configured limit, including ones
+// raised above 2 GiB.
+func recoverAttachmentSize(fileSize int64) int64 {
+	if fileSize < 0 {
+		return fileSize + (1 << 32)
+	}
+	return fileSize
+}
+
 func (c *IMClient) videoTranscoding() bool {
 	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.VideoTranscoding != nil {
 		return *meta.VideoTranscoding
@@ -1491,10 +1522,27 @@ func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {
 }
 
 func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
+	base := caps
 	if portal.RoomType == database.RoomTypeDM {
-		return capsDM
+		base = capsDM
 	}
-	return caps
+	if !c.Main.Config.ReadReceipts || !c.Main.Config.TypingNotifications {
+		modified := *base
+		modified.ReadReceipts = c.Main.Config.ReadReceipts
+		modified.TypingNotifications = c.Main.Config.TypingNotifications
+		// Vary the capability ID so bridgev2's UpdateCapabilities re-advertises
+		// the reduced feature set. It short-circuits when caps.GetID() matches
+		// the stored CapState.ID, so reusing base.ID would leave clients showing
+		// stale support after the flag is toggled. Mirrors the "+dm" convention.
+		if !c.Main.Config.ReadReceipts {
+			modified.ID += "+nordr"
+		}
+		if !c.Main.Config.TypingNotifications {
+			modified.ID += "+notyp"
+		}
+		return &modified
+	}
+	return base
 }
 
 // ============================================================================
@@ -5778,7 +5826,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 }
 
 func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixTyping) error {
-	if c.client == nil {
+	if c.client == nil || !c.Main.Config.TypingNotifications {
 		return nil
 	}
 	conv := c.portalToConversation(msg.Portal)
@@ -5791,7 +5839,7 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 }
 
 func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev2.MatrixReadReceipt) error {
-	if c.client == nil {
+	if c.client == nil || !c.Main.Config.ReadReceipts {
 		return nil
 	}
 	conv := c.portalToConversation(receipt.Portal)
@@ -7288,9 +7336,11 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			textContent.Format = event.FormatHTML
 			textContent.FormattedBody = formattedBody
 		}
-		if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
-			textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
-				fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
+		if c.Main.Config.URLPreviewsInBackfill {
+			if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
+				textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+					fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
+				}
 			}
 		}
 		messages = append(messages, &bridgev2.BackfillMessage{
