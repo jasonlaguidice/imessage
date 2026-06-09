@@ -636,6 +636,16 @@ void uniffi_rustpushgo_fn_free_wrappedapsconnection(
 	RustCallStatus* out_status
 );
 
+void uniffi_rustpushgo_fn_method_wrappedapsconnection_close(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
+uint64_t uniffi_rustpushgo_fn_method_wrappedapsconnection_seconds_since_last_inbound(
+	void* ptr,
+	RustCallStatus* out_status
+);
+
 void* uniffi_rustpushgo_fn_method_wrappedapsconnection_state(
 	void* ptr,
 	RustCallStatus* out_status
@@ -1846,6 +1856,14 @@ uint16_t uniffi_rustpushgo_checksum_method_loginsession_needs_2fa(
 );
 
 uint16_t uniffi_rustpushgo_checksum_method_loginsession_submit_2fa(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedapsconnection_close(
+	RustCallStatus* out_status
+);
+
+uint16_t uniffi_rustpushgo_checksum_method_wrappedapsconnection_seconds_since_last_inbound(
 	RustCallStatus* out_status
 );
 

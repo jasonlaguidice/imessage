@@ -948,6 +948,14 @@ impl WrappedAPSState {
 #[derive(uniffi::Object)]
 pub struct WrappedAPSConnection {
     pub inner: rustpush::APSConnection,
+    /// Epoch-ms of the last inbound APS frame — ANY frame, real message or the
+    /// ~60s keepalive Pong. The drain task stamps this on every frame; the Go
+    /// receive-watchdog reads `seconds_since_last_inbound()` to spot a wedged
+    /// receive path (a reconnect storm never delivers even a Pong) and trigger
+    /// a full client rebuild. Lives on the connection object, NOT the Client,
+    /// because `Disconnect` only `close()`s the connection — it never destroys
+    /// this object — so the watchdog can poll it without use-after-free risk.
+    pub last_inbound_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -956,6 +964,31 @@ impl WrappedAPSConnection {
         Arc::new(WrappedAPSState {
             inner: Some(self.inner.state.read().await.clone()),
         })
+    }
+
+    /// Seconds since the last inbound APS frame. A healthy link refreshes this
+    /// every ~60s (the keepalive Pong) even when idle, so a value far past that
+    /// means the receive path is wedged — a reconnect storm or half-open socket
+    /// that never delivers a frame. The Go receive-watchdog polls this.
+    pub fn seconds_since_last_inbound(&self) -> u64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let last = self
+            .last_inbound_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        now.saturating_sub(last) / 1000
+    }
+
+    /// Tear down the APNs connection's ResourceManager — stops its reconnect
+    /// loop and frees the courier socket. Called on full client teardown so a
+    /// rebuild never leaves a SECOND live connection on the same device token:
+    /// Apple drops the duplicate ("Failed to read message from APS ... early
+    /// eof"), and rustpush's no-backoff reconnect loop turns that into a
+    /// self-sustaining ~9/sec storm that only a restart clears.
+    pub fn close(&self) {
+        self.inner.close();
     }
 }
 
@@ -5223,7 +5256,10 @@ pub async fn connect(
     if let Some(error) = error {
         error!("APS connection error (non-fatal, will retry): {}", error);
     }
-    Arc::new(WrappedAPSConnection { inner: connection })
+    Arc::new(WrappedAPSConnection {
+        inner: connection,
+        last_inbound_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+    })
 }
 
 /// Login session object that holds state between login steps.
@@ -6695,6 +6731,7 @@ pub async fn new_client(
         let conn = connection.inner.clone();
         let conn_for_download = connection.inner.clone();
         let reconnected_at = reconnected_at.clone();
+        let last_inbound_ms = connection.last_inbound_ms.clone();
         let sk_for_recv = shared_statuskit_for_recv.clone();
         let status_cb_for_recv = status_callback_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.inner.clone();
@@ -6715,6 +6752,7 @@ pub async fn new_client(
             let drain_handle = tokio::spawn({
                 let conn = conn.clone();
                 let reconnected_at = reconnected_at.clone();
+                let last_inbound_ms = last_inbound_ms.clone();
                 let identity_for_reregister = identity_for_reregister.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
@@ -6778,17 +6816,31 @@ pub async fn new_client(
                             result = recv.recv() => {
                                 match result {
                                     Ok(msg) => {
-                                        drain_pending.fetch_add(1, Ordering::Relaxed);
-                                        let drain_ts = std::time::SystemTime::now()
+                                        // Any inbound APS frame proves the transport is alive.
+                                        // Stamp the epoch-ms so the Go receive-watchdog can
+                                        // measure silence (even Pongs count — Pongs never reach
+                                        // Go but prove the socket isn't half-open).
+                                        let now_ms = std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
                                             .unwrap_or_default()
                                             .as_millis() as u64;
-                                        if tx.send((msg, drain_ts)).is_err() {
+                                        last_inbound_ms.store(now_ms, Ordering::Relaxed);
+                                        drain_pending.fetch_add(1, Ordering::Relaxed);
+                                        if tx.send((msg, now_ms)).is_err() {
                                             info!("Process task gone, stopping drain");
                                             break;
                                         }
                                     }
                                     Err(broadcast::error::RecvError::Lagged(n)) => {
+                                        // Frames were flowing fast enough that we fell behind —
+                                        // the link is alive; refresh the watchdog signal too.
+                                        last_inbound_ms.store(
+                                            std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis() as u64,
+                                            Ordering::Relaxed,
+                                        );
                                         error!(
                                             "APS broadcast receiver lagged — {} messages were DROPPED by the \
                                              broadcast channel before we could read them. Real-time messages \

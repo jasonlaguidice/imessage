@@ -1168,6 +1168,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_close(uniffiStatus)
+		})
+		if checksum != 57053 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedapsconnection_close: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_seconds_since_last_inbound(uniffiStatus)
+		})
+		if checksum != 11948 {
+			// If this happens try cleaning and rebuilding your project
+			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedapsconnection_seconds_since_last_inbound: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedapsconnection_state(uniffiStatus)
 		})
 		if checksum != 59967 {
@@ -4154,6 +4172,25 @@ func (_ FfiDestroyerLoginSession) Destroy(value *LoginSession) {
 
 type WrappedApsConnection struct {
 	ffiObject FfiObject
+}
+
+func (_self *WrappedApsConnection) Close() {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedApsConnection")
+	defer _self.ffiObject.decrementPointer()
+	rustCall(func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_rustpushgo_fn_method_wrappedapsconnection_close(
+			_pointer, _uniffiStatus)
+		return false
+	})
+}
+
+func (_self *WrappedApsConnection) SecondsSinceLastInbound() uint64 {
+	_pointer := _self.ffiObject.incrementPointer("*WrappedApsConnection")
+	defer _self.ffiObject.decrementPointer()
+	return FfiConverterUint64INSTANCE.Lift(rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint64_t {
+		return C.uniffi_rustpushgo_fn_method_wrappedapsconnection_seconds_since_last_inbound(
+			_pointer, _uniffiStatus)
+	}))
 }
 
 func (_self *WrappedApsConnection) State() *WrappedApsState {

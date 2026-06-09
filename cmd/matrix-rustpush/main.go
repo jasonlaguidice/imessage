@@ -121,6 +121,14 @@ func main() {
 		return
 	}
 
+	// Raise the open-file-descriptor limit before opening any connections. On
+	// macOS, launchd hands daemons a soft RLIMIT_NOFILE of just 256, which a
+	// busy bridge (many portals, APNs, IDS, the appservice websocket, SQLite,
+	// CardDAV) can exhaust over long uptime — after which new sockets fail with
+	// "too many open files", the websocket can't reconnect, and the bridge goes
+	// silent until restarted. No-op on non-macOS/Linux platforms. See rlimit_*.go.
+	raiseFileLimit()
+
 	// Instead of m.Run(), manually call PreInit/Init/Start so we can
 	// repair broken permissions before validateConfig() runs in Init().
 	m.PreInit()
