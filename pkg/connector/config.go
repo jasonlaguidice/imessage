@@ -49,6 +49,26 @@ type IMConfig struct {
 	// converting HEIC/HEIF images. Default is 95.
 	HEICJPEGQuality int `yaml:"heic_jpeg_quality"`
 
+	// MaxAttachmentSizeMB is the maximum attachment size to bridge, in MB.
+	// Attachments larger than this are skipped entirely — not downloaded,
+	// transcoded, or uploaded. The default 100 matches Beeper's upload limit;
+	// the homeserver rejects anything larger, so bridging it just wastes
+	// bandwidth, CPU, and memory for a guaranteed rejection. Raise this ONLY if
+	// your homeserver accepts larger uploads (e.g. a self-hosted Synapse with a
+	// higher max_upload_size) AND the host has the RAM to spare — attachments
+	// are buffered in memory while downloading. Default 100.
+	MaxAttachmentSizeMB int `yaml:"max_attachment_size_mb"`
+
+	// URLPreviewsInBackfill controls whether the bridge fetches link-preview
+	// metadata (og:/twitter: tags + thumbnail image) for messages that
+	// contain a URL during backfill. Each URL-bearing message triggers up to
+	// three HTTP round-trips (homeserver preview, page metadata, image
+	// download + re-upload) inline with conversion, which on a slow uplink
+	// dominates backfill wall-clock time. Setting this to false skips
+	// preview generation for backfilled history only; live inbound messages
+	// and outbound edits still build previews normally. Default true.
+	URLPreviewsInBackfill bool `yaml:"url_previews_in_backfill"`
+
 	// PreferredHandle overrides the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 	// If empty, the handle chosen during login is used.
@@ -88,6 +108,20 @@ type IMConfig struct {
 	// user. Useful for users who find the notices noisy or who rely on
 	// other Apple devices for Focus visibility.
 	StatusKitNotifications bool `yaml:"statuskit_notifications"`
+
+	// ReadReceipts controls whether the bridge sends read receipts to iMessage
+	// contacts when you mark a message as read in Matrix. When false, iMessage
+	// contacts will not see the "Read" indicator for your messages. Incoming
+	// read receipts from iMessage contacts are always forwarded to Matrix.
+	// Default is true.
+	ReadReceipts bool `yaml:"read_receipts"`
+
+	// TypingNotifications controls whether the bridge sends typing indicators
+	// to iMessage contacts while you compose a reply in Matrix. When false,
+	// iMessage contacts will not see the typing bubble. Incoming typing
+	// indicators from iMessage contacts are always forwarded to Matrix.
+	// Default is true.
+	TypingNotifications bool `yaml:"typing_notifications"`
 
 	// CardDAV is an external CardDAV server for contact name resolution.
 	// When configured, this is used instead of iCloud CardDAV contacts.
@@ -181,11 +215,15 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "video_transcoding")
 	helper.Copy(up.Bool, "heic_conversion")
 	helper.Copy(up.Int, "heic_jpeg_quality")
+	helper.Copy(up.Int, "max_attachment_size_mb")
+	helper.Copy(up.Bool, "url_previews_in_backfill")
 	helper.Copy(up.Str, "preferred_handle")
 	helper.Copy(up.Str, "facetime_display_name")
 	helper.Copy(up.Bool, "disable_facetime")
 	helper.Copy(up.Bool, "statuskit_share_on_startup")
 	helper.Copy(up.Bool, "statuskit_notifications")
+	helper.Copy(up.Bool, "read_receipts")
+	helper.Copy(up.Bool, "typing_notifications")
 	helper.Copy(up.Str, "carddav", "email")
 	helper.Copy(up.Str, "carddav", "url")
 	helper.Copy(up.Str, "carddav", "username")

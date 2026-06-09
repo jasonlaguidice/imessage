@@ -25,6 +25,24 @@ heic_conversion: false
 # JPEG output quality for HEIC/HEIF conversion (1–100). Default is 95.
 heic_jpeg_quality: 95
 
+# Maximum attachment size to bridge, in MB. Attachments larger than this are
+# skipped entirely — not downloaded, transcoded, or uploaded. The default 100
+# matches Beeper's upload limit; the homeserver rejects anything larger, so
+# bridging it just wastes bandwidth, CPU, and memory for a guaranteed rejection.
+# Raise this ONLY if your homeserver accepts larger uploads (e.g. a self-hosted
+# Synapse with a higher max_upload_size) AND the host has the RAM to spare —
+# attachments are buffered in memory while downloading, so a high value on a
+# small host can exhaust memory. Default 100.
+max_attachment_size_mb: 100
+
+# Fetch link previews (og:/twitter: tags + thumbnail) for URL-bearing
+# messages during backfill. Each URL triggers up to three HTTP round-trips
+# (homeserver preview, page fetch, image download + re-upload) inline with
+# conversion — on a slow uplink this dominates backfill time. Set to false
+# to skip previews during backfill only; live inbound messages and outbound
+# edits still build previews normally.
+url_previews_in_backfill: true
+
 # Override the outgoing iMessage identity (what recipients see your messages "from").
 # Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
 # Leave empty to use the handle chosen during login.
@@ -59,6 +77,16 @@ statuskit_share_on_startup: true
 # StatusKit registration / key exchange running normally (the IDS-layer
 # 4-service identity is unaffected, so peer reshare eligibility is kept).
 statuskit_notifications: true
+
+# Send read receipts to iMessage contacts when you read their messages in
+# Matrix. Set to false to stop iMessage contacts seeing when you have read
+# their messages. Incoming read receipts from iMessage contacts are unaffected.
+read_receipts: true
+
+# Send typing indicators to iMessage contacts while you compose a reply in
+# Matrix. Set to false to hide your typing from iMessage contacts. Incoming
+# typing indicators from iMessage contacts are unaffected.
+typing_notifications: true
 
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
