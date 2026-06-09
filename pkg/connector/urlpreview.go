@@ -3,6 +3,7 @@ package connector
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -17,6 +18,56 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 )
+
+// debugDisablePrivacy is a process-global DEVELOPMENT-ONLY switch that, when
+// true, causes log helpers to pass user-identifying values (handles, URLs)
+// through verbatim instead of anonymizing them. Defaults to false (privacy on).
+// Set via IMConnector.Start() in environments that need raw values for debugging.
+var debugDisablePrivacy bool
+
+// sanitizeURLError returns err with every occurrence of the given URLs in
+// the error message replaced by their scheme+host form. Go's net/http wraps
+// transport failures in *url.Error whose Error() embeds the full URL
+// (e.g. `Get "https://x.com/secret/path": dial tcp …`), so .Err(err) re-leaks
+// the path/query that logSafeURL was meant to strip from the same log line.
+func sanitizeURLError(err error, urls ...string) error {
+	if err == nil {
+		return nil
+	}
+	msg := err.Error()
+	original := msg
+	for _, u := range urls {
+		if u == "" {
+			continue
+		}
+		msg = strings.ReplaceAll(msg, u, logSafeURL(u))
+	}
+	if msg == original {
+		return err
+	}
+	return errors.New(msg)
+}
+
+// logSafeURL returns a scheme+host representation of a URL for log fields, so
+// the path and query (which carry user-content references like article slugs
+// or search terms) don't end up in logs. Falls back to "url:redacted" when
+// the URL is unparseable.
+func logSafeURL(u string) string {
+	if u == "" {
+		return ""
+	}
+	if debugDisablePrivacy {
+		return u
+	}
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Host == "" {
+		return "url:redacted"
+	}
+	if parsed.Scheme == "" {
+		return parsed.Host
+	}
+	return parsed.Scheme + "://" + parsed.Host
+}
 
 // metaTagRegex generically matches all <meta> tags with property/name and content
 // attributes, in either attribute order. Captures the full attribute name (including
