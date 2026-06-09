@@ -1111,7 +1111,24 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// mints on-demand (same as legacy behavior). With the bridge's long
 	// uptime, pre-minting here gives Apple's FT server days of
 	// identity-propagation time before the link is actually used.
-	if c.handle != "" {
+	// See lastFullConnectKVKey: skip the Apple-heavy IDS sweep (FT pre-mint +
+	// StatusKit contact invites) when a full connect happened within the
+	// cooldown — a reconnect/rebuild must not re-fire that burst at Apple
+	// mid-storm. Degrades safe: any KV/parse miss → treated as "not recent" →
+	// runs exactly as before. Receiving is unaffected (handled by the APS
+	// reconnect + StatusKit subscribe, neither gated here).
+	skipHeavyIDSSweep := false
+	if raw := c.Main.Bridge.DB.KV.Get(context.Background(), lastFullConnectKVKey); raw != "" {
+		if last, perr := time.Parse(time.RFC3339, raw); perr == nil && time.Since(last) < fullConnectIDSCooldown {
+			skipHeavyIDSSweep = true
+			log.Info().Time("last_full_connect", last).Msg("Skipping FT pre-mint + StatusKit invite sweep — full connect within cooldown (avoids a redundant mid-reconnect IDS burst to Apple)")
+		}
+	}
+	if !skipHeavyIDSSweep {
+		c.Main.Bridge.DB.KV.Set(context.Background(), lastFullConnectKVKey, time.Now().Format(time.RFC3339))
+	}
+
+	if c.handle != "" && !skipHeavyIDSSweep {
 		go func(handle string) {
 			ft, ftErr := c.client.GetFacetimeClient()
 			if ftErr != nil {
@@ -1226,7 +1243,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 			// peer's distribution set the way one-at-a-time invites do —
 			// 12h on passive-only yielded zero real-iOS reshares, whereas
 			// OB (which invites one at a time) gets reshares fine.
-			go c.inviteContactsToStatusSharing(log)
+			// Gated by the full-connect cooldown (see lastFullConnectKVKey): a
+			// reconnect/rebuild must not re-fire this 20+-handle IDS invite burst
+			// at Apple. skipHeavyIDSSweep is captured from Connect's scope.
+			if !skipHeavyIDSSweep {
+				go c.inviteContactsToStatusSharing(log)
+			}
 			// Share status "available" once at startup. Empirically, peer iOS
 			// reciprocates a share with its own reshare, which is what gives
 			// us the key material to decrypt their subsequent presence
@@ -1347,6 +1369,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 		}
 	}
 	c.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
+
+	// Backstop the APNs receive path: if it goes fully silent (no frames, not
+	// even keepalive Pongs) for far longer than a healthy link ever would,
+	// auto-rebuild the client. This recovers the daily "can send but stopped
+	// receiving" reconnect-storm stall without a manual restart. Passed
+	// c.stopChan by value so it tracks this connect epoch.
+	go c.runReceiveWedgeWatchdog(c.stopChan, log.With().Str("component", "receive_wedge_watchdog").Logger())
 
 	// Eagerly silence bridge bot push notifications so the rule is in place
 	// before any bot message (StatusKit notices, admin messages, etc.) fires.
@@ -1503,6 +1532,18 @@ func (c *IMClient) Disconnect() {
 		c.client.Destroy()
 		c.client = nil
 	}
+	// Tear down the APNs connection too (stop its ResourceManager + free the
+	// courier socket). A reconnect/relogin opens a NEW connection on the SAME
+	// device token; if the old one lingered, Apple drops the duplicate
+	// ("Failed to read message from APS ... early eof") and rustpush's
+	// no-backoff reconnect loop turns that into the self-sustaining
+	// receive-stall storm. Closing here guarantees the next connect starts
+	// clean. Close() only stops the underlying connection — it does NOT destroy
+	// the WrappedApsConnection Go object — so the receive-wedge watchdog
+	// polling it is never left holding a freed handle.
+	if c.connection != nil {
+		c.connection.Close()
+	}
 	if c.chatDB != nil {
 		c.chatDB.Close()
 		c.chatDB = nil
@@ -1543,6 +1584,67 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 		return &modified
 	}
 	return base
+}
+
+// receiveWedgeRecoverySecs: if NO inbound APS frame arrives for this long —
+// not even the ~60s keepalive Pong — the receive path is wedged (a reconnect
+// storm or half-open socket that the in-Rust 300s request_update couldn't
+// clear), and we escalate to a full client rebuild. 10 min is well past the
+// 60s Pong cadence and the 300s cheap recovery, so a healthy or merely-quiet
+// link (which always sees Pongs) never trips it.
+const receiveWedgeRecoverySecs uint64 = 600
+
+// A reconnect/rebuild re-runs Connect, which re-fires the Apple-heavy IDS work:
+// the FaceTime link pre-mint and the StatusKit contact-invite sweep (a 20+-handle
+// per-handle IDS query burst). Mid-reconnect-storm that burst has been observed
+// escalating to a temporary Apple account disable. Gate it behind a cooldown so a
+// Connect within this window of the last full one reuses the recent sweep instead
+// of re-querying Apple. Receive recovery (APS reconnect + StatusKit subscribe) is
+// NOT gated — only the outbound invite/mint sweep. Global key (single-login bridge,
+// matching the existing statuskit/pet KV keys).
+const lastFullConnectKVKey = database.Key("im.last_full_connect")
+
+// Must exceed the wedge-rebuild cycle (≈10-min wedge threshold + 5-min reconnect
+// delay ≈ 15 min) so consecutive auto-rebuilds reliably skip the sweep instead of
+// landing right on the boundary; 30 min also still allows a periodic real sweep.
+const fullConnectIDSCooldown = 30 * time.Minute
+
+// runReceiveWedgeWatchdog watches the connection-level "seconds since last
+// inbound frame" signal and, on a prolonged wedge, asks bridgev2 to rebuild
+// the client by reporting StateUnknownError (→ recreateClient → Connect,
+// bounded by UnknownErrorMaxAutoReconnects so it can't loop forever). It is the
+// automated form of the manual restart that recovers the daily "can send but
+// stopped receiving" stall. One-shot: after firing it returns; the rebuilt
+// client starts a fresh watchdog. Gated by `stop` (taken by value so it tracks
+// this connect epoch, like the body-scrub loop) so a normal teardown ends it.
+// Polls c.connection (which Disconnect only closes, never destroys), so the
+// poll can never touch a freed handle.
+func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logger) {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			conn := c.connection
+			if conn == nil {
+				continue
+			}
+			idle := conn.SecondsSinceLastInbound()
+			if idle >= receiveWedgeRecoverySecs {
+				log.Warn().
+					Uint64("idle_secs", idle).
+					Msg("APNs receive path wedged far past the keepalive cadence and the in-process reconnect — forcing a full client rebuild (StateUnknownError → recreateClient → Connect)")
+				c.UserLogin.BridgeState.Send(status.BridgeState{
+					StateEvent: status.StateUnknownError,
+					Error:      "im-receive-wedged",
+					Message:    "iMessage stopped receiving; reconnecting",
+				})
+				return
+			}
+		}
+	}
 }
 
 // ============================================================================
