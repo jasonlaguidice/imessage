@@ -43,6 +43,21 @@ type contactMatch struct {
 	label       string // human-readable identifier: "📞 +1 (555) 234-5678"
 }
 
+// maxContactValidate caps how many contact identifiers a single `contacts`
+// search validates against Apple's identity service (IDS). A broad query
+// (e.g. "David" against a 6,000-entry address book) can match thousands of
+// phone/email identifiers; validating them all hammers IDS. Only the
+// top-ranked identifiers are checked — the user is told to narrow the search
+// if there were more.
+const maxContactValidate = 25
+
+// Name-match score tiers, ranked most- to least-relevant.
+const (
+	matchNone = iota
+	matchFuzzy
+	matchExact
+)
+
 // cmdContacts is the !im contacts command handler.
 var cmdContacts = &commands.FullHandler{
 	Name:    "contacts",
@@ -87,13 +102,23 @@ func fnContacts(ce *commands.Event) {
 		rawLabel   string // phone/email as stored in the contact record
 		name       string // contact display name
 	}
+	// Rank matching contacts so exact name matches come before fuzzy ones —
+	// this matters once we cap the IDS validation below, so the most relevant
+	// matches stay within the cap.
+	var exact, fuzzy []*imessage.Contact
+	for _, contact := range all {
+		switch contactMatchScore(contact, query) {
+		case matchExact:
+			exact = append(exact, contact)
+		case matchFuzzy:
+			fuzzy = append(fuzzy, contact)
+		}
+	}
+	ranked := append(exact, fuzzy...)
+
 	var candidates []candidate
 	seen := make(map[string]bool)
-
-	for _, contact := range all {
-		if !contactMatchesQuery(contact, query) {
-			continue
-		}
+	for _, contact := range ranked {
 		name := contact.Name()
 
 		for _, phone := range contact.Phones {
@@ -123,12 +148,36 @@ func fnContacts(ce *commands.Event) {
 		return
 	}
 
-	// --- Phase 2: batch-validate all identifiers against Apple iMessage ---
+	// Cap how many identifiers are validated against Apple's identity service.
+	// Building candidates above is cheap (string ops only); the IDS round-trip
+	// is the expensive part, so we cap here — keeping the top-ranked matches —
+	// rather than spamming IDS with every match for a broad query.
+	totalCandidates := len(candidates)
+	truncated := false
+	if len(candidates) > maxContactValidate {
+		candidates = candidates[:maxContactValidate]
+		truncated = true
+	}
+
+	// --- Phase 2: batch-validate the (capped) identifiers against Apple iMessage ---
 	ids := make([]string, len(candidates))
 	for i, c := range candidates {
 		ids[i] = c.identifier
 	}
-	valid := client.client.ValidateTargets(ids, client.handle)
+	// ValidateTargets crosses into the identity-manager FFI path, which has
+	// reachable panic sites upstream. This is a user-triggered command, so
+	// recover instead of letting a panic crash the bridge.
+	var valid []string
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				client.UserLogin.Log.Error().Interface("panic", r).
+					Msg("contacts command: ValidateTargets panicked in FFI path")
+				valid = nil
+			}
+		}()
+		valid = client.client.ValidateTargets(ids, client.handle)
+	}()
 	validSet := make(map[string]bool, len(valid))
 	for _, v := range valid {
 		validSet[v] = true
@@ -154,7 +203,11 @@ func fnContacts(ce *commands.Event) {
 	}
 
 	if len(matches) == 0 {
-		ce.Reply("No contacts matching **\"%s\"** are reachable on iMessage.", strings.Join(ce.Args, " "))
+		if truncated {
+			ce.Reply("None of the first %d of %d identifiers matching **\"%s\"** are reachable on iMessage. Add a last name (e.g. `$cmdprefix contacts David Smith`) to narrow your search.", maxContactValidate, totalCandidates, strings.Join(ce.Args, " "))
+		} else {
+			ce.Reply("No contacts matching **\"%s\"** are reachable on iMessage.", strings.Join(ce.Args, " "))
+		}
 		return
 	}
 
@@ -163,6 +216,9 @@ func fnContacts(ce *commands.Event) {
 	fmt.Fprintf(&sb, "Found **%d** iMessage contact(s) matching \"%s\":\n\n", len(matches), strings.Join(ce.Args, " "))
 	for i, m := range matches {
 		fmt.Fprintf(&sb, "%d. **%s** — %s\n", i+1, m.displayName, m.label)
+	}
+	if truncated {
+		fmt.Fprintf(&sb, "\n_Your search matched %d possible numbers/emails; only the first %d were checked against iMessage to avoid overloading Apple. Add a last name (e.g. `$cmdprefix contacts David Smith`) to narrow it down._\n", totalCandidates, maxContactValidate)
 	}
 	sb.WriteString("\nReply with a number to start a chat, or `$cmdprefix cancel` to cancel.")
 	ce.Reply(sb.String())
@@ -211,35 +267,37 @@ func fnContacts(ce *commands.Event) {
 	})
 }
 
-// contactMatchesQuery returns true if the contact's name fuzzy-matches the query.
+// contactMatchScore scores how well a contact's name matches the query:
+// matchExact for an exact substring of the name/nickname, matchFuzzy for a
+// word-by-word fuzzy match, matchNone for no match.
 //
 // Strategy (applied in order, short-circuits on first hit):
-//  1. Fast exact substring on the full name / nickname.
+//  1. Fast exact substring on the full name / nickname  → matchExact.
 //  2. Fuzzy: split both query and name into words; every query word must
 //     fuzzily match at least one name word via prefix match OR Levenshtein
-//     distance within the per-word threshold.
+//     distance within the per-word threshold              → matchFuzzy.
 //
 // Threshold table (Levenshtein):
 //
 //	≤2 chars → 0 (short tokens must prefix-match exactly)
 //	3–5 chars → 1 edit  ("jon"→"John", "smth"→"Smith")
 //	6+ chars  → 2 edits ("johnsen"→"Johnson")
-func contactMatchesQuery(contact *imessage.Contact, query string) bool {
+func contactMatchScore(contact *imessage.Contact, query string) int {
 	name := strings.ToLower(contact.Name())
 	nick := strings.ToLower(contact.Nickname)
 
 	// 1. Fast path: exact substring anywhere in name or nickname.
 	if strings.Contains(name, query) {
-		return true
+		return matchExact
 	}
 	if nick != "" && strings.Contains(nick, query) {
-		return true
+		return matchExact
 	}
 
 	// 2. Fuzzy word-by-word match.
 	queryWords := strings.Fields(query)
 	if len(queryWords) == 0 {
-		return false
+		return matchNone
 	}
 	nameWords := strings.Fields(name)
 	if nick != "" {
@@ -247,10 +305,10 @@ func contactMatchesQuery(contact *imessage.Contact, query string) bool {
 	}
 	for _, qw := range queryWords {
 		if !anyNameWordFuzzyMatches(qw, nameWords) {
-			return false
+			return matchNone
 		}
 	}
-	return true
+	return matchFuzzy
 }
 
 // anyNameWordFuzzyMatches returns true if qw fuzzy-matches any word in nameWords.
