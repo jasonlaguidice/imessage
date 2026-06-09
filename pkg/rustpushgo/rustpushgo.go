@@ -2599,6 +2599,24 @@ func (_self *Client) ForceReregisterIdentity() (uint32, error) {
 		})
 }
 
+// ClearIdentityCache drops the local IDS key cache and re-registers the
+// identity bundle (clear + update_users → refresh_now → register). Use this
+// to recover from a smeared/stale registration where FaceTime calls present
+// as temp:<uuid> or inbound routing is wrong.
+//
+// NOTE: the matching Rust FFI export (clear_identity_cache on Client) was
+// added to lib.rs but the pre-compiled .a has not been rebuilt yet. Run
+// `make build` to regenerate the bindings; after that, replace this stub
+// with the real UniFFI-generated binding.
+func (_self *Client) ClearIdentityCache() (uint32, error) {
+	// TODO: replace with real CGo binding after `make build` regenerates .a
+	// return uniffiRustCallAsyncWithErrorAndResult(
+	//     FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
+	//         return (*C.void)(C.uniffi_rustpushgo_fn_method_client_clear_identity_cache(_pointer, status))
+	//     }, ...)
+	return 0, fmt.Errorf("clear_identity_cache: Rust library not rebuilt yet — run 'make build' to regenerate bindings")
+}
+
 func (_self *Client) GetContactsUrl() (*string, error) {
 	_pointer := _self.ffiObject.incrementPointer("*Client")
 	defer _self.ffiObject.decrementPointer()
@@ -4663,6 +4681,21 @@ func (_self *WrappedFaceTimeClient) UseLinkFor(oldUsage string, usage string) er
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
 		})
+}
+
+// SetSelfDisplayName stamps the bridge user's display name into the global
+// FACETIME_SELF_DISPLAY_NAME slot (Rust-side RwLock). The Rust letmein path
+// reads it to fill the peer-visible webview nickname instead of temp:<uuid>.
+//
+// NOTE: the matching Rust FFI export (set_self_display_name on
+// WrappedFaceTimeClient) was added to lib.rs but the pre-compiled .a has not
+// been rebuilt yet. Run `make build` to regenerate the bindings; after that,
+// replace this stub with the real UniFFI-generated binding.
+func (_self *WrappedFaceTimeClient) SetSelfDisplayName(name string) {
+	// TODO: replace with real CGo binding after `make build` regenerates .a
+	// C.uniffi_rustpushgo_fn_method_wrappedfacetimeclient_set_self_display_name(
+	//     _pointer, rustBufferToC(FfiConverterStringINSTANCE.Lower(name)), _uniffiStatus)
+	_ = name
 }
 
 func (object *WrappedFaceTimeClient) Destroy() {

@@ -3442,14 +3442,24 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
         return;
     }
 
-    let targets = ft
+    // Suppress the user's OTHER Apple devices (e.g. a MacBook in the same
+    // Apple ID) from ringing when the bridge places/answers a call — but never
+    // the bridge's OWN call-carrying leg. Upstream identifies the bridge's own
+    // participant by base64(conn.get_token()) (facetime.rs:730-748); excluding
+    // that token here keeps the RespondedElsewhere off the live leg (which
+    // would tear the call down) while still reaching genuine sibling devices.
+    let my_token = ft.conn.get_token().await;
+    let targets: Vec<_> = ft
         .identity
         .cache
         .lock()
         .await
-        .get_participants_targets(topic, &handle, &relevant_people);
+        .get_participants_targets(topic, &handle, &relevant_people)
+        .into_iter()
+        .filter(|t| t.delivery_data.push_token != my_token)
+        .collect();
     if targets.is_empty() {
-        // No other own-devices registered — nothing to suppress.
+        // Only the bridge's own leg was registered — nothing to suppress.
         return;
     }
 
@@ -3466,15 +3476,11 @@ async fn suppress_own_device_ring(ft: &rustpush::facetime::FTClient, guid: &str)
         extras: Default::default(),
     };
 
-    match ft.identity.send_message(topic, ids_send, targets).await {
-        Ok(_) => info!(
-            "suppress_own_device_ring: sent RespondedElsewhere to own handle {} for session {}",
-            handle, guid
-        ),
-        Err(e) => warn!(
+    if let Err(e) = ft.identity.send_message(topic, ids_send, targets).await {
+        warn!(
             "suppress_own_device_ring: send_message failed for session {}: {:?}",
             guid, e
-        ),
+        );
     }
 }
 
@@ -3993,6 +3999,22 @@ async fn ft_handle_with_join_recovery(
     Ok(emitted)
 }
 
+// Bridge user's FaceTime display name (resolved Go-side: facetime_display_name
+// config override → Apple SPD name → handle), set via set_self_display_name.
+// Stamped onto the bridge webview's LetMeIn nickname so the peer sees the
+// user's name instead of the raw temp:<uuid> pseud — the URL &n= pre-fill only
+// fills Apple's join-page name box client-side and never reaches the wire.
+static FACETIME_SELF_DISPLAY_NAME: std::sync::RwLock<Option<String>> =
+    std::sync::RwLock::new(None);
+
+fn facetime_self_display_name() -> Option<String> {
+    FACETIME_SELF_DISPLAY_NAME
+        .read()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|s| !s.trim().is_empty())
+}
+
 async fn auto_approve_bridge_letmein(
     facetime: &rustpush::facetime::FTClient,
     request: &rustpush::facetime::LetMeInRequest,
@@ -4237,6 +4259,16 @@ async fn auto_approve_bridge_letmein(
         let mut retry_request = request.clone();
         if attempt > 0 {
             retry_request.delegation_uuid = None;
+        }
+        // Stamp the bridge user's display name onto the webview's nickname so
+        // the peer sees a name (FTMember.nickname → ConversationMember on the
+        // wire, facetime.rs:127-131) instead of the raw temp:<uuid> pseud. The
+        // webview's own LetMeIn carries no usable nickname (Apple's &n= join-
+        // page pre-fill stays client-side), so we set it bridge-side.
+        if retry_request.nickname.as_deref().unwrap_or("").trim().is_empty() {
+            if let Some(name) = facetime_self_display_name() {
+                retry_request.nickname = Some(name);
+            }
         }
         match facetime.respond_letmein(retry_request, Some(&approved_group)).await {
             Ok(()) => {
@@ -5902,6 +5934,16 @@ impl WrappedFaceTimeClient {
         serialize_state_json(&*state)
     }
 
+    /// Set the bridge user's FaceTime display name (resolved Go-side:
+    /// facetime_display_name override → Apple SPD name → handle). Stamped onto
+    /// the bridge webview's LetMeIn nickname in auto_approve_bridge_letmein so
+    /// peers see the user's name instead of the raw temp:<uuid> pseud.
+    pub fn set_self_display_name(&self, name: String) {
+        if let Ok(mut g) = FACETIME_SELF_DISPLAY_NAME.write() {
+            *g = if name.trim().is_empty() { None } else { Some(name) };
+        }
+    }
+
     pub async fn use_link_for(&self, old_usage: String, usage: String) -> Result<(), WrappedError> {
         self.inner.use_link_for(&old_usage, &usage).await?;
         Ok(())
@@ -6699,7 +6741,6 @@ pub async fn new_client(
         let status_cb_for_recv = status_callback_for_recv.clone();
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
-        let identity_for_reregister = client.identity.clone();
         let user_state_key = cache_key.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
@@ -6715,7 +6756,6 @@ pub async fn new_client(
             let drain_handle = tokio::spawn({
                 let conn = conn.clone();
                 let reconnected_at = reconnected_at.clone();
-                let identity_for_reregister = identity_for_reregister.clone();
                 async move {
                     let mut recv = conn.messages_cont.subscribe();
                     let mut state = conn.resource_state.subscribe();
@@ -6751,28 +6791,30 @@ pub async fn new_client(
                                     reconnected_at.store(now, Ordering::Relaxed);
                                     info!("APNs reconnecting (Generating), marking messages as stored for {}ms", RECONNECT_WINDOW_MS);
                                 }
-                                // APS courier reconnect: refresh IDS registration so the
-                                // madrid push-token binding tracks the (possibly rotated)
-                                // APS token. Upstream's do_connect adopts a new token
-                                // from Apple's ConnectResponse without notifying IDS,
-                                // leaving madrid silently routed to the old token even
-                                // though multiplex1 keeps working on the new connection.
-                                //
-                                // refresh_now() = ResourceManager::refresh — same call
-                                // OpenBubbles' "Reregister" button makes (api.rs
-                                // do_reregister). It has a 15s internal no-op gate so
-                                // network flaps don't spam IDS. Permanent failures
-                                // (6005 et al.) close the ResourceManager — same risk
-                                // as today's schedule_rereg loop, not new exposure.
-                                if matches!(current, ResourceState::Generated) {
-                                    let identity = identity_for_reregister.clone();
-                                    tokio::spawn(async move {
-                                        match identity.refresh_now().await {
-                                            Ok(()) => info!("Refreshed IDS registration after APS reconnect"),
-                                            Err(e) => warn!("IDS refresh_now after APS reconnect failed: {:?}", e),
-                                        }
-                                    });
+                                if matches!(current, ResourceState::Closed) {
+                                    // Connection closed (e.g. Disconnect → close()). Exit so
+                                    // this DETACHED drain task releases its Arc clone of the
+                                    // connection. Otherwise, in the wedged case it runs
+                                    // forever (it otherwise only breaks when a frame arrives
+                                    // and the process task is gone — and no frame arrives when
+                                    // wedged), pinning the courier socket open until process
+                                    // exit. With this, the socket's last strong ref drops once
+                                    // the (GC-finalized) Go connection handle is also gone.
+                                    info!("APS resource closed, stopping drain task");
+                                    break;
                                 }
+                                // NOTE: previously re-registered the full IDS bundle
+                                // (refresh_now()) on every APS reconnect to rebind the
+                                // madrid push token. REMOVED — re-registering the whole
+                                // 4-service bundle (incl. FACETIME/VIDEO) on every network
+                                // flap accumulated dozens of stale FaceTime registrations
+                                // under the bridge's own handle (38 observed). Callees
+                                // could no longer resolve a single clean identity for the
+                                // bridge, so calls presented/answered as an unresolvable
+                                // UUID and failed in both directions (no ring outbound,
+                                // hangup inbound). It also never fixed the "bridge not
+                                // connecting" report it was added for — that was a flaky
+                                // network, not stale IDS routing.
                             }
                             // Message drain: forward APNs messages to process task
                             result = recv.recv() => {
@@ -9924,6 +9966,42 @@ impl Client {
             .map_err(|e| WrappedError::GenericError {
                 msg: format!("force_reregister_identity failed: {:?}", e),
             })?;
+        Ok(registered_count)
+    }
+
+    /// Drop the local IDS key cache and re-register the identity bundle.
+    ///
+    /// Recovery path for a smeared/stale registration set (e.g. the dozens of
+    /// stale FaceTime registrations the reverted May-19 reconnect re-reg churn
+    /// left under the own handle, which break calls). invalidate_id_cache()
+    /// clears the cached lookups; the immediate re-register re-establishes the
+    /// identity so the bridge isn't left in a cache-wiped, unregistered state.
+    /// Returns the number of services in the rebuilt registration.
+    pub async fn clear_identity_cache(&self) -> Result<u32, WrappedError> {
+        // 1. Drop the local IDS key cache.
+        self.client.identity.invalidate_id_cache().await;
+
+        // 2. Re-register (update_users → refresh_now → register) so the
+        //    identity is re-established and the cache rebuilds.
+        let current_users: Vec<rustpush::IDSUser> = self
+            .client
+            .identity
+            .users
+            .read()
+            .await
+            .clone();
+        let registered_count = current_users
+            .first()
+            .map(|u| u.registration.len() as u32)
+            .unwrap_or(0);
+        self.client
+            .identity
+            .update_users(current_users)
+            .await
+            .map_err(|e| WrappedError::GenericError {
+                msg: format!("clear_identity_cache: re-register failed: {:?}", e),
+            })?;
+        info!("clear_identity_cache: invalidated IDS key cache and re-registered identity bundle ({} services)", registered_count);
         Ok(registered_count)
     }
 
