@@ -277,6 +277,12 @@ func armBridgeFaceTimeCall(
 	ringTTLSecs uint64,
 	displayName string,
 ) (webLink string, sessionID string, err error) {
+	// Make the bridge user's display name available to the rust webview-letmein
+	// path, which stamps it onto the participant nickname so the peer sees a
+	// name instead of the raw temp:<uuid> pseud. Persists across calls, so it
+	// also covers inbound answers after the first outbound call.
+	ft.SetSelfDisplayName(displayName)
+
 	sessionID, err = newFaceTimeSessionID()
 	if err != nil {
 		return "", "", fmt.Errorf("generate session ID: %w", err)
