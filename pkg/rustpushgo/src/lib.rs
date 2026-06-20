@@ -6779,6 +6779,7 @@ pub async fn new_client(
         let ft_for_recv = prewarmed_facetime.inner.clone();
         let client_weak_for_loop = client_weak_for_loop.clone();
         let user_state_key = cache_key.clone();
+        let identity_for_reregister = client.identity.clone();
         async move {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(rustpush::APSMessage, u64)>();
             let pending = Arc::new(AtomicU64::new(0));
