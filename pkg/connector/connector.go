@@ -52,6 +52,45 @@ func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
+	// Enable bridgev2's unknown-error auto-reconnect so the receive-wedge
+	// watchdog's StateUnknownError actually rebuilds the client. bridgev2 treats
+	// any value < 1min as "disabled" (bridgestate.go waitForUnknownErrorReconnect),
+	// and the shipped/base config defaults this to null → 0 → the watchdog would
+	// be a silent no-op. Default it when unset; an explicit larger value is kept.
+	// Set here (not Init) because the config YAML is loaded before Start.
+	if c.Bridge.Config.UnknownErrorAutoReconnect < time.Minute {
+		c.Bridge.Config.UnknownErrorAutoReconnect = 5 * time.Minute
+		c.Bridge.Log.Info().Msg("Defaulting unknown_error_auto_reconnect to 5m so the APNs receive-wedge watchdog can rebuild the client")
+	}
+	// bridgev2 counts unknown-error reconnects against UnknownErrorMaxAutoReconnects
+	// and NEVER resets the counter in-process (bridgestate.go: incremented only).
+	// The default (0/low) exhausts the budget after ~1 rebuild → the watchdog
+	// silently reverts to manual-restart-only on a long-uptime deploy. Raise it so
+	// recovery survives many wedges. Apple-safe even at this count: rebuilds are
+	// rate-limited (10-min wedge threshold + 5-min reconnect delay ⇒ ≤~4/hr) AND
+	// kept LIGHT (the 20+-handle IDS invite sweep + FT pre-mint are gated by the
+	// full-connect cooldown), so even a long run of rebuilds stays far below any
+	// abuse threshold; the finite bound still stops infinite churn on a truly
+	// permanent failure. Counter refreshes on process restart.
+	if c.Bridge.Config.UnknownErrorMaxAutoReconnects < 100 {
+		c.Bridge.Config.UnknownErrorMaxAutoReconnects = 100
+	}
+
+	// iMessage's primary identifier IS the phone number, and the Matrix client
+	// (Beeper) gates the call button — and treats a contact as callable/phone —
+	// on a tel: identifier in the ghost's profile. bridgev2 STRIPS every tel:
+	// from profiles unless this is set (ghost.go prepareContactInfo deletes
+	// tel: when !PhoneNumbersInProfile). With the default (false), phone-only
+	// contacts ended up email-only in their profile ("defaulting to email", no
+	// call button) even though GetUserInfo includes the phone. Force it on:
+	// exposing the phone is the whole point of an iMessage contact, and it's
+	// what makes the call button work. Set in Start() (config YAML is loaded by
+	// now); existing ghosts repopulate the tel: on their next contact refresh.
+	if !c.Bridge.Config.PhoneNumbersInProfile {
+		c.Bridge.Config.PhoneNumbersInProfile = true
+		c.Bridge.Log.Info().Msg("Forcing phone_numbers_in_profile=true so contact phone numbers stay in Matrix profiles (call button + contact resolution)")
+	}
+
 	// Override backfill defaults for iMessage CloudKit sync.
 	// Applied in Start() because Init() runs before config YAML is loaded.
 	// Only apply when CloudKit backfill is enabled — otherwise leave the
@@ -252,6 +291,19 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
 
 	rustpushgo.InitLogger()
+
+	// If this login already has a live client, this is a reconnect/recreate
+	// (not first startup) — fully disconnect it BEFORE opening a new APNs
+	// connection on the same device token. bridgev2's recreateClient does NOT
+	// disconnect the old client (it only reassigns login.Client), so without
+	// this the old connection lingers and the new one becomes a duplicate that
+	// Apple drops ("early eof"), which rustpush's no-backoff reconnect loop
+	// turns into the self-sustaining receive-stall storm. Disconnect closes the
+	// old connection and stops its goroutines, so the rebuild starts clean.
+	if existing, ok := login.Client.(*IMClient); ok && existing != nil && existing.client != nil {
+		log.Info().Msg("LoadUserLogin: disconnecting existing client before reconnect (avoids a duplicate APNs connection on the same device token)")
+		existing.Disconnect()
+	}
 
 	var cfg *rustpushgo.WrappedOsConfig
 	var err error
