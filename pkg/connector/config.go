@@ -109,6 +109,19 @@ type IMConfig struct {
 	// other Apple devices for Focus visibility.
 	StatusKitNotifications bool `yaml:"statuskit_notifications"`
 
+	// StatusKitNotificationStyle controls how an enabled StatusKit
+	// notification (see StatusKitNotifications) is presented. Two values:
+	//   - "topic" (the default): sets the contact's DM room topic to their
+	//     current state (e.g. "🔕 Do Not Disturb"), clearing it when they
+	//     become available again. Overwrites/clears any topic you've set
+	//     manually on the room without trying to detect or preserve it.
+	//   - "notice": the original behavior — posts a silent m.notice instead.
+	// Group portals (shared rooms the contact was last active in) always use
+	// the "notice" behavior regardless of this setting — a single room topic
+	// can't unambiguously represent one member's presence in a multi-person
+	// chat. An invalid or empty value falls back to "topic".
+	StatusKitNotificationStyle string `yaml:"statuskit_notification_style"`
+
 	// ReadReceipts controls whether the bridge sends read receipts to iMessage
 	// contacts when you mark a message as read in Matrix. When false, iMessage
 	// contacts will not see the "Read" indicator for your messages. Incoming
@@ -222,6 +235,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "disable_facetime")
 	helper.Copy(up.Bool, "statuskit_share_on_startup")
 	helper.Copy(up.Bool, "statuskit_notifications")
+	helper.Copy(up.Str, "statuskit_notification_style")
 	helper.Copy(up.Bool, "read_receipts")
 	helper.Copy(up.Bool, "typing_notifications")
 	helper.Copy(up.Str, "carddav", "email")

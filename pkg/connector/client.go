@@ -188,6 +188,20 @@ func (c *IMClient) statusKitNotifications() bool {
 	return c.Main.Config.StatusKitNotifications
 }
 
+// statusKitNotificationStyle returns "topic" or "notice", defaulting to
+// "topic" when the per-user override and global config are both unset or
+// hold an unrecognized value.
+func (c *IMClient) statusKitNotificationStyle() string {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.StatusKitNotificationStyle != nil && *meta.StatusKitNotificationStyle != "" {
+		return *meta.StatusKitNotificationStyle
+	}
+	style := c.Main.Config.StatusKitNotificationStyle
+	if style != "topic" && style != "notice" {
+		return "topic"
+	}
+	return style
+}
+
 // recordAttachmentFailure increments the retry count for a failed attachment.
 // Returns the updated entry so callers can log the retry count.
 func (c *IMClient) recordAttachmentFailure(recordName, errMsg string) *failedAttachmentEntry {
@@ -1652,24 +1666,22 @@ func (c *IMClient) runReceiveWedgeWatchdog(stop chan struct{}, log zerolog.Logge
 // ============================================================================
 
 // statusKitModeLabel converts a Focus/DND mode identifier to a human-readable
-// label for use in bridge bot notices.
+// label for use in bridge bot notices and DM topics. Checks the well-known
+// mode table (statuskit_commands.go) first so built-in Focus modes like
+// Driving/Personal/Work get their specific name instead of a generic one.
 func statusKitModeLabel(mode *string) string {
 	if mode == nil || *mode == "" {
 		return ""
 	}
-	switch *mode {
-	case "com.apple.donotdisturb.mode.default":
-		return "Do Not Disturb"
-	case "com.apple.donotdisturb.mode.sleep":
-		return "Sleep"
-	default:
-		// Focus modes use identifiers like "com.apple.focus.mode.personal"
-		// or user-defined UUIDs. Humanise what we can; fall back to a generic label.
-		if strings.Contains(*mode, "focus") {
-			return "Focus"
+	for _, m := range wellKnownFocusModes {
+		if m.ID == *mode {
+			return m.Label
 		}
-		return "Do Not Disturb"
 	}
+	// Custom user-created Focus modes use opaque UUIDs that don't contain
+	// "focus" and aren't in the table above — they're essentially never
+	// actually Do Not Disturb, so label anything unrecognized as "Focus".
+	return "Focus"
 }
 
 // OnStatusUpdate is called by StatusKit when a contact's presence changes.
@@ -1978,6 +1990,16 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			notice = name + " has notifications turned on."
 		}
 
+		// topicStr is what the DM room's topic is set to under "topic"
+		// style: empty (clears the topic) when available, or a short
+		// "🔕 <Label>" when silenced. No contact name needed — it's the
+		// contact's own 1:1 DM room.
+		var topicStr string
+		if silenced {
+			topicStr = "🔕 " + statusKitModeLabel(modeCopy)
+		}
+		style := c.statusKitNotificationStyle()
+
 		targetPortals := map[networkid.PortalID]*bridgev2.Portal{
 			portal.ID: portal,
 		}
@@ -2078,8 +2100,21 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 			return sendErr
 		}
 
+		// sendStatusTopic sets/clears the DM room's topic to reflect the
+		// current presence state. UpdateInfo no-ops internally if the topic
+		// is already the target value, so this is safe to call unconditionally.
+		sendStatusTopic := func(targetPortal *bridgev2.Portal) {
+			targetPortal.UpdateInfo(ctx, &bridgev2.ChatInfo{Topic: ptr.Ptr(topicStr)}, c.UserLogin, nil, time.Time{})
+		}
+
 		sent := 0
 		for _, targetPortal := range targetPortals {
+			if style == "topic" && targetPortal.RoomType == database.RoomTypeDM {
+				sendStatusTopic(targetPortal)
+				sent++
+				log.Info().Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: updated DM topic for presence state")
+				continue
+			}
 			if err := sendStatusNotice(targetPortal); err != nil {
 				log.Warn().Err(err).Str("portal_mxid", string(targetPortal.MXID)).Msg("StatusKit: failed to send presence notice")
 				continue

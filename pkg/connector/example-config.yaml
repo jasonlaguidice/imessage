@@ -78,6 +78,17 @@ statuskit_share_on_startup: true
 # 4-service identity is unaffected, so peer reshare eligibility is kept).
 statuskit_notifications: true
 
+# How an enabled StatusKit notification (above) is presented. "topic"
+# (default) sets the contact's DM room topic to their current state (e.g.
+# "🔕 Do Not Disturb"), clearing it when they become available again —
+# overwriting/clearing any topic you've set manually on the room without
+# trying to detect or preserve it. "notice" is the original behavior: posts
+# a silent m.notice instead. Group chats (shared rooms the contact was last
+# active in) always use the notice behavior regardless of this setting — a
+# single room topic can't unambiguously represent one member's presence in
+# a multi-person chat.
+statuskit_notification_style: topic
+
 # Send read receipts to iMessage contacts when you read their messages in
 # Matrix. Set to false to stop iMessage contacts seeing when you have read
 # their messages. Incoming read receipts from iMessage contacts are unaffected.

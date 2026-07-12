@@ -551,6 +551,58 @@ elif [ -t 0 ]; then
     fi
 fi
 
+# ── Ensure statuskit_notification_style key exists in config ─
+if ! grep -q 'statuskit_notification_style:' "$CONFIG" 2>/dev/null; then
+    sed -i '/statuskit_notifications:/a\    statuskit_notification_style: topic' "$CONFIG"
+fi
+
+# ── StatusKit notification style (topic vs notice) ───────────
+CURRENT_STATUSKIT_STYLE=$(grep 'statuskit_notification_style:' "$CONFIG" 2>/dev/null | head -1 | sed 's/.*statuskit_notification_style: *//' || true)
+if [ -n "${STATUSKIT_NOTIFICATION_STYLE:-}" ]; then
+    case "$STATUSKIT_NOTIFICATION_STYLE" in
+        notice|NOTICE)
+            sed -i "s/statuskit_notification_style: .*/statuskit_notification_style: notice/" "$CONFIG"
+            echo "✓ StatusKit notification style: notice (STATUSKIT_NOTIFICATION_STYLE env)"
+            ;;
+        *)
+            sed -i "s/statuskit_notification_style: .*/statuskit_notification_style: topic/" "$CONFIG"
+            echo "✓ StatusKit notification style: topic (STATUSKIT_NOTIFICATION_STYLE env)"
+            ;;
+    esac
+elif [ -t 0 ] && [ "$CURRENT_STATUSKIT_NOTIF" != "false" ]; then
+    echo ""
+    echo "StatusKit notification style:"
+    echo "  How an enabled StatusKit notification is shown. \"topic\" sets the"
+    echo "  contact's DM room topic to their current state (e.g. \"🔕 Do Not"
+    echo "  Disturb\"), clearing it when they're available again. \"notice\""
+    echo "  posts a silent chat message instead (the original behavior)."
+    echo "  Group chats always use the notice style regardless of this choice."
+    echo ""
+    if [ "$CURRENT_STATUSKIT_STYLE" = "notice" ]; then
+        read -p "Use topic style instead of notice? [y/N]: " EN_SK_STYLE
+        case "$EN_SK_STYLE" in
+            [yY]*)
+                sed -i "s/statuskit_notification_style: .*/statuskit_notification_style: topic/" "$CONFIG"
+                echo "✓ StatusKit notification style: topic"
+                ;;
+            *)
+                echo "✓ StatusKit notification style: notice"
+                ;;
+        esac
+    else
+        read -p "Use topic style (recommended) instead of notice? [Y/n]: " EN_SK_STYLE
+        case "$EN_SK_STYLE" in
+            [nN]*)
+                sed -i "s/statuskit_notification_style: .*/statuskit_notification_style: notice/" "$CONFIG"
+                echo "✓ StatusKit notification style: notice"
+                ;;
+            *)
+                echo "✓ StatusKit notification style: topic"
+                ;;
+        esac
+    fi
+fi
+
 # ── Write auto-update wrapper ─────────────────────────────────
 cat > "$DATA_DIR/start.sh" << HEADER_EOF
 #!/bin/bash

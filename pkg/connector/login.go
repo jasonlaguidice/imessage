@@ -26,15 +26,15 @@ import (
 )
 
 const (
-	LoginFlowIDAppleID       = "apple-id"
-	LoginFlowIDExternalKey   = "external-key"
-	LoginStepAppleIDPassword = "fi.mau.imessage.login.appleid"
-	LoginStepExternalKey     = "fi.mau.imessage.login.externalkey"
-	LoginStepTwoFactor       = "fi.mau.imessage.login.2fa"
-	LoginStepSelectDevice    = "fi.mau.imessage.login.select_device"
-	LoginStepDevicePasscode  = "fi.mau.imessage.login.device_passcode"
-	LoginStepSelectHandle    = "fi.mau.imessage.login.select_handle"
-	LoginStepComplete        = "fi.mau.imessage.login.complete"
+	LoginFlowIDAppleID        = "apple-id"
+	LoginFlowIDExternalKey    = "external-key"
+	LoginStepAppleIDPassword  = "fi.mau.imessage.login.appleid"
+	LoginStepExternalKey      = "fi.mau.imessage.login.externalkey"
+	LoginStepTwoFactor        = "fi.mau.imessage.login.2fa"
+	LoginStepSelectDevice     = "fi.mau.imessage.login.select_device"
+	LoginStepDevicePasscode   = "fi.mau.imessage.login.device_passcode"
+	LoginStepSelectHandle     = "fi.mau.imessage.login.select_handle"
+	LoginStepComplete         = "fi.mau.imessage.login.complete"
 	LoginStepCloudKitBackfill = "fi.mau.imessage.login.cloudkit_backfill"
 	LoginStepVideoTranscoding = "fi.mau.imessage.login.video_transcoding"
 	LoginStepHEICConversion   = "fi.mau.imessage.login.heic_conversion"
@@ -45,31 +45,33 @@ const (
 	LoginStepCardDAVOther     = "fi.mau.imessage.login.carddav_other"
 	LoginStepFaceTime         = "fi.mau.imessage.login.facetime"
 	LoginStepStatusKit        = "fi.mau.imessage.login.statuskit"
+	LoginStepStatusKitStyle   = "fi.mau.imessage.login.statuskit_style"
 )
 
 // AppleIDLogin implements the multi-step login flow:
 // Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
 type AppleIDLogin struct {
-	User           *bridgev2.User
-	Main           *IMConnector
-	username       string
-	cfg            *rustpushgo.WrappedOsConfig
-	conn           *rustpushgo.WrappedApsConnection
-	session        *rustpushgo.LoginSession
-	result         *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle         string                                 // chosen handle
-	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
-	selectedDevice int                                    // index into devices (-1 = not yet selected)
-	cloudKitBackfill         bool
-	videoTranscoding         bool
-	heicConversion           bool
-	disableFaceTime          bool
-	statusKitNotifications   bool
-	handleSelected           bool
-	cardDAVEmail             string
-	cardDAVURL               string
-	cardDAVUsername          string
-	cardDAVPasswordEncrypted string
+	User                       *bridgev2.User
+	Main                       *IMConnector
+	username                   string
+	cfg                        *rustpushgo.WrappedOsConfig
+	conn                       *rustpushgo.WrappedApsConnection
+	session                    *rustpushgo.LoginSession
+	result                     *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle                     string                                 // chosen handle
+	devices                    []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
+	selectedDevice             int                                    // index into devices (-1 = not yet selected)
+	cloudKitBackfill           bool
+	videoTranscoding           bool
+	heicConversion             bool
+	disableFaceTime            bool
+	statusKitNotifications     bool
+	statusKitNotificationStyle string
+	handleSelected             bool
+	cardDAVEmail               string
+	cardDAVURL                 string
+	cardDAVUsername            string
+	cardDAVPasswordEncrypted   string
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -192,6 +194,15 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		if sk, ok := input["statuskit_notifications"]; ok {
 			enabled := sk == "yes"
 			l.statusKitNotifications = enabled
+			if enabled {
+				return l.askStatusKitStyleStep()
+			}
+			return l.completeLogin(ctx)
+		}
+		if style, ok := input["statuskit_notification_style"]; ok {
+			if style == "topic" || style == "notice" {
+				l.statusKitNotificationStyle = style
+			}
 			return l.completeLogin(ctx)
 		}
 		if hc, ok := input["heic_conversion"]; ok {
@@ -365,22 +376,27 @@ func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, 
 	if l.Main.Config.UseCloudKitBackfill() {
 		cloudKitPref = boolPtr(l.cloudKitBackfill)
 	}
+	var styleMeta *string
+	if l.statusKitNotificationStyle != "" {
+		styleMeta = strPtr(l.statusKitNotificationStyle)
+	}
 	meta := &UserLoginMetadata{
-		Platform:                 "rustpush-local",
-		APSState:                 l.conn.State().ToString(),
-		IDSUsers:                 l.result.Users.ToString(),
-		IDSIdentity:              l.result.Identity.ToString(),
-		DeviceID:                 l.cfg.GetDeviceId(),
-		PreferredHandle:          l.handle,
-		VideoTranscoding:         boolPtr(l.videoTranscoding),
-		HEICConversion:           boolPtr(l.heicConversion),
-		CloudKitBackfill:         cloudKitPref,
-		DisableFaceTime:          boolPtr(l.disableFaceTime),
-		StatusKitNotifications:   boolPtr(l.statusKitNotifications),
-		CardDAVEmail:             l.cardDAVEmail,
-		CardDAVURL:               l.cardDAVURL,
-		CardDAVUsername:          l.cardDAVUsername,
-		CardDAVPasswordEncrypted: l.cardDAVPasswordEncrypted,
+		Platform:                   "rustpush-local",
+		APSState:                   l.conn.State().ToString(),
+		IDSUsers:                   l.result.Users.ToString(),
+		IDSIdentity:                l.result.Identity.ToString(),
+		DeviceID:                   l.cfg.GetDeviceId(),
+		PreferredHandle:            l.handle,
+		VideoTranscoding:           boolPtr(l.videoTranscoding),
+		HEICConversion:             boolPtr(l.heicConversion),
+		CloudKitBackfill:           cloudKitPref,
+		DisableFaceTime:            boolPtr(l.disableFaceTime),
+		StatusKitNotifications:     boolPtr(l.statusKitNotifications),
+		StatusKitNotificationStyle: styleMeta,
+		CardDAVEmail:               l.cardDAVEmail,
+		CardDAVURL:                 l.cardDAVURL,
+		CardDAVUsername:            l.cardDAVUsername,
+		CardDAVPasswordEncrypted:   l.cardDAVPasswordEncrypted,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
@@ -392,6 +408,9 @@ func (l *AppleIDLogin) askContactSourceStep() (*bridgev2.LoginStep, error) {
 
 func (l *AppleIDLogin) askFaceTimeStep() (*bridgev2.LoginStep, error)  { return askFaceTimeStep() }
 func (l *AppleIDLogin) askStatusKitStep() (*bridgev2.LoginStep, error) { return askStatusKitStep() }
+func (l *AppleIDLogin) askStatusKitStyleStep() (*bridgev2.LoginStep, error) {
+	return askStatusKitStyleStep()
+}
 
 func (l *AppleIDLogin) askCardDAVGoogleStep() (*bridgev2.LoginStep, error) {
 	return askCardDAVGoogleStep()
@@ -479,27 +498,28 @@ func (l *AppleIDLogin) askHEICConversionStep() (*bridgev2.LoginStep, error) {
 // ExternalKeyLogin implements the multi-step login flow for non-macOS platforms:
 // Hardware key → Apple ID + password → 2FA code → IDS registration → device selection → passcode → handle selection → connected.
 type ExternalKeyLogin struct {
-	User           *bridgev2.User
-	Main           *IMConnector
-	hardwareKey    string
-	username       string
-	cfg            *rustpushgo.WrappedOsConfig
-	conn           *rustpushgo.WrappedApsConnection
-	session        *rustpushgo.LoginSession
-	result         *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
-	handle         string                                 // chosen handle
-	devices        []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
-	selectedDevice int                                    // index into devices (-1 = not yet selected)
-	cloudKitBackfill         bool
-	videoTranscoding         bool
-	heicConversion           bool
-	disableFaceTime          bool
-	statusKitNotifications   bool
-	handleSelected           bool
-	cardDAVEmail             string
-	cardDAVURL               string
-	cardDAVUsername          string
-	cardDAVPasswordEncrypted string
+	User                       *bridgev2.User
+	Main                       *IMConnector
+	hardwareKey                string
+	username                   string
+	cfg                        *rustpushgo.WrappedOsConfig
+	conn                       *rustpushgo.WrappedApsConnection
+	session                    *rustpushgo.LoginSession
+	result                     *rustpushgo.IdsUsersWithIdentityRecord // set after IDS registration
+	handle                     string                                 // chosen handle
+	devices                    []rustpushgo.EscrowDeviceInfo          // escrow devices (fetched after IDS registration)
+	selectedDevice             int                                    // index into devices (-1 = not yet selected)
+	cloudKitBackfill           bool
+	videoTranscoding           bool
+	heicConversion             bool
+	disableFaceTime            bool
+	statusKitNotifications     bool
+	statusKitNotificationStyle string
+	handleSelected             bool
+	cardDAVEmail               string
+	cardDAVURL                 string
+	cardDAVUsername            string
+	cardDAVPasswordEncrypted   string
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -602,6 +622,15 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		if sk, ok := input["statuskit_notifications"]; ok {
 			enabled := sk == "yes"
 			l.statusKitNotifications = enabled
+			if enabled {
+				return l.askStatusKitStyleStep()
+			}
+			return l.completeLogin(ctx)
+		}
+		if style, ok := input["statuskit_notification_style"]; ok {
+			if style == "topic" || style == "notice" {
+				l.statusKitNotificationStyle = style
+			}
 			return l.completeLogin(ctx)
 		}
 		if hc, ok := input["heic_conversion"]; ok {
@@ -820,23 +849,28 @@ func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginSt
 	if l.Main.Config.UseCloudKitBackfill() {
 		cloudKitPref = boolPtr(l.cloudKitBackfill)
 	}
+	var styleMeta *string
+	if l.statusKitNotificationStyle != "" {
+		styleMeta = strPtr(l.statusKitNotificationStyle)
+	}
 	meta := &UserLoginMetadata{
-		Platform:                 "rustpush-external-key",
-		APSState:                 l.conn.State().ToString(),
-		IDSUsers:                 l.result.Users.ToString(),
-		IDSIdentity:              l.result.Identity.ToString(),
-		DeviceID:                 l.cfg.GetDeviceId(),
-		HardwareKey:              l.hardwareKey,
-		PreferredHandle:          l.handle,
-		VideoTranscoding:         boolPtr(l.videoTranscoding),
-		HEICConversion:           boolPtr(l.heicConversion),
-		CloudKitBackfill:         cloudKitPref,
-		DisableFaceTime:          boolPtr(l.disableFaceTime),
-		StatusKitNotifications:   boolPtr(l.statusKitNotifications),
-		CardDAVEmail:             l.cardDAVEmail,
-		CardDAVURL:               l.cardDAVURL,
-		CardDAVUsername:          l.cardDAVUsername,
-		CardDAVPasswordEncrypted: l.cardDAVPasswordEncrypted,
+		Platform:                   "rustpush-external-key",
+		APSState:                   l.conn.State().ToString(),
+		IDSUsers:                   l.result.Users.ToString(),
+		IDSIdentity:                l.result.Identity.ToString(),
+		DeviceID:                   l.cfg.GetDeviceId(),
+		HardwareKey:                l.hardwareKey,
+		PreferredHandle:            l.handle,
+		VideoTranscoding:           boolPtr(l.videoTranscoding),
+		HEICConversion:             boolPtr(l.heicConversion),
+		CloudKitBackfill:           cloudKitPref,
+		DisableFaceTime:            boolPtr(l.disableFaceTime),
+		StatusKitNotifications:     boolPtr(l.statusKitNotifications),
+		StatusKitNotificationStyle: styleMeta,
+		CardDAVEmail:               l.cardDAVEmail,
+		CardDAVURL:                 l.cardDAVURL,
+		CardDAVUsername:            l.cardDAVUsername,
+		CardDAVPasswordEncrypted:   l.cardDAVPasswordEncrypted,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
@@ -848,6 +882,9 @@ func (l *ExternalKeyLogin) askContactSourceStep() (*bridgev2.LoginStep, error) {
 
 func (l *ExternalKeyLogin) askFaceTimeStep() (*bridgev2.LoginStep, error)  { return askFaceTimeStep() }
 func (l *ExternalKeyLogin) askStatusKitStep() (*bridgev2.LoginStep, error) { return askStatusKitStep() }
+func (l *ExternalKeyLogin) askStatusKitStyleStep() (*bridgev2.LoginStep, error) {
+	return askStatusKitStyleStep()
+}
 
 func (l *ExternalKeyLogin) askCardDAVGoogleStep() (*bridgev2.LoginStep, error) {
 	return askCardDAVGoogleStep()
@@ -962,6 +999,24 @@ func askStatusKitStep() (*bridgev2.LoginStep, error) {
 					ID:      "statuskit_notifications",
 					Name:    "Enable StatusKit notifications",
 					Options: []string{"yes", "no"},
+				},
+			},
+		},
+	}, nil
+}
+
+func askStatusKitStyleStep() (*bridgev2.LoginStep, error) {
+	return &bridgev2.LoginStep{
+		Type:         bridgev2.LoginStepTypeUserInput,
+		StepID:       LoginStepStatusKitStyle,
+		Instructions: "How should StatusKit notifications be shown? \"topic\" sets the contact's DM room topic to their current state (e.g. \"🔕 Do Not Disturb\"), clearing it when they're available again. \"notice\" posts a silent chat message instead (the original behavior). Group chats always use the notice style regardless of this choice.",
+		UserInputParams: &bridgev2.LoginUserInputParams{
+			Fields: []bridgev2.LoginInputDataField{
+				{
+					Type:    bridgev2.LoginInputFieldTypeSelect,
+					ID:      "statuskit_notification_style",
+					Name:    "Notification style",
+					Options: []string{"topic", "notice"},
 				},
 			},
 		},
