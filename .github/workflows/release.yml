@@ -19,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-go@v5
         with:
@@ -43,6 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -77,15 +80,15 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar czf mautrix-imessage-v2-macos-arm64.tar.gz \
-            mautrix-imessage-v2.app/ bbctl \
+          tar czf matrix-rustpush-macos-arm64.tar.gz \
+            matrix-rustpush.app/ bbctl \
             scripts/install.sh scripts/install-beeper.sh scripts/reset-bridge.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: mautrix-imessage-v2-macos-arm64.tar.gz
+          path: matrix-rustpush-macos-arm64.tar.gz
 
   # ───────────────────────────────────────────────────────────────
   # Build Linux amd64 binary
@@ -97,6 +100,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -130,8 +134,8 @@ jobs:
 
       - name: Create tarball
         run: |
-          tar czf mautrix-imessage-v2-linux-amd64.tar.gz \
-            mautrix-imessage-v2 bbctl \
+          tar czf matrix-rustpush-linux-amd64.tar.gz \
+            matrix-rustpush bbctl \
             scripts/install-linux.sh scripts/install-beeper-linux.sh \
             scripts/bootstrap-linux.sh scripts/reset-bridge.sh
 
@@ -139,7 +143,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: linux-amd64
-          path: mautrix-imessage-v2-linux-amd64.tar.gz
+          path: matrix-rustpush-linux-amd64.tar.gz
 
   # ───────────────────────────────────────────────────────────────
   # Build extract-key tool (macOS only)
@@ -150,6 +154,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-go@v5
         with:
@@ -175,6 +181,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Download all artifacts
@@ -203,11 +210,12 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag }}
           body_path: changelog.md
           draft: false
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          prerelease: ${{ contains(inputs.tag, '-rc') || contains(inputs.tag, '-beta') || contains(inputs.tag, '-alpha') }}
           generate_release_notes: true
           files: |
-            artifacts/macos-arm64/mautrix-imessage-v2-macos-arm64.tar.gz
-            artifacts/linux-amd64/mautrix-imessage-v2-linux-amd64.tar.gz
+            artifacts/macos-arm64/matrix-rustpush-macos-arm64.tar.gz
+            artifacts/linux-amd64/matrix-rustpush-linux-amd64.tar.gz
             artifacts/extract-key-macos/extract-key
