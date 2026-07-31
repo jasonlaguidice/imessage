@@ -116,13 +116,24 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 
 	// Step 4: Fetch all vCards
 	var allContacts []*imessage.Contact
+	fetchFailures := 0
 	for _, abURL := range addressBooks {
 		contacts, fetchErr := c.fetchAllVCards(log, abURL)
 		if fetchErr != nil {
 			log.Warn().Err(fetchErr).Str("address_book", abURL).Msg("External CardDAV: failed to fetch vCards")
+			fetchFailures++
 			continue
 		}
 		allContacts = append(allContacts, contacts...)
+	}
+
+	// If every address book fetch failed (e.g. a transient 500 from the
+	// server), bail out without touching the existing cache. Rebuilding
+	// from an empty result set here would wipe every known contact name
+	// until the next successful sync, up to periodicCloudContactSync's
+	// 15-minute interval later.
+	if len(addressBooks) > 0 && fetchFailures == len(addressBooks) {
+		return fmt.Errorf("all %d address book(s) failed to fetch vCards", fetchFailures)
 	}
 
 	// Step 4.5: Download any photo URLs (e.g. Google uses URL-based PHOTO fields)
