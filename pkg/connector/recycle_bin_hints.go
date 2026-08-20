@@ -99,8 +99,8 @@ func (c *IMClient) participantSeedsForRecoverableMessage(portalID string, metada
 	if metadata.Sender != "" {
 		participants = append(participants, metadata.Sender)
 	}
-	if metadata.IsFromMe && c.handle != "" {
-		participants = append(participants, c.handle)
+	if metadata.IsFromMe && c.getHandle() != "" {
+		participants = append(participants, c.getHandle())
 	}
 	if strings.Contains(portalID, ",") {
 		participants = append(participants, strings.Split(portalID, ",")...)
