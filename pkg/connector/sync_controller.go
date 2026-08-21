@@ -815,8 +815,8 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	}
 	defer rows.Close()
 
-	selfHandles := make(map[string]struct{}, len(c.allHandles))
-	for _, h := range c.allHandles {
+	selfHandles := make(map[string]struct{}, len(c.getAllHandles()))
+	for _, h := range c.getAllHandles() {
 		selfHandles[h] = struct{}{}
 	}
 	var handles []string
@@ -923,8 +923,8 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 //     automatic paths leave it false to preserve the "invite once per peer"
 //     contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
-	if c.client == nil || c.handle == "" {
-		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.handle).Msg("StatusKit invite: skipped (client or handle not ready)")
+	if c.client == nil || c.getHandle() == "" {
+		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.getHandle()).Msg("StatusKit invite: skipped (client or handle not ready)")
 		return
 	}
 	// Mark the sweep as running so the new-portal hook
@@ -933,7 +933,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	// this gate, a bootstrap burst of fresh DM portals would race the sweep
 	// and spawn unpaced concurrent invites.
 	c.statusKitSweepRunning.Store(true)
-	log.Info().Str("handle", c.handle).Msg("StatusKit invite: starting")
+	log.Info().Str("handle", c.getHandle()).Msg("StatusKit invite: starting")
 	defer func() {
 		c.statusKitSweepRunning.Store(false)
 		if r := recover(); r != nil {
@@ -947,8 +947,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		log.Warn().Err(err).Msg("StatusKit invite: failed to query portals")
 		return
 	}
-	selfHandles := make(map[string]struct{}, len(c.allHandles))
-	for _, h := range c.allHandles {
+	selfHandles := make(map[string]struct{}, len(c.getAllHandles()))
+	for _, h := range c.getAllHandles() {
 		selfHandles[h] = struct{}{}
 	}
 
@@ -1074,7 +1074,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 
 	// One sender only — OB calls invite_to_channel with a single
 	// `ensureHandle()` result per chat, not with every registered handle.
-	sender := c.handle
+	sender := c.getHandle()
 	var okCount, failCount, timeoutCount int
 	nowStr := now.Format(time.RFC3339)
 
@@ -1215,16 +1215,16 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 		}
 	}()
 
-	if c.client == nil || c.handle == "" || c.UserLogin == nil {
+	if c.client == nil || c.getHandle() == "" || c.UserLogin == nil {
 		return
 	}
 	if handle == "" || isGroupPortalID(handle) {
 		return
 	}
-	if handle == c.handle {
+	if handle == c.getHandle() {
 		return
 	}
-	for _, h := range c.allHandles {
+	for _, h := range c.getAllHandles() {
 		if h == handle {
 			return
 		}
@@ -1283,7 +1283,7 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 		return
 	}
 
-	sender := c.handle
+	sender := c.getHandle()
 	log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): dispatching")
 
 	const perInviteTimeout = 30 * time.Second
@@ -2717,7 +2717,7 @@ func (c *IMClient) resolveConversationID(ctx context.Context, msg rustpushgo.Wra
 		if !isSelfChatID {
 			return ""
 		}
-		normalized := normalizeIdentifierForPortalID(c.handle)
+		normalized := normalizeIdentifierForPortalID(c.getHandle())
 		if normalized != "" {
 			return normalized
 		}

@@ -386,7 +386,7 @@ func (c *IMClient) resolveFaceTimeDisplayName(ctx context.Context) string {
 		}
 		c.UserLogin.Log.Debug().Msg("FaceTime display-name: Apple Account SPD lookup returned empty; set facetime_display_name in config to override")
 	}
-	return stripIdentifierPrefix(c.handle)
+	return stripIdentifierPrefix(c.getHandle())
 }
 
 // retryOnAPNsFlap retries an APNs-dependent operation up to three times
@@ -521,7 +521,7 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		ce.Reply("Bridge client not available.")
 		return true
 	}
-	if client.handle == "" {
+	if client.getHandle() == "" {
 		ce.Reply("No iMessage handle configured. Please complete bridge setup first.")
 		return true
 	}
@@ -544,7 +544,7 @@ func fnFaceTimeCallInPortal(ce *commands.Event) bool {
 		return true
 	}
 
-	webLink, sessionID, err := armBridgeFaceTimeCall(ft, client.handle, target, 60, client.resolveFaceTimeDisplayName(ce.Ctx))
+	webLink, sessionID, err := armBridgeFaceTimeCall(ft, client.getHandle(), target, 60, client.resolveFaceTimeDisplayName(ce.Ctx))
 	if err != nil {
 		switch {
 		case isNonRetryableResourceClosed(err):
@@ -611,7 +611,7 @@ func fnFaceTimeSend(ce *commands.Event) {
 		ce.Reply("Bridge client not available.")
 		return
 	}
-	if client.handle == "" {
+	if client.getHandle() == "" {
 		ce.Reply("No iMessage handle configured. Please complete bridge setup first.")
 		return
 	}
@@ -622,18 +622,18 @@ func fnFaceTimeSend(ce *commands.Event) {
 		return
 	}
 
-	link, linkErr := getFaceTimeLinkWithRecovery(ft, client.handle, ftLinkUsageNext)
+	link, linkErr := getFaceTimeLinkWithRecovery(ft, client.getHandle(), ftLinkUsageNext)
 	if linkErr != nil {
 		ce.Reply("Failed to get FaceTime link: %v", linkErr)
 		return
 	}
 	go func() {
-		_ = rotateOutboundLink(ft, client.handle)
+		_ = rotateOutboundLink(ft, client.getHandle())
 	}()
 	link = appendFaceTimeLinkName(link, client.resolveFaceTimeDisplayName(ce.Ctx))
 
 	conv := client.portalToConversation(ce.Portal)
-	if _, sendErr := client.client.SendMessage(conv, link, nil, client.handle, nil, nil, nil); sendErr != nil {
+	if _, sendErr := client.client.SendMessage(conv, link, nil, client.getHandle(), nil, nil, nil); sendErr != nil {
 		recipient := stripIdentifierPrefix(string(ce.Portal.ID))
 		if isLikelyDeliveredSendTimeout(sendErr) {
 			ce.Reply("FaceTime link send timed out waiting for Apple ACK, but it may have already delivered to **%s**.\n\nCheck with them before retrying to avoid duplicates.", recipient)
@@ -762,7 +762,7 @@ func faceTimeClientAndCandidates(ce *commands.Event) (client *IMClient, handles 
 		return nil, nil, false, false
 	}
 
-	if len(client.allHandles) == 0 && client.handle == "" {
+	if len(client.getAllHandles()) == 0 && client.getHandle() == "" {
 		ce.Reply("No iMessage handle configured. Please complete bridge setup first.")
 		return nil, nil, false, false
 	}
@@ -770,15 +770,15 @@ func faceTimeClientAndCandidates(ce *commands.Event) (client *IMClient, handles 
 	if len(ce.Args) > 0 {
 		explicit = true
 		requested := strings.TrimSpace(ce.Args[0])
-		resolved, found := resolveFaceTimeHandle(requested, client.allHandles)
+		resolved, found := resolveFaceTimeHandle(requested, client.getAllHandles())
 		if !found {
-			ce.Reply("Handle `%s` is not registered on this account. Available handles: `%s`", requested, strings.Join(client.allHandles, "`, `"))
+			ce.Reply("Handle `%s` is not registered on this account. Available handles: `%s`", requested, strings.Join(client.getAllHandles(), "`, `"))
 			return nil, nil, true, false
 		}
 		return client, []string{resolved}, true, true
 	}
 
-	seen := make(map[string]struct{}, len(client.allHandles)+1)
+	seen := make(map[string]struct{}, len(client.getAllHandles())+1)
 	appendHandle := func(handle string) {
 		if handle == "" {
 			return
@@ -789,8 +789,8 @@ func faceTimeClientAndCandidates(ce *commands.Event) (client *IMClient, handles 
 		seen[handle] = struct{}{}
 		handles = append(handles, handle)
 	}
-	appendHandle(client.handle)
-	for _, handle := range client.allHandles {
+	appendHandle(client.getHandle())
+	for _, handle := range client.getAllHandles() {
 		appendHandle(handle)
 	}
 	if len(handles) == 0 {
@@ -847,7 +847,7 @@ func fnFaceTimeInvalidatePeer(ce *commands.Event) {
 	if !ok {
 		return
 	}
-	if client.handle == "" {
+	if client.getHandle() == "" {
 		ce.Reply("No iMessage handle configured. Please complete bridge setup first.")
 		return
 	}
@@ -870,15 +870,15 @@ func fnFaceTimeInvalidatePeer(ce *commands.Event) {
 	}
 
 	conv := rustpushgo.WrappedConversation{
-		Participants: []string{target, client.handle},
+		Participants: []string{target, client.getHandle()},
 	}
-	if err := client.client.SendPeerCacheInvalidate(conv, client.handle); err != nil {
+	if err := client.client.SendPeerCacheInvalidate(conv, client.getHandle()); err != nil {
 		ce.Reply("Failed to send PeerCacheInvalidate to %s: %v", stripIdentifierPrefix(target), err)
 		return
 	}
 	ce.Reply(
 		"Sent PeerCacheInvalidate to **%s**. Their device should refresh its identity cache for **%s** within seconds — try the call again.",
-		stripIdentifierPrefix(target), stripIdentifierPrefix(client.handle),
+		stripIdentifierPrefix(target), stripIdentifierPrefix(client.getHandle()),
 	)
 }
 
@@ -896,7 +896,7 @@ func fnFaceTimeRotateIdentity(ce *commands.Event) {
 	}
 	ce.Reply(
 		"Re-registered bridge IDS identity (services in registration: %d). Peer iPhones should re-resolve **%s** on their next IDS query — try the call again.",
-		count, stripIdentifierPrefix(client.handle),
+		count, stripIdentifierPrefix(client.getHandle()),
 	)
 }
 
@@ -916,7 +916,7 @@ func faceTimeClientAndHandle(ce *commands.Event) (client *IMClient, handle strin
 	}
 
 	// Explicit handle arg takes precedence over the primary bridge handle.
-	handle = client.handle
+	handle = client.getHandle()
 	if len(ce.Args) > 0 {
 		if arg := strings.TrimSpace(ce.Args[0]); arg != "" {
 			handle = arg
@@ -1398,7 +1398,7 @@ func fnFaceTimeCreateSession(ce *commands.Event) {
 			err = ftErr
 			return
 		}
-		err = ft.CreateSession(groupID, client.handle, participants)
+		err = ft.CreateSession(groupID, client.getHandle(), participants)
 	}()
 	if err != nil {
 		ce.Reply("Failed to create FaceTime session: %v", err)

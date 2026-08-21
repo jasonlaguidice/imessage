@@ -89,7 +89,7 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 		}
 	}()
 
-	valid := c.client.ValidateTargets([]string{portalID}, c.handle)
+	valid := c.client.ValidateTargets([]string{portalID}, c.getHandle())
 	if len(valid) > 0 {
 		return portalID
 	}
@@ -102,7 +102,7 @@ func (c *IMClient) resolveSendTarget(portalID string) (target string) {
 		if altID == portalID {
 			continue
 		}
-		valid := c.client.ValidateTargets([]string{altID}, c.handle)
+		valid := c.client.ValidateTargets([]string{altID}, c.getHandle())
 		if len(valid) > 0 {
 			c.UserLogin.Log.Info().
 				Str("portal_id", portalID).

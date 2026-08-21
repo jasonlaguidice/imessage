@@ -226,6 +226,10 @@ type IMClient struct {
 	connection *rustpushgo.WrappedApsConnection
 	handle     string   // Primary iMessage handle used for sending (e.g., tel:+1234567890)
 	allHandles []string // All registered handles (for IsThisUser checks)
+	// identityMu guards handle and allHandles together — they're always read
+	// and written as a pair. Use getHandle/getAllHandles/setIdentity rather
+	// than accessing the fields directly.
+	identityMu sync.RWMutex
 
 	// iCloud token provider (auth for CardDAV, CloudKit, etc.)
 	tokenProvider **rustpushgo.WrappedTokenProvider
@@ -529,6 +533,33 @@ var _ bridgev2.DeleteChatHandlingNetworkAPI = (*IMClient)(nil)
 var _ rustpushgo.MessageCallback = (*IMClient)(nil)
 var _ rustpushgo.UpdateUsersCallback = (*IMClient)(nil)
 var _ rustpushgo.StatusCallback = (*IMClient)(nil)
+
+// ============================================================================
+// Identity accessors (handle / allHandles)
+// ============================================================================
+
+// getHandle returns the currently selected send-from handle. Safe for concurrent use.
+func (c *IMClient) getHandle() string {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	return c.handle
+}
+
+// getAllHandles returns the full set of registered handles. Safe for concurrent use.
+func (c *IMClient) getAllHandles() []string {
+	c.identityMu.RLock()
+	defer c.identityMu.RUnlock()
+	return c.allHandles
+}
+
+// setIdentity atomically updates the selected handle and the full registered-handle
+// set together. Safe for concurrent use.
+func (c *IMClient) setIdentity(handle string, allHandles []string) {
+	c.identityMu.Lock()
+	c.handle = handle
+	c.allHandles = allHandles
+	c.identityMu.Unlock()
+}
 
 // ============================================================================
 // APNs message reorder buffer
@@ -1080,9 +1111,9 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	// Get our handle (precedence: config > login metadata > first handle)
 	handles := client.GetHandles()
-	c.allHandles = handles
+	var handle string
 	if len(handles) > 0 {
-		c.handle = handles[0]
+		handle = handles[0]
 		preferred := c.Main.Config.PreferredHandle
 		if preferred == "" {
 			if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
@@ -1093,7 +1124,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			found := false
 			for _, h := range handles {
 				if h == preferred {
-					c.handle = h
+					handle = h
 					found = true
 					break
 				}
@@ -1107,16 +1138,17 @@ func (c *IMClient) Connect(ctx context.Context) {
 				Msg("No preferred_handle configured — using first available. Run the install script to select one.")
 		}
 	}
+	c.setIdentity(handle, handles)
 
 	// Persist the selected handle to metadata so it's stable across restarts.
-	if c.handle != "" {
-		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != c.handle {
-			meta.PreferredHandle = c.handle
-			log.Info().Str("handle", c.handle).Msg("Persisted selected handle to metadata")
+	if c.getHandle() != "" {
+		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != c.getHandle() {
+			meta.PreferredHandle = c.getHandle()
+			log.Info().Str("handle", c.getHandle()).Msg("Persisted selected handle to metadata")
 		}
 	}
 
-	log.Info().Str("selected_handle", c.handle).Strs("handles", handles).Msg("Connected to iMessage")
+	log.Info().Str("selected_handle", c.getHandle()).Strs("handles", handles).Msg("Connected to iMessage")
 
 	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
 	// for outbound, "nextincomingcall" for inbound). Done in the
@@ -1142,7 +1174,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.Main.Bridge.DB.KV.Set(context.Background(), lastFullConnectKVKey, time.Now().Format(time.RFC3339))
 	}
 
-	if c.handle != "" && !skipHeavyIDSSweep {
+	if c.getHandle() != "" && !skipHeavyIDSSweep {
 		go func(handle string) {
 			ft, ftErr := c.client.GetFacetimeClient()
 			if ftErr != nil {
@@ -1151,7 +1183,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			}
 			premintFaceTimeLinks(ft, handle)
 			log.Info().Str("handle", handle).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
-		}(c.handle)
+		}(c.getHandle())
 	}
 
 	if c.videoTranscoding() {
@@ -2438,7 +2470,7 @@ func (c *IMClient) OnMessage(msg rustpushgo.WrappedMessage) {
 			if c.client == nil {
 				return
 			}
-			if err := c.client.SendDeliveryReceipt(conv, c.handle); err != nil {
+			if err := c.client.SendDeliveryReceipt(conv, c.getHandle()); err != nil {
 				log.Warn().Err(err).Msg("Failed to send delivery receipt")
 			}
 		}()
@@ -3704,10 +3736,10 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 		// in "nextincomingcall" slot); rotation below renames it to
 		// "incomingcall" while preserving session_link.
 		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.handle, ftLinkUsageNextIncomingCall); genErr == nil {
+			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.getHandle(), ftLinkUsageNextIncomingCall); genErr == nil {
 				link = generated
 				if guid := extractFaceTimeGuid(rawText); guid != "" {
-					if bindErr := ft.BindBridgeLinkToSession(c.handle, ftLinkUsageNextIncomingCall, guid); bindErr != nil {
+					if bindErr := ft.BindBridgeLinkToSession(c.getHandle(), ftLinkUsageNextIncomingCall, guid); bindErr != nil {
 						log.Warn().Err(bindErr).Str("guid", guid).Msg("FaceTimeRing: failed to pin bridge link to inbound session; web answer may route incorrectly")
 					}
 				}
@@ -3716,7 +3748,7 @@ func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.W
 				// The rotation renames the bound link's slot to
 				// "incomingcall" while preserving its session_link.
 				go func() {
-					_ = rotateIncomingLink(ft, c.handle)
+					_ = rotateIncomingLink(ft, c.getHandle())
 				}()
 				// Pre-fill the web page's display-name prompt with the
 				// user's own handle so tapping Answer lands in the call
@@ -3803,9 +3835,9 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 	// still post the notice with no callback button; the user can always
 	// `!im facetime` in the portal manually.
 	noticeMarkdown := "📞 **Missed FaceTime call from " + name + ".**"
-	if senderHandle != "" && c.handle != "" {
+	if senderHandle != "" && c.getHandle() != "" {
 		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if webLink, _, armErr := armBridgeFaceTimeCall(ft, c.handle, senderHandle, 3600, c.resolveFaceTimeDisplayName(ctx)); armErr == nil {
+			if webLink, _, armErr := armBridgeFaceTimeCall(ft, c.getHandle(), senderHandle, 3600, c.resolveFaceTimeDisplayName(ctx)); armErr == nil {
 				noticeMarkdown += "\n\n[**📞 Call back " + name + "**](" + webLink + ")"
 				noticeMarkdown += "\n\n⚠️ **Tapping this link will ring " + name + "'s phone.** The ring fires the moment you join — open the link when you're ready to be on camera. Works on iOS, macOS, Android, Windows, and Linux.\n\nRaw URL: " + webLink
 			} else {
@@ -3827,7 +3859,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 	}
 	if err == nil && portal != nil && portal.MXID != "" {
 		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to portal")
+			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.getHandle() != "").Msg("FaceTimeMissed: posted missed call notice to portal")
 			return
 		}
 	}
@@ -3840,7 +3872,7 @@ func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo
 		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
 		return
 	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.handle != "").Msg("FaceTimeMissed: posted missed call notice to management room")
+	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.getHandle() != "").Msg("FaceTimeMissed: posted missed call notice to management room")
 }
 
 func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -3960,7 +3992,7 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 	if len(msg.DeleteChatParticipants) > 1 {
 		members := make([]string, 0, len(msg.DeleteChatParticipants)+1)
-		members = append(members, c.handle)
+		members = append(members, c.getHandle())
 		for _, p := range msg.DeleteChatParticipants {
 			members = append(members, addIdentifierPrefix(p))
 		}
@@ -4145,7 +4177,7 @@ func (c *IMClient) handleChatRecover(log zerolog.Logger, msg rustpushgo.WrappedM
 	}
 	if strings.HasPrefix(portalID, "gid:") && len(msg.DeleteChatParticipants) > 0 {
 		normalized := make([]string, 0, len(msg.DeleteChatParticipants)+1)
-		normalized = append(normalized, c.handle)
+		normalized = append(normalized, c.getHandle())
 		for _, p := range msg.DeleteChatParticipants {
 			normalized = append(normalized, addIdentifierPrefix(p))
 		}
@@ -5663,7 +5695,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
 	// fresh MessageInst and orphan delivery receipts for the first attempt.
-	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.getHandle(), replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
@@ -5694,7 +5726,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(uuid),
-			SenderID:  makeUserID(c.handle),
+			SenderID:  makeUserID(c.getHandle()),
 			Timestamp: time.Now(),
 			Metadata:  &MessageMetadata{},
 		},
@@ -5863,7 +5895,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID — no Go-side retry here (would orphan delivery receipts).
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.handle, replyGuid, replyPart, nil)
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.getHandle(), replyGuid, replyPart, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
@@ -5882,7 +5914,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	textMXID := id.EventID("")
 	siblingUUID := ""
 	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
-		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.handle, nil, nil, nil)
+		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.getHandle(), nil, nil, nil)
 		if textErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
 		} else {
@@ -5934,7 +5966,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		bridgeRef := c.Main.Bridge
 		userLogin := c.UserLogin
 		portalKey := msg.Portal.PortalKey
-		senderID := makeUserID(c.handle)
+		senderID := makeUserID(c.getHandle())
 		now := time.Now()
 		return &bridgev2.MatrixMessageResponse{
 			DB: &database.Message{
@@ -5972,7 +6004,7 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(finalUUID),
-			SenderID:  makeUserID(c.handle),
+			SenderID:  makeUserID(c.getHandle()),
 			Timestamp: time.Now(),
 			Metadata:  &MessageMetadata{HasAttachments: hasAttachments, SiblingUUID: siblingUUID},
 		},
@@ -5988,7 +6020,7 @@ func (c *IMClient) HandleMatrixTyping(ctx context.Context, msg *bridgev2.MatrixT
 		return nil
 	}
 	return retrySendOnAPNsFlap(func() error {
-		return c.client.SendTyping(conv, msg.IsTyping, c.handle)
+		return c.client.SendTyping(conv, msg.IsTyping, c.getHandle())
 	})
 }
 
@@ -6010,7 +6042,7 @@ func (c *IMClient) HandleMatrixReadReceipt(ctx context.Context, receipt *bridgev
 		forUuid = &uuid
 	}
 	err := retrySendOnAPNsFlap(func() error {
-		return c.client.SendReadReceipt(conv, c.handle, forUuid)
+		return c.client.SendReadReceipt(conv, c.getHandle(), forUuid)
 	})
 	if err != nil {
 		errStr := err.Error()
@@ -6041,7 +6073,7 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	targetGUID := string(msg.EditTarget.ID)
 
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.handle)
+	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.getHandle())
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
@@ -6070,7 +6102,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 	if siblingUUID != "" {
 		c.trackOutboundUnsend(siblingUUID)
-		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.handle); sibErr != nil {
+		if _, sibErr := c.client.SendUnsend(conv, siblingUUID, 0, c.getHandle()); sibErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(sibErr).
 				Str("sibling_uuid", siblingUUID).
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
@@ -6082,7 +6114,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// Track outbound unsend so we can suppress the APNs echo.
 	c.trackOutboundUnsend(string(msg.TargetMessage.ID))
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.handle)
+	_, err := c.client.SendUnsend(conv, string(msg.TargetMessage.ID), 0, c.getHandle())
 
 	// Soft-delete the message in local DB so it doesn't re-bridge on backfill,
 	// while preserving the UUID for echo detection.
@@ -6095,7 +6127,7 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 
 func (c *IMClient) PreHandleMatrixReaction(ctx context.Context, msg *bridgev2.MatrixReaction) (bridgev2.MatrixReactionPreResponse, error) {
 	return bridgev2.MatrixReactionPreResponse{
-		SenderID: makeUserID(c.handle),
+		SenderID: makeUserID(c.getHandle()),
 		Emoji:    msg.Content.RelatesTo.Key,
 	}, nil
 }
@@ -6131,7 +6163,7 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 			}
 		}
 		// Rust-side retry handles SendTimedOut with stable UUID.
-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.getHandle(), &targetGUID, nil, nil)
 		if err != nil {
 			return nil, fmt.Errorf("failed to send SMS reaction: %w", err)
 		}
@@ -6145,14 +6177,14 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.handle)
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.getHandle())
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
 	}
 
 	return &database.Reaction{
 		MessageID: msg.TargetMessage.ID,
-		SenderID:  makeUserID(c.handle),
+		SenderID:  makeUserID(c.getHandle()),
 		Emoji:     msg.Content.RelatesTo.Key,
 		Metadata:  &MessageMetadata{},
 		MXID:      msg.Event.ID,
@@ -6180,7 +6212,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 			}
 		}
 		// Rust-side retry handles SendTimedOut with stable UUID.
-		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.handle, &targetGUID, nil, nil)
+		uuid, err := c.client.SendMessage(conv, reactionText, nil, c.getHandle(), &targetGUID, nil, nil)
 		if err != nil {
 			return err
 		}
@@ -6190,7 +6222,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.handle)
+	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.getHandle())
 	return err
 }
 
@@ -6310,7 +6342,7 @@ func (c *IMClient) deleteFromApple(portalID string, conv rustpushgo.WrappedConve
 	log := c.Main.Bridge.Log.With().Str("portal_id", portalID).Str("chat_guid", chatGuid).Logger()
 
 	// Send MoveToRecycleBin via APNs — notifies other Apple devices.
-	if err := c.client.SendMoveToRecycleBin(conv, c.handle, chatGuid); err != nil {
+	if err := c.client.SendMoveToRecycleBin(conv, c.getHandle(), chatGuid); err != nil {
 		log.Warn().Err(err).Msg("Failed to send MoveToRecycleBin via APNs")
 	} else {
 		log.Info().Msg("Sent MoveToRecycleBin via APNs")
@@ -6394,7 +6426,7 @@ func (c *IMClient) recoverChatOnApple(portalID string) {
 		}
 	} else {
 		sendTo := c.resolveSendTarget(portalID)
-		participants := []string{c.handle, sendTo}
+		participants := []string{c.getHandle(), sendTo}
 		if c.isMyHandle(sendTo) {
 			participants = []string{sendTo}
 		}
@@ -6405,7 +6437,7 @@ func (c *IMClient) recoverChatOnApple(portalID string) {
 	}
 
 	// Send RecoverChat via APNs (command 182) — notifies other Apple devices.
-	if err := c.client.SendRecoverChat(conv, c.handle, chatGuid); err != nil {
+	if err := c.client.SendRecoverChat(conv, c.getHandle(), chatGuid); err != nil {
 		log.Warn().Err(err).Str("chat_guid", chatGuid).Msg("Failed to send RecoverChat via APNs")
 	} else {
 		log.Info().Str("chat_guid", chatGuid).Msg("Sent RecoverChat via APNs — chat will reappear on Apple devices")
@@ -6534,7 +6566,7 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		// CloudKit doesn't include the owner in the participant list (it's
 		// implied). Always ensure we're in the member map so Beeper knows
 		// we belong to this conversation.
-		myUserID := makeUserID(c.handle)
+		myUserID := makeUserID(c.getHandle())
 		if _, hasSelf := memberMap[myUserID]; !hasSelf {
 			memberMap[myUserID] = bridgev2.ChatMember{
 				EventSender: bridgev2.EventSender{
@@ -6643,11 +6675,11 @@ func (c *IMClient) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*b
 		isSelfChat := c.isMyHandle(portalID)
 
 		memberMap := map[networkid.UserID]bridgev2.ChatMember{
-			makeUserID(c.handle): {
+			makeUserID(c.getHandle()): {
 				EventSender: bridgev2.EventSender{
 					IsFromMe:    true,
 					SenderLogin: c.UserLogin.ID,
-					Sender:      makeUserID(c.handle),
+					Sender:      makeUserID(c.getHandle()),
 				},
 				Membership: event.MembershipJoin,
 			},
@@ -6867,7 +6899,7 @@ func (c *IMClient) ResolveIdentifier(ctx context.Context, identifier string, cre
 		}
 	}()
 
-	valid := c.client.ValidateTargets([]string{identifier}, c.handle)
+	valid := c.client.ValidateTargets([]string{identifier}, c.getHandle())
 	if len(valid) == 0 {
 		return nil, fmt.Errorf("user not found on iMessage: %s", identifier)
 	}
@@ -7189,7 +7221,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 							Sender: bridgev2.EventSender{
 								IsFromMe:    true,
 								SenderLogin: c.UserLogin.ID,
-								Sender:      makeUserID(c.handle),
+								Sender:      makeUserID(c.getHandle()),
 							},
 							Timestamp: lastMsgTS,
 						},
@@ -7545,7 +7577,7 @@ func (c *IMClient) makeCloudSender(row cloudMessageRow) bridgev2.EventSender {
 		return bridgev2.EventSender{
 			IsFromMe:    true,
 			SenderLogin: c.UserLogin.ID,
-			Sender:      makeUserID(c.handle),
+			Sender:      makeUserID(c.getHandle()),
 		}
 	}
 	normalizedSender := normalizeIdentifierForPortalID(row.Sender)
@@ -8742,7 +8774,7 @@ func (c *IMClient) refreshAllGhosts(log zerolog.Logger) {
 
 func (c *IMClient) isMyHandle(handle string) bool {
 	normalizedHandle := normalizeIdentifierForPortalID(handle)
-	for _, h := range c.allHandles {
+	for _, h := range c.getAllHandles() {
 		if normalizedHandle == normalizeIdentifierForPortalID(h) {
 			return true
 		}
@@ -8796,7 +8828,7 @@ func (c *IMClient) buildCanonicalParticipantList(participants []string) []string
 		}
 		sorted = append(sorted, normalized)
 	}
-	sorted = append(sorted, normalizeIdentifierForPortalID(c.handle))
+	sorted = append(sorted, normalizeIdentifierForPortalID(c.getHandle()))
 	sort.Strings(sorted)
 	deduped := sorted[:0]
 	for i, s := range sorted {
@@ -8835,7 +8867,7 @@ func (c *IMClient) makeEventSender(sender *string) bridgev2.EventSender {
 		return bridgev2.EventSender{
 			IsFromMe:    true,
 			SenderLogin: c.UserLogin.ID,
-			Sender:      makeUserID(c.handle),
+			Sender:      makeUserID(c.getHandle()),
 		}
 	}
 	normalizedSender := normalizeIdentifierForPortalID(*sender)
@@ -9905,7 +9937,7 @@ func (c *IMClient) portalToConversation(portal *bridgev2.Portal) rustpushgo.Wrap
 	// For self-chats, only include one participant. Duplicating our own
 	// handle (e.g. [self, self]) causes rustpush to reject the message
 	// with NoValidTargets because all targets belong to the sender.
-	participants := []string{c.handle, sendTo}
+	participants := []string{c.getHandle(), sendTo}
 	if c.isMyHandle(sendTo) {
 		participants = []string{sendTo}
 	}
@@ -11052,7 +11084,7 @@ func (c *IMClient) runChatDBInitialSync(log zerolog.Logger) {
 		isSms := parsed.Service == "SMS"
 		if parsed.IsGroup {
 			members := make([]string, 0, len(info.Members)+1)
-			members = append(members, addIdentifierPrefix(c.handle))
+			members = append(members, addIdentifierPrefix(c.getHandle()))
 			for _, m := range info.Members {
 				members = append(members, addIdentifierPrefix(stripSmsSuffix(m)))
 			}
@@ -11230,11 +11262,11 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 			IsFull:    true,
 			MemberMap: make(map[networkid.UserID]bridgev2.ChatMember),
 		}
-		members.MemberMap[makeUserID(c.handle)] = bridgev2.ChatMember{
+		members.MemberMap[makeUserID(c.getHandle())] = bridgev2.ChatMember{
 			EventSender: bridgev2.EventSender{
 				IsFromMe:    true,
 				SenderLogin: c.UserLogin.ID,
-				Sender:      makeUserID(c.handle),
+				Sender:      makeUserID(c.getHandle()),
 			},
 			Membership: event.MembershipJoin,
 		}
@@ -11253,11 +11285,11 @@ func (c *IMClient) chatDBInfoToBridgev2(info *imessage.ChatInfo) *bridgev2.ChatI
 		isSelfChat := c.isMyHandle(portalID)
 
 		memberMap := map[networkid.UserID]bridgev2.ChatMember{
-			makeUserID(c.handle): {
+			makeUserID(c.getHandle()): {
 				EventSender: bridgev2.EventSender{
 					IsFromMe:    true,
 					SenderLogin: c.UserLogin.ID,
-					Sender:      makeUserID(c.handle),
+					Sender:      makeUserID(c.getHandle()),
 				},
 				Membership: event.MembershipJoin,
 			},
