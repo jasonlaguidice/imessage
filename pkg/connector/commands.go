@@ -20,14 +20,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
 	"maunium.net/go/mautrix/bridgev2/networkid"
@@ -54,9 +51,9 @@ var (
 //
 // Invocation conventions for users:
 //
-//   - Management room (the bot DM): type the command bare, e.g. `logout`.
+//   - Management room (the bot DM): type the command bare, e.g. `contacts`.
 //   - Portal rooms (bridged chats): prefix with the bridge tag, e.g.
-//     `!im logout`.
+//     `!im contacts`.
 //
 // User-facing reply strings should use `$cmdprefix` (substituted by bridgev2
 // at render time) instead of a hard-coded `!` so the rendered example matches
@@ -69,7 +66,6 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 	cmds := []*commands.FullHandler{
 		cmdStartChat,
 		cmdResolveIdentifierRedirect,
-		cmdLogout,
 		cmdListIdentities,
 		cmdSetIdentity,
 		cmdRestoreChat,
@@ -321,162 +317,6 @@ func startChatKindLabel(identifier string) string {
 		return "email address"
 	}
 	return "phone number"
-}
-
-// cmdLogout signs the user out of one (or all) of their iMessage logins and
-// scrubs the on-disk session backup so a re-login can't silently resume the
-// identity that was just signed out.
-//
-// Usage (management room — prefix with `!im` if invoked from a portal room):
-//
-//	logout     — show numbered list of active handles
-//	1          — (bare number after listing) sign out handle #1
-//	all        — sign out every active handle
-var cmdLogout = &commands.FullHandler{
-	Name:    "logout",
-	Aliases: []string{"signout", "sign-out"},
-	Func:    fnLogout,
-	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionAuth,
-		Description: "Sign out of iMessage. Disconnects from Apple, removes the bridge connection, and clears the local session backup so the next login starts fresh.",
-		Args:        "",
-	},
-}
-
-func fnLogout(ce *commands.Event) {
-	type entry struct {
-		login *bridgev2.UserLogin
-		label string
-	}
-	var entries []entry
-	for _, l := range ce.User.GetCachedUserLogins() {
-		if l == nil {
-			continue
-		}
-		label := string(l.ID)
-		if meta, ok := l.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != "" {
-			label = meta.PreferredHandle
-		}
-		entries = append(entries, entry{login: l, label: label})
-	}
-
-	if len(entries) == 0 {
-		// No active logins, but a stale session backup may still be on disk
-		// (e.g. previous logout crashed mid-cleanup). Sweep it so the next
-		// login won't auto-resume an orphan identity.
-		removed := clearLocalSessionBackup(ce.Log)
-		if removed > 0 {
-			ce.Reply("You're not logged in to iMessage. Cleared %d stale session file(s) so the next login starts fresh.", removed)
-		} else {
-			ce.Reply("You're not logged in to iMessage.")
-		}
-		return
-	}
-
-	var sb strings.Builder
-	sb.WriteString("**Logged-in iMessage handles:**\n\n")
-	for i, e := range entries {
-		sb.WriteString(fmt.Sprintf("%d. **%s**\n", i+1, e.label))
-	}
-	sb.WriteString("\nReply with a number to sign out that handle, `all` to sign out everything, or `$cmdprefix cancel` to cancel.")
-	ce.Reply(sb.String())
-
-	commands.StoreCommandState(ce.User, &commands.CommandState{
-		Action: "logout",
-		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
-			commands.StoreCommandState(ce.User, nil)
-			choice := strings.ToLower(strings.TrimSpace(ce.RawArgs))
-
-			var targets []entry
-			switch {
-			case choice == "all":
-				targets = entries
-			default:
-				n, err := strconv.Atoi(choice)
-				if err != nil || n < 1 || n > len(entries) {
-					ce.Reply("Please reply with a number between 1 and %d, `all`, or `$cmdprefix cancel`.", len(entries))
-					return
-				}
-				targets = []entry{entries[n-1]}
-			}
-
-			signedOut := make([]string, 0, len(targets))
-			for _, t := range targets {
-				t.login.Logout(ce.Ctx)
-				signedOut = append(signedOut, t.label)
-			}
-
-			// If every login was removed, scrub the session backup files so
-			// a fresh login can't auto-resume the identity we just signed out.
-			if len(ce.User.GetCachedUserLogins()) == 0 {
-				clearLocalSessionBackup(ce.Log)
-			}
-
-			// One consolidated reply that confirms the bridge-side teardown
-			// AND walks the user through removing the device from Apple's
-			// servers — the bridge has no API to do that itself, so the only
-			// way to fully sever the connection is for the user to revoke the
-			// device under their Apple ID.
-			var sb strings.Builder
-			sb.WriteString("**Signed out of:**\n")
-			for _, label := range signedOut {
-				sb.WriteString(fmt.Sprintf("  • %s\n", label))
-			}
-			sb.WriteString("\nBridge-side state has been cleared (rustpush stopped, login removed, session backup wiped).\n\n")
-			sb.WriteString("**Finish the cleanup on Apple's side — required to fully sever the connection:**\n")
-			sb.WriteString("  1. Open https://appleid.apple.com and sign in with the Apple ID you used to log into the bridge.\n")
-			sb.WriteString("  2. Go to **Devices** in the sidebar.\n")
-			sb.WriteString("  3. Find the entry that represents this bridge (it'll show as a Mac, often named \"Apple Device\" or similar).\n")
-			sb.WriteString("  4. Click it and choose **Remove from account**.\n\n")
-			sb.WriteString("Until you do step 4, Apple still considers the bridge a registered iMessage device and may attempt deliveries to it.")
-			ce.Reply(sb.String())
-		}),
-		Cancel: func() {},
-	})
-}
-
-// clearLocalSessionBackup deletes the on-disk session/identity files so a
-// re-login starts from a clean slate (no auto-resume of the just-signed-out
-// identity). Returns the count of files that existed and were removed.
-func clearLocalSessionBackup(log *zerolog.Logger) int {
-	pathFns := []func() (string, error){
-		sessionFilePath,
-		legacyIdentityFilePath,
-	}
-	removed := 0
-	removeFile := func(p string) {
-		if err := os.Remove(p); err == nil {
-			removed++
-			if log != nil {
-				log.Info().Str("path", p).Msg("Removed session backup file during logout")
-			}
-		} else if !os.IsNotExist(err) && log != nil {
-			log.Warn().Err(err).Str("path", p).Msg("Failed to remove session backup file during logout")
-		}
-	}
-	for _, fn := range pathFns {
-		p, err := fn()
-		if err != nil {
-			continue
-		}
-		removeFile(p)
-	}
-	// Remove all per-user trustedpeers_*.plist files (one per DSID).
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		if home, err := os.UserHomeDir(); err == nil {
-			dataDir = filepath.Join(home, ".local", "share")
-		}
-	}
-	if dataDir != "" {
-		pattern := filepath.Join(dataDir, "mautrix-imessage", "trustedpeers_*.plist")
-		if matches, err := filepath.Glob(pattern); err == nil {
-			for _, p := range matches {
-				removeFile(p)
-			}
-		}
-	}
-	return removed
 }
 
 // cmdRestoreChat lists deleted rooms, then waits for the user to reply with

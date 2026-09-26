@@ -1547,7 +1547,7 @@ You're signed in. This is your **management room** — the bot uses it to delive
 
 #### Sign out cleanly
 
-- ` + "`logout`" + ` — sign out of the bridge. Lists your active handles; reply with a number (or ` + "`all`" + `) to confirm. The bot tells you exactly how to finish the cleanup at appleid.apple.com so Apple stops treating the bridge as a registered device.
+- ` + "`logout <login ID>`" + ` — sign out of the bridge. Run ` + "`logout`" + ` on its own to list your login IDs. Only that login is signed out. To stop Apple treating the bridge as a registered device, also remove it under **Devices** at appleid.apple.com.
 
 #### Where to type commands
 
@@ -1600,8 +1600,16 @@ func (c *IMClient) IsLoggedIn() bool {
 	return c.client != nil
 }
 
+// LogoutRemote implements bridgev2.NetworkAPI. bridgev2 handles the rest of
+// the logout (login row, space, portal cleanup, bridge state); this only
+// tears down what lives outside the bridge DB for this login: the rustpush
+// connection and the on-disk session backup. Other users' logins and backups
+// are untouched.
 func (c *IMClient) LogoutRemote(ctx context.Context) {
 	c.Disconnect()
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		clearSessionBackupForAccount(c.UserLogin.Log, meta.AccountDSID, meta.IDSUsers)
+	}
 }
 
 func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {

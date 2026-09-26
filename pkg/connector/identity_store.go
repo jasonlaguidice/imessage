@@ -188,6 +188,39 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 	return state
 }
 
+// clearSessionBackupForAccount removes the on-disk state belonging to one
+// Apple account so tryAutoRestore can't resurrect a login after it was
+// logged out. session.json is a single bridge-wide backup (last writer wins),
+// so it is only removed when it belongs to this account — matched by DSID, or
+// by IDS users blob for backups written before DSID was recorded. Another
+// user's backup is left untouched. trustedpeers_<dsid>.plist is per-account.
+func clearSessionBackupForAccount(log zerolog.Logger, dsid, idsUsers string) {
+	removeFile := func(path string) {
+		if err := os.Remove(path); err == nil {
+			log.Info().Str("path", path).Msg("Removed session backup file on logout")
+		} else if !os.IsNotExist(err) {
+			log.Warn().Err(err).Str("path", path).Msg("Failed to remove session backup file on logout")
+		}
+	}
+
+	state := loadSessionState(log)
+	ownedByDSID := dsid != "" && state.AccountDSID == dsid
+	ownedByUsers := idsUsers != "" && state.IDSUsers == idsUsers
+	if ownedByDSID || ownedByUsers {
+		if path, err := sessionFilePath(); err == nil {
+			removeFile(path)
+		}
+	} else if state.IDSUsers != "" {
+		log.Debug().Msg("session.json belongs to another account, leaving it in place")
+	}
+
+	if dsid != "" {
+		if path, err := trustedPeersFilePath(dsid); err == nil {
+			removeFile(path)
+		}
+	}
+}
+
 // ListHandles returns the available iMessage handles (phone numbers and
 // email addresses) from the backup session state. Returns nil if no valid
 // session state is found. Intended for CLI use (list-handles subcommand).
