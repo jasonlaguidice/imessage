@@ -6,6 +6,7 @@ pub mod anisette;
 mod account_persist;
 mod aps_watchdog;
 mod cloud_message_legacy;
+mod escrow_bottles;
 mod escrow_diag;
 mod facetime_notify;
 mod ids_guard;
@@ -2441,7 +2442,7 @@ impl WrappedTokenProvider {
             info!("Fetching escrow devices...");
             let (keychain, _cloudkit) = create_keychain_clients(self).await?;
 
-            let bottles = keychain.get_viable_bottles().await
+            let bottles = escrow_bottles::viable_bottles(&keychain, self.escrow_proxy_host().await).await
                 .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
 
             if bottles.is_empty() {
@@ -2481,7 +2482,7 @@ impl WrappedTokenProvider {
             let (keychain, cloudkit) = create_keychain_clients(self).await?;
 
             info!("Fetching escrow bottles...");
-            let bottles = keychain.get_viable_bottles().await
+            let bottles = escrow_bottles::viable_bottles(&keychain, self.escrow_proxy_host().await).await
                 .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
 
             if bottles.is_empty() {
@@ -2511,7 +2512,7 @@ impl WrappedTokenProvider {
             let (keychain, cloudkit) = create_keychain_clients(self).await?;
 
             info!("Fetching escrow bottles...");
-            let bottles = keychain.get_viable_bottles().await
+            let bottles = escrow_bottles::viable_bottles(&keychain, self.escrow_proxy_host().await).await
                 .map_err(|e| WrappedError::GenericError { msg: format!("Failed to get escrow bottles: {}", e) })?;
 
             if bottles.is_empty() {
