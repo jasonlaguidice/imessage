@@ -69,6 +69,7 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdRestoreDebug,
 		cmdMsgDebug,
 		cmdKeychainDiagnose,
+		cmdKeychainJoin,
 		cmdContacts,
 		cmdSetCardDAV,
 		cmdSetVideoTranscoding,
