@@ -49,6 +49,9 @@ func (c *IMConnector) GetName() bridgev2.BridgeName {
 
 func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 	c.Bridge = bridge
+	// First FFI call in the bridge process: route Rust logging into the
+	// bridge logger before any InitLogger fallback can claim it.
+	installRustLogSink(bridge.Log)
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
@@ -235,6 +238,7 @@ func (c *IMConnector) tryAutoRestore(ctx context.Context) {
 		AccountDSID:              state.AccountDSID,
 		AccountSPDBase64:         state.AccountSPDBase64,
 		MmeDelegateJSON:          state.MmeDelegateJSON,
+		AccountPersistBlob:       state.AccountPersistBlob,
 	}
 
 	_, err = user.NewLogin(ctx, &database.UserLogin{
@@ -359,6 +363,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 			AccountDSID:              meta.AccountDSID,
 			AccountSPDBase64:         meta.AccountSPDBase64,
 			MmeDelegateJSON:          meta.MmeDelegateJSON,
+			AccountPersistBlob:       meta.AccountPersistBlob,
 		})
 	}
 

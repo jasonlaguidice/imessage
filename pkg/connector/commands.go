@@ -39,15 +39,12 @@ import (
 // Admin=50), so the `help` command renders each service as its own heading at
 // the bottom instead of lumping everything under "General".
 var (
-	HelpSectionFaceTime      = commands.HelpSection{Name: "FaceTime", Order: 60}
 	HelpSectionSharedStreams = commands.HelpSection{Name: "Shared Streams", Order: 80}
 	HelpSectionStatusKit     = commands.HelpSection{Name: "StatusKit", Order: 90}
 )
 
 // BridgeCommands returns the custom slash commands for the iMessage bridge.
-// Pass disableFaceTime=true to skip every facetime* handler — used by
-// IMConfig.DisableFaceTime to give Apple-native FaceTime users a way to
-// keep the bridge's FT wrapper out of their chat.
+// FaceTime is notify-only, so there are no FaceTime commands.
 //
 // Invocation conventions for users:
 //
@@ -61,8 +58,8 @@ var (
 //
 // Register these in main.go's PostInit hook:
 //
-//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands(...)...)
-func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
+//	m.Bridge.Commands.(*commands.Processor).AddHandlers(connector.BridgeCommands()...)
+func BridgeCommands() []*commands.FullHandler {
 	cmds := []*commands.FullHandler{
 		cmdStartChat,
 		cmdResolveIdentifierRedirect,
@@ -71,31 +68,12 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
+		cmdKeychainDiagnose,
 		cmdContacts,
 		cmdSetCardDAV,
 		cmdSetVideoTranscoding,
 		cmdSetHEICConversion,
 		cmdClearIdentityCache,
-	}
-	if !disableFaceTime {
-		cmds = append(cmds,
-			cmdFaceTime,
-			cmdFaceTimeSend,
-			cmdFaceTimeClear,
-			cmdFaceTimeInvalidatePeer,
-			cmdFaceTimeRotateIdentity,
-			cmdFaceTimeState,
-			cmdFaceTimeSessionLink,
-			cmdFaceTimeUseLink,
-			cmdFaceTimeDeleteLink,
-			cmdFaceTimeLetMeIn,
-			cmdFaceTimeLetMeInApprove,
-			cmdFaceTimeLetMeInDeny,
-			cmdFaceTimeCreateSession,
-			cmdFaceTimeRing,
-			cmdFaceTimeAddMembers,
-			cmdFaceTimeRemoveMembers,
-		)
 	}
 	cmds = append(cmds,
 		cmdSharedAlbums,
@@ -113,7 +91,6 @@ func BridgeCommands(disableFaceTime bool) []*commands.FullHandler {
 		cmdStatuskitRequestHandles,
 		cmdStatuskitClearInterest,
 		cmdStatuskitInviteToChannel,
-		cmdStatuskitInviteAll,
 		cmdStatuskitClearLatch,
 	)
 	return cmds
@@ -496,7 +473,7 @@ func fnRestoreChatFromCloudKit(ce *commands.Event, login *bridgev2.UserLogin, cl
 		recoverableChats, err := client.client.ListRecoverableChats()
 		if err == nil {
 			for _, chat := range recoverableChats {
-				portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+				portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 				if portalID == "" || seenPortalIDs[portalID] {
 					continue
 				}
@@ -991,7 +968,7 @@ func fnRestoreDebug(ce *commands.Event) {
 				photo = " photo=" + g + "…"
 			}
 
-			portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+			portalID := client.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 			cacheBackfillable := "?"
 			cacheContentful := "?"
 			if portalID != "" {
@@ -1147,7 +1124,7 @@ func fnMsgDebug(ce *commands.Event) {
 				idsTargets = append(idsTargets, altID)
 			}
 		}
-		valid := client.client.ValidateTargets(idsTargets, client.handle)
+		valid := client.validateTargetsSafe(idsTargets)
 		validSet := make(map[string]bool, len(valid))
 		for _, v := range valid {
 			validSet[v] = true
@@ -1246,6 +1223,65 @@ func fnMsgDebug(ce *commands.Event) {
 	ce.Reply(sb.String())
 }
 
+// ============================================================================
+// keychain-diagnose command
+// ============================================================================
+
+// cmdKeychainDiagnose asks Apple (read-only) what this login's iCloud Keychain
+// escrow state actually looks like, so "No escrow bottles found" can be told
+// apart from the three different situations that produce it: Apple holds no
+// bottle at all, Apple holds only incomplete ("partial") bottles, or Apple
+// holds valid bottles that rustpush cannot match/parse locally. It makes two
+// Apple lookups and changes nothing.
+var cmdKeychainDiagnose = &commands.FullHandler{
+	Name:          "keychain-diagnose",
+	Func:          fnKeychainDiagnose,
+	RequiresLogin: true,
+	Help: commands.HelpMeta{
+		Section: commands.HelpSectionAdmin,
+		Description: "Read-only check of this login's iCloud Keychain escrow bottles " +
+			"(why a keychain join reports \"No escrow bottles found\"). " +
+			"Makes two Apple lookups; changes nothing.",
+	},
+}
+
+func fnKeychainDiagnose(ce *commands.Event) {
+	login := ce.User.GetDefaultLogin()
+	if login == nil {
+		ce.Reply("Not logged in.")
+		return
+	}
+	client, ok := login.Client.(*IMClient)
+	if !ok || client == nil {
+		ce.Reply("Bridge client not available.")
+		return
+	}
+	if client.tokenProvider == nil || *client.tokenProvider == nil {
+		ce.Reply("No token provider for this login.")
+		return
+	}
+	// Snapshot the provider: the two CloudKit/keychain lookups below take a
+	// second or two, and the client could be torn down while we wait.
+	tp := *client.tokenProvider
+
+	ce.Reply("Checking escrow bottles…")
+
+	// Same reason the Rust side wraps this call in guard_panic: a panic inside
+	// the FFI call must not take the whole bridge down.
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ce.Reply("Escrow diagnostic failed: %v", r)
+			}
+		}()
+		res, err := tp.DiagnoseEscrowBottles()
+		if err != nil {
+			ce.Reply("Escrow diagnostic failed: %v", err)
+			return
+		}
+		ce.Reply("%s", res)
+	}()
+}
 
 // ============================================================================
 // set-carddav command
@@ -1617,7 +1653,6 @@ func setBoolSetting(
 // identity bundle so the bridge isn't left cache-wiped/unregistered. Use when
 // the bridge's identity has gone stale or smeared — e.g. peers can't resolve a
 // clean identity (calls ring a UUID / don't connect, inbound routing is wrong).
-// Not FaceTime-specific; stays available even with disable_facetime set.
 var cmdClearIdentityCache = &commands.FullHandler{
 	Name: "clear-identity-cache",
 	Func: fnClearIdentityCache,

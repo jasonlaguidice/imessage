@@ -9,9 +9,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libolm-dev libclang-dev libssl-dev libunicorn-dev libheif-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust — install to default ~/.cargo so the Makefile's $(HOME)/.cargo/bin path resolves
+# Rust — install to default ~/.cargo so the Makefile's $(HOME)/.cargo/bin path resolves.
+# rustpush needs Rust >= 1.95 (keep in sync with RUST_MIN_VERSION in the
+# Makefile). The ARG is referenced in the RUN so that raising it invalidates a
+# layer cache that still holds an older "stable".
+ARG RUST_MIN_VERSION=1.95
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable
+    | sh -s -- -y --default-toolchain stable \
+    && echo "installed $(/root/.cargo/bin/rustc --version) (need >= ${RUST_MIN_VERSION})"
 ENV PATH=/root/.cargo/bin:$PATH
 
 # Go — arch-aware, fetches latest stable with fallback
@@ -21,7 +26,7 @@ RUN set -e; \
     GO_VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json' \
         | grep -o '"version":"go[0-9.]*"' | head -1 \
         | sed 's/"version":"//;s/"//'); \
-    : "${GO_VERSION:=go1.25.0}"; \
+    : "${GO_VERSION:=go1.26.0}"; \
     curl -fsSL "https://go.dev/dl/${GO_VERSION}.linux-${GOARCH}.tar.gz" \
         | tar -C /usr/local -xz
 ENV PATH=/usr/local/go/bin:$PATH \
@@ -37,7 +42,9 @@ COPY rustpush/ rustpush/
 COPY Makefile .
 
 # Clone upstream rustpush at the pinned SHA, apply all patches, overlay open-absinthe.
-RUN make ensure-rustpush-source
+# check-rust-toolchain fails fast if the (possibly layer-cached) toolchain above
+# is older than the Makefile's RUST_MIN_VERSION (1.95, required by rustpush).
+RUN make check-rust-toolchain ensure-rustpush-source
 
 # Copy Rust crate sources. Changing these invalidates only the Rust build layer,
 # not the clone layer above.

@@ -49,16 +49,9 @@ url_previews_in_backfill: true
 # Available handles are logged on startup.
 preferred_handle: ""
 
-# Override the display name pre-filled on the FaceTime web join page (the
-# `#n=…` fragment in the ring-notice link). If empty, the bridge reads
-# "First Last" from the Apple Account SPD; if that's also blank it falls
-# back to the bare iMessage handle (e.g. "+15551234567").
-facetime_display_name: ""
-
-# Disable bridge FaceTime integration. When true, !facetime* commands aren't
-# registered and inbound ring / missed / answered-elsewhere / peer-invite
-# notices are suppressed. Intended for users with their own Apple device who
-# answer FaceTime natively — the bridge wrapper adds nothing in that case.
+# FaceTime is notify-only: the bridge posts a notice for incoming and missed
+# FaceTime calls; answer them on an Apple device. Set true to suppress those
+# notices. Default for new logins; each login can override it at login time.
 disable_facetime: false
 
 # Publish "available" to StatusKit once after startup. Peer iOS reciprocates

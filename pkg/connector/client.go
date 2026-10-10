@@ -15,6 +15,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"image"
@@ -30,6 +31,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	_ "image/gif"
 	_ "image/png"
@@ -174,11 +176,20 @@ func (c *IMClient) externalCardDAVConfig() CardDAVConfig {
 	return c.Main.Config.CardDAV
 }
 
+// disableFaceTime reports whether this login suppresses FaceTime call
+// notices. FaceTime is notify-only, so that is all it controls.
 func (c *IMClient) disableFaceTime() bool {
 	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.DisableFaceTime != nil {
 		return *meta.DisableFaceTime
 	}
 	return c.Main.Config.DisableFaceTime
+}
+
+// existingManagementRoom returns the user's management room without creating
+// one (from upstream d41878e9). Background notices use it so a room the user
+// left is not recreated and re-joined behind their back; "" means none.
+func (c *IMClient) existingManagementRoom() id.RoomID {
+	return c.UserLogin.User.ManagementRoom
 }
 
 func (c *IMClient) statusKitNotifications() bool {
@@ -273,6 +284,37 @@ type IMClient struct {
 	// indistinguishable from a single user catching up on chats.
 	statusKitIDSGate idsRateGate
 
+	// carrierCheckedAt is the last time an outbound carrier-route check issued an
+	// IDS lookup for a portal that came back unreachable. It bounds Apple traffic
+	// to at most one lookup per portal per carrierCheckTTL no matter how many
+	// messages the user sends, independently of the Rust-side KeyCache — so an
+	// invalidation there (APNs "devices changed", a cache reset) cannot turn a
+	// burst of sends into a burst of lookups.
+	carrierCheckedAt map[string]time.Time
+	// carrierVerifiedAt records portals IDS has confirmed reachable on iMessage.
+	// Because the routing decision is per-send and nothing is persisted, this is
+	// what stops repeat sends to the same portal re-querying Apple.
+	carrierVerifiedAt map[string]time.Time
+	// carrierCheckLog holds the timestamps of recent carrier-route lookups so an
+	// absolute per-hour ceiling can be enforced across all portals at once.
+	carrierCheckLog []time.Time
+	// smsRelay* memoize whether this ACCOUNT has a text-message relay. Account
+	// scope, not portal scope, so one entry serves every portal.
+	smsRelayCheckedAt time.Time
+	smsRelayValue     bool
+	smsRelayHandle    string // handle the cached relay answer is for
+	carrierCheckedMu  sync.Mutex
+
+	// sendPathIDSGate paces the carrier-flag re-verification lookup that
+	// checkCarrierRoute runs before an outbound send is routed to the SMS
+	// relay. Kept separate from statusKitIDSGate so a noisy background
+	// presence sweep can never stall a user-initiated send behind its
+	// backoff (or vice versa). Volume here is inherently tiny: the lookup
+	// only fires for carrier-flagged 1:1 DMs, and the Rust KeyCache absorbs
+	// repeats (an empty answer for an hour, a non-empty one until Apple's
+	// session token expires, normally much longer).
+	sendPathIDSGate idsRateGate
+
 	// sharedStreamAssetCache tracks the last observed asset GUID set per shared
 	// album for this session. The Shared Streams watcher uses it to suppress
 	// false-positive "new content" notices from Apple's getchanges endpoint,
@@ -303,10 +345,21 @@ type IMClient struct {
 	// statusKitSweepRunning is true while inviteContactsToStatusSharingOpts
 	// is iterating its paced loop. The new-portal hook checks this and
 	// skips during a sweep so a burst of fresh portals doesn't spawn
-	// unpaced concurrent FFI calls alongside the sweep's 1.5s-paced ones.
+	// unpaced concurrent FFI calls alongside the sweep's paced ones.
 	// The next sweep (or the soft-expired re-invite path) picks up the
 	// missed handles, so skipping is safe.
 	statusKitSweepRunning atomic.Bool
+
+	// statusKitInviteMu / statusKitNextInviteAt enforce a per-login minimum
+	// interval between StatusKit invite dispatches, shared across every invite
+	// caller of this login: the periodic sweep, the new-portal hook, and
+	// concurrent reconnect-triggered sweeps. The sweep's per-loop delay only
+	// bounded one sweep; the new-portal hook fires once per portal during
+	// CloudKit backfill and was otherwise unpaced, so a fresh start could still
+	// burst Apple's IDS. Every invite funnels through this gate so the
+	// aggregate rate trickles.
+	statusKitInviteMu     sync.Mutex
+	statusKitNextInviteAt time.Time
 
 	// statusKitCloudPassFirstCallDone gates the inter-pass-backoff bypass
 	// for the first StatusKit-CloudKit pass after process startup. If a
@@ -318,6 +371,19 @@ type IMClient struct {
 	// its natural "let me try again" semantics; if that pass also fails,
 	// the persisted backoff resumes and steady-state behavior takes over.
 	statusKitCloudPassFirstCallDone atomic.Bool
+
+	// statusKitPassInFlight is a single-flight guard so only one
+	// syncCloudStatusKitPeers pass runs at a time. The periodic pull loop, the
+	// post-backfill trigger, and the cloud-sync phases can all call it; two
+	// concurrent passes would race on the shared continuation-token / pass-meta
+	// rows and double the CKKS round-trips. Released in a defer.
+	statusKitPassInFlight atomic.Bool
+
+	// lastDecryptFailureRepull is the unix-millisecond time of the last CloudKit
+	// re-pull forced by a presence decrypt failure (a stale peer key). Cooldown-
+	// gates onPresenceDecryptFailed so a burst of undecryptable presence updates
+	// can't hammer CKKS and re-trigger the clique-kick. Accessed atomically.
+	lastDecryptFailureRepull int64
 
 	// statusKitShareMu serializes the cooldown-check / publish /
 	// cooldown-write sequence in publishStatusKitAvailableAfterInvite.
@@ -332,6 +398,17 @@ type IMClient struct {
 	// storms.
 	lastPresenceSubscribe     time.Time
 	lastPresenceSubscribeLock sync.Mutex
+
+	// Trailing-edge coalescing for OnKeysReceived. A key-sharing burst (a
+	// heavily-keyed account at startup fires OnKeysReceived dozens of times in
+	// seconds) would otherwise trigger a full chunked SubscribeToStatus per
+	// event — a storm against Apple that gets worse the more keys a user has.
+	// schedulePresenceSubscribe collapses a burst into ONE re-subscribe that
+	// runs after the burst settles. See schedulePresenceSubscribe.
+	presenceSubscribeLock    sync.Mutex
+	presenceSubscribeGen     uint64
+	presenceSubscribePending bool
+	presenceSubscribeFirstAt time.Time
 
 	// Contacts readiness gate for CloudKit message sync.
 	contactsReady     bool
@@ -375,6 +452,8 @@ type IMClient struct {
 
 	// Background goroutine lifecycle
 	stopChan chan struct{}
+	// Serializes Disconnect — see the comment there.
+	disconnectMu sync.Mutex
 
 	// Unsend re-delivery suppression
 	recentUnsends     map[string]time.Time
@@ -861,7 +940,7 @@ func (c *IMClient) onForwardBackfillDone() {
 		//
 		// Sleep slightly longer than the gate's settle window so when the
 		// gate runs it definitely sees ">60s elapsed since backfill done".
-		// On warm restart with a fast/empty backfill, the 12h success floor
+		// On warm restart with a fast/empty backfill, the 4h success floor
 		// will short-circuit the call — no redundant CKKS round-trip.
 		go func() {
 			select {
@@ -988,14 +1067,20 @@ func (c *IMClient) migrateSmsSuffixPortals(log zerolog.Logger, ctx context.Conte
 func safeRestoreTokenProvider(
 	config *rustpushgo.WrappedOsConfig,
 	conn *rustpushgo.WrappedApsConnection,
-	username, hashedPwHex, pet, spdBase64 string,
+	username, hashedPwHex, pet, spdBase64, persistBlob string,
 ) (tp *rustpushgo.WrappedTokenProvider, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("RestoreTokenProvider panicked: %v", r)
 		}
 	}()
-	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64)
+	// The blob is optional: sessions that predate it restore from the legacy
+	// SPD fields, and Rust falls back to those itself if it cannot use it.
+	var blob *string
+	if persistBlob != "" {
+		blob = &persistBlob
+	}
+	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64, blob)
 }
 
 func (c *IMClient) Connect(ctx context.Context) {
@@ -1033,7 +1118,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Info().Msg("Restoring iCloud TokenProvider from persisted credentials")
 			tp, err := safeRestoreTokenProvider(c.config, c.connection,
 				meta.AccountUsername, meta.AccountHashedPasswordHex,
-				meta.AccountPET, meta.AccountSPDBase64)
+				meta.AccountPET, meta.AccountSPDBase64, meta.AccountPersistBlob)
 			if err != nil {
 				log.Warn().Err(err).Msg("Failed to restore TokenProvider — cloud services unavailable")
 			} else {
@@ -1150,40 +1235,21 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	log.Info().Str("selected_handle", c.getHandle()).Strs("handles", handles).Msg("Connected to iMessage")
 
-	// Pre-mint the OpenBubbles-style rotating FaceTime link slots ("next"
-	// for outbound, "nextincomingcall" for inbound). Done in the
-	// background because it's network-dependent and not load-bearing for
-	// connect; a failed pre-mint means the first outbound/inbound call
-	// mints on-demand (same as legacy behavior). With the bridge's long
-	// uptime, pre-minting here gives Apple's FT server days of
-	// identity-propagation time before the link is actually used.
-	// See lastFullConnectKVKey: skip the Apple-heavy IDS sweep (FT pre-mint +
-	// StatusKit contact invites) when a full connect happened within the
+	// See lastFullConnectKVKey: skip the Apple-heavy IDS sweep (StatusKit
+	// contact invites) when a full connect happened within the
 	// cooldown — a reconnect/rebuild must not re-fire that burst at Apple
 	// mid-storm. Degrades safe: any KV/parse miss → treated as "not recent" →
 	// runs exactly as before. Receiving is unaffected (handled by the APS
 	// reconnect + StatusKit subscribe, neither gated here).
 	skipHeavyIDSSweep := false
-	if raw := c.Main.Bridge.DB.KV.Get(context.Background(), lastFullConnectKVKey); raw != "" {
+	if raw := c.Main.Bridge.DB.KV.Get(context.Background(), c.lastFullConnectKVKey()); raw != "" {
 		if last, perr := time.Parse(time.RFC3339, raw); perr == nil && time.Since(last) < fullConnectIDSCooldown {
 			skipHeavyIDSSweep = true
-			log.Info().Time("last_full_connect", last).Msg("Skipping FT pre-mint + StatusKit invite sweep — full connect within cooldown (avoids a redundant mid-reconnect IDS burst to Apple)")
+			log.Info().Time("last_full_connect", last).Msg("Skipping StatusKit invite sweep — full connect within cooldown (avoids a redundant mid-reconnect IDS burst to Apple)")
 		}
 	}
 	if !skipHeavyIDSSweep {
-		c.Main.Bridge.DB.KV.Set(context.Background(), lastFullConnectKVKey, time.Now().Format(time.RFC3339))
-	}
-
-	if c.getHandle() != "" && !skipHeavyIDSSweep {
-		go func(handle string) {
-			ft, ftErr := c.client.GetFacetimeClient()
-			if ftErr != nil {
-				log.Warn().Err(ftErr).Msg("Pre-mint FaceTime links: GetFacetimeClient failed; links will be minted on demand")
-				return
-			}
-			premintFaceTimeLinks(ft, handle)
-			log.Info().Str("handle", handle).Msg("Pre-minted FaceTime link slots (next, nextincomingcall)")
-		}(c.getHandle())
+		c.Main.Bridge.DB.KV.Set(context.Background(), c.lastFullConnectKVKey(), time.Now().Format(time.RFC3339))
 	}
 
 	if c.videoTranscoding() {
@@ -1320,8 +1386,44 @@ func (c *IMClient) Connect(ctx context.Context) {
 					if err := c.safeRefreshPetTokenThrottled(); err != nil {
 						log.Debug().Err(err).Msg("StatusKit startup share: PET refresh skipped")
 					}
-					if err := sk.ShareStatus(true, nil); err != nil {
-						log.Warn().Err(err).Msg("StatusKit startup share_status failed")
+					shareErr := sk.ShareStatus(true, nil)
+					if shareErr != nil && strings.Contains(shareErr.Error(), "Auth Missing") &&
+						c.tokenProvider != nil && *c.tokenProvider != nil {
+						// The restored GSA token map can lack
+						// com.apple.gs.sharedchannels.auth, which share_status needs;
+						// only a full login_email_pass repopulates it, and upstream
+						// get_token won't lazily fetch an *absent* token (it only
+						// re-logs-in for an expired-but-present one), so the share
+						// fails "Auth Missing". The throttled refresh above is
+						// skipped on a quick restart, so force a full refresh here to
+						// rebuild the token map, then retry once.
+						//
+						// This deliberately bypasses the 5-minute PET throttle. To
+						// still protect against a crash-restart loop hammering Apple's
+						// GSA login, honor a short floor: skip the prime if any token
+						// refresh for this login ran in the last 60s.
+						const statusKitPrimeFloor = 60 * time.Second
+						recentRefresh := false
+						if raw := c.Main.Bridge.DB.KV.Get(context.Background(), c.petRefreshKVKey()); raw != "" {
+							if ts, perr := strconv.ParseInt(raw, 10, 64); perr == nil && time.Since(time.Unix(ts, 0)) < statusKitPrimeFloor {
+								recentRefresh = true
+							}
+						}
+						if recentRefresh {
+							log.Warn().Msg("StatusKit startup share hit Auth Missing, but a token refresh ran <60s ago — skipping prime to avoid hammering Apple GSA (crash-loop guard)")
+						} else {
+							log.Info().Msg("StatusKit startup share hit Auth Missing — priming GSA tokens and retrying")
+							c.Main.Bridge.DB.KV.Set(context.Background(), c.petRefreshKVKey(), strconv.FormatInt(time.Now().Unix(), 10))
+							if rErr := safeRefreshPetToken(*c.tokenProvider); rErr != nil {
+								log.Warn().Err(rErr).Msg("StatusKit startup share: GSA token prime failed")
+							} else {
+								c.persistAccountState(log)
+								shareErr = sk.ShareStatus(true, nil)
+							}
+						}
+					}
+					if shareErr != nil {
+						log.Warn().Err(shareErr).Msg("StatusKit startup share_status failed")
 						return
 					}
 					// Stamp the post-invite cooldown key so the sweep's
@@ -1331,7 +1433,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 					// firing a redundant ShareStatus. Restart-within-5min
 					// is the only case that "loses" a publish; the next
 					// state change or sweep republishes.
-					c.Main.Bridge.DB.KV.Set(context.Background(), database.Key(statusKitLastPostInviteShareKey), time.Now().Format(time.RFC3339))
+					c.Main.Bridge.DB.KV.Set(context.Background(), c.statusKitLastPostInviteShareKVKey(), time.Now().Format(time.RFC3339))
 					log.Info().Msg("StatusKit startup share_status(available) published")
 				}()
 			} else {
@@ -1467,7 +1569,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 				log.Warn().Err(syncErr).Msg("Initial CardDAV sync failed")
 			} else {
 				c.setContactsReady(log)
-				c.persistMmeDelegate(log)
+				c.persistAccountState(log)
 			}
 			go c.periodicCloudContactSync(log)
 		} else {
@@ -1492,6 +1594,13 @@ func (c *IMClient) Connect(ctx context.Context) {
 		c.setCloudSyncDone()
 	} else if cloudStoreReady && c.useCloudKitBackfill() {
 		c.startCloudSyncController(log)
+		// Periodically re-run the StatusKit-CloudKit peer-key pull. The cloud
+		// sync only fires it at startup; without this loop, peer keys that
+		// reshare in later (the common case on fresh/large accounts) are never
+		// pulled until the next restart. Self-gated to a gentle cadence — see
+		// runStatusKitPullLoop / statusKitFreshFloor. c.stopChan is passed by
+		// value so the loop ends with this connect epoch.
+		go c.runStatusKitPullLoop(log.With().Str("component", "statuskit_pull").Logger(), c.stopChan)
 	} else {
 		if !c.Main.Config.CloudKitBackfill {
 			log.Info().Msg("CloudKit backfill disabled by config — skipping cloud sync")
@@ -1552,12 +1661,12 @@ You're signed in. This is your **management room** — the bot uses it to delive
 #### Where to type commands
 
 - **Here in the management room**: type the command bare — ` + "`start-chat`" + `, ` + "`help`" + `, ` + "`logout`" + `.
-- **Inside a chat room** (a DM or group): prefix with ` + "`%[1]s`" + ` — e.g. ` + "`%[1]s facetime`" + ` to start a call from a DM.
+- **Inside a chat room** (a DM or group): prefix with ` + "`%[1]s`" + ` — e.g. ` + "`%[1]s help`" + `.
 - To abort an interactive command (like the ` + "`start-chat`" + ` picker): type ` + "`cancel`" + ` here, or ` + "`%[1]s cancel`" + ` from a portal room.
 
 #### Notices the bot will post here
 
-- FaceTime invites, missed-call notices, and "answered elsewhere" updates when there's no portal yet
+- Incoming and missed FaceTime call notices when there's no portal yet
 - Chat-restore confirmations and recycle-bin activity
 - StatusKit / presence updates
 - Shared-album / Shared Streams activity
@@ -1565,7 +1674,18 @@ You're signed in. This is your **management room** — the bot uses it to delive
 Run ` + "`help`" + ` any time for the full command list.
 `
 
+// clientStopTimeout bounds client.Stop() during Disconnect (upstream 298fb05b).
+const clientStopTimeout = 10 * time.Second
+
 func (c *IMClient) Disconnect() {
+	// bridgev2 serializes its own Disconnect calls, but LogoutRemote and
+	// LoadUserLogin (disconnect-before-rebuild) invoke this directly, so two
+	// teardowns can overlap: double-close of stopChan, or one frame nil-ing
+	// c.client while the other's Stop() goroutine still reads it. Serialize
+	// here; the second caller no-ops on the already-nil'd fields
+	// (upstream 6fe4b175).
+	c.disconnectMu.Lock()
+	defer c.disconnectMu.Unlock()
 	if c.msgBuffer != nil {
 		c.msgBuffer.stop()
 	}
@@ -1573,22 +1693,40 @@ func (c *IMClient) Disconnect() {
 		close(c.stopChan)
 		c.stopChan = nil
 	}
-	if c.client != nil {
-		c.client.Stop()
-		c.client.Destroy()
-		c.client = nil
-	}
-	// Tear down the APNs connection too (stop its ResourceManager + free the
-	// courier socket). A reconnect/relogin opens a NEW connection on the SAME
+	// Tear down the APNs connection BEFORE stopping the client (upstream
+	// 298fb05b): its death signal (a non-blocking try_send) aborts any
+	// in-flight reconnect so nothing is still generating traffic while the
+	// client shuts down. It also stops the ResourceManager and frees the
+	// courier socket: a reconnect/relogin opens a NEW connection on the SAME
 	// device token; if the old one lingered, Apple drops the duplicate
 	// ("Failed to read message from APS ... early eof") and rustpush's
 	// no-backoff reconnect loop turns that into the self-sustaining
-	// receive-stall storm. Closing here guarantees the next connect starts
-	// clean. Close() only stops the underlying connection — it does NOT destroy
-	// the WrappedApsConnection Go object — so the receive-wedge watchdog
-	// polling it is never left holding a freed handle.
+	// receive-stall storm. Close() only stops the underlying connection — it
+	// does NOT destroy the WrappedApsConnection Go object — so don't nil
+	// c.connection: the receive-wedge watchdog and the final persistState may
+	// still poll it.
 	if c.connection != nil {
 		c.connection.Close()
+	}
+	if c.client != nil {
+		// Stop() is an async Rust/UniFFI call; bound it with a timeout so a
+		// wedge can't hang Disconnect (and with it bridgev2's reconnect or this
+		// user's logout). Destroy() runs regardless — UniFFI refcounting defers
+		// the free until any in-flight Stop() returns, so the leaked goroutine
+		// never touches freed memory.
+		client := c.client
+		stopDone := make(chan struct{})
+		go func() {
+			defer close(stopDone)
+			client.Stop()
+		}()
+		select {
+		case <-stopDone:
+		case <-time.After(clientStopTimeout):
+			c.UserLogin.Log.Warn().Dur("timeout", clientStopTimeout).Msg("client.Stop() timed out during disconnect; proceeding to destroy")
+		}
+		client.Destroy()
+		c.client = nil
 	}
 	if c.chatDB != nil {
 		c.chatDB.Close()
@@ -1649,14 +1787,20 @@ func (c *IMClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal)
 const receiveWedgeRecoverySecs uint64 = 600
 
 // A reconnect/rebuild re-runs Connect, which re-fires the Apple-heavy IDS work:
-// the FaceTime link pre-mint and the StatusKit contact-invite sweep (a 20+-handle
-// per-handle IDS query burst). Mid-reconnect-storm that burst has been observed
+// the StatusKit contact-invite sweep (a 20+-handle per-handle IDS query burst). Mid-reconnect-storm that burst has been observed
 // escalating to a temporary Apple account disable. Gate it behind a cooldown so a
 // Connect within this window of the last full one reuses the recent sweep instead
 // of re-querying Apple. Receive recovery (APS reconnect + StatusKit subscribe) is
-// NOT gated — only the outbound invite/mint sweep. Global key (single-login bridge,
-// matching the existing statuskit/pet KV keys).
-const lastFullConnectKVKey = database.Key("im.last_full_connect")
+// NOT gated — only the outbound invite/mint sweep. Scoped per login (see
+// lastFullConnectKVKey): upstream used one global key because it is single-login,
+// which here let one user's connect suppress every other login's sweep. The old
+// global "im.last_full_connect" row is simply never read again.
+const lastFullConnectKVKeyPrefix = "im.last_full_connect."
+
+// lastFullConnectKVKey returns this login's full-connect cooldown KV key.
+func (c *IMClient) lastFullConnectKVKey() database.Key {
+	return database.Key(lastFullConnectKVKeyPrefix + string(c.UserLogin.ID))
+}
 
 // Must exceed the wedge-rebuild cycle (≈10-min wedge threshold + 5-min reconnect
 // delay ≈ 15 min) so consecutive auto-rebuilds reliably skip the sweep instead of
@@ -1755,9 +1899,9 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		modeKey = *mode
 	}
 	// kvKeyFor returns the KV store key used to persist StatusKit state for
-	// a given user handle across bridge restarts.
+	// a given user handle across bridge restarts. Scoped to this login.
 	kvKeyFor := func(u string) database.Key {
-		return database.Key("statuskit.presence." + u)
+		return c.statusKitKey(statusKitPresenceKeyPrefix, u)
 	}
 
 	if prev, loaded := c.statusKitPresence.Load(user); loaded {
@@ -1802,6 +1946,22 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 	// fallback, and Matrix send — to a goroutine so this callback returns
 	// to Rust immediately and does not block the APNs receive loop.
 	go func() {
+		// This goroutine calls into the IDS FFI (ResolveHandleCached /
+		// ResolveHandle) to map a presence update onto a portal. A Rust panic
+		// surfaced by uniffi re-panics in the generated binding, and this
+		// goroutine is spawned per presence update: dropping one notice is
+		// the correct degradation, crashing every login's bridge is not.
+		defer func() {
+			if r := recover(); r != nil {
+				// Roll back the optimistic dedup stored above, so a
+				// re-delivery of the same state retries instead of being
+				// suppressed until the mode changes again.
+				c.statusKitPresence.Delete(user)
+				c.Main.Bridge.DB.KV.Set(context.Background(), kvKeyFor(user), "")
+				log.Error().Interface("panic", r).
+					Msg("StatusKit presence handler panicked — dropping this update and clearing dedup so a re-delivery retries")
+			}
+		}()
 		ctx := context.Background()
 
 		// Apple sends available=true for both DND-on and DND-off; the mode
@@ -1956,7 +2116,7 @@ func (c *IMClient) OnStatusUpdate(user string, mode *string, available bool) {
 		// as the canonical key so only the first alias of each state
 		// change actually sends the notice. Persisted to KV under a
 		// distinct prefix so the dedup survives bridge restarts.
-		portalKey := database.Key("statuskit.presence.portal." + string(portal.ID))
+		portalKey := c.statusKitKey(statusKitPresencePortalKeyPrefix, string(portal.ID))
 		if prev, loaded := c.statusKitPresenceByPortal.Load(portal.ID); loaded {
 			if prev.(string) == modeKey {
 				log.Debug().
@@ -2204,14 +2364,15 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	overrideRuleID := botMXID + ".dont_notify"
 	err := asIntent.Matrix.PutPushRule(ctx, "global", pushrules.OverrideRule, overrideRuleID,
 		&mautrix.ReqPutPushRule{
-			Conditions: []pushrules.PushCondition{
+			Conditions: []*pushrules.PushCondition{
 				{
 					Kind:    pushrules.KindEventMatch,
 					Key:     "sender",
 					Pattern: botMXID,
 				},
 			},
-			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+			// An empty (non-nil) actions list means "don't notify" (spec v1.7+); dont_notify is deprecated.
+			Actions: []*pushrules.PushAction{},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot override push rule")
@@ -2221,7 +2382,7 @@ func (c *IMClient) ensureBotPushRuleSilenced(ctx context.Context) {
 	// Sender rule (secondary catch-all for homeservers without override support).
 	err = asIntent.Matrix.PutPushRule(ctx, "global", pushrules.SenderRule, botMXID,
 		&mautrix.ReqPutPushRule{
-			Actions: []pushrules.PushActionType{pushrules.ActionDontNotify},
+			Actions: []*pushrules.PushAction{},
 		})
 	if err != nil {
 		log.Debug().Err(err).Str("bot_mxid", botMXID).Msg("Failed to install bot sender push rule")
@@ -2292,12 +2453,34 @@ func (c *IMClient) resolveStatusPortalViaIDS(ctx context.Context, log zerolog.Lo
 
 	// Slow path: validate_targets queries Apple IDS. Can block or hang;
 	// caller is responsible for applying a timeout.
-	aliases, err := c.client.ResolveHandle(user, knownHandles)
+	aliases, err := c.resolveHandleSafe(user, knownHandles)
 	if err != nil {
 		log.Warn().Err(err).Str("user", user).Msg("StatusKit IDS fallback: ResolveHandle failed")
 		return nil
 	}
 	return c.findPortalForAliases(ctx, log, user, aliases)
+}
+
+// resolveHandleSafe wraps Client.ResolveHandle with a recover guard. The Rust
+// side (ids_guard) isolates IDS lookup panics before they reach uniffi; this
+// is the backstop, because a panic surfaced through the generated Go binding
+// would otherwise take the whole multi-user bridge down from one presence
+// update.
+func (c *IMClient) resolveHandleSafe(user string, knownHandles []string) (aliases []string, err error) {
+	if c.client == nil {
+		return nil, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).
+				Str("user", user).
+				Int("known_handles", len(knownHandles)).
+				Msg("ResolveHandle panicked in FFI path")
+			aliases = nil
+			err = fmt.Errorf("ResolveHandle panicked: %v", r)
+		}
+	}()
+	return c.client.ResolveHandle(user, knownHandles)
 }
 
 // findPortalForAliases iterates aliases returned by IDS correlation and
@@ -2335,16 +2518,37 @@ func (c *IMClient) findPortalForAliases(ctx context.Context, log zerolog.Logger,
 
 // OnKeysReceived is called by StatusKit when a key-sharing message arrives.
 // New encryption keys mean we can now subscribe to APNs presence channels
-// for handles that previously had no keys. Re-subscribe to pick them up,
-// and reciprocate by sending our key to any handle that keyed us but hasn't
-// received our invite yet (iOS does this automatically; the bridge must do
-// it explicitly or the exchange stays one-sided).
+// for handles that previously had no keys. Schedule a coalesced re-subscribe to
+// pick them up, and reciprocate by sending our key to any handle that keyed us
+// but hasn't received our invite yet (iOS does this automatically; the bridge
+// must do it explicitly or the exchange stays one-sided).
 func (c *IMClient) OnKeysReceived() {
 	log := c.UserLogin.Log.With().
 		Str("component", "statuskit").
 		Logger()
-	log.Info().Msg("StatusKit: key-sharing message received — re-subscribing to presence")
-	go c.subscribeToContactPresence(log)
+	log.Info().Msg("StatusKit: key-sharing message received — scheduling presence re-subscribe")
+	c.schedulePresenceSubscribe(log)
+}
+
+// OnStatusDecryptFailed is called by StatusKit when a presence update on the
+// presence.mode.status topic could not be decoded — almost always a peer who
+// rotated their StatusKit channel key, leaving the copy we pulled from CloudKit
+// stale. We force a rate-limited CloudKit peer-key re-pull to fetch the fresh key
+// right away (instead of waiting for the steady-state pull floor), which then
+// re-subscribes and lets the peer's real presence flow again — clearing a status
+// (e.g. a 🔕 topic) that would otherwise be stuck. sender is best-effort (the
+// peer handle when the envelope exposes it) and used only for logging.
+func (c *IMClient) OnStatusDecryptFailed(sender *string) {
+	if !c.statusKitNotifications() {
+		return
+	}
+	log := c.UserLogin.Log.With().Str("component", "statuskit").Logger()
+	s := ""
+	if sender != nil {
+		s = *sender
+	}
+	log.Info().Str("sender", s).Msg("StatusKit: presence decrypt failed (likely stale peer key) — forcing rate-limited CloudKit re-pull")
+	c.onPresenceDecryptFailed(log)
 }
 
 // OnReshareSender is called once per reshare with the peer handle that sent
@@ -2369,9 +2573,9 @@ func (c *IMClient) OnReshareSender(sender string, channelId string) {
 	normalized := normalizeIdentifierForPortalID(sender)
 	ctx := context.Background()
 	now := time.Now().UTC().Format(time.RFC3339)
-	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+sender), now)
+	c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitReshareSeenKeyPrefix, sender), now)
 	if normalized != sender {
-		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized), now)
+		c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitReshareSeenKeyPrefix, normalized), now)
 	}
 	clusterLog := c.UserLogin.Log.With().
 		Str("component", "statuskit").
@@ -2721,7 +2925,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// for messages that CloudKit already bridged. Check the Bridge DB for any
 	// message whose UUID is already known to prevent duplicates.
 	if msg.Uuid != "" {
-		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 		if dbMsgs, err := c.Main.Bridge.DB.Message.GetAllPartsByID(
 			context.Background(), c.UserLogin.ID, makeMessageID(msg.Uuid),
 		); err == nil && len(dbMsgs) > 0 {
@@ -2769,7 +2973,7 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	}
 
 	sender := c.makeEventSender(msg.Sender)
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	sender = c.canonicalizeDMSender(portalKey, sender)
 
 	// Keep the stored gid: group roster in sync with the sender's current view
@@ -3031,7 +3235,6 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
 		}
 	}
-	c.maybeNotifyIncomingFaceTimeInvite(log, &msg, portalKey, sender.IsFromMe, createPortal)
 	if createPortal || sender.IsFromMe {
 		log.Info().
 			Bool("create_portal", createPortal).
@@ -3142,7 +3345,7 @@ func (c *IMClient) handleTapback(log zerolog.Logger, msg rustpushgo.WrappedMessa
 	// self-reflections can still have participants=[self, self].
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
-		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	}
 
 	// Persist the tapback UUID so cross-restart APNs re-deliveries are caught
@@ -3227,7 +3430,7 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 	// determine the correct DM portal.
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
-		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	}
 
 	newText := ptrStringOr(msg.EditNewText, "")
@@ -3243,20 +3446,45 @@ func (c *IMClient) handleEdit(log zerolog.Logger, msg rustpushgo.WrappedMessage)
 		ID:            makeMessageID(msg.Uuid),
 		TargetMessage: makeMessageID(targetGUID),
 		ConvertEditFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, text string) (*bridgev2.ConvertedEdit, error) {
-			var targetPart *database.Message
-			if len(existing) > 0 {
-				targetPart = existing[0]
+			// Only the text parts of the target may be rewritten — attachment
+			// parts (att0, att1, …) belong to the same message and must not be
+			// clobbered by an edit of its text.
+			textParts := make([]*database.Message, 0, len(existing))
+			for _, part := range existing {
+				if isTextPartID(part.PartID) {
+					textParts = append(textParts, part)
+				}
 			}
-			return &bridgev2.ConvertedEdit{
-				ModifiedParts: []*bridgev2.ConvertedEditPart{{
-					Part: targetPart,
-					Type: event.EventMessage,
-					Content: &event.MessageEventContent{
-						MsgType: event.MsgText,
-						Body:    text,
-					},
-				}},
-			}, nil
+			// GetAllPartsByID has no ORDER BY, so the rows arrive in whatever
+			// order the covering index yields. Sort explicitly rather than
+			// relying on that — mapping new parts onto the wrong stored rows
+			// would redact the wrong events. Compare the ordinal numerically:
+			// lexical order breaks the moment the zero padding overflows
+			// ("text1000" < "text999"), and padding width should not be
+			// load-bearing.
+			sort.Slice(textParts, func(i, j int) bool {
+				return textPartIndex(textParts[i].PartID) < textPartIndex(textParts[j].PartID)
+			})
+			newParts := buildTextParts(event.MsgText, "", text, nil, true)
+			edit := &bridgev2.ConvertedEdit{}
+			for i, part := range newParts {
+				if i < len(textParts) {
+					edit.ModifiedParts = append(edit.ModifiedParts, part.ToEditPart(textParts[i]))
+					continue
+				}
+				// The edit needs more parts than the message already had.
+				// bridgev2 appends these at the end of the room rather than
+				// beside the original, but dropping them would lose text.
+				if edit.AddedParts == nil {
+					edit.AddedParts = &bridgev2.ConvertedMessage{}
+				}
+				edit.AddedParts.Parts = append(edit.AddedParts.Parts, part)
+			}
+			// The edit shrank: redact the continuation parts it no longer needs.
+			if len(textParts) > len(newParts) {
+				edit.DeletedParts = textParts[len(newParts):]
+			}
+			return edit, nil
 		},
 	})
 }
@@ -3277,7 +3505,7 @@ func (c *IMClient) handleUnsend(log zerolog.Logger, msg rustpushgo.WrappedMessag
 	// determine the correct DM portal.
 	portalKey := c.resolvePortalByTargetMessage(log, targetGUID)
 	if portalKey.ID == "" {
-		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+		portalKey = c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	}
 
 	c.Main.Bridge.QueueRemoteEvent(c.UserLogin, &simplevent.MessageRemove{
@@ -3298,7 +3526,7 @@ func (c *IMClient) handleRename(log zerolog.Logger, msg rustpushgo.WrappedMessag
 		log.Debug().Str("uuid", msg.Uuid).Msg("Skipping stored rename message")
 		return
 	}
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	newName := ptrStringOr(msg.NewChatName, "")
 
 	// Update the cached iMessage group name to the NEW name so outbound
@@ -3358,7 +3586,7 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 		return
 	}
 	// Resolve the existing portal from the OLD participant list.
-	oldPortalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	oldPortalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 
 	if len(msg.NewParticipants) == 0 {
 		// No new participant list — fall back to a resync with current info.
@@ -3408,6 +3636,32 @@ func (c *IMClient) handleParticipantChange(log zerolog.Logger, msg rustpushgo.Wr
 			Int("result", int(result)).
 			Msg("ReID portal for participant change")
 		finalPortalKey = newPortalKey
+	}
+
+	// Record the service type on the (possibly re-keyed) portal. Carrier groups
+	// re-key on membership change, and reIDPortalWithCacheUpdate only carries the
+	// SMS flag forward if the old portal already had one in memory — a group whose
+	// flag was never set this session would lose it, sending outbound replies over
+	// iMessage. Set it explicitly from msg.IsSms (this path doesn't go through
+	// handleMessage's updatePortalSMS) and persist on change so it survives a
+	// restart (loadSenderGuidsFromDB only hydrates IsSms=true entries).
+	if c.updatePortalSMS(string(finalPortalKey.ID), msg.IsSms) {
+		ctx := context.Background()
+		if p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, finalPortalKey); err == nil && p != nil {
+			meta, ok := p.Metadata.(*PortalMetadata)
+			if !ok {
+				meta = &PortalMetadata{}
+			}
+			if meta.IsSms != msg.IsSms {
+				meta.IsSms = msg.IsSms
+				p.Metadata = meta
+				if err := p.Save(ctx); err != nil {
+					log.Warn().Err(err).Str("portal_id", string(finalPortalKey.ID)).
+						Bool("is_sms", msg.IsSms).
+						Msg("Failed to persist IsSms after participant change")
+				}
+			}
+		}
 	}
 
 	// Cache sender_guid and group_name under the (possibly new) portal ID.
@@ -3562,7 +3816,7 @@ func (c *IMClient) fetchAndCacheGroupPhoto(ctx context.Context, log zerolog.Logg
 // valid MMCS data, letting us catch up on changes that occurred while offline.
 // If the MMCS URL has expired Rust returns nil bytes and we warn harmlessly.
 func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portalID := string(portalKey.ID)
 	log = log.With().Str("portal_id", portalID).Bool("stored", msg.IsStoredMessage).Logger()
 
@@ -3633,10 +3887,6 @@ func (c *IMClient) handleIconChange(log zerolog.Logger, msg rustpushgo.WrappedMe
 	})
 }
 
-const faceTimeRingMarker = "[[FACETIME_RING]]"
-const faceTimeMissedMarker = "[[FACETIME_MISSED]]"
-const faceTimeAnsweredElsewhereMarker = "[[FACETIME_ANSWERED_ELSEWHERE]]"
-
 // handleNotifyAnyways posts a silent bot notice when a contact deliberately
 // breaks through our Focus / Do Not Disturb by tapping "Notify Anyway" on their
 // device. The notice is delivered to the portal that corresponds to this chat so
@@ -3648,25 +3898,13 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 
 	rawText := strings.TrimSpace(ptrStringOr(msg.Text, ""))
-	if strings.HasPrefix(rawText, faceTimeRingMarker) ||
-		strings.HasPrefix(rawText, faceTimeMissedMarker) ||
-		strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker) {
-		if c.disableFaceTime() {
-			return
-		}
-		switch {
-		case strings.HasPrefix(rawText, faceTimeRingMarker):
-			c.handleFaceTimeRingNotice(log, msg, rawText)
-		case strings.HasPrefix(rawText, faceTimeMissedMarker):
-			c.handleFaceTimeMissedNotice(log, msg)
-		case strings.HasPrefix(rawText, faceTimeAnsweredElsewhereMarker):
-			c.handleFaceTimeAnsweredElsewhereNotice(log, msg)
-		}
+	if kind, ok := parseFaceTimeNoticeKind(rawText); ok {
+		c.postFaceTimeNotice(log, msg, kind)
 		return
 	}
 
 	ctx := context.Background()
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
 	if err != nil || portal == nil || portal.MXID == "" {
 		log.Debug().Err(err).Msg("NotifyAnyways: no portal found, skipping notice")
@@ -3699,222 +3937,6 @@ func (c *IMClient) handleNotifyAnyways(log zerolog.Logger, msg rustpushgo.Wrappe
 	if sendErr != nil {
 		log.Warn().Err(sendErr).Msg("NotifyAnyways: failed to send notice")
 	}
-}
-
-func (c *IMClient) handleFaceTimeRingNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage, rawText string) {
-	ctx := context.Background()
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-
-	senderHandle := ptrStringOr(msg.Sender, "")
-	name := stripIdentifierPrefix(senderHandle)
-	if senderHandle != "" {
-		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
-		if ghostErr == nil && ghost != nil && ghost.Name != "" {
-			name = ghost.Name
-		}
-	}
-	if name == "" {
-		name = "someone"
-	}
-
-	link := firstFaceTimeLinkInText(rawText)
-	if link == "" {
-		// Native FaceTime ring — no link embedded. Use the persistent
-		// bridge link + pin its session_link to this inbound session guid.
-		//
-		// Why not GetSessionLink: upstream's get_session_link calls
-		// message_session, which sends a LinkCreated wire message to
-		// every member of the session — including the peer whose call
-		// is currently ringing our handle. Injecting a LinkCreated into
-		// peer's active ring disrupts their FT UI and empirically
-		// downgrades peer's display to audio-mode ("peer sees avatar,
-		// hears audio, no video") even when the user answers natively
-		// on a video-capable device. GetSessionLink only avoids this
-		// when session.link is already set, which it isn't for native
-		// FT calls (no web link embedded in peer's Invitation).
-		//
-		// Use the pre-minted "nextincomingcall" link slot (mirroring
-		// OpenBubbles' rotateIncomingLink pattern at
-		// rustpush_service.dart:2699-2702). The pseud has been on
-		// Apple's FT server since startup (or since the last inbound
-		// call's rotation), giving identity resolution time to fully
-		// propagate the pseud↔handle binding before the webview joins.
-		// The binding is pinned pre-rotation (while the link is still
-		// in "nextincomingcall" slot); rotation below renames it to
-		// "incomingcall" while preserving session_link.
-		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if generated, genErr := getFaceTimeLinkWithRecovery(ft, c.getHandle(), ftLinkUsageNextIncomingCall); genErr == nil {
-				link = generated
-				if guid := extractFaceTimeGuid(rawText); guid != "" {
-					if bindErr := ft.BindBridgeLinkToSession(c.getHandle(), ftLinkUsageNextIncomingCall, guid); bindErr != nil {
-						log.Warn().Err(bindErr).Str("guid", guid).Msg("FaceTimeRing: failed to pin bridge link to inbound session; web answer may route incorrectly")
-					}
-				}
-				// Rotate asynchronously: nextincomingcall → incomingcall,
-				// mint fresh nextincomingcall for the next inbound ring.
-				// The rotation renames the bound link's slot to
-				// "incomingcall" while preserving its session_link.
-				go func() {
-					_ = rotateIncomingLink(ft, c.getHandle())
-				}()
-				// Pre-fill the web page's display-name prompt with the
-				// user's own handle so tapping Answer lands in the call
-				// without the guest-name typing step (which otherwise
-				// creates a second participant distinct from the pseud
-				// bound to the user's handle).
-				link = appendFaceTimeLinkName(link, c.resolveFaceTimeDisplayName(ctx))
-			} else {
-				log.Warn().Err(genErr).Msg("FaceTimeRing: failed to generate bridge FaceTime link")
-			}
-		}
-	}
-
-	// Build the notice as markdown so the join link renders as a tappable
-	// anchor in the formatted_body. Plain-URL notices aren't autolinked by
-	// every Matrix client; wrapping the URL in [text](url) guarantees an
-	// <a> tag reaches the client.
-	noticeMarkdown := "📞 **Incoming FaceTime call from " + name + ".**"
-	if link != "" {
-		noticeMarkdown += "\n\n[**Answer FaceTime call**](" + link + ")"
-		noticeMarkdown += "\n\nRaw link (if the button above doesn't open): " + link
-	}
-
-	sendNotice := func(roomID id.RoomID) error {
-		content := format.RenderMarkdown(noticeMarkdown, true, false)
-		content.MsgType = event.MsgNotice
-		content.Mentions = &event.Mentions{}
-		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &content,
-		}, nil)
-		return sendErr
-	}
-
-	if err == nil && portal != nil && portal.MXID != "" {
-		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().
-				Str("sender", senderHandle).
-				Str("portal_mxid", string(portal.MXID)).
-				Msg("FaceTimeRing: posted incoming call notice to portal")
-			return
-		} else {
-			log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send portal notice")
-		}
-	}
-
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg("FaceTimeRing: failed to get management room for fallback notice")
-		return
-	}
-	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
-		log.Warn().Err(sendErr).Msg("FaceTimeRing: failed to send management room notice")
-		return
-	}
-	log.Info().
-		Str("sender", senderHandle).
-		Str("management_room", string(mgmtRoom)).
-		Msg("FaceTimeRing: posted incoming call notice to management room")
-}
-
-func (c *IMClient) handleFaceTimeMissedNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	ctx := context.Background()
-	senderHandle := ptrStringOr(msg.Sender, "")
-	name := stripIdentifierPrefix(senderHandle)
-	if senderHandle != "" {
-		ghost, ghostErr := c.Main.Bridge.GetGhostByID(ctx, makeUserID(normalizeIdentifierForPortalID(senderHandle)))
-		if ghostErr == nil && ghost != nil && ghost.Name != "" {
-			name = ghost.Name
-		}
-	}
-	if name == "" {
-		name = "someone"
-	}
-
-	// Build a call-back button that uses the bridge's pending-ring flow,
-	// same mechanism as the outbound `!im facetime` command. Tap → letmein
-	// approve adds the user to a pre-armed session → JoinEvent fires
-	// maybe_fire_pending_ring → ft.ring() against the original caller.
-	// By the time their phone rings the user is already a live participant
-	// so the callee's answer connects cleanly.
-	//
-	// No facetime:// fallback: that scheme only worked on native iOS/macOS
-	// and provided no bridge integration. If the bridge-link arm fails we
-	// still post the notice with no callback button; the user can always
-	// `!im facetime` in the portal manually.
-	noticeMarkdown := "📞 **Missed FaceTime call from " + name + ".**"
-	if senderHandle != "" && c.getHandle() != "" {
-		if ft, ftErr := c.client.GetFacetimeClient(); ftErr == nil {
-			if webLink, _, armErr := armBridgeFaceTimeCall(ft, c.getHandle(), senderHandle, 3600, c.resolveFaceTimeDisplayName(ctx)); armErr == nil {
-				noticeMarkdown += "\n\n[**📞 Call back " + name + "**](" + webLink + ")"
-				noticeMarkdown += "\n\n⚠️ **Tapping this link will ring " + name + "'s phone.** The ring fires the moment you join — open the link when you're ready to be on camera. Works on iOS, macOS, Android, Windows, and Linux.\n\nRaw URL: " + webLink
-			} else {
-				log.Warn().Err(armErr).Str("caller", senderHandle).Msg("FaceTimeMissed: bridge-link callback arm failed; notice posted without callback button")
-			}
-		}
-	}
-
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	sendNotice := func(roomID id.RoomID) error {
-		content := format.RenderMarkdown(noticeMarkdown, true, false)
-		content.MsgType = event.MsgNotice
-		content.Mentions = &event.Mentions{}
-		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &content,
-		}, nil)
-		return sendErr
-	}
-	if err == nil && portal != nil && portal.MXID != "" {
-		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Bool("has_callback", senderHandle != "" && c.getHandle() != "").Msg("FaceTimeMissed: posted missed call notice to portal")
-			return
-		}
-	}
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg("FaceTimeMissed: failed to get management room for fallback notice")
-		return
-	}
-	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
-		log.Warn().Err(sendErr).Msg("FaceTimeMissed: failed to send management room notice")
-		return
-	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Bool("has_callback", senderHandle != "" && c.getHandle() != "").Msg("FaceTimeMissed: posted missed call notice to management room")
-}
-
-func (c *IMClient) handleFaceTimeAnsweredElsewhereNotice(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	ctx := context.Background()
-	notice := "📞 Incoming FaceTime call was answered on another device."
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
-	portal, err := c.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
-	sendNotice := func(roomID id.RoomID) error {
-		_, sendErr := c.Main.Bridge.Bot.SendMessage(ctx, roomID, event.EventMessage, &event.Content{
-			Parsed: &event.MessageEventContent{
-				MsgType:  event.MsgNotice,
-				Body:     notice,
-				Mentions: &event.Mentions{},
-			},
-		}, nil)
-		return sendErr
-	}
-	senderHandle := ptrStringOr(msg.Sender, "")
-	if err == nil && portal != nil && portal.MXID != "" {
-		if sendErr := sendNotice(portal.MXID); sendErr == nil {
-			log.Info().Str("sender", senderHandle).Str("portal_mxid", string(portal.MXID)).Msg("FaceTimeAnsweredElsewhere: posted notice to portal")
-			return
-		}
-	}
-	mgmtRoom, mgmtErr := c.UserLogin.User.GetManagementRoom(ctx)
-	if mgmtErr != nil {
-		log.Warn().Err(mgmtErr).Msg("FaceTimeAnsweredElsewhere: failed to get management room for fallback notice")
-		return
-	}
-	if sendErr := sendNotice(mgmtRoom); sendErr != nil {
-		log.Warn().Err(sendErr).Msg("FaceTimeAnsweredElsewhere: failed to send management room notice")
-		return
-	}
-	log.Info().Str("sender", senderHandle).Str("management_room", string(mgmtRoom)).Msg("FaceTimeAnsweredElsewhere: posted notice to management room")
 }
 
 // makeDeletePortalKey constructs a PortalKey from the delete/recover-specific
@@ -4012,7 +4034,7 @@ func (c *IMClient) makeDeletePortalKey(log zerolog.Logger, msg rustpushgo.Wrappe
 	}
 
 	log.Warn().Msg("Delete/recover message has no delete-specific fields, falling back to regular makePortalKey")
-	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	return c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 }
 
 func (c *IMClient) handleMessageDelete(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
@@ -5262,7 +5284,7 @@ func (c *IMClient) handleReadReceipt(log zerolog.Logger, msg rustpushgo.WrappedM
 		}
 	}
 
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	ctx := context.Background()
 
 	// Try sender_guid lookup — first check gid: portal ID, then cache
@@ -5381,7 +5403,7 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 	// format churn) silently drops every delivery receipt while read receipts
 	// keep working via their fallback chain — which manifests as "Beeper
 	// shows read but never delivered" with zero log signal.
-	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makeReceiptPortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 	resolved := false
 
 	if msg.SenderGuid != nil && *msg.SenderGuid != "" {
@@ -5546,7 +5568,7 @@ func (c *IMClient) handleDeliveryReceipt(log zerolog.Logger, msg rustpushgo.Wrap
 }
 
 func (c *IMClient) handleTyping(log zerolog.Logger, msg rustpushgo.WrappedMessage) {
-	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid)
+	portalKey := c.makePortalKey(msg.Participants, msg.GroupName, msg.Sender, msg.SenderGuid, msg.IsSms)
 
 	// For group typing indicators, iMessage may only include [sender, target]
 	// without the full participant list. If the portal key resolves to a
@@ -5692,6 +5714,40 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	conv := c.portalToConversation(msg.Portal)
 
+	// A stale carrier flag would route this into the SMS relay, where a bridge
+	// with no forwarding device silently drops it. Override for THIS send only:
+	// the evidence (the peer is registered on iMessage now) does not justify
+	// changing what retro-active operations on older messages do, so nothing here
+	// writes the portal's stored flag.
+	//
+	// The flag may still change later, by a different and better-evidenced route:
+	// the iMessage this produces becomes a CloudKit chat record, and
+	// resolvePortalIDForCloudChat keys a DM purely on the handle, so ingestCloudChats
+	// can settle the portal on iMessage via the pre-existing a96678a3 path. That is
+	// driven by "Apple accepted and recorded an iMessage", not by our lookup.
+	//
+	// Set before the file branch so it covers attachments too; handleMatrixFile
+	// takes conv as a parameter.
+	if c.checkCarrierRoute(ctx, msg.Portal) {
+		conv.IsSms = false
+	}
+
+	// Still headed for the text-message relay after the check above. If no device
+	// on this account is registered to relay, Apple accepts the push and discards
+	// it, so reporting a checkmark would be a lie — fail visibly instead. Asked of
+	// IDS rather than inferred or configured, and memoized per account in
+	// hasSMSRelay. Placed after the repair, so a portal that just routed over
+	// iMessage is unaffected, and before the file branch so it covers attachments.
+	//
+	// Deliberately has no group exclusion, unlike the repair above. A carrier
+	// GROUP send with no relay is exactly as undeliverable as a DM one, and
+	// failing it is honest; the repair excludes groups only because re-keying one
+	// is a portal re-ID rather than a flag flip. Groups have no repair path, so
+	// this is their only protection.
+	if conv.IsSms && !c.hasSMSRelay() {
+		return nil, errNoCarrierRoute
+	}
+
 	// File/image messages
 	if msg.Content.URL != "" || msg.Content.File != nil {
 		return c.handleMatrixFile(ctx, msg, conv)
@@ -5700,23 +5756,84 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
 	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	// Bodies large enough to need splitting do reach us: 45,000 bytes of content
+	// still encrypts to well under the homeserver's 65,536-byte PDU cap, and an
+	// unencrypted room has more room still. Measured after the link-preview
+	// envelope is prepended, since that also counts against the wire size.
+	outbound := splitTextChunks(textToSend, maxOutboundTextBytes)
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID (lib.rs:~7373). No Go-side retry here — a retry would generate a
 	// fresh MessageInst and orphan delivery receipts for the first attempt.
-	uuid, err := c.client.SendMessage(conv, textToSend, nil, c.getHandle(), replyGuid, replyPart, nil)
+	uuid, err := c.client.SendMessage(conv, outbound[0], nil, c.getHandle(), replyGuid, replyPart, nil)
 	if err != nil {
+		// rustpush retried an unreachable iMessage as SMS and found no relay to
+		// carry it. Surface the same explanation as the pre-send guard rather than
+		// a bare wrapped error, which would reach the user with no message at all.
+		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+			return nil, errNoCarrierRoute
+		}
 		return nil, fmt.Errorf("failed to send iMessage: %w", err)
 	}
 	zerolog.Ctx(ctx).Info().
 		Str("uuid", uuid).
 		Str("portal_id", string(msg.Portal.ID)).
-		Bool("is_sms", c.isPortalSMS(string(msg.Portal.ID))).
+		Bool("is_sms", conv.IsSms).
 		Msg("Message sent, storing UUID in bridge DB")
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
 		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent message UUID; echo may be delivered as duplicate")
+		}
+	}
+
+	// Continuation chunks follow the first, once the primary UUID is persisted.
+	// The first UUID stays the bridge message ID so replies, echo dedup and
+	// unsends keep targeting one message; a failed continuation is logged rather
+	// than failing the whole send, since the first chunk has already been
+	// delivered and cannot be recalled. Every UUID that does land is recorded so
+	// a later redaction can unsend all of them — otherwise Matrix would show the
+	// message deleted while the tail stayed on the recipient's device.
+	var continuationUUIDs []string
+	for i, chunk := range outbound[1:] {
+		contUUID, contErr := c.client.SendMessage(conv, chunk, nil, c.getHandle(), nil, nil, nil)
+		if contErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(contErr).
+				Str("uuid", uuid).
+				Int("chunk", i+1).
+				Int("chunks", len(outbound)).
+				Msg("Failed to send continuation chunk of oversized outbound message")
+			break
+		}
+		continuationUUIDs = append(continuationUUIDs, contUUID)
+		if c.cloudStore != nil {
+			if err := c.cloudStore.persistMessageUUID(ctx, contUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", contUUID).Msg("Failed to persist continuation UUID; echo may be delivered as duplicate")
+			}
+			// A continuation is a real iMessage, so CloudKit will eventually
+			// return a record for it and upsertMessageBatch will promote the
+			// stub (record_name goes non-empty), at which point the backfill
+			// list queries stop filtering it out. Its text already lives in the
+			// single Matrix event, so bridging it back would duplicate the tail.
+			// Soft-delete is the existing, race-safe way to say "never bridge
+			// this row": upsertMessageBatch preserves deleted=TRUE on conflict.
+			//
+			// Known residual, deliberately not worked around. Nothing here can
+			// lose message content: the row is a contentless stub from
+			// persistMessageUUID, and the chunk's text lives in the Matrix event.
+			// The risk is the reverse — the row coming back. The pre-existing
+			// tombstone reaper (deleteOrphanedMessages) removes rows that are
+			// already deleted=TRUE and whose portal has no cloud_chat row yet,
+			// which clears the flag this relies on; a later CloudKit sync then
+			// re-inserts the row deleted=FALSE with a record_name and the chunk
+			// becomes backfillable again, showing up as a duplicate tail under a
+			// message that already contains that text. Every flag we could set
+			// lives in cloud_message so the reap takes all of them, and a
+			// bridgev2 message row would not help because CloudKit backfill
+			// dedups on the anchor cursor rather than per row. The window needs
+			// an outbound send over maxOutboundTextBytes into a portal whose chat
+			// has not synced yet, plus a reap landing inside it.
+			c.cloudStore.softDeleteMessageByGUID(ctx, contUUID)
 		}
 	}
 
@@ -5736,7 +5853,7 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			ID:        makeMessageID(uuid),
 			SenderID:  makeUserID(c.getHandle()),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{},
+			Metadata:  &MessageMetadata{ContinuationUUIDs: continuationUUIDs},
 		},
 	}, nil
 }
@@ -5905,6 +6022,9 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// UUID — no Go-side retry here (would orphan delivery receipts).
 	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.getHandle(), replyGuid, replyPart, nil)
 	if err != nil {
+		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
+			return nil, errNoCarrierRoute
+		}
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
 	// Persist UUID immediately so echo detection works even if the portal
@@ -6074,11 +6194,33 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	if conv.IsSms {
 		return fmt.Errorf("edits are not supported for SMS conversations")
 	}
 	targetGUID := string(msg.EditTarget.ID)
+
+	// An iMessage edit replaces one message, so a Matrix message that had to go
+	// out as several iMessages can only have its first chunk edited; the
+	// continuations keep their original text. Log it rather than inventing a
+	// mechanism — this needs an outbound body over maxOutboundTextBytes, which
+	// no ordinary client produces.
+	if meta, ok := msg.EditTarget.Metadata.(*MessageMetadata); ok && meta != nil && len(meta.ContinuationUUIDs) > 0 {
+		zerolog.Ctx(ctx).Warn().
+			Str("target_uuid", targetGUID).
+			Int("continuations", len(meta.ContinuationUUIDs)).
+			Msg("Editing only the first chunk of a message that was split across several iMessages")
+	}
 
 	// Rust-side retry handles SendTimedOut with stable UUID.
 	_, err := c.client.SendEdit(conv, targetGUID, 0, msg.Content.Body, c.getHandle())
@@ -6094,6 +6236,16 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	if conv.IsSms {
 		return fmt.Errorf("message retraction is not supported for SMS conversations")
@@ -6104,8 +6256,10 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 	// so unsend it first to keep the same wire ordering — some peers ignore unsends
 	// that arrive out of timeline order for an attachment.
 	var siblingUUID string
+	var continuationUUIDs []string
 	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil {
 		siblingUUID = meta.SiblingUUID
+		continuationUUIDs = meta.ContinuationUUIDs
 	}
 
 	if siblingUUID != "" {
@@ -6116,6 +6270,24 @@ func (c *IMClient) HandleMatrixMessageRemove(ctx context.Context, msg *bridgev2.
 				Msg("Failed to unsend sibling iMessage on split image+caption redact")
 		} else if c.cloudStore != nil {
 			c.cloudStore.softDeleteMessageByGUID(ctx, siblingUUID)
+		}
+	}
+
+	// An oversized Matrix message was sent as several iMessages. Unsend the
+	// continuations before the primary, mirroring the sibling ordering above:
+	// the tail was sent last, so retracting it first keeps the recipient from
+	// briefly seeing a message whose head is gone but whose tail remains.
+	for i := len(continuationUUIDs) - 1; i >= 0; i-- {
+		contUUID := continuationUUIDs[i]
+		c.trackOutboundUnsend(contUUID)
+		if _, contErr := c.client.SendUnsend(conv, contUUID, 0, c.getHandle()); contErr != nil {
+			zerolog.Ctx(ctx).Warn().Err(contErr).
+				Str("continuation_uuid", contUUID).
+				Msg("Failed to unsend continuation chunk on redact of split message")
+		} else if c.cloudStore != nil {
+			// softDeleteMessageByGUID returns no error in this bridge, so the
+			// scrub is fire-and-forget (upstream's copy checks an error return).
+			c.cloudStore.softDeleteMessageByGUID(ctx, contUUID)
 		}
 	}
 
@@ -6145,6 +6317,16 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 		return nil, bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check. That check applies its answer to a
+	// single outbound message and persists nothing, so it cannot reach this
+	// handler directly; the flag here is whatever the portal actually holds
+	// (which CloudKit may later settle on iMessage of its own accord). Deliberate
+	// either way — the check
+	// answers "is the peer on iMessage now", while a retro-active operation needs
+	// "what service carried the message it targets". Those diverge when the flag is
+	// accurate and the peer has since joined iMessage, and acting on the wrong one
+	// retargets the operation at a GUID the recipient's device holds as an SMS.
+	// The right input is cloud_message.service.
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.Content.RelatesTo.Key)
 
@@ -6204,6 +6386,7 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 		return bridgev2.ErrNotLoggedIn
 	}
 
+	// Not wired to the carrier-route check; see HandleMatrixReaction.
 	conv := c.portalToConversation(msg.Portal)
 	reaction, emoji := emojiToTapbackType(msg.TargetReaction.Emoji)
 
@@ -6839,22 +7022,12 @@ func (c *IMClient) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*bri
 			name := c.Main.Config.FormatDisplayname(identifierToDisplaynameParams(identifier))
 			ui.Name = &name
 		}
-		for _, phone := range contact.Phones {
-			ui.Identifiers = append(ui.Identifiers, "tel:"+phone)
-		}
-		for _, email := range contact.Emails {
-			ui.Identifiers = append(ui.Identifiers, "mailto:"+email)
-		}
-		if len(contact.Avatar) > 0 {
-			avatarHash := sha256.Sum256(contact.Avatar)
-			avatarData := contact.Avatar // capture for closure
-			ui.Avatar = &bridgev2.Avatar{
-				ID: networkid.AvatarID(fmt.Sprintf("contact:%s:%s", identifier, hex.EncodeToString(avatarHash[:8]))),
-				Get: func(ctx context.Context) ([]byte, error) {
-					return avatarData, nil
-				},
-			}
-		}
+		ui.Identifiers = contactIdentifiers(identifier, contact)
+		source := c.contacts
+		ui.Avatar = contactAvatar(identifier, contact, func() *imessage.Contact {
+			fresh, _ := source.GetContactInfo(localID)
+			return fresh
+		})
 		return ui, nil
 	}
 
@@ -7192,7 +7365,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		lastMsgTS := lastMsg.Timestamp
 
 		return &bridgev2.FetchMessagesResponse{
-			Messages: allMessages,
+			Messages: keepPastBackfillCutoff(allMessages, params.AnchorMessage, true),
 			HasMore:  false,
 			Forward:  true,
 			// Don't set MarkRead here — MarkReadBy on the batch send creates
@@ -7323,7 +7496,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 						Int("backfill_msgs", len(allMessages)).
 						Msg("Recovery backfill COMPLETE")
 					return &bridgev2.FetchMessagesResponse{
-						Messages: allMessages,
+						Messages: keepPastBackfillCutoff(allMessages, params.AnchorMessage, false),
 						HasMore:  false,
 						Forward:  false,
 					}, nil
@@ -7384,7 +7557,7 @@ func (c *IMClient) FetchMessages(ctx context.Context, params bridgev2.FetchMessa
 		Msg("Backward backfill COMPLETE — older messages returned")
 
 	return &bridgev2.FetchMessagesResponse{
-		Messages: messages,
+		Messages: keepPastBackfillCutoff(messages, params.AnchorMessage, false),
 		Cursor:   nextCursor,
 		HasMore:  hasMore,
 		Forward:  false,
@@ -7511,28 +7684,12 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 
 	// Text message — trim OBJ placeholders before building body.
 	body := strings.Trim(row.Text, "\ufffc \n")
-	var formattedBody string
-	if row.Subject != "" {
-		if body != "" {
-			formattedBody = fmt.Sprintf("<strong>%s</strong><br>%s", html.EscapeString(row.Subject), html.EscapeString(body))
-			body = fmt.Sprintf("**%s**\n%s", row.Subject, body)
-		} else {
-			body = row.Subject
-		}
-	}
-	hasText := strings.TrimSpace(body) != ""
+	hasText := strings.TrimSpace(body) != "" || strings.TrimSpace(row.Subject) != ""
 	if hasText {
-		textContent := &event.MessageEventContent{
-			MsgType: event.MsgText,
-			Body:    body,
-		}
-		if formattedBody != "" {
-			textContent.Format = event.FormatHTML
-			textContent.FormattedBody = formattedBody
-		}
+		var previews []*event.BeeperLinkPreview
 		if c.Main.Config.URLPreviewsInBackfill {
 			if detectedURL := urlRegex.FindString(row.Text); detectedURL != "" {
-				textContent.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+				previews = []*event.BeeperLinkPreview{
 					fetchURLPreview(ctx, c.Main.Bridge, c.Main.Bridge.Bot, "", detectedURL),
 				}
 			}
@@ -7542,10 +7699,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 			ID:        makeMessageID(row.GUID),
 			Timestamp: ts,
 			ConvertedMessage: &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{{
-					Type:    event.EventMessage,
-					Content: textContent,
-				}},
+				Parts: buildTextParts(event.MsgText, row.Subject, body, previews, false),
 			},
 		})
 	}
@@ -8495,22 +8649,57 @@ func (c *IMClient) persistState(log zerolog.Logger) {
 			log.Warn().Interface("panic", r).Msg("persistState panicked — skipped this cycle")
 		}
 	}()
-	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	// Snapshot FFI state into locals before touching Metadata (upstream
+	// 2329f143): the final stopChan-triggered save can stall inside
+	// connection.State() on a wedged runtime, and by the time it returns
+	// bridgev2 may have replaced this client (recreateClient after a wedge
+	// rebuild, or LoadUserLogin on reconnect). Metadata is shared with the
+	// successor, so a late write would clobber its fresh APS/IDS state both
+	// in memory and, via Save, in this user's DB row. Other per-user fields
+	// (preferred handle, feature toggles) are never written here.
+	var apsState, idsUsers, idsIdentity, deviceID string
+	var haveAPS, haveUsers, haveIdentity, haveDevice bool
 	if c.connection != nil {
-		meta.APSState = c.connection.State().ToString()
+		apsState, haveAPS = c.connection.State().ToString(), true
 	}
 	if c.users != nil {
-		meta.IDSUsers = c.users.ToString()
+		idsUsers, haveUsers = c.users.ToString(), true
 	}
 	if c.identity != nil {
-		meta.IDSIdentity = c.identity.ToString()
+		idsIdentity, haveIdentity = c.identity.ToString(), true
 	}
 	if c.config != nil {
-		meta.DeviceID = c.config.GetDeviceId()
+		deviceID, haveDevice = c.config.GetDeviceId(), true
+	}
+	if !c.isCurrentClient() {
+		log.Debug().Msg("Dropping state save from a replaced client")
+		return
+	}
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	if haveAPS {
+		meta.APSState = apsState
+	}
+	if haveUsers {
+		meta.IDSUsers = idsUsers
+	}
+	if haveIdentity {
+		meta.IDSIdentity = idsIdentity
+	}
+	if haveDevice {
+		meta.DeviceID = deviceID
 	}
 	if err := c.UserLogin.Save(context.Background()); err != nil {
 		log.Err(err).Msg("Failed to persist state")
 	}
+}
+
+// isCurrentClient reports whether this IMClient is still the one bridgev2 has
+// attached to its UserLogin. Legitimate saves (including logout's final one;
+// bridgev2 never nils Client) all run with Client == c, so only a client that
+// has since been replaced by a rebuild returns false.
+func (c *IMClient) isCurrentClient() bool {
+	cur, _ := c.UserLogin.Client.(*IMClient)
+	return cur == c
 }
 
 func (c *IMClient) periodicStateSave(log zerolog.Logger) {
@@ -8538,11 +8727,17 @@ func (c *IMClient) periodicStateSave(log zerolog.Logger) {
 // still allowing legitimate manual restarts close together during debugging.
 const petRefreshMinInterval = 5 * time.Minute
 
-// petRefreshKVKey is the KV key used to persist the last PET refresh time.
-// Persistent (not in-memory) so the throttle survives the exact failure mode
-// it's protecting against — a crash-restart loop that wipes in-memory state
-// between each attempt.
-const petRefreshKVKey = database.Key("gsa.pet_last_refresh")
+// petRefreshKVKeyPrefix prefixes the per-login KV key that persists the last
+// PET refresh time. Persistent (not in-memory) so the throttle survives the
+// exact failure mode it's protecting against — a crash-restart loop that wipes
+// in-memory state between each attempt. Scoped per login: each Apple account
+// has its own GSA rate limit, and a shared key let one user's refresh skip
+// every other user's startup refresh.
+const petRefreshKVKeyPrefix = "gsa.pet_last_refresh."
+
+func (c *IMClient) petRefreshKVKey() database.Key {
+	return database.Key(petRefreshKVKeyPrefix + string(c.UserLogin.ID))
+}
 
 // safeRefreshPetTokenThrottled is safeRefreshPetToken with a persistent
 // timestamp guard. Returns an error without hitting GSA if a refresh
@@ -8556,7 +8751,7 @@ func (c *IMClient) safeRefreshPetTokenThrottled() error {
 	}
 	ctx := context.Background()
 	now := time.Now()
-	if raw := c.Main.Bridge.DB.KV.Get(ctx, petRefreshKVKey); raw != "" {
+	if raw := c.Main.Bridge.DB.KV.Get(ctx, c.petRefreshKVKey()); raw != "" {
 		if ts, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil {
 			if elapsed := now.Sub(time.Unix(ts, 0)); elapsed < petRefreshMinInterval {
 				return fmt.Errorf("PET refresh throttled: last refresh %s ago (min %s)",
@@ -8564,10 +8759,14 @@ func (c *IMClient) safeRefreshPetTokenThrottled() error {
 			}
 		}
 	}
+	// Record the attempt, not just a success: RefreshPetToken errors whenever
+	// Apple issued no fresh PET (corten f72e753c), and a hot path must not
+	// re-run SRP on every call while Apple keeps refusing.
+	c.Main.Bridge.DB.KV.Set(ctx, c.petRefreshKVKey(), strconv.FormatInt(now.Unix(), 10))
 	if err := safeRefreshPetToken(*c.tokenProvider); err != nil {
 		return err
 	}
-	c.Main.Bridge.DB.KV.Set(ctx, petRefreshKVKey, strconv.FormatInt(now.Unix(), 10))
+	c.persistAccountState(c.UserLogin.Log.With().Str("component", "imessage").Logger())
 	return nil
 }
 
@@ -8617,6 +8816,8 @@ func (c *IMClient) periodicPetRefresh(log zerolog.Logger) {
 				log.Warn().Err(err).Msg("Periodic PET refresh failed")
 			} else {
 				log.Debug().Msg("Periodic PET refresh completed")
+				// Save the refreshed tokens so a restart reuses them.
+				c.persistAccountState(log)
 			}
 		case <-c.stopChan:
 			return
@@ -8649,76 +8850,112 @@ func (c *IMClient) periodicStatusSharingReinvite(log zerolog.Logger) {
 // same tick so we keep one ticker but don't gate the share-profile path
 // behind CardDAV success — refreshAllSharedProfiles only needs CloudKit
 // (ProfilesClient) and runs independently even if SyncContacts errors.
+//
+// Consecutive CardDAV failures back off exponentially (15m → 6h) and reset
+// on success, so a throttled account eases off instead of compounding the
+// rate limit. Applies to both iCloud and external CardDAV sources.
 func (c *IMClient) periodicCloudContactSync(log zerolog.Logger) {
-	ticker := time.NewTicker(15 * time.Minute)
-	defer ticker.Stop()
+	schedule := newContactSyncSchedule(15*time.Minute, 6*time.Hour)
+	timer := time.NewTimer(schedule.next())
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			if err := c.contacts.SyncContacts(log); err != nil {
-				log.Warn().Err(err).Msg("Periodic CardDAV sync failed")
+				next := schedule.failed()
+				log.Warn().Err(err).
+					Int("failures", schedule.failures).
+					Dur("next_in", next).
+					Bool("throttled", isContactSyncThrottled(err)).
+					Msg("Periodic CardDAV sync failed, backing off")
 			} else {
+				if schedule.succeeded() {
+					log.Info().Msg("CardDAV sync recovered, resetting to base interval")
+				}
 				c.setContactsReady(log)
-				c.persistMmeDelegate(log)
+				c.persistAccountState(log)
 			}
 			c.refreshAllSharedProfiles(log)
+			timer.Reset(schedule.next())
 		case <-c.stopChan:
 			return
 		}
 	}
 }
 
-// persistMmeDelegate saves the current MobileMe delegate to user_login metadata
-// so it can be seeded on restore without needing a fresh PET-based auth.
-func (c *IMClient) persistMmeDelegate(log zerolog.Logger) {
+// persistAccountState saves this login's current MobileMe delegate and
+// rustpush account state (tokens with their real expirations plus the delegate
+// state) to user_login metadata, so a restart reuses them instead of needing a
+// fresh PET-based auth. Saves only when something changed.
+func (c *IMClient) persistAccountState(log zerolog.Logger) {
 	if c.tokenProvider == nil || *c.tokenProvider == nil {
 		return
 	}
 	tp := *c.tokenProvider
-	delegateJSON, err := tp.GetMmeDelegateJson()
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to get MobileMe delegate for persistence")
-		return
-	}
-	if delegateJSON == nil || *delegateJSON == "" {
-		return
-	}
 	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
-	if meta.MmeDelegateJSON == *delegateJSON {
-		return // unchanged
+	changed := false
+	if delegateJSON, err := tp.GetMmeDelegateJson(); err != nil {
+		log.Warn().Err(err).Msg("Failed to get MobileMe delegate for persistence")
+	} else if delegateJSON != nil && *delegateJSON != "" && meta.MmeDelegateJSON != *delegateJSON {
+		meta.MmeDelegateJSON = *delegateJSON
+		changed = true
 	}
-	meta.MmeDelegateJSON = *delegateJSON
-	if err = c.UserLogin.Save(context.Background()); err != nil {
-		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate")
+	if blob, err := tp.GetAccountPersistBlob(); err != nil {
+		log.Warn().Err(err).Msg("Failed to get rustpush account state for persistence")
+	} else if blob != nil && *blob != "" && meta.AccountPersistBlob != *blob {
+		meta.AccountPersistBlob = *blob
+		changed = true
+	}
+	if !changed {
+		return
+	}
+	if err := c.UserLogin.Save(context.Background()); err != nil {
+		log.Warn().Err(err).Msg("Failed to persist MobileMe delegate and account state")
 	} else {
-		log.Info().Msg("Persisted MobileMe delegate to user_login metadata")
+		log.Info().Msg("Persisted MobileMe delegate and rustpush account state to user_login metadata")
 	}
 }
 
 // retryCloudContacts retries the cloud contacts initialization periodically
 // when it fails on startup (e.g., expired MobileMe delegate). Once contacts
 // succeed, the readiness gate opens and cloud sync begins.
+//
+// Failures back off exponentially (2m → 1h) so an expired delegate or a
+// throttled account isn't hit at a fixed two-minute cadence.
 func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
-	ticker := time.NewTicker(2 * time.Minute)
-	defer ticker.Stop()
+	schedule := newContactSyncSchedule(2*time.Minute, time.Hour)
+	timer := time.NewTimer(schedule.next())
+	defer timer.Stop()
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			log.Info().Msg("Retrying cloud contacts initialization...")
-			c.contacts = newCloudContactsClient(c.client, log)
+			// Assign through a concrete-typed local: a nil *cloudContactsClient
+			// stored in the contactSource interface would be non-nil.
+			if cloudContacts := newCloudContactsClient(c.client, log); cloudContacts != nil {
+				c.contacts = cloudContacts
+			}
 			if c.contacts != nil {
 				if syncErr := c.contacts.SyncContacts(log); syncErr != nil {
-					log.Warn().Err(syncErr).Msg("Cloud contacts retry: sync failed")
+					next := schedule.failed()
+					log.Warn().Err(syncErr).
+						Int("failures", schedule.failures).
+						Dur("next_in", next).
+						Bool("throttled", isContactSyncThrottled(syncErr)).
+						Msg("Cloud contacts retry: sync failed, backing off")
 				} else {
 					c.setContactsReady(log)
-					c.persistMmeDelegate(log)
+					c.persistAccountState(log)
 					log.Info().Msg("Cloud contacts retry succeeded, starting periodic sync")
 					go c.periodicCloudContactSync(log)
 					return
 				}
 			} else {
-				log.Warn().Msg("Cloud contacts retry: still unavailable")
+				next := schedule.failed()
+				log.Warn().Int("failures", schedule.failures).Dur("next_in", next).
+					Msg("Cloud contacts retry: still unavailable, backing off")
 			}
+			timer.Reset(schedule.next())
 		case <-c.stopChan:
 			return
 		}
@@ -9043,6 +9280,9 @@ func (c *IMClient) ensureGroupPortalIndex() {
 func (c *IMClient) indexGroupPortalLocked(portalID string) {
 	if c.groupPortalIndex == nil {
 		return
+	}
+	if !strings.Contains(portalID, ",") {
+		return // gid:/DM portals are not member-indexed (see ensureGroupPortalIndex)
 	}
 	for _, member := range strings.Split(portalID, ",") {
 		if c.groupPortalIndex[member] == nil {
@@ -9567,16 +9807,25 @@ func (c *IMClient) resolveExistingGroupByGid(gidPortalID string, senderGuid stri
 	return networkid.PortalID(gidPortalID)
 }
 
-func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
-	isGroup := c.getUniqueParticipantCount(participants) > 2 || (groupName != nil && *groupName != "")
+func (c *IMClient) makePortalKey(participants []string, groupName *string, sender *string, senderGuid *string, isSms bool) networkid.PortalKey {
+	// Group = >=2 members besides us. Relayed carrier groups omit self, so a
+	// 3-person group arrives with 2 participants; count non-self members across
+	// participants AND sender so such a reply isn't mis-routed into a 1:1 DM.
+	isGroup := c.countNonSelfMembers(participants, sender) >= 2 || (groupName != nil && *groupName != "")
 
 	if isGroup {
 		// When a persistent group UUID (sender_guid / gid) is available,
 		// use "gid:<UUID>" as the stable portal ID. This avoids the
 		// fragility of participant-based IDs that break when membership
 		// changes or participants normalize differently.
+		//
+		// Carrier groups (SMS/RCS/MMS) are the exception: their group_id is
+		// unstable (CloudKit hands the same group back under several encodings),
+		// so we ignore senderGuid and key them purely by participant set — the
+		// same key resolvePortalIDForCloudChat uses — so the live and backfill
+		// paths converge on one room instead of splitting into a gid: room here.
 		var portalID networkid.PortalID
-		if senderGuid != nil && *senderGuid != "" {
+		if senderGuid != nil && *senderGuid != "" && !isSms {
 			gidID := "gid:" + strings.ToLower(*senderGuid)
 
 			// Fast path: check if we've previously resolved this gid to
@@ -9630,10 +9879,16 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 				}
 			}
 		} else {
-			// Fallback: build a participant-based ID for groups without a UUID.
+			// Fallback: build a participant-based ID for groups without a usable
+			// UUID. Carrier groups reach here even with senderGuid set; pass nil
+			// so their unstable guid is never associated with the portal.
 			deduped := c.buildCanonicalParticipantList(participants)
 			computedID := strings.Join(deduped, ",")
-			portalID = c.resolveExistingGroupPortalID(computedID, senderGuid)
+			sg := senderGuid
+			if isSms {
+				sg = nil
+			}
+			portalID = c.resolveExistingGroupPortalID(computedID, sg)
 		}
 		// Cache the actual iMessage group name (cv_name) so outbound
 		// messages can route to the correct conversation. Also push a
@@ -9825,9 +10080,9 @@ func (c *IMClient) makePortalKey(participants []string, groupName *string, sende
 // makeReceiptPortalKey handles receipt messages where participants may be empty.
 // When participants is empty (rustpush sets conversation: None for receipts),
 // use the sender field to identify the DM portal.
-func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string, senderGuid *string) networkid.PortalKey {
+func (c *IMClient) makeReceiptPortalKey(participants []string, groupName *string, sender *string, senderGuid *string, isSms bool) networkid.PortalKey {
 	if len(participants) > 0 {
-		return c.makePortalKey(participants, groupName, sender, senderGuid)
+		return c.makePortalKey(participants, groupName, sender, senderGuid, isSms)
 	}
 	if sender != nil && *sender != "" {
 		// Resolve to existing portal for contacts with multiple numbers
@@ -10204,29 +10459,293 @@ func convertURLPreviewToBeeper(ctx context.Context, portal *bridgev2.Portal, int
 	return nil
 }
 
-func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
-	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
-	content := &event.MessageEventContent{
-		MsgType: event.MsgText,
-		Body:    text,
+// Matrix caps a PDU at 65,536 bytes, and mautrix encrypts every event before
+// submitting it, so the marshaled event content has to leave room for megolm
+// padding, base64 expansion (~4/3) and the PDU envelope. Measured against a real
+// megolm session the cliff sits just under 48,000 bytes of content; 40,000 keeps
+// roughly 15% margin. Text above this is split across several Matrix events
+// instead of being rejected by the server, which used to drop live messages
+// silently and wedge a portal's backfill permanently.
+const maxTextContentBytes = 40000
+
+// maxOutboundTextBytes bounds text travelling the other way, to iMessage. Bodies
+// in the 45,000-47,000 range do reach the bridge from Matrix (that much content
+// still encrypts to under 65,536), so this path is live, if narrow.
+const maxOutboundTextBytes = 45000
+
+// Fixed per-message overhead that rides on the first part and cannot be reduced
+// by splitting the text. Without a bound the shrink loop below can never reach
+// its budget, because shrinking the chunk does nothing about a 60 KB og:
+// description or subject. Neither field is meaningful at these sizes, so
+// truncating loses nothing real. Note this caps the maximum overhead, it does
+// not make the part count deterministic: fetchURLPreview does a live HTTP fetch,
+// so a preview that succeeds on one backfill pass and fails on the next shifts
+// the first chunk boundary and can change the part count.
+const (
+	maxSubjectBytes      = 2048
+	maxPreviewFieldBytes = 2048
+)
+
+// truncateBytes cuts s to at most max bytes on a rune boundary.
+func truncateBytes(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
 	}
-	if msg.Subject != nil && *msg.Subject != "" {
-		if text != "" {
-			content.Body = fmt.Sprintf("**%s**\n%s", *msg.Subject, text)
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max]
+}
+
+// firstChunk returns the leading chunk of text that splitTextChunks would emit,
+// without building the rest of the list. The shrink loop calls this on every
+// iteration, so materialising every chunk each time would be quadratic.
+func firstChunk(text string, max int) string {
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	cut := max
+	// Never cut inside a multi-byte rune.
+	for cut > 0 && !utf8.RuneStart(text[cut]) {
+		cut--
+	}
+	if i := strings.LastIndexByte(text[:cut], '\n'); i > max*3/4 {
+		cut = i + 1
+	} else if i := strings.LastIndexByte(text[:cut], ' '); i > max*3/4 {
+		cut = i + 1
+	}
+	if cut <= 0 {
+		// Unreachable for any sane max, but the caller must always advance.
+		cut = max
+	}
+	return text[:cut]
+}
+
+// splitTextChunks cuts text into UTF-8-safe pieces of at most max bytes,
+// preferring a newline and then a space in the last quarter of the window so
+// chunks break at paragraph boundaries rather than mid-word. The chunks always
+// concatenate back to the exact input — nothing is dropped or rewritten.
+func splitTextChunks(text string, max int) []string {
+	if max <= 0 || len(text) <= max {
+		return []string{text}
+	}
+	var out []string
+	for len(text) > max {
+		chunk := firstChunk(text, max)
+		out = append(out, chunk)
+		text = text[len(chunk):]
+	}
+	if text != "" {
+		out = append(out, text)
+	}
+	return out
+}
+
+// boundPreviews returns copies of the previews with their free-text fields
+// capped. Nothing upstream bounds them: urlpreview.go takes og:title and
+// og:description verbatim from a remote page, limited only by the 512 KB body
+// read, and inbound rich links come straight off the wire.
+func boundPreviews(previews []*event.BeeperLinkPreview) []*event.BeeperLinkPreview {
+	if len(previews) == 0 {
+		return nil
+	}
+	out := make([]*event.BeeperLinkPreview, 0, len(previews))
+	for _, p := range previews {
+		if p == nil {
+			continue
+		}
+		bounded := *p
+		// Every free-text field, not just the obvious two: any one of them can
+		// exceed the whole budget on its own, and leaving one uncapped means the
+		// fit loop sheds the entire preview instead of trimming it.
+		bounded.Title = truncateBytes(bounded.Title, maxPreviewFieldBytes)
+		bounded.Description = truncateBytes(bounded.Description, maxPreviewFieldBytes)
+		bounded.SiteName = truncateBytes(bounded.SiteName, maxPreviewFieldBytes)
+		bounded.Type = truncateBytes(bounded.Type, maxPreviewFieldBytes)
+		bounded.ImageType = truncateBytes(bounded.ImageType, maxPreviewFieldBytes)
+		bounded.CanonicalURL = truncateBytes(bounded.CanonicalURL, maxPreviewFieldBytes)
+		bounded.MatchedURL = truncateBytes(bounded.MatchedURL, maxPreviewFieldBytes)
+		bounded.ImageBlurhash = truncateBytes(bounded.ImageBlurhash, maxPreviewFieldBytes)
+		bounded.ImageURL = id.ContentURIString(truncateBytes(string(bounded.ImageURL), maxPreviewFieldBytes))
+		out = append(out, &bounded)
+	}
+	return out
+}
+
+// buildTextContent builds the Matrix content for one chunk of an iMessage's text.
+// Only the first chunk carries the subject, HTML formatting and link previews,
+// so the body/formatted_body duplication is paid once rather than per part.
+func buildTextContent(msgType event.MessageType, subject, chunk string, previews []*event.BeeperLinkPreview, first bool) *event.MessageEventContent {
+	content := &event.MessageEventContent{MsgType: msgType, Body: chunk}
+	if !first {
+		return content
+	}
+	if subject != "" {
+		if chunk != "" {
+			content.Body = fmt.Sprintf("**%s**\n%s", subject, chunk)
 			content.Format = event.FormatHTML
-			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", *msg.Subject, text)
+			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s",
+				html.EscapeString(subject), html.EscapeString(chunk))
 		} else {
-			content.Body = *msg.Subject
+			content.Body = subject
 		}
 	}
+	content.BeeperLinkPreviews = previews
+	return content
+}
 
-	content.BeeperLinkPreviews = convertURLPreviewToBeeper(ctx, portal, intent, msg, text)
+// editProbeEventID stands in for the real target when measuring what an edit
+// will marshal to. Only its length matters.
+var editProbeEventID = id.EventID("$" + strings.Repeat("A", 43))
 
-	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
+// measuredSize reports what this content will marshal to on the wire. For an
+// edit that is not the content itself: sendConvertedEdit calls SetEdit after the
+// converter returns, which copies the whole content into m.new_content. SetEdit
+// only drops the duplicated fallback once the *raw* body passes 10,000 bytes,
+// which never happens for heavily escaped text, so the doubling has to be
+// measured rather than assumed away. SetEdit assigns fresh pointers for every
+// field it changes, so probing a shallow copy cannot disturb the original.
+func measuredSize(content *event.MessageEventContent, forEdit bool) int {
+	target := content
+	if forEdit {
+		probe := *content
+		probe.SetEdit(editProbeEventID)
+		target = &probe
+	}
+	encoded, err := json.Marshal(target)
+	if err != nil {
+		// Treat an unmarshalable part as over budget so it degrades rather than
+		// being emitted unmeasured.
+		return maxTextContentBytes + 1
+	}
+	return len(encoded)
+}
+
+// shedOverhead removes the per-part extras that splitting cannot shrink, in
+// increasing order of what dropping them costs the reader. Level 0 keeps
+// everything.
+func shedOverhead(content *event.MessageEventContent, level int) {
+	if level >= 1 {
+		content.Format = ""
+		content.FormattedBody = ""
+	}
+	if level >= 2 {
+		content.BeeperLinkPreviews = nil
+	}
+}
+
+// maxShedLevel is the highest level shedOverhead understands.
+const maxShedLevel = 2
+
+// fitPart returns the largest leading chunk of text whose content fits the
+// budget, together with that content. It shrinks the chunk first and sheds
+// overhead only once shrinking has bottomed out, because the excess is then
+// fixed cost — a subject or a link preview — that no amount of chunking reduces.
+//
+// It never truncates. The caller advances by len(chunk), so a byte dropped here
+// would be lost outright, which is the exact failure this change exists to
+// prevent.
+func fitPart(msgType event.MessageType, subject, text string, previews []*event.BeeperLinkPreview, first, forEdit bool) (string, *event.MessageEventContent) {
+	for level := 0; ; level++ {
+		limit := maxTextContentBytes
+		for {
+			chunk := firstChunk(text, limit)
+			content := buildTextContent(msgType, subject, chunk, previews, first)
+			shedOverhead(content, level)
+			size := measuredSize(content, forEdit)
+			if size <= maxTextContentBytes {
+				return chunk, content
+			}
+			if limit <= 512 {
+				if level >= maxShedLevel {
+					// Unreachable rather than a silent fallthrough: with the
+					// subject bounded to maxSubjectBytes, formatting and
+					// previews shed, and the chunk down at 512 bytes, the body
+					// is at most ~2.5 KB raw. Even at JSON escaping's 6x worst
+					// case, doubled for an edit, that is far under the budget.
+					return chunk, content
+				}
+				break // shed one more level and restart the shrink
+			}
+			// Shrink in proportion to the overshoot. Halving would land the
+			// chunk at half the budget instead of just under it, roughly
+			// doubling the event count for no benefit.
+			next := limit * maxTextContentBytes / size * 98 / 100
+			if next >= limit {
+				next = limit / 2
+			}
+			limit = next
+		}
+	}
+}
+
+// buildTextParts converts one iMessage's text into the Matrix message parts for
+// it. Anything that fits in a single event produces exactly one part with the
+// empty part ID, which is what replies, tapbacks, edits and deduplication
+// already target; only oversized text produces continuation parts.
+//
+// Every emitted part is measured, never assumed, and the split is lossless: the
+// parts' text concatenates back to the input exactly.
+func buildTextParts(msgType event.MessageType, subject, text string, previews []*event.BeeperLinkPreview, forEdit bool) []*bridgev2.ConvertedMessagePart {
+	subject = truncateBytes(subject, maxSubjectBytes)
+	previews = boundPreviews(previews)
+
+	var parts []*bridgev2.ConvertedMessagePart
+	for first := true; ; first = false {
+		chunk, content := fitPart(msgType, subject, text, previews, first, forEdit)
+		partID := networkid.PartID("")
+		if !first {
+			// Zero-padded so lexical ordering matches emission ordering:
+			// GetAllPartsByID has no ORDER BY, and the edit path maps new parts
+			// onto stored parts positionally.
+			partID = networkid.PartID(fmt.Sprintf("text%03d", len(parts)))
+		}
+		parts = append(parts, &bridgev2.ConvertedMessagePart{
+			ID:      partID,
 			Type:    event.EventMessage,
 			Content: content,
-		}},
+		})
+		text = text[len(chunk):]
+		if text == "" {
+			return parts
+		}
+	}
+}
+
+// textPartIndex returns the ordinal encoded in a text part ID: the default part
+// ("") is 0 and "textNNN" is NNN. Anything unparseable sorts last, so a
+// malformed row cannot shift the positions of the valid ones — sorting it first
+// would push every real part down by one and make the edit path rewrite and
+// redact the wrong events. No current code path emits such an ID; this is a
+// guard, not a live case.
+func textPartIndex(id networkid.PartID) int {
+	if id == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(string(id), "text"))
+	if err != nil || n < 0 {
+		return math.MaxInt
+	}
+	return n
+}
+
+// isTextPartID reports whether a stored part belongs to the text of a message
+// (the default part, or a continuation emitted by buildTextParts) rather than
+// to an attachment.
+func isTextPartID(id networkid.PartID) bool {
+	return id == "" || strings.HasPrefix(string(id), "text")
+}
+
+func convertMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *rustpushgo.WrappedMessage) (*bridgev2.ConvertedMessage, error) {
+	text := strings.TrimSpace(strings.ReplaceAll(ptrStringOr(msg.Text, ""), "\uFFFC", ""))
+	subject := ""
+	if msg.Subject != nil {
+		subject = *msg.Subject
+	}
+
+	cm := &bridgev2.ConvertedMessage{
+		Parts: buildTextParts(event.MsgText, subject, text,
+			convertURLPreviewToBeeper(ctx, portal, intent, msg, text), false),
 	}
 
 	if msg.ReplyGuid != nil && *msg.ReplyGuid != "" {
@@ -10257,7 +10776,18 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 	if contact == nil {
 		return nil
 	}
-	name := strings.TrimSpace(contact.Name())
+	// vCard values come straight off a peer-supplied .vcf and parseVCard applies
+	// no length or count limit, so this notice can exceed Matrix's PDU limit —
+	// the same silent-drop-and-wedge failure the text splitter exists to
+	// prevent, and reachable on the CloudKit backfill path too.
+	//
+	// A per-field cap is not enough: the notice assembles up to seven values
+	// into both body and formatted_body, and each input byte can cost 16 bytes
+	// on the wire ('&' becomes "&amp;" via html.EscapeString, then "&amp;"
+	// via encoding/json). Two escape-heavy 2 KB fields already blow the limit.
+	// The only bound that holds for every input is measuring what we built, so
+	// assemble first and then drop lines until it fits.
+	name := truncateBytes(strings.TrimSpace(contact.Name()), maxSubjectBytes)
 	if name == "" && len(contact.Phones) == 0 && len(contact.Emails) == 0 {
 		return nil
 	}
@@ -10272,7 +10802,7 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		if i >= 3 {
 			break
 		}
-		phone = strings.TrimSpace(phone)
+		phone = truncateBytes(strings.TrimSpace(phone), maxSubjectBytes)
 		if phone == "" {
 			continue
 		}
@@ -10283,7 +10813,7 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		if i >= 3 {
 			break
 		}
-		email = strings.TrimSpace(email)
+		email = truncateBytes(strings.TrimSpace(email), maxSubjectBytes)
 		if email == "" {
 			continue
 		}
@@ -10291,13 +10821,26 @@ func makeVCardPreviewContent(data []byte) *event.MessageEventContent {
 		htmlLines = append(htmlLines, "Email: "+html.EscapeString(email))
 	}
 
-	return &event.MessageEventContent{
-		MsgType:       event.MsgNotice,
-		Body:          strings.Join(bodyLines, "\n"),
-		Format:        event.FormatHTML,
-		FormattedBody: strings.Join(htmlLines, "<br/>"),
-		Mentions:      &event.Mentions{},
+	build := func() *event.MessageEventContent {
+		return &event.MessageEventContent{
+			MsgType:       event.MsgNotice,
+			Body:          strings.Join(bodyLines, "\n"),
+			Format:        event.FormatHTML,
+			FormattedBody: strings.Join(htmlLines, "<br/>"),
+			Mentions:      &event.Mentions{},
+		}
 	}
+	content := build()
+	// Drop detail lines from the end — emails first, then phones, then the name —
+	// until the assembled event fits. The "Shared contact" header is a constant,
+	// so this always terminates with something bridgeable rather than an event
+	// the server will reject.
+	for len(bodyLines) > 1 && measuredSize(content, false) > maxTextContentBytes {
+		bodyLines = bodyLines[:len(bodyLines)-1]
+		htmlLines = htmlLines[:len(htmlLines)-1]
+		content = build()
+	}
+	return content
 }
 
 func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, attMsg *attachmentMessage, videoTranscoding, heicConversion bool, heicQuality int) (*bridgev2.ConvertedMessage, error) {

@@ -58,12 +58,11 @@ jobs:
   # ───────────────────────────────────────────────────────────────
   # Verify rustpush patches – clones OpenBubbles/rustpush at the pinned
   # SHA (third_party/rustpush-upstream.sha) and asserts every Makefile
-  # sed-patch in `ensure-rustpush-source` actually applied. The sed
-  # patches are guarded by `grep -q '<original pattern>'`; if upstream
-  # rewords a guarded line, the sed is skipped silently and the build
-  # still goes green with the patch dropped on the floor. This job
-  # catches that case explicitly so a SHA-pin bump that breaks any
-  # patch fails CI before it ships.
+  # patch in `ensure-rustpush-source` actually applied. The Makefile's
+  # rp_patch helper already fails closed (missing file or stale anchor
+  # fails the target); this job is a second, independent check of the
+  # end state so a SHA-pin bump that breaks any patch fails CI before
+  # it ships.
   # ───────────────────────────────────────────────────────────────
   verify-rustpush-patches:
     name: Verify rustpush patches apply
@@ -103,9 +102,11 @@ jobs:
           }
           check "activation pub"           "$BASE/src/lib.rs"                                       "pub mod activation;"
           check "ids pub"                  "$BASE/src/lib.rs"                                       "pub mod ids;"
-          check "FetchedToken.token pub"   "$BASE/apple-private-apis/icloud-auth/src/client.rs"     "pub token: String,"
-          check "FetchedToken.expiration"  "$BASE/apple-private-apis/icloud-auth/src/client.rs"     "pub expiration: SystemTime,"
-          check "FetchedToken re-export"   "$BASE/apple-private-apis/icloud-auth/src/lib.rs"        "pub use client::{AppleAccount, FetchedToken,"
+          APA="$BASE/third_party/apple-private-apis"
+          check "FetchedToken.token pub"   "$APA/icloud-auth/src/client.rs"                         "pub token: String,"
+          check "FetchedToken.expiration"  "$APA/icloud-auth/src/client.rs"                         "pub expiration: SystemTime,"
+          # Re-export is native upstream since apple-private-apis b8598d2 (rustpush 8c8d32b); our patch is retired.
+          check "FetchedToken re-export (native upstream)" "$APA/icloud-auth/src/lib.rs"            "FetchedToken, LoginState,"
           check "keychain self-exclusion"  "$BASE/src/icloud/keychain.rs"                           "Ignoring exclusion of ourselves"
           check "register XML dump"        "$BASE/src/ids/user.rs"                                  "RUSTPUSH_LOG_REGISTER_BODY"
           check "statuskit no-saved-channel softened"  "$BASE/src/statuskit.rs"                     "no saved channel for identifier — using last_msg_ns=0"
@@ -205,6 +206,13 @@ jobs:
           key: cargo-linux-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
           restore-keys: cargo-linux-
 
+      - name: Cache uniffi-bindgen-go (FFI binding generator)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/uniffi-bindgen-go
+          # Keyed on the pinned tag (AGENTS.md) so bumping the version busts it.
+          key: uniffi-bindgen-go-v0.2.2+v0.25.0
+
       - name: Verify pinned rustpush SHA file
         run: |
           PIN_FILE=third_party/rustpush-upstream.sha
@@ -221,6 +229,23 @@ jobs:
 
       - name: Build
         run: make build
+
+      - name: Verify FFI bindings are in sync with the Rust FFI surface
+        run: |
+          # Guards against editing the Rust #[uniffi::export] surface without
+          # running `make bindings`: a stale committed rustpushgo.go can compile
+          # yet break at runtime (uniffi contract mismatch) and ship via Docker,
+          # which trusts the committed bindings. No Makefile changes — this just
+          # regenerates from the librustpushgo.a built above and diffs.
+          # Pinned to the version in AGENTS.md (the one the committed bindings
+          # were generated with) so the diff is stable across generator releases.
+          command -v uniffi-bindgen-go >/dev/null 2>&1 || \
+            cargo install uniffi-bindgen-go \
+              --git https://github.com/NordSecurity/uniffi-bindgen-go \
+              --tag v0.2.2+v0.25.0
+          make bindings
+          git diff --exit-code -- pkg/rustpushgo/rustpushgo.go pkg/rustpushgo/rustpushgo.h \
+            || { echo "::error::Committed FFI bindings are stale — run 'make bindings' and commit pkg/rustpushgo/rustpushgo.{go,h}"; exit 1; }
 
       - name: Test pkg/connector/
         run: go test -count=1 ./pkg/connector/...

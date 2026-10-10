@@ -148,6 +148,22 @@ func TestIMConfig_UseCloudKitBackfill(t *testing.T) {
 	}
 }
 
+// Configs written before FaceTime went notify-only still carry
+// facetime_display_name; they must keep loading.
+func TestIMConfig_UnmarshalYAML_RemovedFaceTimeDisplayName(t *testing.T) {
+	yamlData := `
+facetime_display_name: "Jane Doe"
+disable_facetime: true
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("config with removed facetime_display_name key failed to load: %v", err)
+	}
+	if !c.DisableFaceTime {
+		t.Error("DisableFaceTime should still be read")
+	}
+}
+
 func TestIMConfig_UnmarshalYAML(t *testing.T) {
 	yamlData := `
 displayname_template: "{{.FirstName}}"
