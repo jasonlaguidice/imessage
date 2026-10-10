@@ -2374,6 +2374,22 @@ impl WrappedTokenProvider {
         }).await
     }
 
+    /// This login's escrow-proxy host (`escrowProxyUrl` of the MobileMe
+    /// delegate's `com.apple.Dataclass.KeychainSync` class), for the escrow
+    /// diagnostic. rustpush keeps its copy in a private field.
+    pub(crate) async fn escrow_proxy_host(&self) -> Option<String> {
+        let delegate: plist::Value = self.parse_mme_delegate().await.ok()?;
+        delegate
+            .as_dictionary()?
+            .get("config")?
+            .as_dictionary()?
+            .get("com.apple.Dataclass.KeychainSync")?
+            .as_dictionary()?
+            .get("escrowProxyUrl")?
+            .as_string()
+            .map(|s| s.to_string())
+    }
+
     /// Parse the stored MobileMe delegate plist bytes into whatever typed form
     /// the caller context expects (usually `rustpush::auth::MobileMeDelegateResponse`).
     /// `T` is inferred from the receiving function's signature at the call site —
@@ -2431,7 +2447,7 @@ impl WrappedTokenProvider {
             if bottles.is_empty() {
                 // Read-only Apple-side lookups, so the user learns *why* there
                 // are no bottles instead of just that there are none.
-                let diag = escrow_diag::diagnose(&keychain).await;
+                let diag = escrow_diag::diagnose(&keychain, self.escrow_proxy_host().await).await;
                 return Err(WrappedError::GenericError {
                     msg: format!("No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac. ({})", diag)
                 });
@@ -2471,7 +2487,7 @@ impl WrappedTokenProvider {
             if bottles.is_empty() {
                 // Read-only Apple-side lookups, so the user learns *why* there
                 // are no bottles instead of just that there are none.
-                let diag = escrow_diag::diagnose(&keychain).await;
+                let diag = escrow_diag::diagnose(&keychain, self.escrow_proxy_host().await).await;
                 return Err(WrappedError::GenericError {
                     msg: format!("No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac. ({})", diag)
                 });
@@ -2501,7 +2517,7 @@ impl WrappedTokenProvider {
             if bottles.is_empty() {
                 // Read-only Apple-side lookups, so the user learns *why* there
                 // are no bottles instead of just that there are none.
-                let diag = escrow_diag::diagnose(&keychain).await;
+                let diag = escrow_diag::diagnose(&keychain, self.escrow_proxy_host().await).await;
                 return Err(WrappedError::GenericError {
                     msg: format!("No escrow bottles found. Make sure Messages in iCloud is enabled on your iPhone/Mac. ({})", diag)
                 });
@@ -2530,7 +2546,7 @@ impl WrappedTokenProvider {
     pub async fn diagnose_escrow_bottles(&self) -> Result<String, WrappedError> {
         guard_token_op("diagnose_escrow_bottles", async move {
             let (keychain, _cloudkit) = create_keychain_clients(self).await?;
-            Ok(escrow_diag::diagnose(&keychain).await)
+            Ok(escrow_diag::diagnose(&keychain, self.escrow_proxy_host().await).await)
         }).await
     }
 }
