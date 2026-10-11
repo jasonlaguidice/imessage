@@ -1601,15 +1601,6 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
-			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_diagnose_escrow_bottles(uniffiStatus)
-		})
-		if checksum != 54515 {
-			// If this happens try cleaning and rebuilding your project
-			panic("rustpushgo: uniffi_rustpushgo_checksum_method_wrappedtokenprovider_diagnose_escrow_bottles: UniFFI API checksum mismatch")
-		}
-	}
-	{
-		checksum := rustCall(func(uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_rustpushgo_checksum_method_wrappedtokenprovider_get_account_persist_blob(uniffiStatus)
 		})
 		if checksum != 63205 {
@@ -5489,31 +5480,6 @@ func (_self *WrappedTokenProvider) AnnounceAppleDeviceIfNeeded() error {
 		func(bool) {}, func(rustFuture *C.void, status *C.RustCallStatus) {
 			// freeFunc
 			C.ffi_rustpushgo_rust_future_free_void(unsafe.Pointer(rustFuture), status)
-		})
-}
-
-func (_self *WrappedTokenProvider) DiagnoseEscrowBottles() (string, error) {
-	_pointer := _self.ffiObject.incrementPointer("*WrappedTokenProvider")
-	defer _self.ffiObject.decrementPointer()
-	return uniffiRustCallAsyncWithErrorAndResult(
-		FfiConverterTypeWrappedError{}, func(status *C.RustCallStatus) *C.void {
-			// rustFutureFunc
-			return (*C.void)(C.uniffi_rustpushgo_fn_method_wrappedtokenprovider_diagnose_escrow_bottles(
-				_pointer,
-				status,
-			))
-		},
-		func(handle *C.void, ptr unsafe.Pointer, status *C.RustCallStatus) {
-			// pollFunc
-			C.ffi_rustpushgo_rust_future_poll_rust_buffer(unsafe.Pointer(handle), ptr, status)
-		},
-		func(handle *C.void, status *C.RustCallStatus) RustBufferI {
-			// completeFunc
-			return rustBufferFromC(C.ffi_rustpushgo_rust_future_complete_rust_buffer(unsafe.Pointer(handle), status))
-		},
-		FfiConverterStringINSTANCE.Lift, func(rustFuture *C.void, status *C.RustCallStatus) {
-			// freeFunc
-			C.ffi_rustpushgo_rust_future_free_rust_buffer(unsafe.Pointer(rustFuture), status)
 		})
 }
 

@@ -68,7 +68,6 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdRestoreChat,
 		cmdRestoreDebug,
 		cmdMsgDebug,
-		cmdKeychainDiagnose,
 		cmdKeychainJoin,
 		cmdContacts,
 		cmdSetCardDAV,
@@ -1222,66 +1221,6 @@ func fnMsgDebug(ce *commands.Event) {
 	}
 
 	ce.Reply(sb.String())
-}
-
-// ============================================================================
-// keychain-diagnose command
-// ============================================================================
-
-// cmdKeychainDiagnose asks Apple (read-only) what this login's iCloud Keychain
-// escrow state actually looks like, so "No escrow bottles found" can be told
-// apart from the three different situations that produce it: Apple holds no
-// bottle at all, Apple holds only incomplete ("partial") bottles, or Apple
-// holds valid bottles that rustpush cannot match/parse locally. It makes two
-// Apple lookups and changes nothing.
-var cmdKeychainDiagnose = &commands.FullHandler{
-	Name:          "keychain-diagnose",
-	Func:          fnKeychainDiagnose,
-	RequiresLogin: true,
-	Help: commands.HelpMeta{
-		Section: commands.HelpSectionAdmin,
-		Description: "Read-only check of this login's iCloud Keychain escrow bottles " +
-			"(why a keychain join reports \"No escrow bottles found\"). " +
-			"Makes two Apple lookups; changes nothing.",
-	},
-}
-
-func fnKeychainDiagnose(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
-	if login == nil {
-		ce.Reply("Not logged in.")
-		return
-	}
-	client, ok := login.Client.(*IMClient)
-	if !ok || client == nil {
-		ce.Reply("Bridge client not available.")
-		return
-	}
-	if client.tokenProvider == nil || *client.tokenProvider == nil {
-		ce.Reply("No token provider for this login.")
-		return
-	}
-	// Snapshot the provider: the two CloudKit/keychain lookups below take a
-	// second or two, and the client could be torn down while we wait.
-	tp := *client.tokenProvider
-
-	ce.Reply("Checking escrow bottles…")
-
-	// Same reason the Rust side wraps this call in guard_panic: a panic inside
-	// the FFI call must not take the whole bridge down.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ce.Reply("Escrow diagnostic failed: %v", r)
-			}
-		}()
-		res, err := tp.DiagnoseEscrowBottles()
-		if err != nil {
-			ce.Reply("Escrow diagnostic failed: %v", err)
-			return
-		}
-		ce.Reply("%s", res)
-	}()
 }
 
 // ============================================================================

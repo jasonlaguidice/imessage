@@ -65,9 +65,7 @@ pub(crate) fn classify(valid: usize, partial: usize, viable: usize) -> &'static 
 /// rustpush could use none of them, and to name *which* filter (label match
 /// vs. metadata parse) dropped them. `None` means we could not read it.
 ///
-/// The caller appends the result to its "No escrow bottles found" error; Go
-/// also gets it verbatim through
-/// `WrappedTokenProvider::diagnose_escrow_bottles`.
+/// The caller appends the result to its "No escrow bottles found" error.
 pub(crate) async fn diagnose<P: omnisette::AnisetteProvider + Send + Sync + 'static>(
     keychain: &rustpush::keychain::KeychainClient<P>,
     escrow_host: Option<String>,

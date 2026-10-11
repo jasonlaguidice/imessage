@@ -2540,16 +2540,6 @@ impl WrappedTokenProvider {
             join_keychain_with_bottles(keychain, cloudkit, &bottles, &passcode, preferred).await
         }).await
     }
-
-    /// Read-only escrow diagnostic for the login's iCloud Keychain: counts
-    /// Apple's valid / partial escrow bottles and how many rustpush can use,
-    /// with a one-line verdict. Never joins or changes anything.
-    pub async fn diagnose_escrow_bottles(&self) -> Result<String, WrappedError> {
-        guard_token_op("diagnose_escrow_bottles", async move {
-            let (keychain, _cloudkit) = create_keychain_clients(self).await?;
-            Ok(escrow_diag::diagnose(&keychain, self.escrow_proxy_host().await).await)
-        }).await
-    }
 }
 
 /// Restore a TokenProvider from persisted account credentials.
