@@ -109,11 +109,15 @@ use rustpush::{
     },
 };
 
-use crate::{persist_plist_state, read_plist_state, subsystem_state_path, Client, WrappedError};
+use crate::{
+    persist_plist_state, read_plist_state, statuskit_channel_dates_path, statuskit_state_path,
+    subsystem_state_path, Client, WrappedError,
+};
 
 /// On-disk path for the persistent CD_Channel.record_id → CD_identifier
-/// map. Lives in the same xdg_data_dir as `statuskit-state.plist` and
-/// `facetime-state.plist`. CD_Channel and CD_ReceivedInvitation records
+/// map. Lives in the same xdg_data_dir as the per-user
+/// `statuskit-state_{user_state_key}.plist`, and like it is scoped per
+/// user (see `channel_map_path`). CD_Channel and CD_ReceivedInvitation records
 /// arrive in unrelated fetch pages — when an invitation references a
 /// channel that landed on a different page, the in-pass map can't
 /// resolve the FK and decode fails with "CD_channel FK '...' not
@@ -122,7 +126,17 @@ use crate::{persist_plist_state, read_plist_state, subsystem_state_path, Client,
 ///
 /// Pure local state — never sent to Apple, has zero impact on CKKS or
 /// CloudKit request volume.
-const STATUSKIT_CHANNEL_MAP_FILE: &str = "statuskit-cloud-channel-map.plist";
+const STATUSKIT_CHANNEL_MAP_PREFIX: &str = "statuskit-cloud-channel-map";
+
+/// Per-user channel map path. Channel record ids come from each user's
+/// own CloudKit zone, so sharing one file would leak (and needlessly
+/// grow) one login's map into another's.
+fn channel_map_path(user_state_key: &str) -> String {
+    subsystem_state_path(&format!(
+        "{}_{}.plist",
+        STATUSKIT_CHANNEL_MAP_PREFIX, user_state_key
+    ))
+}
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PersistedChannelMap {
@@ -232,6 +246,28 @@ impl CloudSyncStatusKitPage {
     }
 }
 
+/// Re-opens the one-shot empty-channel-map re-pull latch unless the forced
+/// call succeeded, so a failed attempt (auth/network) is retried on the next
+/// call instead of leaving the empty map parked behind the old token.
+struct ChannelMapRepullLatch<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+    armed: bool,
+}
+
+impl ChannelMapRepullLatch<'_> {
+    fn succeeded(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChannelMapRepullLatch<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 #[uniffi::export(async_runtime = "tokio")]
 impl Client {
     pub async fn cloud_sync_statuskit_peers(
@@ -244,6 +280,46 @@ impl Client {
             cached_zone,
             since_token.is_some()
         );
+
+        // If the channel-map plist is empty — a fresh install, or it was
+        // cleared because it was corrupt — a saved continuation token is a
+        // trap: resuming incrementally fetches only records that CHANGED since
+        // the token, so the CD_ReceivedInvitation / CD_Channel keys already
+        // sitting in CloudKit are never re-fetched and the empty map can never
+        // rebuild. The pass drains 0 records and reports 0 keys forever. Force
+        // ONE full re-pull (drop the token) to re-fetch everything and rebuild
+        // the map; once the plist repopulates, later passes resume incrementally.
+        // One-shot per login per process (statuskit_channel_map_repull_forced):
+        // Go calls this once per page with the previous page's token, so an
+        // unconditional reset would re-fetch page 1 forever while the map is
+        // still empty. The map is per login (channel_map_path), so this only
+        // ever re-pulls this login's zone.
+        //
+        // If the forced call fails, the latch re-opens (ChannelMapRepullLatch)
+        // so the next call retries.
+        let mut repull_latch = None;
+        let since_token = {
+            let channel_map_path = channel_map_path(&self.user_state_key);
+            let persisted: PersistedChannelMap =
+                read_plist_state(&channel_map_path).unwrap_or_default();
+            if persisted.entries.is_empty()
+                && since_token.is_some()
+                && !self
+                    .statuskit_channel_map_repull_forced
+                    .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                info!(
+                    "StatusKit-CloudKit pass: channel-map plist is empty but a continuation token is set — forcing a full re-pull to rebuild from CloudKit"
+                );
+                repull_latch = Some(ChannelMapRepullLatch {
+                    flag: &self.statuskit_channel_map_repull_forced,
+                    armed: true,
+                });
+                None
+            } else {
+                since_token
+            }
+        };
 
         let cm = self.get_or_init_cloud_messages_client().await?;
 
@@ -343,6 +419,11 @@ impl Client {
         let hit = match hit {
             Some(h) => h,
             None => {
+                // No records to decode either way, so the re-pull did what it
+                // could: keep the latch spent and resume incrementally.
+                if let Some(l) = repull_latch.as_mut() {
+                    l.succeeded();
+                }
                 return Ok(CloudSyncStatusKitPage::empty(
                     None,
                     Some("no candidate container/zone produced records".into()),
@@ -362,7 +443,7 @@ impl Client {
         // channel that arrived several passes ago. Without persistence,
         // those FK lookups fail and the records are reported as
         // decode_failed even though the data is reachable.
-        let channel_map_path = subsystem_state_path(STATUSKIT_CHANNEL_MAP_FILE);
+        let channel_map_path = channel_map_path(&self.user_state_key);
         let persisted: PersistedChannelMap =
             read_plist_state(&channel_map_path).unwrap_or_default();
 
@@ -412,6 +493,9 @@ impl Client {
             }
         }
 
+        // No latch disarming on the `?` below: any failed pass re-opens the
+        // latch (ChannelMapRepullLatch's Drop) so the next pass retries the
+        // full re-pull instead of resuming from the parked token.
         let inject_stats = inject_into_state(self, decoded).await?;
 
         // Persist the merged map for the next pass. Skip the write when
@@ -439,6 +523,13 @@ impl Client {
             failure_examples,
             inject_stats.injected_handles
         );
+
+        if let Some(l) = repull_latch.as_mut() {
+            // The fetch itself succeeded, so the latch stays spent: the next
+            // pass resumes incrementally from `since_token` instead of
+            // re-pulling page 1 forever while the map happens to be empty.
+            l.succeeded();
+        }
 
         Ok(CloudSyncStatusKitPage {
             resolved_zone: Some(format!("{}::{}", hit.container_idx, hit.zone_name)),
@@ -633,7 +724,7 @@ fn record_id_name(
 /// Map CD_Channel.record_id → CD_identifier (the base64 channel id used as
 /// the key in `state.keys`). Used to translate a CD_ReceivedInvitation's
 /// CD_channel foreign-key string into the actual channel id we'll insert
-/// under in `statuskit-state.plist`.
+/// under in the per-user `statuskit-state_{user_state_key}.plist`.
 ///
 /// `CD_identifier` is itself an encrypted STRING_TYPE field, and each
 /// CD_Channel record carries its own `protection_info`, so we have to
@@ -757,6 +848,35 @@ struct DecodedPeer {
     channel_id: String,
     from: String,
     device: StatusKitSharedDevice,
+    /// CD_dateInvitationCreated as raw seconds (CloudKit epoch — only relative
+    /// ordering matters). Identifies a peer's MOST-RECENT channel so the
+    /// subscribe-side prune can keep a heavy re-registration churner's current
+    /// channel instead of guessing among dozens of dead ones. 0 if absent.
+    invite_date: i64,
+}
+
+/// Read a CloudKit date field (CD_dateInvitationCreated) as raw seconds. Handles
+/// the plaintext fast-path and the encrypted form, mirroring decrypt_string_field.
+fn read_date_field(
+    rec: &cloudkit_proto::retrieve_changes_response::RecordChange,
+    name: &str,
+    encryptor: &rustpush::pcs::PCSEncryptor,
+) -> Option<i64> {
+    let f = find_field(rec, name)?;
+    let v = f.value.as_ref()?;
+    if v.is_encrypted != Some(true) {
+        if let Some(d) = &v.date_value {
+            return d.time.map(|t| t as i64);
+        }
+    }
+    let ct = v.bytes_value.as_deref()?;
+    let plaintext = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        encryptor.decrypt_data(ct, name)
+    }))
+    .ok()
+    .filter(|b| !b.is_empty())?;
+    let ev = cloudkit_proto::record::field::EncryptedValue::decode(&plaintext[..]).ok()?;
+    ev.date_value.and_then(|d| d.time).map(|t| t as i64)
 }
 
 async fn decode_invitation_record<P: omnisette::AnisetteProvider>(
@@ -872,10 +992,17 @@ async fn decode_invitation_record<P: omnisette::AnisetteProvider>(
     // an empty StatusKitPersonalConfig in that case.
     let device = build_shared_device(sender_handle.clone(), &share_message, "")?;
 
+    // Best-effort: when did the peer share THIS channel? The most-recent invite
+    // is the peer's current channel (a churner re-registers, minting a new one
+    // each time). 0 when absent; the subscribe-side prune ranks undated
+    // channels as newest (they arrived by APNs reshare, not CloudKit).
+    let invite_date = read_date_field(rec, "CD_dateInvitationCreated", &encryptor).unwrap_or(0);
+
     Ok(Some(DecodedPeer {
         channel_id,
         from: sender_handle,
         device,
+        invite_date,
     }))
 }
 
@@ -1032,8 +1159,15 @@ async fn inject_into_state(
     let mut inserted: u32 = 0;
     let mut already_known: u32 = 0;
     let mut injected_handles: Vec<String> = Vec::new();
+    // channel_id -> CD_dateInvitationCreated, recorded for EVERY decoded peer
+    // (not just newly-inserted) so the subscribe-side prune can rank a churner's
+    // dozens of channels by recency and keep their CURRENT one.
+    let mut channel_dates: Vec<(String, i64)> = Vec::with_capacity(peers.len());
 
     for p in peers {
+        if p.invite_date != 0 {
+            channel_dates.push((p.channel_id.clone(), p.invite_date));
+        }
         if let Some(existing) = state.keys.get(&p.channel_id) {
             let existing_bytes = device_canonical_bytes(existing);
             let new_bytes = device_canonical_bytes(&p.device);
@@ -1052,12 +1186,26 @@ async fn inject_into_state(
     }
 
     if inserted > 0 {
-        let path = subsystem_state_path("statuskit-state.plist");
+        let path = statuskit_state_path(&client.user_state_key);
         info!(
             "StatusKit-CloudKit inject: persisting {} new/updated peer(s) to {}",
             inserted, path
         );
         persist_plist_state(&path, &*state);
+    }
+    drop(state);
+
+    // Merge the invite dates into the side plist the prune reads. Channel ids are
+    // stable; merging keeps dates for channels seen in earlier passes too.
+    // Per login: statuskit_channel_dates_path is keyed by user_state_key.
+    if !channel_dates.is_empty() {
+        let dates_path = statuskit_channel_dates_path(&client.user_state_key);
+        let mut dates: plist::Dictionary =
+            read_plist_state::<plist::Dictionary>(&dates_path).unwrap_or_default();
+        for (cid, d) in channel_dates {
+            dates.insert(cid, plist::Value::Integer(d.into()));
+        }
+        persist_plist_state(&dates_path, &dates);
     }
 
     Ok(InjectStats {
@@ -1065,4 +1213,41 @@ async fn inject_into_state(
         already_known,
         injected_handles,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChannelMapRepullLatch;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn repull_latch_reopens_on_failure_and_sticks_on_success() {
+        // A pass that never reaches `succeeded()` (any `?`/`return Err` exit)
+        // must hand the one-shot re-pull back to the next call, otherwise the
+        // empty channel map stays parked behind the old continuation token.
+        let flag = AtomicBool::new(true);
+        {
+            let latch = ChannelMapRepullLatch { flag: &flag, armed: true };
+            // Simulate a failed pass: never disarmed.
+            assert!(latch.armed);
+            drop(latch);
+        }
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a failed pass must re-open the latch so the next call retries the re-pull"
+        );
+
+        // A successful pass consumes the latch for good.
+        flag.store(true, Ordering::Relaxed);
+        {
+            let mut latch = ChannelMapRepullLatch { flag: &flag, armed: true };
+            latch.succeeded();
+            assert!(!latch.armed, "succeeded() disarms the latch");
+            drop(latch);
+        }
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "a successful pass must keep the latch spent so the next pass stays incremental"
+        );
+    }
 }

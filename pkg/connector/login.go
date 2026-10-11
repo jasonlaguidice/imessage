@@ -250,7 +250,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		}
 		l.username = username
 
-		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -287,7 +287,7 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 		return nil, fmt.Errorf("2FA code is required")
 	}
 
-	success, err := l.session.Submit2fa(code)
+	success, err := safeSubmit2fa(l.session, code)
 	if err != nil {
 		return nil, fmt.Errorf("2FA verification failed: %w", err)
 	}
@@ -323,7 +323,7 @@ func (l *AppleIDLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep, er
 		log.Info().Msg("No existing users found, will register fresh (first login)")
 	}
 
-	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
+	result, err := safeFinish(l.session, l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -727,7 +727,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		}
 		l.username = username
 
-		session, err := rustpushgo.LoginStart(username, password, l.cfg, l.conn)
+		session, err := safeLoginStart(username, password, l.cfg, l.conn)
 		if err != nil {
 			l.Main.Bridge.Log.Error().Err(err).Str("username", username).Msg("Login failed")
 			return nil, fmt.Errorf("login failed: %w", err)
@@ -760,7 +760,7 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 		return nil, fmt.Errorf("2FA code is required")
 	}
 
-	success, err := l.session.Submit2fa(code)
+	success, err := safeSubmit2fa(l.session, code)
 	if err != nil {
 		return nil, fmt.Errorf("2FA verification failed: %w", err)
 	}
@@ -796,7 +796,7 @@ func (l *ExternalKeyLogin) finishLogin(ctx context.Context) (*bridgev2.LoginStep
 		log.Info().Msg("No existing users found, will register fresh (first login)")
 	}
 
-	result, err := l.session.Finish(l.cfg, l.conn, existingIdentityArg, existingUsersArg)
+	result, err := safeFinish(l.session, l.cfg, l.conn, existingIdentityArg, existingUsersArg)
 	if err != nil {
 		l.Main.Bridge.Log.Error().Err(err).Msg("IDS registration failed during finishLogin")
 		return nil, fmt.Errorf("login completion failed: %w", err)
@@ -973,13 +973,13 @@ func askFaceTimeStep() (*bridgev2.LoginStep, error) {
 	return &bridgev2.LoginStep{
 		Type:         bridgev2.LoginStepTypeUserInput,
 		StepID:       LoginStepFaceTime,
-		Instructions: "FaceTime Bridge: if you have an Apple device that already handles FaceTime natively, disabling this removes the !im facetime command and suppresses inbound FaceTime notices in bridge chats.",
+		Instructions: "FaceTime call notices: the bridge can't answer or place FaceTime calls, but it can post a notice in the chat when someone calls you and when you miss a call. Answer calls on an Apple device.",
 		UserInputParams: &bridgev2.LoginUserInputParams{
 			Fields: []bridgev2.LoginInputDataField{
 				{
 					Type:    bridgev2.LoginInputFieldTypeSelect,
 					ID:      "facetime_bridge",
-					Name:    "Enable FaceTime Bridge",
+					Name:    "Post FaceTime call notices?",
 					Options: []string{"yes", "no"},
 				},
 			},
@@ -1470,6 +1470,14 @@ func completeLoginWithMeta(
 				meta.MmeDelegateJSON = *delegateJSON
 				log.Info().Msg("Captured MobileMe delegate for persistence")
 			}
+			// And rustpush's account state, so the next restart reuses tokens
+			// that are still valid instead of re-running SRP.
+			if blob, blobErr := tp.GetAccountPersistBlob(); blobErr != nil {
+				log.Warn().Err(blobErr).Msg("Failed to capture rustpush account state for persistence")
+			} else if blob != nil {
+				meta.AccountPersistBlob = *blob
+				log.Info().Msg("Captured rustpush account state for persistence")
+			}
 		}
 	} else {
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
@@ -1491,6 +1499,7 @@ func completeLoginWithMeta(
 		AccountDSID:              meta.AccountDSID,
 		AccountSPDBase64:         meta.AccountSPDBase64,
 		MmeDelegateJSON:          meta.MmeDelegateJSON,
+		AccountPersistBlob:       meta.AccountPersistBlob,
 	})
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))

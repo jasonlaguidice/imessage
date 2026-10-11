@@ -465,6 +465,27 @@ func (s *cloudBackfillStore) upsertChat(
 	return err
 }
 
+// sqlPlaceholders returns a comma-separated list of n bind placeholders in the
+// dialect's own spelling: "$1, $2, …" on Postgres, "?, ?, …" on SQLite.
+//
+// Most queries in this package can write "$N" unconditionally, because
+// dbutil rewrites "$N" to "?N" for SQLite in its Exec/Query/QueryRow
+// wrappers. The batch upserts run through tx.PrepareContext on the raw
+// *sql.Tx from beginTx, which bypasses dbutil entirely, so those statements
+// must carry the correct spelling themselves (lib/pq rejects "?").
+// Ported from upstream ed4c27dd.
+func sqlPlaceholders(db *dbutil.Database, n int) string {
+	out := make([]string, n)
+	for i := range out {
+		if db.Dialect == dbutil.Postgres {
+			out[i] = "$" + strconv.Itoa(i+1)
+		} else {
+			out[i] = "?"
+		}
+	}
+	return strings.Join(out, ", ")
+}
+
 // beginTx starts a database transaction for batch operations.
 func (s *cloudBackfillStore) beginTx(ctx context.Context) (*sql.Tx, error) {
 	return s.db.RawDB.BeginTx(ctx, nil)
@@ -503,7 +524,7 @@ func (s *cloudBackfillStore) upsertMessageBatch(ctx context.Context, rows []clou
 			tapback_type, tapback_target_guid, tapback_emoji,
 			attachments_json, date_read_ms, has_body,
 			created_ts, updated_ts
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (`+sqlPlaceholders(s.db, 20)+`)
 		ON CONFLICT (login_id, guid) DO UPDATE SET
 			record_name=excluded.record_name,
 			chat_id=excluded.chat_id,
@@ -772,7 +793,7 @@ func (s *cloudBackfillStore) upsertChatBatch(ctx context.Context, chats []cloudC
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service, display_name,
 			group_photo_guid, participants_json, updated_ts, created_ts, is_filtered
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (`+sqlPlaceholders(s.db, 12)+`)
 		ON CONFLICT (login_id, cloud_chat_id) DO UPDATE SET
 			record_name=excluded.record_name,
 			group_id=excluded.group_id,
@@ -1082,7 +1103,7 @@ func (s *cloudBackfillStore) insertDeletedChatTombstone(
 		INSERT INTO cloud_chat (
 			login_id, cloud_chat_id, record_name, group_id, portal_id, service,
 			display_name, participants_json, updated_ts, created_ts, deleted
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE)
 		ON CONFLICT (login_id, cloud_chat_id) DO NOTHING
 	`, s.loginID, cloudChatID, recordName, groupID, portalID, service, nullableString(displayName), participantsJSON, nowMS, nowMS)
 	return err
@@ -2021,7 +2042,7 @@ func (s *cloudBackfillStore) hardDeleteMessagesByPortalID(ctx context.Context, p
 	return n, nil
 }
 
-// resetForwardBackfillDone unconditionally sets fwd_backfill_done=0 for all
+// resetForwardBackfillDone unconditionally sets fwd_backfill_done=FALSE for all
 // cloud_chat rows of a portal so forward backfill re-runs. Used during chat
 // recovery where the cloud_chat may or may not be soft-deleted.
 func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, portalID string) error {
@@ -2030,6 +2051,89 @@ func (s *cloudBackfillStore) resetForwardBackfillDone(ctx context.Context, porta
 		s.loginID, portalID,
 	)
 	return err
+}
+
+// carrierGroupChatRow is one carrier-service (SMS/RCS/MMS) group cloud_chat row
+// used by the participant-set consolidation migration.
+type carrierGroupChatRow struct {
+	portalID     string
+	participants []string
+}
+
+// listCarrierGroupChats returns the distinct group portals (gid: or comma) for
+// non-deleted SMS/RCS/MMS chats, each with its normalized participant roster, for
+// consolidateCarrierGroupPortals. DM portals and empty-roster rows are excluded.
+func (s *cloudBackfillStore) listCarrierGroupChats(ctx context.Context) ([]carrierGroupChatRow, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT DISTINCT portal_id, participants_json FROM cloud_chat
+		 WHERE login_id=$1 AND UPPER(TRIM(service)) IN ('SMS','RCS','MMS') AND deleted=FALSE
+		   AND portal_id <> '' AND participants_json IS NOT NULL AND participants_json <> ''
+		   AND (portal_id LIKE 'gid:%' OR portal_id LIKE '%,%')`,
+		s.loginID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []carrierGroupChatRow
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var portalID, participantsJSON string
+		if err = rows.Scan(&portalID, &participantsJSON); err != nil {
+			return nil, err
+		}
+		if seen[portalID] {
+			continue
+		}
+		var raw []string
+		if err = json.Unmarshal([]byte(participantsJSON), &raw); err != nil {
+			continue
+		}
+		normalized := make([]string, 0, len(raw))
+		for _, p := range raw {
+			if n := normalizeIdentifierForPortalID(p); n != "" {
+				normalized = append(normalized, n)
+			}
+		}
+		if len(normalized) == 0 {
+			continue
+		}
+		seen[portalID] = true
+		out = append(out, carrierGroupChatRow{portalID: portalID, participants: normalized})
+	}
+	return out, rows.Err()
+}
+
+// reKeyPortalID re-points all cloud_chat and cloud_message rows from oldPortalID
+// to newPortalID and resets forward-backfill state so the re-keyed messages
+// re-backfill into the new portal's room. updated_ts is bumped so the portal
+// isn't skipped by the "fully backfilled, no new content" startup filter.
+// Mirrors the normalizeGroup*PortalIDs migrations. No-op-safe.
+func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, newPortalID string) error {
+	if oldPortalID == "" || newPortalID == "" || oldPortalID == newPortalID {
+		return nil
+	}
+	nowMS := time.Now().UnixMilli()
+	// Messages first, then the chat row: the carrier-group planner reads only
+	// cloud_chat, so if the second update fails the chat still sits under the
+	// old ID and the next startup retries the whole re-key (re-running the
+	// message update is a no-op).
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_message SET portal_id=$3, updated_ts=$4
+		 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, oldPortalID, newPortalID, nowMS,
+	); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(ctx,
+		`UPDATE cloud_chat SET portal_id=$3, fwd_backfill_done=FALSE, updated_ts=$4
+		 WHERE login_id=$1 AND portal_id=$2`,
+		s.loginID, oldPortalID, newPortalID, nowMS,
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 // persistMessageUUID inserts a minimal cloud_message record for a realtime
@@ -3139,12 +3243,20 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	// Reactions (tapback_type IS NOT NULL) are excluded: an incoming reaction
 	// to something you sent does not create an unread state. The filter finds
 	// the last substantive message and uses its direction as the read signal.
+	//
+	// The tiebreaker used to be `rowid DESC`, which Postgres tables do not
+	// have. `guid` replaces it (upstream a9024dd2): it is half of the primary
+	// key, so the result is deterministic on both dialects, and it matches
+	// the (timestamp_ms, guid) ordering the paging queries use to pick the
+	// message a read receipt targets. Do not add created_ts in front of it:
+	// a batch upsert stamps every row with the same value, and it would make
+	// this query disagree with the paging order.
 	var isFromMe bool
 	err := s.db.QueryRow(ctx, `
 		SELECT is_from_me FROM cloud_message
 		WHERE login_id=$1 AND portal_id=$2 AND deleted=FALSE
 		  AND tapback_type IS NULL
-		ORDER BY timestamp_ms DESC, rowid DESC
+		ORDER BY timestamp_ms DESC, guid DESC
 		LIMIT 1
 	`, s.loginID, portalID).Scan(&isFromMe)
 	if err == nil {
@@ -3169,6 +3281,35 @@ func (s *cloudBackfillStore) getConversationReadByMe(ctx context.Context, portal
 	return count > 0, nil
 }
 
+// referencedAttachmentRecordNamesQuery returns a subquery selecting every
+// attachment record_name referenced by a live cloud_message row of login $1.
+// SQLite expands the attachments_json array with json_each/json_extract;
+// Postgres has neither, so it uses jsonb_array_elements. The CASE guards the
+// ::jsonb cast, since Postgres does not promise to apply the WHERE filters
+// before evaluating the lateral function.
+func referencedAttachmentRecordNamesQuery(db *dbutil.Database) string {
+	if db.Dialect == dbutil.Postgres {
+		return `
+			SELECT DISTINCT je.value->>'record_name'
+			FROM cloud_message, jsonb_array_elements(
+				CASE WHEN cloud_message.attachments_json LIKE '[%'
+				THEN cloud_message.attachments_json::jsonb
+				ELSE '[]'::jsonb END
+			) AS je
+			WHERE cloud_message.login_id=$1
+			  AND cloud_message.deleted=FALSE
+			  AND je.value->>'record_name' IS NOT NULL`
+	}
+	return `
+			SELECT DISTINCT json_extract(je.value, '$.record_name')
+			FROM cloud_message, json_each(cloud_message.attachments_json) AS je
+			WHERE cloud_message.login_id=$1
+			  AND cloud_message.deleted=FALSE
+			  AND cloud_message.attachments_json IS NOT NULL
+			  AND cloud_message.attachments_json <> ''
+			  AND json_extract(je.value, '$.record_name') IS NOT NULL`
+}
+
 // pruneOrphanedAttachmentCache deletes cloud_attachment_cache entries whose
 // record_name is not referenced by any live (non-deleted) cloud_message row.
 // This prevents unbounded growth after portal deletions or message tombstones
@@ -3177,15 +3318,7 @@ func (s *cloudBackfillStore) pruneOrphanedAttachmentCache(ctx context.Context) (
 	result, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_attachment_cache
 		WHERE login_id=$1
-		  AND record_name NOT IN (
-			SELECT DISTINCT json_extract(je.value, '$.record_name')
-			FROM cloud_message, json_each(cloud_message.attachments_json) AS je
-			WHERE cloud_message.login_id=$1
-			  AND cloud_message.deleted=FALSE
-			  AND cloud_message.attachments_json IS NOT NULL
-			  AND cloud_message.attachments_json <> ''
-			  AND json_extract(je.value, '$.record_name') IS NOT NULL
-		  )
+		  AND record_name NOT IN (`+referencedAttachmentRecordNamesQuery(s.db)+`)
 	`, s.loginID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to prune orphaned attachment cache: %w", err)

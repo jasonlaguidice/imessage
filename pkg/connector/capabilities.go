@@ -22,7 +22,7 @@ func supportedIfFFmpeg() event.CapabilitySupportLevel {
 }
 
 const iMessageMaxFileSize = 2000 * 1024 * 1024 // 2 GB
-const capabilityID = "fi.mau.imessage.capabilities.2025_03"
+const capabilityID = "fi.mau.imessage.capabilities.2026_07"
 
 var caps = &event.RoomFeatures{
 	ID: capabilityID,
@@ -79,6 +79,13 @@ var caps = &event.RoomFeatures{
 			MaxSize: iMessageMaxFileSize,
 		},
 	},
+	// iMessage itself imposes no documented text limit, but a Matrix event has
+	// to fit in a 65,536-byte PDU. Advertise what one event can actually hold so
+	// clients can warn before sending something larger. This is deliberately
+	// tighter than maxOutboundTextBytes: clients should respect this number, and
+	// the outbound splitter only catches whatever gets past it.
+	MaxTextLength: maxTextContentBytes,
+
 	Reply:               event.CapLevelFullySupported,
 	Edit:                event.CapLevelFullySupported,
 	Delete:              event.CapLevelFullySupported,
@@ -106,6 +113,9 @@ func (c *IMConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return generalCaps
 }
 
+// Bump the capabilities version whenever `caps` changes, otherwise portals keep
+// serving the previously cached capability event. Last bumped when
+// MaxTextLength was added.
 func (c *IMConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 1
+	return 1, 2
 }

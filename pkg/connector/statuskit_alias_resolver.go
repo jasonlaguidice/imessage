@@ -3,13 +3,13 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
@@ -55,16 +55,19 @@ const (
 	// its DM portal. KV-backed mirror of statusKitPortalCache; persists
 	// across bridge restarts so previously-resolved aliases remain O(1)
 	// without re-paying IDS / contact-store lookups.
+	// Scoped per login via statusKitKey.
 	statusKitAliasPortalKeyPrefix = "statuskit.alias_portal."
 
 	// statusKitChannelClusterKeyPrefix maps a StatusKit channel id to a
 	// JSON-encoded list of every peer handle observed publishing on it.
 	// Aliases of the same peer share a channel id.
+	// Scoped per login via statusKitKey.
 	statusKitChannelClusterKeyPrefix = "statuskit.channel_cluster."
 
 	// statusKitAliasChannelsKeyPrefix is the reverse index — handle to
 	// JSON-encoded list of channel ids the handle has been seen on. Used
 	// during transitive resolution to find sibling aliases.
+	// Scoped per login via statusKitKey.
 	statusKitAliasChannelsKeyPrefix = "statuskit.alias_channels."
 
 	// statusKitIDSAttemptKeyPrefix records the last time we asked Apple
@@ -75,6 +78,7 @@ const (
 	// negative cache. Apple is fine with periodic IDS round-trips per the
 	// existing chat/message paths, but we don't want a tight loop of
 	// retries against a handle that genuinely returns LookupFailed.
+	// Scoped per login via statusKitKey.
 	statusKitIDSAttemptKeyPrefix = "statuskit.ids_attempt."
 )
 
@@ -184,7 +188,7 @@ func (c *IMClient) recordReshareObservation(ctx context.Context, log zerolog.Log
 		return
 	}
 
-	clusterKey := database.Key(statusKitChannelClusterKeyPrefix + channelID)
+	clusterKey := c.statusKitKey(statusKitChannelClusterKeyPrefix, channelID)
 	cluster := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, clusterKey))
 	clusterGrew := false
 	if !containsString(cluster, senderHandle) {
@@ -200,7 +204,7 @@ func (c *IMClient) recordReshareObservation(ctx context.Context, log zerolog.Log
 		}
 	}
 
-	revKey := database.Key(statusKitAliasChannelsKeyPrefix + senderHandle)
+	revKey := c.statusKitKey(statusKitAliasChannelsKeyPrefix, senderHandle)
 	channels := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, revKey))
 	if !containsString(channels, channelID) {
 		channels = append(channels, channelID)
@@ -280,14 +284,14 @@ func (c *IMClient) resolveViaCluster(ctx context.Context, log zerolog.Logger, un
 	if unknown == "" {
 		return nil
 	}
-	channels := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitAliasChannelsKeyPrefix+unknown)))
+	channels := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitAliasChannelsKeyPrefix, unknown)))
 	if len(channels) == 0 {
 		return nil
 	}
 
 	visited := map[string]struct{}{unknown: {}}
 	for _, channelID := range channels {
-		cluster := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitChannelClusterKeyPrefix+channelID)))
+		cluster := decodeAliasList(c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitChannelClusterKeyPrefix, channelID)))
 		for _, sibling := range cluster {
 			if _, dup := visited[sibling]; dup {
 				continue
@@ -334,7 +338,7 @@ func (c *IMClient) lookupAliasPortal(ctx context.Context, alias string) *bridgev
 			return p
 		}
 	}
-	raw := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitAliasPortalKeyPrefix+alias))
+	raw := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitAliasPortalKeyPrefix, alias))
 	if raw == "" {
 		return nil
 	}
@@ -407,7 +411,7 @@ func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portal
 		return
 	}
 	c.statusKitPortalCache.Store(alias, portalID)
-	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitAliasPortalKeyPrefix+alias), string(portalID))
+	c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitAliasPortalKeyPrefix, alias), string(portalID))
 }
 
 // hydrateAliasPortalCacheFromKV pre-loads the in-memory
@@ -415,9 +419,11 @@ func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portal
 // resolved aliases are usable on the very first presence update after a
 // restart. Reads are bulk against the KV table.
 func (c *IMClient) hydrateAliasPortalCacheFromKV(ctx context.Context, log zerolog.Logger) {
+	// This login's rows only: "statuskit.alias_portal.<loginID>.<alias>".
+	loginPrefix := string(c.statusKitKey(statusKitAliasPortalKeyPrefix, ""))
 	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx,
 		"SELECT key, value FROM kv_store WHERE bridge_id=$1 AND key LIKE $2",
-		c.Main.Bridge.ID, statusKitAliasPortalKeyPrefix+"%")
+		c.Main.Bridge.ID, loginPrefix+"%")
 	if err != nil {
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration query failed")
 		return
@@ -429,7 +435,11 @@ func (c *IMClient) hydrateAliasPortalCacheFromKV(ctx context.Context, log zerolo
 		if err := rows.Scan(&key, &value); err != nil {
 			continue
 		}
-		alias := strings.TrimPrefix(key, statusKitAliasPortalKeyPrefix)
+		// LIKE treats "_" in a login ID as a wildcard; keep exact-prefix rows only.
+		if !strings.HasPrefix(key, loginPrefix) {
+			continue
+		}
+		alias := strings.TrimPrefix(key, loginPrefix)
 		c.statusKitPortalCache.Store(alias, networkid.PortalID(value))
 		loaded++
 	}
@@ -500,7 +510,7 @@ func (c *IMClient) resolveStatusPortalViaIDSCached(ctx context.Context, log zero
 	if portal := c.lookupAliasPortal(ctx, canonical); portal != nil {
 		return portal
 	}
-	attemptKey := database.Key(statusKitIDSAttemptKeyPrefix + canonical)
+	attemptKey := c.statusKitKey(statusKitIDSAttemptKeyPrefix, canonical)
 	if raw := c.Main.Bridge.DB.KV.Get(ctx, attemptKey); raw != "" {
 		if attemptedAt, err := time.Parse(time.RFC3339, raw); err == nil {
 			if time.Since(attemptedAt) < statusKitIDSAttemptCooldown {
@@ -562,6 +572,28 @@ func (c *IMClient) resolveStatusPortalViaIDSCached(ctx context.Context, log zero
 // each pass confirms link state and picks up aliases that became resolvable
 // (new ghosts, new cluster observations, Apple finally returning a correlation)
 // since the prior pass. Also runs once at bridge start so a restart resyncs.
+// batchResolveHandlesSafe wraps Client.BatchResolveHandles with a recover
+// guard. The Rust side isolates lookup panics through ids_guard, so this
+// should never fire; it is the backstop for panic sites that seam does not
+// cover, since uniffi's Go binding re-panics and this runs on the
+// StatusKit-CloudKit sync path.
+func (c *IMClient) batchResolveHandlesSafe(unknowns, knownHandles []string) (results map[string][]string, err error) {
+	if c.client == nil || len(unknowns) == 0 {
+		return nil, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			c.UserLogin.Log.Error().Interface("panic", r).
+				Int("unknowns", len(unknowns)).
+				Int("known_siblings", len(knownHandles)).
+				Msg("BatchResolveHandles panicked in FFI path")
+			results = nil
+			err = fmt.Errorf("BatchResolveHandles panicked: %v", r)
+		}
+	}()
+	return c.client.BatchResolveHandles(unknowns, knownHandles)
+}
+
 func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Logger) {
 	if c.client == nil {
 		return
@@ -639,7 +671,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 		}
 	}
 
-	results, err := c.client.BatchResolveHandles(unknowns, knownHandles)
+	results, err := c.batchResolveHandlesSafe(unknowns, knownHandles)
 	if err != nil {
 		log.Warn().Err(err).
 			Int("unknowns", len(unknowns)).
@@ -673,7 +705,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 		// state cached against this handle. Subsequent updates with the
 		// same mode are then deduped as "unchanged" and the matrix portal
 		// never sees the indicator — even though routing now works.
-		preExisting := c.Main.Bridge.DB.KV.Get(persistCtx, database.Key(statusKitAliasPortalKeyPrefix+unknown))
+		preExisting := c.Main.Bridge.DB.KV.Get(persistCtx, c.statusKitKey(statusKitAliasPortalKeyPrefix, unknown))
 		isNewMapping := preExisting != string(portal.ID)
 
 		// Persist explicitly with the detached ctx. findPortalForAliases
@@ -686,7 +718,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 		// to "already attempted, skip" — the batch path just succeeded for
 		// it. lookupAliasPortal would short-circuit first anyway, but
 		// clearing keeps the KV honest.
-		c.Main.Bridge.DB.KV.Set(persistCtx, database.Key(statusKitIDSAttemptKeyPrefix+unknown), "")
+		c.Main.Bridge.DB.KV.Set(persistCtx, c.statusKitKey(statusKitIDSAttemptKeyPrefix, unknown), "")
 
 		if isNewMapping {
 			// Clear the presence dedupe state keyed on the raw (prefix-stripped)
@@ -702,7 +734,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 				raw = strings.TrimPrefix(raw, "tel:")
 			}
 			c.statusKitPresence.Delete(raw)
-			c.Main.Bridge.DB.KV.Set(persistCtx, database.Key("statuskit.presence."+raw), "")
+			c.Main.Bridge.DB.KV.Set(persistCtx, c.statusKitKey(statusKitPresenceKeyPrefix, raw), "")
 			newMappings++
 			log.Info().
 				Str("alias", unknown).
@@ -713,7 +745,7 @@ func (c *IMClient) batchLinkStatusKitAliases(ctx context.Context, log zerolog.Lo
 
 		// Read-after-write verification surfaces silent KV failures so
 		// future regressions are immediately visible in the logs.
-		if got := c.Main.Bridge.DB.KV.Get(persistCtx, database.Key(statusKitAliasPortalKeyPrefix+unknown)); got != string(portal.ID) {
+		if got := c.Main.Bridge.DB.KV.Get(persistCtx, c.statusKitKey(statusKitAliasPortalKeyPrefix, unknown)); got != string(portal.ID) {
 			log.Warn().
 				Str("alias", unknown).
 				Str("expected_portal_id", string(portal.ID)).

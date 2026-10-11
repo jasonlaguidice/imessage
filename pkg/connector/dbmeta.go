@@ -28,6 +28,13 @@ type MessageMetadata struct {
 	// iMessages (attachment + follow-up text). Stored on the primary DB row so
 	// redact/unsend can remove both halves together.
 	SiblingUUID string `json:"sibling_uuid,omitempty"`
+
+	// ContinuationUUIDs holds the extra iMessages produced when one oversized
+	// Matrix message had to be sent as several. Kept separate from SiblingUUID,
+	// which pairs an attachment with its caption and holds exactly one UUID.
+	// Without this a Matrix redaction would unsend only the first chunk, leaving
+	// the rest on the recipient's device while Matrix shows the message deleted.
+	ContinuationUUIDs []string `json:"continuation_uuids,omitempty"`
 }
 
 type UserLoginMetadata struct {
@@ -54,7 +61,7 @@ type UserLoginMetadata struct {
 	VideoTranscoding           *bool   `json:"video_transcoding,omitempty"`
 	HEICConversion             *bool   `json:"heic_conversion,omitempty"`
 	CloudKitBackfill           *bool   `json:"cloudkit_backfill,omitempty"`
-	DisableFaceTime            *bool   `json:"disable_facetime,omitempty"`
+	DisableFaceTime            *bool   `json:"disable_facetime,omitempty"` // suppresses FaceTime call notices (FaceTime is notify-only)
 	StatusKitNotifications     *bool   `json:"statuskit_notifications,omitempty"`
 	StatusKitNotificationStyle *string `json:"statuskit_notification_style,omitempty"`
 
@@ -77,6 +84,14 @@ type UserLoginMetadata struct {
 	// Cached MobileMe delegate JSON — seeded on restore so contacts work
 	// without needing to refresh (which requires a still-valid PET).
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// Opaque rustpush account state for this login: the account record
+	// (tokens with their real expirations) and the MobileMe delegate state,
+	// as a base64 binary plist (rustpushgo get_account_persist_blob). Handed
+	// back to RestoreTokenProvider so a restart reuses still-valid tokens
+	// instead of an SRP login; the Account* fields above remain the fallback
+	// for sessions that predate it. Ported from corten af1fe3e1.
+	AccountPersistBlob string `json:"account_persist_blob,omitempty"`
 }
 
 func boolPtr(b bool) *bool    { return &b }

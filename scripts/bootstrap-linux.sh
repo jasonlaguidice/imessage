@@ -3,8 +3,10 @@
 # Equivalent to macOS's Homebrew auto-install in check-deps.
 set -euo pipefail
 
-MIN_GO="1.24"
-MIN_RUST="1.88"
+MIN_GO="1.26"
+# Rust 1.95+: rustpush (>= 8983677) uses atomic_try_update, stable since 1.95.
+# Keep in sync with RUST_MIN_VERSION in the Makefile.
+MIN_RUST="1.95"
 
 echo ""
 echo "Checking Linux build dependencies..."
@@ -52,15 +54,31 @@ install_rust() {
     echo "✓ Rust $(rustc --version | awk '{print $2}') installed"
 }
 
+rust_too_old() {
+    local ver major minor need_minor
+    ver=$(rustc --version | awk '{print $2}')
+    major=$(echo "$ver" | cut -d. -f1)
+    minor=$(echo "$ver" | cut -d. -f2)
+    need_minor=$(echo "$MIN_RUST" | cut -d. -f2)
+    [ "$major" -lt 1 ] || { [ "$major" -eq 1 ] && [ "$minor" -lt "$need_minor" ]; }
+}
+
 if command -v rustc >/dev/null 2>&1; then
     RUST_VER=$(rustc --version | awk '{print $2}')
-    RUST_MAJOR=$(echo "$RUST_VER" | cut -d. -f1)
-    RUST_MINOR=$(echo "$RUST_VER" | cut -d. -f2)
-    NEED_MINOR=$(echo "$MIN_RUST" | cut -d. -f2)
-    if [ "$RUST_MAJOR" -lt 1 ] || { [ "$RUST_MAJOR" -eq 1 ] && [ "$RUST_MINOR" -lt "$NEED_MINOR" ]; }; then
+    if rust_too_old; then
         echo "Rust $RUST_VER is too old (need $MIN_RUST+), upgrading..."
         if command -v rustup >/dev/null 2>&1; then
             rustup update stable
+            # A default pinned to an older numbered toolchain is not moved by
+            # `rustup update stable`; switch the default to stable in that case.
+            if rust_too_old; then
+                rustup default stable
+            fi
+            if rust_too_old; then
+                echo "✗ Rust is still $(rustc --version | awk '{print $2}') after updating (need $MIN_RUST+)." >&2
+                echo "  Check for a rust-toolchain override or RUSTUP_TOOLCHAIN in your environment." >&2
+                exit 1
+            fi
             echo "✓ Rust updated to $(rustc --version | awk '{print $2}')"
         else
             install_rust
@@ -83,7 +101,7 @@ install_go() {
     local GO_VERSION
     GO_VERSION=$(curl -sSL 'https://go.dev/dl/?mode=json' | grep -o '"version": *"go[0-9.]*"' | head -1 | grep -o 'go[0-9.]*')
     if [ -z "$GO_VERSION" ]; then
-        GO_VERSION="go1.25.0"
+        GO_VERSION="go1.26.0"
     fi
     local ARCH
     case "$(uname -m)" in

@@ -741,7 +741,8 @@ func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL str
 type photoFetcher func(ctx context.Context, url string) ([]byte, error)
 
 // deadContactPhotoURLs remembers photo URLs that returned a permanent HTTP
-// failure (401/403/404/410) so the contact-photo download phase doesn't
+// failure (see photoFailurePermanentForHost: 404/410 from any host, 401/403
+// from third-party hosts only) so the contact-photo download phase doesn't
 // re-hammer the same dead host on every sync. The common case is a third-party
 // photo host embedded in a contact's vCard (e.g. img.contactsplus.com) that
 // blocks the bridge with a 403 — CardDAV re-supplies that URL from the vCard
@@ -785,6 +786,32 @@ func photoFailurePermanent(err error) bool {
 		strings.Contains(s, "HTTP 403 ") ||
 		strings.Contains(s, "HTTP 404 ") ||
 		strings.Contains(s, "HTTP 410 ")
+}
+
+// isAppleContactPhotoHost reports whether url points at Apple's own contact
+// photo CDN (iCloud / Apple), which is fetched with iCloud auth headers.
+func isAppleContactPhotoHost(url string) bool {
+	return strings.Contains(url, ".icloud.com") || strings.Contains(url, ".apple.com")
+}
+
+// photoFailurePermanentForHost is photoFailurePermanent, but a 401/403 from
+// Apple's own photo CDN is treated as transient rather than a dead photo. It
+// is almost always rate limiting from fetching many photos at once (e.g. a
+// restart re-downloading the whole address book). Dead-caching it cleared the
+// URL and blanked every iCloud photo for the cache TTL, so it is retried on
+// the next sync instead. A genuinely removed photo returns 404/410, which is
+// still cached for every host, and a third-party 401/403 is a real block.
+func photoFailurePermanentForHost(err error, url string) bool {
+	if !photoFailurePermanent(err) {
+		return false
+	}
+	if isAppleContactPhotoHost(url) {
+		s := err.Error()
+		if strings.Contains(s, "HTTP 401 ") || strings.Contains(s, "HTTP 403 ") {
+			return false
+		}
+	}
+	return true
 }
 
 // downloadContactPhotos downloads photo URLs for contacts that have AvatarURL
@@ -837,16 +864,17 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 
 			var data []byte
 			var err error
-			if authDL != nil && (strings.Contains(c.AvatarURL, ".icloud.com") || strings.Contains(c.AvatarURL, ".apple.com")) {
+			if authDL != nil && isAppleContactPhotoHost(c.AvatarURL) {
 				data, err = authDL(ctx, c.AvatarURL)
 			} else {
 				data, _, err = downloadURL(ctx, c.AvatarURL)
 			}
 			if err != nil {
-				// Cache permanent failures (403/401/404/410) so we stop
-				// re-fetching this dead host every sync. Transient errors
-				// (429/5xx/network) are left out so they retry next cycle.
-				if photoFailurePermanent(err) {
+				// Cache permanent failures so we stop re-fetching a dead
+				// host every sync. Transient errors (429/5xx/network, and
+				// 401/403 from Apple's own CDN) retry next cycle; the ghost
+				// keeps a deferred avatar meanwhile (see contactAvatar).
+				if photoFailurePermanentForHost(err, c.AvatarURL) {
 					deadContactPhotoURLs.Store(c.AvatarURL, time.Now())
 				}
 				log.Debug().Err(sanitizeURLError(err, c.AvatarURL)).
@@ -856,8 +884,12 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 				return
 			}
 			if len(data) > 0 {
+				// Keep AvatarURL. carryOverAvatars reuses a cached photo only
+				// when the old and fresh URLs match; clearing it here made
+				// every photo re-download each sync (hammering iCloud into a
+				// 403). needsDownload already skips contacts with bytes, so a
+				// retained URL never causes a re-fetch.
 				c.Avatar = data
-				c.AvatarURL = ""
 			}
 		}(contact)
 	}

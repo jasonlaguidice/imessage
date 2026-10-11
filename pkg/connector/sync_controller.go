@@ -3,7 +3,9 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"runtime/debug"
 	"sort"
@@ -279,7 +281,7 @@ func (c *IMClient) seedDeletedChatsFromRecycleBin(log zerolog.Logger) {
 		log.Info().Int("recoverable_chats", len(recoverableChats)).
 			Msg("DELETE-SEED: read recoverable chats, matching against local portal IDs")
 		for _, chat := range recoverableChats {
-			portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+			portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 			if portalID == "" {
 				log.Debug().
 					Str("record_name", chat.RecordName).
@@ -781,11 +783,77 @@ func (c *IMClient) setContactsReady(log zerolog.Logger) {
 	}
 }
 
+const (
+	// presenceSubscribeDebounce is the quiet window after the LAST key-sharing
+	// message in a burst before a coalesced re-subscribe fires. Trailing-edge:
+	// the subscribe reads the fully-settled state.keys snapshot, so it never
+	// misses a channel (a prior LEADING-edge debounce swallowed the follow-up
+	// that carried the new channel — see subscribeToContactPresence).
+	presenceSubscribeDebounce = 3 * time.Second
+	// presenceSubscribeMaxWait caps the total delay from the FIRST key in a
+	// burst, so a continuous key stream (a heavily-keyed account whose reshares
+	// trickle in without a 3s gap) can't starve presence indefinitely.
+	presenceSubscribeMaxWait = 30 * time.Second
+)
+
+// schedulePresenceSubscribe coalesces a burst of OnKeysReceived events into a
+// single subscribeToContactPresence call. Each key-sharing message re-arms a
+// trailing-edge timer; the subscribe runs once, presenceSubscribeDebounce after
+// the last key (or presenceSubscribeMaxWait after the first, whichever comes
+// first). This is the pounding fix for heavily-keyed accounts: instead of one
+// full chunked SubscribeToStatus per key (dozens, back-to-back, each larger the
+// more keys the user has), the whole startup burst becomes ONE re-subscribe.
+//
+// A monotonically-increasing generation stamps each arm; only the timer whose
+// generation is still current fires the subscribe, so re-arming is race-free
+// without holding a timer handle. Keys that arrive DURING a running subscribe
+// re-arm a fresh generation, so the tail is always picked up by a follow-up
+// (subscribeToContactPresence serializes via lastPresenceSubscribeLock).
+func (c *IMClient) schedulePresenceSubscribe(log zerolog.Logger) {
+	c.presenceSubscribeLock.Lock()
+	now := time.Now()
+	if !c.presenceSubscribePending {
+		c.presenceSubscribePending = true
+		c.presenceSubscribeFirstAt = now
+	}
+	c.presenceSubscribeGen++
+	gen := c.presenceSubscribeGen
+	delay := presenceSubscribeDelay(now, c.presenceSubscribeFirstAt)
+	c.presenceSubscribeLock.Unlock()
+
+	time.AfterFunc(delay, func() {
+		c.presenceSubscribeLock.Lock()
+		if c.presenceSubscribeGen != gen {
+			// A newer key re-armed the timer; this generation is stale.
+			c.presenceSubscribeLock.Unlock()
+			return
+		}
+		c.presenceSubscribePending = false
+		c.presenceSubscribeLock.Unlock()
+		c.subscribeToContactPresence(log)
+	})
+}
+
+// presenceSubscribeDelay returns how long to wait before the coalesced
+// re-subscribe: the debounce window, capped so the total wait since the
+// first key of the burst never exceeds presenceSubscribeMaxWait.
+func presenceSubscribeDelay(now, firstAt time.Time) time.Duration {
+	delay := presenceSubscribeDebounce
+	if remaining := presenceSubscribeMaxWait - now.Sub(firstAt); remaining < delay {
+		if remaining < 0 {
+			remaining = 0
+		}
+		delay = remaining
+	}
+	return delay
+}
+
 // subscribeToContactPresence subscribes to iMessage presence updates for all
 // known ghosts via StatusKit. Presence changes are delivered via
 // OnStatusUpdate and mapped to Matrix ghost presence.
 func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
-	if c.client == nil {
+	cl := c.client
+	if cl == nil {
 		return
 	}
 	// Guard against panics inside the SubscribeToStatus FFI call (upstream
@@ -837,7 +905,7 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 	if len(handles) == 0 {
 		return
 	}
-	if err := c.client.SubscribeToStatus(handles); err != nil {
+	if err := cl.SubscribeToStatus(handles); err != nil {
 		log.Warn().Err(err).Int("count", len(handles)).Msg("Failed to subscribe to presence")
 	} else {
 		log.Info().Int("count", len(handles)).Msg("Subscribed to iMessage presence for known ghosts")
@@ -850,12 +918,21 @@ func (c *IMClient) subscribeToContactPresence(log zerolog.Logger) {
 // paced sweep (startup + periodic), one handle per IDS send, with this
 // delay between sends so we don't recreate the all-at-once batch shape
 // that appears to trigger peer-side filtering / spam heuristics.
-const statusKitInterInviteDelay = 1500 * time.Millisecond
+// Rate-limit the StatusKit invite path: pace one-handle-per-IDS-send invites
+// well apart so a sweep can never burst Apple's IDS endpoint (on top of the
+// no-keys cache, which removes the bulk of the queries entirely). Each invite
+// is 2 IDS queries + 1 send, so 30s spacing keeps the worst-case rate to ~2
+// invites/min — and after the cache populates, a steady-state sweep has only a
+// handful of live targets anyway. StatusKit reshare is not time-critical, so a
+// slow sweep is a safe trade against pounding Apple.
+const statusKitInterInviteDelay = 30 * time.Second
 
 // statusKitLastInviteKeyPrefix is the KV store prefix for per-handle
 // last-ATTEMPT timestamps (RFC3339). Used only on the periodic tick path
 // to bound failed-retry cadence; successful sends are latched separately
 // and never re-attempted.
+//
+// The full key is scoped per login via statusKitKey: "<prefix><loginID>.<handle>".
 const statusKitLastInviteKeyPrefix = "statuskit.last_invite."
 
 // statusKitLastPostInviteShareKey stores the last time we published our
@@ -863,6 +940,9 @@ const statusKitLastInviteKeyPrefix = "statuskit.last_invite."
 // Android zen-mode hooks that keep its channel status fresh; the bridge's only
 // truthful state is "available", so publish that state after successful
 // invites, but coalesce invite sweeps into a single channel publish.
+//
+// Not a prefix: the raw handle-less key is suffixed with ".<loginID>" per
+// login (see statusKitLastPostInviteShareKVKey) so logins do not share the cooldown.
 const statusKitLastPostInviteShareKey = "statuskit.last_post_invite_share"
 
 const statusKitPostInviteShareMinSpacing = 5 * time.Minute
@@ -876,6 +956,8 @@ const statusKitPostInviteShareMinSpacing = 5 * time.Minute
 // treated as expired — IDS-accepted dispatch is not the same as peer
 // reciprocation, and a peer that never reshared probably never got the
 // invite (cert-stale, ratchet, transient IDS issue).
+//
+// Scoped per login via statusKitKey: "<prefix><loginID>.<handle>".
 const statusKitInvitedOkKeyPrefix = "statuskit.invited_ok."
 
 // statusKitReshareSeenKeyPrefix marks handles whose StatusKit reshare we have
@@ -883,6 +965,8 @@ const statusKitInvitedOkKeyPrefix = "statuskit.invited_ok."
 // Used by the soft-latch logic to distinguish "invite dispatched and peer
 // replied" (permanent latch) from "invite dispatched but peer never replied"
 // (TTL'd latch).
+//
+// Scoped per login via statusKitKey: "<prefix><loginID>.<handle>".
 const statusKitReshareSeenKeyPrefix = "statuskit.reshare_seen."
 
 // statusKitInvitedOkTTL is how long the dispatch latch holds before being
@@ -895,6 +979,116 @@ const statusKitInvitedOkTTL = 7 * 24 * time.Hour
 // invites. Only applies on the periodic tick path to handles that did NOT
 // succeed; successful sends are latched and never retried.
 const statusKitPerHandleMinSpacing = 4 * time.Hour
+
+// statusKitNoKeysKeyPrefix / statusKitNoKeysTTL: once an invite resolves to
+// NoValidTargets (the peer isn't registered for the keysharing sub-service —
+// Android / non-iPhone / StatusKit off), cache that and STOP re-querying
+// Apple's IDS for them. Without this, the periodic sweep re-queries the SAME
+// dead peers every statusKitPerHandleMinSpacing (4h) forever — pure futile
+// Apple IDS pounding (one production bridge re-queried ~27 dead peers ~12k
+// times over its uptime), which contributes to Apple throttling / temporarily
+// disabling the account. The TTL is a week, not forever, so a peer who later
+// enables StatusKit is re-discovered within ~7 days. Only NoValidTargets is
+// cached; transient errors still retry on the normal 4h cadence.
+//
+// Scoped per login via statusKitKey: "<prefix><loginID>.<handle>".
+const statusKitNoKeysKeyPrefix = "statuskit.no_keys."
+const statusKitNoKeysTTL = 7 * 24 * time.Hour
+
+// statusKitNoKeysJitterWindow spreads no-keys re-checks so a wave of peers
+// cached together (fresh start, CloudKit backfill) doesn't all expire and
+// re-query Apple on the same day. Each handle gets a deterministic offset in
+// [0, window) added to the base TTL — derived from the handle so it's stable
+// across restarts.
+const statusKitNoKeysJitterWindow = 48 * time.Hour
+
+// statusKitNoKeysGated reports whether handle was recently confirmed not on the
+// keysharing sub-service (an invite that returned NoValidTargets), so every
+// StatusKit invite path can skip it instead of re-querying Apple's IDS. Shared
+// by the periodic sweep and the new-portal hook so the gate is comprehensive.
+func (c *IMClient) statusKitNoKeysGated(ctx context.Context, handle string, now time.Time) bool {
+	raw := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitNoKeysKeyPrefix, handle))
+	if raw == "" {
+		return false
+	}
+	ts, err := time.Parse(time.RFC3339, raw)
+	return err == nil && now.Sub(ts) < statusKitNoKeysEffectiveTTL(handle)
+}
+
+// statusKitNoKeysEffectiveTTL is the base no-keys TTL plus a deterministic
+// per-handle jitter (see statusKitNoKeysJitterWindow) so re-checks stagger
+// instead of all expiring on the same day and re-pounding Apple at once.
+func statusKitNoKeysEffectiveTTL(handle string) time.Duration {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(handle))
+	jitter := time.Duration(h.Sum32()%uint32(statusKitNoKeysJitterWindow/time.Second)) * time.Second
+	return statusKitNoKeysTTL + jitter
+}
+
+// waitStatusKitInviteSlot blocks until this login's next paced invite slot and
+// reserves it, returning false if the bridge is stopping. Every invite caller
+// funnels through here (or tryStatusKitInviteSlot) so this login's AGGREGATE
+// dispatch rate to Apple is bounded — not just one sweep's rate. This is what makes a
+// fresh-start backfill or a TTL-expiry wave trickle instead of pound.
+//
+// c.stopChan is captured into a local first: it can be set to nil on
+// disconnect, and a nil channel blocks forever (acceptable here because
+// time.After still fires).
+func (c *IMClient) waitStatusKitInviteSlot() bool {
+	c.statusKitInviteMu.Lock()
+	now := time.Now()
+	slot := c.statusKitNextInviteAt
+	if slot.Before(now) {
+		slot = now
+	}
+	c.statusKitNextInviteAt = slot.Add(statusKitInterInviteDelay)
+	c.statusKitInviteMu.Unlock()
+	d := time.Until(slot)
+	if d <= 0 {
+		return true
+	}
+	stop := c.stopChan
+	select {
+	case <-time.After(d):
+		return true
+	case <-stop:
+		return false
+	}
+}
+
+// tryStatusKitInviteSlot reserves the next invite slot only if one is free right
+// now; otherwise returns false so the caller (the new-portal hook) defers to the
+// paced sweep instead of bursting an extra IDS query on top of it.
+func (c *IMClient) tryStatusKitInviteSlot() bool {
+	c.statusKitInviteMu.Lock()
+	defer c.statusKitInviteMu.Unlock()
+	now := time.Now()
+	if c.statusKitNextInviteAt.After(now) {
+		return false
+	}
+	c.statusKitNextInviteAt = now.Add(statusKitInterInviteDelay)
+	return true
+}
+
+// isNoStatusKitTargetsErr reports whether an InviteToStatusSharing failure means
+// the peer simply isn't on the keysharing sub-service, as opposed to a transient
+// error. It matches the TYPED WrappedError::NoStatusKitTargets variant — lib.rs
+// invite_to_status_sharing maps rustpush PushError::NoValidTargets to it — NOT a
+// Debug-formatted error string. So a rustpush rename breaks the Rust match arm
+// at compile time, and a binding change breaks this errors.Is at compile time;
+// the no-keys cache can't silently stop populating.
+func isNoStatusKitTargetsErr(err error) bool {
+	return errors.Is(err, rustpushgo.ErrWrappedErrorNoStatusKitTargets)
+}
+
+// markStatusKitNoKeysIfUnreachable caches handle as not-on-StatusKit when an
+// invite failed with NoStatusKitTargets, so future invites skip it for
+// statusKitNoKeysTTL. Only that case is cached — transient errors retry.
+func (c *IMClient) markStatusKitNoKeysIfUnreachable(ctx context.Context, handle string, err error, now time.Time) {
+	if isNoStatusKitTargetsErr(err) {
+		c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitNoKeysKeyPrefix, handle), now.Format(time.RFC3339))
+	}
+}
 
 // inviteContactsToStatusSharing sends our StatusKit key to the peer
 // handles of every 1:1 iMessage portal that has not yet keyed us back,
@@ -912,6 +1106,17 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 	c.inviteContactsToStatusSharingOpts(log, false, false)
 }
 
+// statusKitAutoInvite gates the legacy IDS bulk invite sweep. OFF: peers share
+// their StatusKit keys automatically (OB's passive model), those keys land in the
+// user's CloudKit, and the periodic CloudKit pull (syncCloudStatusKitPeers)
+// hydrates whatever we're missing — so the bridge never bulk-invites anyone. This
+// removes the sweep's IDS queries entirely AND unblocks the pull (the sweep used
+// to defer it via statusKitSweepRunning). Per-peer manual invites remain via the
+// !statuskit-invite-channel command (a separate, bounded path); the dangerous
+// bulk !statuskit-invite-all command was removed. Set true only to re-enable the
+// legacy auto bulk sweep.
+const statusKitAutoInvite = false
+
 // inviteContactsToStatusSharingOpts is the core invite sweep.
 //
 //   - respectSpacing (periodic tick path): skip handles invited within
@@ -919,12 +1124,21 @@ func (c *IMClient) inviteContactsToStatusSharing(log zerolog.Logger) {
 //     an unresponsive peer. Startup / post-backfill paths pass false.
 //   - bypassLatch (user-invoked retry): ignore the invited_ok one-shot
 //     latch so every pending 1:1 portal target is re-invited, even peers
-//     that previously got an accepted invite. Use for !statuskit-invite-all;
-//     automatic paths leave it false to preserve the "invite once per peer"
-//     contract with peer iOS.
+//     that previously got an accepted invite. The bulk !statuskit-invite-all
+//     command that used to pass true was removed, so nothing passes true
+//     anymore; automatic paths leave it false to preserve the "invite once per
+//     peer" contract with peer iOS.
 func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respectSpacing bool, bypassLatch bool) {
 	if c.client == nil || c.getHandle() == "" {
 		log.Warn().Bool("client_nil", c.client == nil).Str("handle", c.getHandle()).Msg("StatusKit invite: skipped (client or handle not ready)")
+		return
+	}
+	// Bulk auto-invite is disabled (statusKitAutoInvite): peer keys come from the
+	// periodic CloudKit pull. Return BEFORE setting statusKitSweepRunning so this
+	// can never block syncCloudStatusKitPeers. Per-peer invites use a separate
+	// path (!statuskit-invite-channel).
+	if !statusKitAutoInvite {
+		log.Debug().Msg("StatusKit bulk invite disabled — keys come from the CloudKit pull; skipping sweep")
 		return
 	}
 	// Mark the sweep as running so the new-portal hook
@@ -1005,10 +1219,17 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 
 	now := time.Now()
 	var pending []string
-	var skippedKnown, skippedSpacing, skippedAlreadySent, softExpired int
+	var skippedKnown, skippedSpacing, skippedAlreadySent, softExpired, skippedNoKeys int
 	for _, h := range allGhosts {
 		if _, known := knownSet[h]; known {
 			skippedKnown++
+			continue
+		}
+		// Skip peers recently confirmed NOT on the keysharing sub-service —
+		// see statusKitNoKeysGated. bypassLatch (a user-invoked retry) ignores
+		// this so a manual retry forces a look.
+		if !bypassLatch && c.statusKitNoKeysGated(ctx, h, now) {
+			skippedNoKeys++
 			continue
 		}
 		// Soft latch: if we've previously dispatched an invite to this handle
@@ -1024,12 +1245,12 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		//
 		// User-invoked retry (bypassLatch) ignores both layers.
 		if !bypassLatch {
-			latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+h))
+			latchedAt := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitInvitedOkKeyPrefix, h))
 			if latchedAt != "" {
-				reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+h)) != ""
+				reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitReshareSeenKeyPrefix, h)) != ""
 				if !reshareSeen {
 					if normalized := normalizeIdentifierForPortalID(h); normalized != h {
-						reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized)) != ""
+						reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitReshareSeenKeyPrefix, normalized)) != ""
 					}
 				}
 				if reshareSeen {
@@ -1047,7 +1268,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			}
 		}
 		if respectSpacing {
-			last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastInviteKeyPrefix+h))
+			last := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitLastInviteKeyPrefix, h))
 			if last != "" {
 				if ts, parseErr := time.Parse(time.RFC3339, last); parseErr == nil && now.Sub(ts) < statusKitPerHandleMinSpacing {
 					skippedSpacing++
@@ -1064,6 +1285,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		Int("already_invited_ok", skippedAlreadySent).
 		Int("soft_expired_retrying", softExpired).
 		Int("spacing_skip", skippedSpacing).
+		Int("no_keys_skip", skippedNoKeys).
 		Int("pending", len(pending)).
 		Bool("respect_spacing", respectSpacing).
 		Msg("StatusKit invite: plan")
@@ -1088,6 +1310,14 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 	const perInviteTimeout = 30 * time.Second
 
 	for i, h := range pending {
+		// Per-login pace: wait for this login's next invite slot (shared with the
+		// new-portal hook and any concurrent sweep) so this login trickles
+		// invites to Apple instead of one sweep pacing itself while other callers
+		// pile on. Returns false when the bridge is stopping.
+		if !c.waitStatusKitInviteSlot() {
+			log.Info().Int("done", i).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
+			return
+		}
 		// In-memory single-flight: skip if another path (new-portal hook,
 		// post-backfill hook, prior sweep iteration) already has an FFI
 		// call in flight for this handle. The DB-side dispatch latch is
@@ -1118,6 +1348,7 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 		case err := <-inviteDone:
 			if err != nil {
 				failCount++
+				c.markStatusKitNoKeysIfUnreachable(ctx, h, err, now)
 				log.Warn().Err(err).Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: failed for handle")
 			} else {
 				okCount++
@@ -1126,8 +1357,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 				// - last_invite: periodic-tick spacing timestamp (no effect
 				//   because invited_ok is checked first, but harmless and
 				//   useful for debug timelines)
-				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+h), nowStr)
-				c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+h), nowStr)
+				c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitInvitedOkKeyPrefix, h), nowStr)
+				c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitLastInviteKeyPrefix, h), nowStr)
 				log.Info().Str("sender", sender).Str("handle", h).Int("i", i+1).Int("total", len(pending)).Msg("StatusKit invite: ok for handle")
 				log.Info().Str("handle", h).Msg("StatusKit: latch set on dispatch — relies on 4h retry if peer doesn't reciprocate")
 			}
@@ -1139,15 +1370,8 @@ func (c *IMClient) inviteContactsToStatusSharingOpts(log zerolog.Logger, respect
 			return
 		}
 
-		// Skip the delay after the last handle.
-		if i < len(pending)-1 {
-			select {
-			case <-time.After(statusKitInterInviteDelay):
-			case <-c.stopChan:
-				log.Info().Int("done", i+1).Int("total", len(pending)).Msg("StatusKit invite: bridge stopping, aborting sweep")
-				return
-			}
-		}
+		// Pacing is handled at the top of the loop by waitStatusKitInviteSlot
+		// (shared by every invite caller of this login), so there's no per-loop sleep here.
 	}
 	log.Info().Int("pending", len(pending)).Int("ok", okCount).Int("failed", failCount).Int("timed_out", timeoutCount).Str("sender", sender).Msg("Sent StatusKit key invites one-per-handle (pending-only, paced)")
 	if okCount > 0 {
@@ -1168,7 +1392,7 @@ func (c *IMClient) publishStatusKitAvailableAfterInvite(log zerolog.Logger, reas
 
 	ctx := context.Background()
 	now := time.Now()
-	last := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitLastPostInviteShareKey))
+	last := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitLastPostInviteShareKVKey())
 	if last != "" {
 		if ts, parseErr := time.Parse(time.RFC3339, last); parseErr == nil && now.Sub(ts) < statusKitPostInviteShareMinSpacing {
 			log.Debug().
@@ -1192,7 +1416,7 @@ func (c *IMClient) publishStatusKitAvailableAfterInvite(log zerolog.Logger, reas
 		log.Warn().Err(err).Str("reason", reason).Msg("StatusKit post-invite share_status failed")
 		return
 	}
-	c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastPostInviteShareKey), now.Format(time.RFC3339))
+	c.Main.Bridge.DB.KV.Set(ctx, c.statusKitLastPostInviteShareKVKey(), now.Format(time.RFC3339))
 	log.Info().Str("reason", reason).Msg("StatusKit post-invite share_status(available) published")
 }
 
@@ -1214,6 +1438,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 			log.Warn().Interface("panic", r).Msg("inviteSingleHandleToStatusSharing panicked — skipped")
 		}
 	}()
+
+	// Bulk auto-invite is disabled — a new portal's peer key arrives via the
+	// periodic CloudKit pull, not an auto-invite (statusKitAutoInvite).
+	if !statusKitAutoInvite {
+		return
+	}
 
 	if c.client == nil || c.getHandle() == "" || c.UserLogin == nil {
 		return
@@ -1252,12 +1482,12 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 
 	now := time.Now()
-	latchedAt := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle))
+	latchedAt := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitInvitedOkKeyPrefix, handle))
 	if latchedAt != "" {
-		reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+handle)) != ""
+		reshareSeen := c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitReshareSeenKeyPrefix, handle)) != ""
 		if !reshareSeen {
 			if normalized := normalizeIdentifierForPortalID(handle); normalized != handle {
-				reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, database.Key(statusKitReshareSeenKeyPrefix+normalized)) != ""
+				reshareSeen = c.Main.Bridge.DB.KV.Get(ctx, c.statusKitKey(statusKitReshareSeenKeyPrefix, normalized)) != ""
 			}
 		}
 		if reshareSeen {
@@ -1268,6 +1498,22 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 			log.Debug().Str("handle", handle).Time("latched_at", ts).Msg("StatusKit invite (new portal): dispatch latch within TTL; skipping")
 			return
 		}
+	}
+
+	// Same no-keys gate as the sweep: a new portal for a peer not on the
+	// keysharing sub-service must not re-query Apple every time it's recreated.
+	if c.statusKitNoKeysGated(ctx, handle, now) {
+		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): peer not on StatusKit (cached); skipping")
+		return
+	}
+
+	// Per-login invite pacing: if a slot isn't free right now, defer to the paced
+	// sweep rather than fire an extra IDS query. CloudKit backfill calls this
+	// hook once per portal; without this gate a fresh start bursts Apple. The
+	// peer is a pending 1:1 portal, so the next sweep invites it (paced).
+	if !c.tryStatusKitInviteSlot() {
+		log.Debug().Str("handle", handle).Msg("StatusKit invite (new portal): invite slot busy; deferring to paced sweep")
+		return
 	}
 
 	// In-memory single-flight: claim the slot after the cheap DB checks
@@ -1303,12 +1549,13 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	select {
 	case err := <-inviteDone:
 		if err != nil {
+			c.markStatusKitNoKeysIfUnreachable(ctx, handle, err, now)
 			log.Warn().Err(err).Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): failed")
 			return
 		}
 		nowStr := now.Format(time.RFC3339)
-		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitInvitedOkKeyPrefix+handle), nowStr)
-		c.Main.Bridge.DB.KV.Set(ctx, database.Key(statusKitLastInviteKeyPrefix+handle), nowStr)
+		c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitInvitedOkKeyPrefix, handle), nowStr)
+		c.Main.Bridge.DB.KV.Set(ctx, c.statusKitKey(statusKitLastInviteKeyPrefix, handle), nowStr)
 		log.Info().Str("sender", sender).Str("handle", handle).Msg("StatusKit invite (new portal): ok")
 		c.publishStatusKitAvailableAfterInvite(log, "new portal invite")
 	case <-time.After(perInviteTimeout):
@@ -1318,13 +1565,20 @@ func (c *IMClient) inviteSingleHandleToStatusSharing(log zerolog.Logger, handle 
 	}
 }
 
+// ghostReconcilePacing is the gap left between ghost profile writes during the
+// contact reconcile. 80ms puts a 30-contact address book at ~2.4s: slow enough
+// that a Matrix client sees a stream of member events rather than a wall of
+// them, fast enough that nobody watching a first connect notices.
+const ghostReconcilePacing = 80 * time.Millisecond
+
 func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	if c.contacts == nil {
 		return
 	}
 	ctx := context.Background()
 
-	// Use bridge_id-scoped query and fetch the current name for diff-gating.
+	// Use bridge_id-scoped query and fetch the current name so blank-named
+	// ghosts can be healed.
 	rows, err := c.Main.Bridge.DB.Database.Query(ctx,
 		"SELECT id, COALESCE(name, '') FROM ghost WHERE bridge_id=$1",
 		c.Main.Bridge.ID,
@@ -1353,7 +1607,8 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 	}
 	rows.Close()
 
-	updated := 0
+	reconciled := 0
+	pacePending := false
 	for _, g := range ghosts {
 		// Skip ghosts with no matching contact (efficiency: avoids loading
 		// the full ghost object for participants who aren't in the address book).
@@ -1362,37 +1617,52 @@ func (c *IMClient) refreshGhostNamesFromContacts(log zerolog.Logger) {
 			continue
 		}
 		contact, _ := c.contacts.GetContactInfo(localID)
-		if contact == nil || !contact.HasName() {
+		if (contact == nil || !contact.HasName()) && g.name != "" {
+			// No address-book name and the ghost already has a stored name:
+			// nothing to reconcile. A ghost with an EMPTY stored name renders
+			// as its bare Matrix ID (tapback senders, DMs with unsaved
+			// numbers), so fall through and let GetUserInfo's identifier
+			// fallback give it a readable name. Once healed it is skipped
+			// here again, so this costs one reconcile per damaged ghost.
 			continue
 		}
-		// Diff-gate: compute the expected displayname and skip if it matches
-		// the stored name. This prevents unnecessary Matrix profile update API
-		// calls on every contact refresh cycle (AggressiveUpdateInfo=true means
-		// UpdateInfo always makes an API call; diffing here is our only guard).
-		expectedName := c.Main.Config.FormatDisplayname(DisplaynameParams{
-			FirstName: contact.FirstName,
-			LastName:  contact.LastName,
-			Nickname:  contact.Nickname,
-			ID:        localID,
-		})
-		if g.name == expectedName {
-			continue
-		}
+		// Reconcile the full profile (name, avatar, identifiers) every cycle,
+		// not only when the name changed. UpdateInfo self-gates: prepareName,
+		// prepareAvatar and prepareContactInfo compare against the stored
+		// values and pushProfileChanges returns early when nothing differs, so
+		// an unchanged ghost costs no Matrix API calls. Gating on the name
+		// alone left identifier and avatar drift (a malformed tel: identifier
+		// from an earlier bug, a photo that finished downloading on a later
+		// sync) unhealed until the contact's next inbound message.
 		ghost, err := c.Main.Bridge.GetGhostByID(ctx, g.id)
 		if err != nil || ghost == nil {
-			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for name refresh")
+			log.Warn().Err(err).Str("ghost_id", string(g.id)).Msg("Failed to load ghost for profile reconcile")
 			continue
 		}
-		// Use the full GetUserInfo → UpdateInfo cycle (same as refreshAllGhosts)
-		// to ensure name, avatar, and identifiers are all propagated to Matrix.
 		info, err := c.GetUserInfo(ctx, ghost)
 		if err != nil || info == nil {
 			continue
 		}
+		// Pace the writes. A profile change emits an m.room.member event into
+		// every DM the ghost is in, and clients derive DM titles and avatars
+		// from those; an unpaced first reconcile fired 22 changes in 9ms and
+		// wedged Beeper Desktop's icon cache. Only writes that changed the
+		// visible profile are spaced out, so a steady-state tick over an
+		// unchanged address book isn't slowed down.
+		if pacePending {
+			select {
+			case <-c.stopChan:
+				log.Debug().Int("reconciled", reconciled).Msg("Ghost profile reconcile interrupted by shutdown")
+				return
+			case <-time.After(ghostReconcilePacing):
+			}
+		}
+		before := snapshotGhostProfile(ghost)
 		ghost.UpdateInfo(ctx, info)
-		updated++
+		pacePending = !before.equal(snapshotGhostProfile(ghost))
+		reconciled++
 	}
-	log.Info().Int("updated", updated).Int("total", len(ghosts)).Msg("Refreshed ghost names from contacts")
+	log.Info().Int("reconciled", reconciled).Int("total", len(ghosts)).Msg("Reconciled ghost profiles from contacts")
 }
 
 // refreshGroupPortalNamesFromContacts re-resolves group portal names using
@@ -1505,10 +1775,34 @@ func (c *IMClient) startCloudSyncController(log zerolog.Logger) {
 const cloudSyncRetryInterval = 1 * time.Minute
 
 func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
-	// NOTE: no defer recover() here intentionally. A panic in this goroutine
-	// must crash the process so the bridge restarts and re-runs CloudKit sync.
-	// Swallowing the panic would leave setCloudSyncDone() uncalled, permanently
-	// blocking the APNs message buffer and dropping all incoming messages.
+	// Recover, but ONLY once the APNs gate is already open.
+	//
+	// A panic before setCloudSyncDone() must still crash the process: swallowing
+	// it would leave the gate closed, permanently blocking the APNs message
+	// buffer, and opening the gate before tombstones load would let APNs echoes
+	// resurrect portals for deleted chats. So that case re-panics and the
+	// bridge restarts into a clean bootstrap.
+	//
+	// After the gate is open, a panic in a best-effort background pass (e.g.
+	// one unanswerable IDS handle in the StatusKit alias-link pass, which
+	// crash-looped an upstream install every ~3.5 minutes) must not kill a
+	// working bridge; in a multi-user process it would take every login down
+	// with it. Messages keep flowing and the resync resumes next cycle. The
+	// Rust side (ids_guard) contains lookup panics before they reach here;
+	// this is the backstop for everything else. Ported from corten 12447adc.
+	defer func() {
+		r := recover()
+		if r == nil {
+			return
+		}
+		if !c.isCloudSyncDone() {
+			log.Error().Interface("panic", r).
+				Msg("CloudKit sync controller panicked before sync completed — re-panicking so the bridge restarts into a clean bootstrap (opening the APNs gate here would resurrect deleted portals)")
+			panic(r)
+		}
+		log.Error().Interface("panic", r).
+			Msg("CloudKit sync controller panicked after sync completed — bridge stays up, resync resumes on the next cycle")
+	}()
 
 	// Derive a cancellable context from stopChan so that preUploadCloudAttachments
 	// and other long-running operations can be interrupted promptly on shutdown
@@ -1646,6 +1940,10 @@ func (c *IMClient) runCloudSyncController(log zerolog.Logger) {
 		log.Info().Int64("normalized", normalized).
 			Msg("Normalized inconsistent group message portal IDs using cloud_chat mappings")
 	}
+
+	// Heal carrier groups that the old gid: key sharded across many rooms, before
+	// createPortalsFromCloudSync so the canonical portal is the one (re-)backfilled.
+	c.consolidateCarrierGroupPortals(ctx, log)
 
 	// Create portals and queue forward backfill for all of them.
 	// Skip portals that are tombstoned or recently deleted this session.
@@ -2396,17 +2694,19 @@ func (c *IMClient) ingestCloudChats(ctx context.Context, chats []rustpushgo.Wrap
 			continue
 		}
 
-		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style)
+		portalID := c.resolvePortalIDForCloudChat(chat.Participants, chat.DisplayName, chat.GroupId, chat.Style, chat.Service)
 		if portalID == "" {
 			counts.Skipped++
 			continue
 		}
 
 		// Update SMS flag from CloudKit chat service type. If a stale
-		// CloudKit record briefly clears the flag for a legitimately-SMS
-		// portal, the next live SMS message will re-set it immediately
-		// via handleMessage's unconditional updatePortalSMS call.
-		if strings.EqualFold(chat.Service, "SMS") {
+		// CloudKit record briefly clears the flag for a legitimately-carrier
+		// portal, the next live carrier message will re-set it immediately
+		// via handleMessage's unconditional updatePortalSMS call. Covers all
+		// carrier services (SMS/RCS/MMS), not just SMS, so RCS/MMS groups send
+		// over the carrier service rather than falling back to iMessage.
+		if isCarrierService(chat.Service) {
 			c.updatePortalSMS(portalID, true)
 		} else if strings.EqualFold(chat.Service, "iMessage") {
 			c.updatePortalSMS(portalID, false)
@@ -3068,7 +3368,7 @@ func (c *IMClient) ingestCloudMessages(
 	return nil
 }
 
-func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string, style int64) string {
+func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayName *string, groupID string, style int64, service string) string {
 	normalizedParticipants := make([]string, 0, len(participants))
 	for _, participant := range participants {
 		normalized := normalizeIdentifierForPortalID(participant)
@@ -3086,6 +3386,16 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	// field is set for ALL CloudKit chats, even DMs, so we can't use its
 	// presence alone.
 	isGroup := style == 43
+
+	// Carrier groups (SMS/RCS/MMS) have no stable Apple group GUID, so keying by
+	// gid: shards one group across many rooms. Key them by participant set — the
+	// same key makePortalKey's no-senderGuid branch uses — so backfill and live
+	// converge on one room (consolidateCarrierGroupPortals heals old gid: splits).
+	// The >=2 non-self gate matches makePortalKey's group test; a degenerate chat
+	// (just us, or one remote handle) falls through to DM/self-chat handling.
+	if isGroup && isCarrierService(service) && c.countNonSelfMembers(participants, nil) >= 2 {
+		return strings.Join(c.buildCanonicalParticipantList(participants), ",")
+	}
 
 	// For groups with a persistent group UUID, use gid:<UUID> as portal ID
 	if isGroup && groupID != "" {
@@ -3128,8 +3438,301 @@ func (c *IMClient) resolvePortalIDForCloudChat(participants []string, displayNam
 	if isGroup && groupID != "" {
 		senderGuidPtr = &groupID
 	}
-	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr)
+	portalKey := c.makePortalKey(normalizedParticipants, groupName, nil, senderGuidPtr, isCarrierService(service))
 	return string(portalKey.ID)
+}
+
+// carrierConsolidationEntry pairs a carrier group portal with the canonical
+// participant key its conversation should live under.
+type carrierConsolidationEntry struct {
+	portalID  string
+	canonical string
+}
+
+// carrierConsolidationGroup is the set of carrier group portals that resolve to
+// one canonical participant key and must be merged into a single room.
+type carrierConsolidationGroup struct {
+	canonical string
+	members   []string // distinct portal IDs sharing this canonical key, sorted
+}
+
+// planCarrierGroupConsolidation groups portals by canonical key and returns those
+// needing consolidation: more than one portal, or a single portal whose ID isn't
+// already the canonical key. Pure logic — the testable core of the migration.
+func planCarrierGroupConsolidation(entries []carrierConsolidationEntry) []carrierConsolidationGroup {
+	byKey := make(map[string]map[string]bool)
+	for _, e := range entries {
+		if e.canonical == "" || e.portalID == "" {
+			continue
+		}
+		if byKey[e.canonical] == nil {
+			byKey[e.canonical] = make(map[string]bool)
+		}
+		byKey[e.canonical][e.portalID] = true
+	}
+
+	var out []carrierConsolidationGroup
+	for canonical, set := range byKey {
+		members := make([]string, 0, len(set))
+		for id := range set {
+			members = append(members, id)
+		}
+		sort.Strings(members)
+		needs := len(members) > 1 || members[0] != canonical
+		if needs {
+			out = append(out, carrierConsolidationGroup{canonical: canonical, members: members})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].canonical < out[j].canonical })
+	return out
+}
+
+// consolidateCarrierGroupPortals collapses carrier groups sharded across multiple
+// gid: rooms into one room per participant set: re-keys each duplicate's cloud
+// rows to the canonical participant key, merges the rooms, and lets ChatResync
+// re-backfill (GUID-deduped, so no history is lost). Runs at startup before
+// createPortalsFromCloudSync; new splits are prevented at ingest.
+func (c *IMClient) consolidateCarrierGroupPortals(ctx context.Context, log zerolog.Logger) {
+	if c.cloudStore == nil {
+		return
+	}
+	log = log.With().Str("component", "carrier_group_consolidation").Logger()
+
+	chats, err := c.cloudStore.listCarrierGroupChats(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to list carrier group chats for consolidation")
+		return
+	}
+	if len(chats) == 0 {
+		return
+	}
+
+	entries := make([]carrierConsolidationEntry, 0, len(chats))
+	for _, chat := range chats {
+		// Use the same >=2 non-self group rule as ingest/live so we only
+		// canonicalize genuine groups; a degenerate roster is left untouched.
+		if c.countNonSelfMembers(chat.participants, nil) < 2 {
+			continue
+		}
+		canonical := strings.Join(c.buildCanonicalParticipantList(chat.participants), ",")
+		entries = append(entries, carrierConsolidationEntry{portalID: chat.portalID, canonical: canonical})
+	}
+
+	groups := planCarrierGroupConsolidation(entries)
+	if len(groups) == 0 {
+		return
+	}
+
+	// Bound the Matrix room moves (re-ID / tombstone — each a homeserver round
+	// trip) performed per startup, so a large backlog of split groups can't stall
+	// startup or flood the homeserver with tombstones in one burst. The migration
+	// is idempotent and self-healing, so groups deferred here are consolidated on
+	// subsequent startups. At least one group always runs so progress is
+	// guaranteed even if a single group exceeds the budget on its own.
+	maxRooms := 0
+	for _, g := range groups {
+		maxRooms += len(g.members)
+	}
+	log.Info().Int("groups", len(groups)).Int("max_member_rooms", maxRooms).
+		Msg("Planning carrier group consolidation")
+
+	consolidated, roomMoves := 0, 0
+	for _, g := range groups {
+		if consolidated > 0 && roomMoves >= carrierGroupRoomMoveBudgetPerStartup {
+			break
+		}
+		roomMoves += c.consolidateOneCarrierGroup(ctx, log, g)
+		consolidated++
+	}
+	deferred := len(groups) - consolidated
+	log.Info().Int("groups", consolidated).Int("room_moves", roomMoves).Int("deferred_groups", deferred).
+		Msg("Consolidated split carrier group portals by participant set")
+	if deferred > 0 {
+		log.Info().Int("deferred_groups", deferred).
+			Msg("Deferred remaining carrier group consolidations to next startup (room-move budget reached)")
+	}
+}
+
+// carrierGroupRoomMoveBudgetPerStartup caps how many room re-ID/tombstone
+// operations consolidateCarrierGroupPortals performs per startup. Bounds startup
+// latency and tombstone bursts; the rest converge on later startups (idempotent).
+const carrierGroupRoomMoveBudgetPerStartup = 50
+
+// carrierMemberRoom is one member portal's Matrix-room state, gathered for the
+// room-move decision in planCarrierRoomMoves.
+type carrierMemberRoom struct {
+	portalID string
+	hasRoom  bool
+	msgCount int // bridged messages; only meaningful when hasRoom
+}
+
+// carrierRoomMovePlan is the decided set of room moves for one carrier group:
+// the survivor room kept as the live conversation, and the member portals whose
+// rooms are re-ID'd onto the canonical key (applied in order, survivor first).
+type carrierRoomMovePlan struct {
+	survivor string   // portal ID of the room kept; "" when no member has a room yet
+	reIDs    []string // portals to re-ID onto the canonical key, in apply order
+}
+
+// planCarrierRoomMoves decides which member room survives and which are merged
+// into it. reIDPortalWithCacheUpdate (ReIDPortal) tombstones the SOURCE when the
+// target room already exists, so a room already holding the canonical key must
+// be the survivor — re-ID'ing a larger member onto it would tombstone that
+// larger room. Otherwise the member with the most bridged history wins and is
+// renamed onto the canonical key (emitted first so it claims the key before the
+// rest tombstone into it). Members without a room are skipped — they're left for
+// createPortalsFromCloudSync to build from the re-keyed cloud_chat. Pure logic:
+// the tested core of consolidateOneCarrierGroup's room moves.
+func planCarrierRoomMoves(canonical string, canonicalHasRoom bool, members []carrierMemberRoom) carrierRoomMovePlan {
+	survivor := ""
+	if canonicalHasRoom {
+		survivor = canonical
+	} else {
+		best := -1
+		for _, m := range members {
+			if m.portalID == canonical || !m.hasRoom {
+				continue
+			}
+			if m.msgCount > best {
+				best = m.msgCount
+				survivor = m.portalID
+			}
+		}
+	}
+
+	plan := carrierRoomMovePlan{survivor: survivor}
+	if survivor != "" && survivor != canonical {
+		plan.reIDs = append(plan.reIDs, survivor)
+	}
+	for _, m := range members {
+		if !m.hasRoom || m.portalID == survivor || m.portalID == canonical {
+			continue
+		}
+		plan.reIDs = append(plan.reIDs, m.portalID)
+	}
+	return plan
+}
+
+// consolidateOneCarrierGroup performs the room + data moves for a single carrier
+// group. Returns the number of room re-ID/tombstone operations it attempted, so
+// the caller can budget room moves across groups per startup.
+//
+// The room moves run BEFORE the cloud re-keying, and a member whose room move
+// failed keeps its cloud rows under its old portal ID. That ordering is what
+// makes a partly failed merge retryable: the next startup's planner reads
+// cloud_chat to decide which portals belong to the group, so re-keying a member
+// whose room never moved would erase the evidence that the merge is unfinished
+// and strand the duplicate room forever.
+func (c *IMClient) consolidateOneCarrierGroup(ctx context.Context, log zerolog.Logger, g carrierConsolidationGroup) int {
+	canonicalKey := networkid.PortalKey{ID: networkid.PortalID(g.canonical), Receiver: c.UserLogin.ID}
+
+	// Gather room state, then let planCarrierRoomMoves decide the survivor and the
+	// re-ID order (the irreversible part, kept pure and unit-tested).
+	members := make([]carrierMemberRoom, 0, len(g.members))
+	for _, m := range g.members {
+		if m == g.canonical {
+			continue
+		}
+		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+		room := carrierMemberRoom{portalID: m, hasRoom: c.portalHasRoom(ctx, mk)}
+		if room.hasRoom {
+			room.msgCount = c.countBridgedMessages(ctx, m)
+		}
+		members = append(members, room)
+	}
+	plan := planCarrierRoomMoves(g.canonical, c.portalHasRoom(ctx, canonicalKey), members)
+
+	// Apply the room moves first. The survivor rename (when present) is reIDs[0]
+	// and must claim the canonical key before the rest tombstone into it, so a
+	// failure there aborts (without touching cloud data) rather than merging rooms
+	// into a non-canonical survivor.
+	moves := 0
+	moved := make(map[string]bool, len(plan.reIDs))
+	// Portal IDs with a room that still has to move onto the canonical key:
+	// planCarrierRoomMoves only lists room-having portals, so a member absent from
+	// it has no room that could be stranded and is always safe to re-key.
+	pending := make(map[string]bool, len(plan.reIDs))
+	for _, m := range plan.reIDs {
+		pending[m] = true
+	}
+	for _, m := range plan.reIDs {
+		mk := networkid.PortalKey{ID: networkid.PortalID(m), Receiver: c.UserLogin.ID}
+		moves++
+		if _, _, err := c.reIDPortalWithCacheUpdate(ctx, mk, canonicalKey); err != nil {
+			log.Warn().Err(err).Str("portal", m).Str("canonical", g.canonical).
+				Msg("Failed to re-ID carrier portal onto canonical key")
+			if m == plan.survivor {
+				// Abort without re-keying anything: the next startup still sees
+				// every member's cloud rows under its own portal ID, so it plans
+				// (and retries) this group's room moves instead of treating the
+				// group as already merged.
+				return moves
+			}
+		} else {
+			moved[m] = true
+		}
+	}
+
+	// Then re-key cloud data to the canonical key, so the survivor re-backfills
+	// the union of the members' messages — but only for members it is safe to
+	// fold in: those without a room, or whose room just moved successfully. A
+	// member whose room move failed keeps its cloud rows under its old portal ID:
+	// that's the evidence the next startup's planner needs to see this group as
+	// still split and retry the move.
+	rekeyed := 0
+	for _, m := range g.members {
+		if m == g.canonical {
+			continue
+		}
+		if _, movingRoom := pending[m]; !movingRoom || moved[m] {
+			if err := c.cloudStore.reKeyPortalID(ctx, m, g.canonical); err != nil {
+				log.Warn().Err(err).Str("old_portal_id", m).Str("canonical", g.canonical).
+					Msg("Failed to re-key carrier group cloud data")
+				continue
+			}
+			rekeyed++
+			continue
+		}
+		log.Info().Str("old_portal_id", m).Str("canonical", g.canonical).
+			Msg("Leaving carrier member un-rekeyed until its room move succeeds")
+	}
+
+	// Reset backfill state last so the survivor re-backfills the union of the
+	// members' messages only once their rows actually live under its key.
+	if rekeyed > 0 {
+		if err := c.cloudStore.resetForwardBackfillDone(ctx, g.canonical); err != nil {
+			log.Warn().Err(err).Str("canonical", g.canonical).
+				Msg("Failed to reset backfill state for canonical carrier portal")
+		}
+	}
+
+	log.Info().
+		Str("canonical", g.canonical).
+		Int("members", len(g.members)).
+		Str("survivor", plan.survivor).
+		Int("room_moves", moves).
+		Msg("Consolidated carrier group portals")
+	return moves
+}
+
+// portalHasRoom reports whether a portal exists and has a Matrix room.
+func (c *IMClient) portalHasRoom(ctx context.Context, key networkid.PortalKey) bool {
+	p, err := c.Main.Bridge.GetExistingPortalByKey(ctx, key)
+	return err == nil && p != nil && p.MXID != ""
+}
+
+// countBridgedMessages returns how many Matrix messages are bridged into the
+// given portal's room. Best-effort: returns 0 on error.
+func (c *IMClient) countBridgedMessages(ctx context.Context, portalID string) int {
+	var n int
+	err := c.Main.Bridge.DB.QueryRow(ctx,
+		`SELECT COUNT(*) FROM message WHERE bridge_id=$1 AND room_id=$2 AND room_receiver=$3`,
+		string(c.Main.Bridge.ID), portalID, string(c.UserLogin.ID),
+	).Scan(&n)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.Logger, pendingDeletePortals map[string]bool) {

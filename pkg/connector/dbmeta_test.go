@@ -5,6 +5,36 @@ import (
 	"testing"
 )
 
+// AccountPersistBlob is additive: metadata written before it existed must
+// still load (empty blob -> SPD fallback on restore), and it is omitted when
+// unset.
+func TestUserLoginMetadata_AccountPersistBlob(t *testing.T) {
+	var old UserLoginMetadata
+	if err := json.Unmarshal([]byte(`{"account_username":"u","account_spd_base64":"s"}`), &old); err != nil {
+		t.Fatalf("pre-R6 metadata failed to load: %v", err)
+	}
+	if old.AccountPersistBlob != "" {
+		t.Errorf("AccountPersistBlob = %q, want empty", old.AccountPersistBlob)
+	}
+	out, err := json.Marshal(&old)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(out, &fields); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := fields["account_persist_blob"]; ok {
+		t.Error("empty account_persist_blob should be omitted")
+	}
+
+	out, _ = json.Marshal(&UserLoginMetadata{AccountPersistBlob: "YmxvYg=="})
+	var back UserLoginMetadata
+	if err := json.Unmarshal(out, &back); err != nil || back.AccountPersistBlob != "YmxvYg==" {
+		t.Errorf("round trip lost the blob: %v %q", err, back.AccountPersistBlob)
+	}
+}
+
 func TestGetDBMetaTypes(t *testing.T) {
 	c := &IMConnector{}
 	mt := c.GetDBMetaTypes()

@@ -51,9 +51,7 @@ var m = mxmain.BridgeMain{
 func init() {
 	m.PostInit = func() {
 		proc := m.Bridge.Commands.(*commands.Processor)
-		conn, _ := m.Connector.(*connector.IMConnector)
-		disableFT := conn != nil && conn.Config.DisableFaceTime
-		for _, h := range connector.BridgeCommands(disableFT) {
+		for _, h := range connector.BridgeCommands() {
 			proc.AddHandler(h)
 		}
 	}
@@ -128,6 +126,12 @@ func main() {
 	// "too many open files", the websocket can't reconnect, and the bridge goes
 	// silent until restarted. No-op on non-macOS/Linux platforms. See rlimit_*.go.
 	raiseFileLimit()
+
+	// Cap the Go heap (GOMEMLIMIT) to a fraction of system memory so an
+	// aggressive backfill can't drive the resident set past physical RAM and
+	// get OOM-killed on small, swap-less hosts. Honours an explicit GOMEMLIMIT
+	// and is cgroup-aware (Docker, systemd MemoryMax=). See memlimit.go.
+	capMemoryLimitFromSystem()
 
 	// Instead of m.Run(), manually call PreInit/Init/Start so we can
 	// repair broken permissions before validateConfig() runs in Init().

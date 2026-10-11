@@ -17,6 +17,8 @@ use std::sync::Arc;
 use log::info;
 use omnisette::AnisetteProvider;
 
+use crate::ids_guard::{guarded_cache_keys, HandleQuarantine, QuarantinePolicy};
+
 use rustpush::{
     ids::user::QueryOptions,
     statuskit::{StatusKitClient, StatusKitPersonalConfig},
@@ -33,6 +35,7 @@ const KEYSHARING_TOPIC: &str = "com.apple.private.alloy.status.keysharing";
 /// send itself fails.
 pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     sk: &Arc<StatusKitClient<T>>,
+    quarantine: &HandleQuarantine,
     sender_handle: &str,
     handles: &[String],
 ) -> Result<usize, PushError> {
@@ -51,18 +54,27 @@ pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     let mut madrid_participants: Vec<String> =
         handles.iter().cloned().collect();
     madrid_participants.push(sender_handle.to_string());
-    sk.identity
-        .cache_keys(
-            MADRID_TOPIC,
-            &madrid_participants,
-            sender_handle,
-            false,
-            &QueryOptions {
-                required_for_message: false,
-                result_expected: false,
-            },
-        )
-        .await?;
+    // Guarded: `cache_keys` can panic upstream when a lookup narrows to a
+    // single URI (ids/user.rs:984). A panic here would kill the bridge
+    // mid-invite-sweep; isolating the offending handle lets the rest of the
+    // sweep proceed. See ids_guard for why this does not change the query
+    // Apple sees on the success path.
+    guarded_cache_keys(
+        quarantine,
+        &sk.identity,
+        MADRID_TOPIC,
+        &madrid_participants,
+        sender_handle,
+        false,
+        &QueryOptions {
+            required_for_message: false,
+            result_expected: false,
+        },
+        30,
+        QuarantinePolicy::Enforce,
+    )
+    .await
+    .into_result("invite_keysharing: madrid primer")?;
 
     // OB chat-open step 2: hold a per-handle presence-channel interest
     // token across the invite send. Matches `requestHandles(to: [participants[0]])`
@@ -85,18 +97,25 @@ pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     // sync on every sweep. Drop down to plain cache_keys (weak) +
     // get_participants_targets, which is exactly what OB's chat-open does
     // implicitly inside invite_to_channel.
-    sk.identity
-        .cache_keys(
-            KEYSHARING_TOPIC,
-            handles,
-            sender_handle,
-            false,
-            &QueryOptions {
-                required_for_message: false,
-                result_expected: false,
-            },
-        )
-        .await?;
+    // Guarded for the same reason as the madrid primer above. This one is the
+    // higher-risk shape: the invite loop calls in with a single handle, so the
+    // list is size 1 before rustpush ever chunks it.
+    let keysharing_report = guarded_cache_keys(
+        quarantine,
+        &sk.identity,
+        KEYSHARING_TOPIC,
+        handles,
+        sender_handle,
+        false,
+        &QueryOptions {
+            required_for_message: false,
+            result_expected: false,
+        },
+        30,
+        QuarantinePolicy::Enforce,
+    )
+    .await
+    .into_result("invite_keysharing: keysharing primer")?;
     let targets = sk
         .identity
         .cache
@@ -134,7 +153,32 @@ pub async fn invite_keysharing<T: AnisetteProvider + Send + Sync + 'static>(
     // corrupted the cache structure (panic in put_keys) or was redundant
     // (same IDS result on the second try). Simpler to let the tick handle
     // it.
+    //
+    // CRITICAL: `NoValidTargets` is a TYPED CLAIM ("Apple says this peer has
+    // no keysharing keys"), not a generic failure. Upstream corten latches it
+    // Go-side as a persisted multi-day "peer not on StatusKit" suppression,
+    // and any caller that ever keys off it must be able to trust it. It may
+    // only be returned when the lookup actually COMPLETED.
+    //
+    // An empty target list also happens when ids_guard caught a panic for a
+    // handle (poisoned) or skipped a quarantined one (skipped) — in those
+    // cases the lookup never produced an answer, and latching the peer for a
+    // week on a failure we contained would be strictly worse than the crash
+    // it replaced. Report those as an ordinary error so the caller retries on
+    // the next tick instead of writing the latch. Note the systemic-panic
+    // classifier cannot help here: invite call sites pass a single handle, so
+    // `poisoned.len()` never exceeds the systemic threshold.
     if targets.is_empty() {
+        if !keysharing_report.poisoned.is_empty() || !keysharing_report.skipped.is_empty() {
+            return Err(PushError::DoNotRetry(Box::new(PushError::ResourcePanic(
+                format!(
+                    "invite_keysharing: keysharing lookup unavailable (contained: {} poisoned, {} quarantined) — \
+                     not claiming the peer is unregistered",
+                    keysharing_report.poisoned.len(),
+                    keysharing_report.skipped.len()
+                ),
+            ))));
+        }
         return Err(PushError::NoValidTargets);
     }
 

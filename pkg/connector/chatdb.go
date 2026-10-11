@@ -273,7 +273,7 @@ func (db *chatDB) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	}
 
 	return &bridgev2.FetchMessagesResponse{
-		Messages:                backfillMessages,
+		Messages:                keepPastBackfillCutoff(backfillMessages, params.AnchorMessage, params.Forward),
 		HasMore:                 len(messages) >= count,
 		Forward:                 params.Forward,
 		AggressiveDeduplication: params.Forward,
@@ -349,35 +349,23 @@ func chatDBMakeEventSender(msg *imessage.Message, c *IMClient) bridgev2.EventSen
 }
 
 func convertChatDBMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *imessage.Message) (*bridgev2.ConvertedMessage, error) {
-	content := &event.MessageEventContent{
-		MsgType: event.MsgText,
-		Body:    msg.Text,
-	}
-	if msg.Subject != "" {
-		if msg.Text != "" {
-			content.Body = fmt.Sprintf("**%s**\n%s", msg.Subject, msg.Text)
-			content.Format = event.FormatHTML
-			content.FormattedBody = fmt.Sprintf("<strong>%s</strong><br/>%s", msg.Subject, msg.Text)
-		} else {
-			content.Body = msg.Subject
-		}
-	}
+	msgType := event.MsgText
 	if msg.IsEmote {
-		content.MsgType = event.MsgEmote
+		msgType = event.MsgEmote
 	}
 
 	// URL preview: detect URL and fetch og: metadata + image
+	var previews []*event.BeeperLinkPreview
 	if detectedURL := urlRegex.FindString(msg.Text); detectedURL != "" {
-		content.BeeperLinkPreviews = []*event.BeeperLinkPreview{
+		previews = []*event.BeeperLinkPreview{
 			fetchURLPreview(ctx, portal.Bridge, intent, portal.MXID, detectedURL),
 		}
 	}
 
+	// buildTextParts escapes the subject/body for formatted_body and splits
+	// text that won't fit one Matrix event (see client.go).
 	cm := &bridgev2.ConvertedMessage{
-		Parts: []*bridgev2.ConvertedMessagePart{{
-			Type:    event.EventMessage,
-			Content: content,
-		}},
+		Parts: buildTextParts(msgType, msg.Subject, msg.Text, previews, false),
 	}
 	if msg.ReplyToGUID != "" {
 		cm.ReplyTo = chatDBReplyTarget(msg.ReplyToGUID, msg.ReplyToPart)

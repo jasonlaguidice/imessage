@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/rs/zerolog"
 
@@ -51,6 +52,10 @@ type PersistedSessionState struct {
 
 	// Cached MobileMe delegate for seeding on restore
 	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
+
+	// Opaque rustpush account state of the same login as the fields above;
+	// see UserLoginMetadata.AccountPersistBlob.
+	AccountPersistBlob string `json:"account_persist_blob,omitempty"`
 }
 
 // sessionFilePath returns the path to the persisted session state file:
@@ -116,9 +121,24 @@ func hasKeychainCliqueState(log zerolog.Logger, dsid string) bool {
 	return false
 }
 
-// saveSessionState writes the full session state to the JSON file.
-// Creates parent directories if needed. Errors are logged but not fatal.
+// sessionStateMu serializes access to session.json across the bridge (ported
+// from upstream 47325808). It is a single bridge-wide file written from login
+// and connector startup for every user, and os.WriteFile is not atomic across
+// concurrent writers, so two logins saving at once could interleave into
+// corrupt JSON. The *Locked variants let a read-modify-write (e.g. logout's
+// ownership check before removal) hold the lock across the whole operation.
+var sessionStateMu sync.Mutex
+
+// saveSessionState writes the full session state to the JSON file (locked).
 func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	saveSessionStateLocked(log, state)
+}
+
+// saveSessionStateLocked is saveSessionState without the lock; callers must hold
+// sessionStateMu. Creates parent directories if needed. Errors are logged, not fatal.
+func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
 	path, err := sessionFilePath()
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to determine session file path, skipping save")
@@ -148,6 +168,14 @@ func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
 // Falls back to the legacy identity.plist file (v1 format) if the new file
 // doesn't exist. Returns a zero-value struct if nothing is found.
 func loadSessionState(log zerolog.Logger) PersistedSessionState {
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	return loadSessionStateLocked(log)
+}
+
+// loadSessionStateLocked is loadSessionState without the lock; callers must hold
+// sessionStateMu.
+func loadSessionStateLocked(log zerolog.Logger) PersistedSessionState {
 	// Try new JSON format first
 	path, err := sessionFilePath()
 	if err != nil {
@@ -182,8 +210,8 @@ func loadSessionState(log zerolog.Logger) PersistedSessionState {
 	state := PersistedSessionState{
 		IDSIdentity: string(legacyData),
 	}
-	// Migrate: save in new format and remove old file
-	saveSessionState(log, state)
+	// Migrate: save in new format and remove old file (already under the lock)
+	saveSessionStateLocked(log, state)
 	_ = os.Remove(legacyPath)
 	return state
 }
@@ -203,7 +231,11 @@ func clearSessionBackupForAccount(log zerolog.Logger, dsid, idsUsers string) {
 		}
 	}
 
-	state := loadSessionState(log)
+	// Hold the lock across the ownership check and removal so another login
+	// can't write its own backup in between and have it deleted here.
+	sessionStateMu.Lock()
+	defer sessionStateMu.Unlock()
+	state := loadSessionStateLocked(log)
 	ownedByDSID := dsid != "" && state.AccountDSID == dsid
 	ownedByUsers := idsUsers != "" && state.IDSUsers == idsUsers
 	if ownedByDSID || ownedByUsers {
@@ -234,7 +266,9 @@ func ListHandles() []string {
 	if err != nil {
 		return nil
 	}
+	sessionStateMu.Lock()
 	data, err := os.ReadFile(path)
+	sessionStateMu.Unlock()
 	if err != nil || len(data) == 0 {
 		return nil
 	}

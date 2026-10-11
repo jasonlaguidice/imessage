@@ -14,7 +14,7 @@ A Matrix-iMessage puppeting bridge. Built using [rustpush](https://github.com/Op
 - Group chats, SMS forwarding
 - Contact name resolution (iCloud, external CardDAV)
 - CloudKit message history backfill
-- FaceTime web-join links (for non-Apple platforms)
+- FaceTime call notices (incoming and missed calls; answer on an Apple device)
 - iOS 18 Focus / Do Not Disturb status
 - iCloud Shared Albums
 - Name & Photo Sharing fallback for unknown senders
@@ -117,7 +117,6 @@ help
 In **portal rooms** (bridged DMs/groups), prefix with `!im`:
 
 ```
-!im facetime
 !im help
 ```
 
@@ -128,7 +127,7 @@ Config lives at `~/.local/share/mautrix-imessage/config.yaml`. Key options:
 | Field | Default | Description |
 |---|---|---|
 | `cloudkit_backfill` | `false` | Enable iMessage history backfill from iCloud |
-| `disable_facetime` | `false` | Suppress FaceTime commands and notices (set true if you have a native Apple device) |
+| `disable_facetime` | `false` | Suppress the incoming / missed FaceTime call notices |
 | `statuskit_notifications` | `true` | Post Focus/DND notices when contacts silence notifications |
 | `video_transcoding` | `false` | Auto-remux non-MP4 video to MP4 (requires `ffmpeg`) |
 | `heic_conversion` | `false` | Auto-convert HEIC images to JPEG (requires `libheif`) |
@@ -136,6 +135,8 @@ Config lives at `~/.local/share/mautrix-imessage/config.yaml`. Key options:
 | `carddav.*` | *(unset)* | External CardDAV for contact resolution (Google, Nextcloud, Fastmail, etc.) |
 
 ## Development
+
+Building from source needs **Rust 1.95 or newer** (rustpush uses `atomic_try_update`, stable since 1.95). The Makefile checks this before compiling and fails with a clear error on older toolchains. `make check-deps` on Linux runs `rustup update stable` when the installed stable is too old; elsewhere run it yourself, or build with a specific installed toolchain via `RUSTUP_TOOLCHAIN=<version> make build`. The Docker image and CI always install the latest stable.
 
 ```bash
 make build      # Go + Rust

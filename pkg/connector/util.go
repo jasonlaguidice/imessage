@@ -113,3 +113,23 @@ func identifierToDisplaynameParams(identifier string) DisplaynameParams {
 	}
 	return DisplaynameParams{ID: localID}
 }
+
+// parseListArgs splits command arguments on commas and whitespace, dropping
+// empty entries.
+func parseListArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	joined := strings.Join(args, " ")
+	parts := strings.FieldsFunc(joined, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t' || r == '\n'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
