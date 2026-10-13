@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -185,6 +186,37 @@ func (c *IMConfig) PostProcess() error {
 	var err error
 	c.displaynameTemplate, err = template.New("displayname").Parse(c.DisplaynameTemplate)
 	return err
+}
+
+// Valid values for StatusKitNotificationStyle.
+const (
+	statusKitStyleTopic  = "topic"
+	statusKitStyleNotice = "notice"
+)
+
+// normalizeStatusKitNotificationStyle lowercases and trims raw and returns the
+// matching style. Anything other than "topic" or "notice" (including an empty
+// value) returns "topic" with ok=false.
+func normalizeStatusKitNotificationStyle(raw string) (style string, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case statusKitStyleTopic:
+		return statusKitStyleTopic, true
+	case statusKitStyleNotice:
+		return statusKitStyleNotice, true
+	default:
+		return statusKitStyleTopic, false
+	}
+}
+
+// invalidStatusKitNotificationStyle reports whether the global
+// statuskit_notification_style is set to something other than "topic" or
+// "notice" (an empty value is unset, not invalid).
+func (c *IMConfig) invalidStatusKitNotificationStyle() bool {
+	if strings.TrimSpace(c.StatusKitNotificationStyle) == "" {
+		return false
+	}
+	_, ok := normalizeStatusKitNotificationStyle(c.StatusKitNotificationStyle)
+	return !ok
 }
 
 type DisplaynameParams struct {

@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // External CardDAV contact source for non-iCloud servers (Google, Nextcloud,
 // Radicale, Fastmail, etc.). Uses HTTP Basic auth and standard CardDAV
@@ -35,11 +36,15 @@ type externalCardDAVClient struct {
 	byEmail  map[string]*imessage.Contact
 	contacts []*imessage.Contact
 	lastSync time.Time
+
+	// deadPhotoURLs is the owning IMClient's per-user skip set of
+	// permanently-failing contact photo URLs.
+	deadPhotoURLs *deadPhotoURLCache
 }
 
 // newExternalCardDAVClient creates an external CardDAV client.
 // Performs auto-discovery if url is empty. Returns nil if configuration is insufficient.
-func newExternalCardDAVClient(cfg CardDAVConfig, log zerolog.Logger) *externalCardDAVClient {
+func newExternalCardDAVClient(cfg CardDAVConfig, deadPhotoURLs *deadPhotoURLCache, log zerolog.Logger) *externalCardDAVClient {
 	if !cfg.IsConfigured() {
 		return nil
 	}
@@ -72,8 +77,9 @@ func newExternalCardDAVClient(cfg CardDAVConfig, log zerolog.Logger) *externalCa
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		byPhone: make(map[string]*imessage.Contact),
-		byEmail: make(map[string]*imessage.Contact),
+		byPhone:       make(map[string]*imessage.Contact),
+		byEmail:       make(map[string]*imessage.Contact),
+		deadPhotoURLs: deadPhotoURLs,
 	}
 }
 
@@ -137,7 +143,7 @@ func (c *externalCardDAVClient) SyncContacts(log zerolog.Logger) error {
 	}
 
 	// Step 4.5: Download any photo URLs (e.g. Google uses URL-based PHOTO fields)
-	downloadContactPhotos(allContacts, log)
+	downloadContactPhotos(allContacts, c.deadPhotoURLs, log)
 
 	// Step 5: Build lookup caches
 	c.mu.Lock()

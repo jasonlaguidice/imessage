@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // Cloud-based contact sync via Apple's CardDAV (iCloud Contacts).
 // Uses DSID + mmeAuthToken credentials obtained from the MobileMe delegate
@@ -47,12 +48,16 @@ type cloudContactsClient struct {
 	byEmail  map[string]*imessage.Contact // lowercase email → contact
 	contacts []*imessage.Contact          // all contacts
 	lastSync time.Time
+
+	// deadPhotoURLs is the owning IMClient's per-user skip set of
+	// permanently-failing contact photo URLs.
+	deadPhotoURLs *deadPhotoURLCache
 }
 
 // newCloudContactsClient creates a CardDAV contacts client using the rust Client's
 // TokenProvider for authentication. Returns nil if the token provider is unavailable
 // or the contacts URL can't be retrieved.
-func newCloudContactsClient(rustClient *rustpushgo.Client, log zerolog.Logger) *cloudContactsClient {
+func newCloudContactsClient(rustClient *rustpushgo.Client, deadPhotoURLs *deadPhotoURLCache, log zerolog.Logger) *cloudContactsClient {
 	if rustClient == nil {
 		return nil
 	}
@@ -80,8 +85,9 @@ func newCloudContactsClient(rustClient *rustpushgo.Client, log zerolog.Logger) *
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		byPhone: make(map[string]*imessage.Contact),
-		byEmail: make(map[string]*imessage.Contact),
+		byPhone:       make(map[string]*imessage.Contact),
+		byEmail:       make(map[string]*imessage.Contact),
+		deadPhotoURLs: deadPhotoURLs,
 	}
 }
 
@@ -175,7 +181,7 @@ func (c *cloudContactsClient) SyncContacts(log zerolog.Logger) error {
 	if reused > 0 {
 		log.Debug().Int("reused", reused).Msg("CardDAV: reused cached contact avatars (skipped re-download)")
 	}
-	downloadContactPhotos(allContacts, log, c.downloadAuthURL)
+	downloadContactPhotos(allContacts, c.deadPhotoURLs, log, c.downloadAuthURL)
 
 	// Step 5: Build lookup caches
 	c.mu.Lock()
@@ -740,7 +746,7 @@ func (c *cloudContactsClient) downloadAuthURL(ctx context.Context, targetURL str
 // photoFetcher downloads a URL with authentication. Nil means use generic unauthenticated fetch.
 type photoFetcher func(ctx context.Context, url string) ([]byte, error)
 
-// deadContactPhotoURLs remembers photo URLs that returned a permanent HTTP
+// deadPhotoURLCache remembers photo URLs that returned a permanent HTTP
 // failure (see photoFailurePermanentForHost: 404/410 from any host, 401/403
 // from third-party hosts only) so the contact-photo download phase doesn't
 // re-hammer the same dead host on every sync. The common case is a third-party
@@ -751,26 +757,43 @@ type photoFetcher func(ctx context.Context, url string) ([]byte, error)
 // the TTL are retried once in case the host recovered. In-memory is sufficient
 // because the bridge runs continuously — a restart costs one retry per dead
 // URL, after which they're re-cached.
-var deadContactPhotoURLs sync.Map // url string -> time.Time
+//
+// Each IMClient owns its own cache (one per user login) so one user's dead
+// photo host never suppresses photos for another user. The zero value is
+// ready to use, and a nil *deadPhotoURLCache disables caching.
+type deadPhotoURLCache struct {
+	urls sync.Map // url string -> time.Time
+}
 
 // deadContactPhotoURLTTL is how long a permanently-failing photo URL stays in
 // the skip set before one retry is allowed. A week is long enough to stop the
 // per-sync hammering while still recovering if the host starts serving again.
 const deadContactPhotoURLTTL = 7 * 24 * time.Hour
 
-// contactPhotoURLDead reports whether url is currently in the dead-URL skip
-// set (and prunes the entry if its TTL has elapsed so it gets one retry).
-func contactPhotoURLDead(url string) bool {
-	v, ok := deadContactPhotoURLs.Load(url)
+// isDead reports whether url is currently in the dead-URL skip set (and
+// prunes the entry if its TTL has elapsed so it gets one retry).
+func (d *deadPhotoURLCache) isDead(url string) bool {
+	if d == nil {
+		return false
+	}
+	v, ok := d.urls.Load(url)
 	if !ok {
 		return false
 	}
 	failedAt, _ := v.(time.Time)
 	if time.Since(failedAt) > deadContactPhotoURLTTL {
-		deadContactPhotoURLs.Delete(url)
+		d.urls.Delete(url)
 		return false
 	}
 	return true
+}
+
+// markDead records url as permanently failing as of now.
+func (d *deadPhotoURLCache) markDead(url string) {
+	if d == nil {
+		return
+	}
+	d.urls.Store(url, time.Now())
 }
 
 // photoFailurePermanent reports whether a photo-download error is a permanent
@@ -817,13 +840,14 @@ func photoFailurePermanentForHost(err error, url string) bool {
 // downloadContactPhotos downloads photo URLs for contacts that have AvatarURL
 // set but no Avatar bytes. Uses bounded concurrency to avoid overwhelming
 // the server. If an authenticated fetcher is provided, iCloud URLs use it;
-// all other URLs use the generic unauthenticated downloader.
-func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, authFetch ...photoFetcher) {
+// all other URLs use the generic unauthenticated downloader. deadURLs is the
+// calling user's skip set of permanently-failing URLs (nil disables it).
+func downloadContactPhotos(contacts []*imessage.Contact, deadURLs *deadPhotoURLCache, log zerolog.Logger, authFetch ...photoFetcher) {
 	var needsDownload []*imessage.Contact
 	skippedDead := 0
 	for _, c := range contacts {
 		if c.AvatarURL != "" && c.Avatar == nil {
-			if contactPhotoURLDead(c.AvatarURL) {
+			if deadURLs.isDead(c.AvatarURL) {
 				// Known-bad URL within its TTL — don't re-fetch the dead host.
 				// Treat as no photo this cycle (CardDAV re-supplies the URL next
 				// sync; it'll be skipped again until the TTL elapses).
@@ -875,7 +899,7 @@ func downloadContactPhotos(contacts []*imessage.Contact, log zerolog.Logger, aut
 				// 401/403 from Apple's own CDN) retry next cycle; the ghost
 				// keeps a deferred avatar meanwhile (see contactAvatar).
 				if photoFailurePermanentForHost(err, c.AvatarURL) {
-					deadContactPhotoURLs.Store(c.AvatarURL, time.Now())
+					deadURLs.markDead(c.AvatarURL)
 				}
 				log.Debug().Err(sanitizeURLError(err, c.AvatarURL)).
 					Str("name", c.Name()).
