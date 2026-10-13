@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -10,79 +11,11 @@ package connector
 
 import (
 	"bytes"
-	"encoding/json"
 	"os"
 	"path/filepath"
-	"sync"
 
 	"github.com/rs/zerolog"
 )
-
-// PersistedSessionState holds all the session data that needs to survive
-// database resets (DB deletion, config wipes, etc.). Persisted to a JSON file
-// at ~/.local/share/mautrix-imessage/session.json.
-//
-// On re-authentication, the bridge reads this file to reuse:
-//   - IDSIdentity: cryptographic device keys (avoids new key generation)
-//   - APSState: APS push connection state (preserves push token)
-//   - IDSUsers: IDS registration data (avoids calling register() endpoint)
-//
-// Together these prevent Apple from treating re-login as a "new device",
-// which would trigger "X added a new Mac" notifications to contacts.
-type PersistedSessionState struct {
-	IDSIdentity     string `json:"ids_identity,omitempty"`
-	APSState        string `json:"aps_state,omitempty"`
-	IDSUsers        string `json:"ids_users,omitempty"`
-	PreferredHandle string `json:"preferred_handle,omitempty"`
-
-	// Login platform and device identity (needed for auto-restore on Linux)
-	Platform    string `json:"platform,omitempty"`
-	HardwareKey string `json:"hardware_key,omitempty"`
-	DeviceID    string `json:"device_id,omitempty"`
-
-	// iCloud account persist data (for TokenProvider restoration across restarts)
-	AccountUsername          string `json:"account_username,omitempty"`
-	AccountHashedPasswordHex string `json:"account_hashed_password_hex,omitempty"`
-	AccountPET               string `json:"account_pet,omitempty"`
-	AccountADSID             string `json:"account_adsid,omitempty"`
-	AccountDSID              string `json:"account_dsid,omitempty"`
-	AccountSPDBase64         string `json:"account_spd_base64,omitempty"`
-
-	// Cached MobileMe delegate for seeding on restore
-	MmeDelegateJSON string `json:"mme_delegate_json,omitempty"`
-
-	// Opaque rustpush account state of the same login as the fields above;
-	// see UserLoginMetadata.AccountPersistBlob.
-	AccountPersistBlob string `json:"account_persist_blob,omitempty"`
-}
-
-// sessionFilePath returns the path to the persisted session state file:
-// ~/.local/share/mautrix-imessage/session.json
-func sessionFilePath() (string, error) {
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		dataDir = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(dataDir, "mautrix-imessage", "session.json"), nil
-}
-
-// legacyIdentityFilePath returns the old v1 identity file path for migration:
-// ~/.local/share/mautrix-imessage/identity.plist
-func legacyIdentityFilePath() (string, error) {
-	dataDir := os.Getenv("XDG_DATA_HOME")
-	if dataDir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "", err
-		}
-		dataDir = filepath.Join(home, ".local", "share")
-	}
-	return filepath.Join(dataDir, "mautrix-imessage", "identity.plist"), nil
-}
 
 // trustedPeersFilePath returns the per-user keychain trust state path:
 // ~/.local/share/mautrix-imessage/trustedpeers_<dsid>.plist
@@ -119,134 +52,22 @@ func hasKeychainCliqueState(log zerolog.Logger, dsid string) bool {
 	return false
 }
 
-// sessionStateMu serializes access to session.json across the bridge (ported
-// from upstream 47325808). It is a single bridge-wide file written from login
-// and connector startup for every user, and os.WriteFile is not atomic across
-// concurrent writers, so two logins saving at once could interleave into
-// corrupt JSON. The *Locked variants let a read-modify-write (e.g. logout's
-// ownership check before removal) hold the lock across the whole operation.
-var sessionStateMu sync.Mutex
-
-// saveSessionState writes the full session state to the JSON file (locked).
-func saveSessionState(log zerolog.Logger, state PersistedSessionState) {
-	sessionStateMu.Lock()
-	defer sessionStateMu.Unlock()
-	saveSessionStateLocked(log, state)
-}
-
-// saveSessionStateLocked is saveSessionState without the lock; callers must hold
-// sessionStateMu. Creates parent directories if needed. Errors are logged, not fatal.
-func saveSessionStateLocked(log zerolog.Logger, state PersistedSessionState) {
-	path, err := sessionFilePath()
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to determine session file path, skipping save")
+// removeAccountFiles removes the on-disk state belonging to one Apple account
+// on logout. Per-user session state lives in that login's UserLoginMetadata in
+// the bridge DB, so the only file left to clean up here is this account's
+// per-DSID keychain trust state (trustedpeers_<dsid>.plist).
+func removeAccountFiles(log zerolog.Logger, dsid string) {
+	if dsid == "" {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("Failed to create session file directory")
+	path, err := trustedPeersFilePath(dsid)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to determine trusted peers file path on logout")
 		return
 	}
-	data, err := json.Marshal(state)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to marshal session state")
-		return
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("Failed to write session file")
-		return
-	}
-	log.Info().Str("path", path).
-		Bool("has_identity", state.IDSIdentity != "").
-		Bool("has_aps_state", state.APSState != "").
-		Bool("has_ids_users", state.IDSUsers != "").
-		Msg("Saved session state to file")
-}
-
-// loadSessionState reads the persisted session state from the JSON file.
-// Falls back to the legacy identity.plist file (v1 format) if the new file
-// doesn't exist. Returns a zero-value struct if nothing is found.
-func loadSessionState(log zerolog.Logger) PersistedSessionState {
-	sessionStateMu.Lock()
-	defer sessionStateMu.Unlock()
-	return loadSessionStateLocked(log)
-}
-
-// loadSessionStateLocked is loadSessionState without the lock; callers must hold
-// sessionStateMu.
-func loadSessionStateLocked(log zerolog.Logger) PersistedSessionState {
-	// Try new JSON format first
-	path, err := sessionFilePath()
-	if err != nil {
-		log.Debug().Err(err).Msg("Failed to determine session file path")
-		return PersistedSessionState{}
-	}
-	data, err := os.ReadFile(path)
-	if err == nil && len(data) > 0 {
-		var state PersistedSessionState
-		if err := json.Unmarshal(data, &state); err != nil {
-			log.Warn().Err(err).Str("path", path).Msg("Failed to parse session file")
-			return PersistedSessionState{}
-		}
-		log.Info().Str("path", path).
-			Bool("has_identity", state.IDSIdentity != "").
-			Bool("has_aps_state", state.APSState != "").
-			Bool("has_ids_users", state.IDSUsers != "").
-			Msg("Loaded session state from file")
-		return state
-	}
-
-	// Fall back to legacy identity.plist (v1 format — identity only)
-	legacyPath, err := legacyIdentityFilePath()
-	if err != nil {
-		return PersistedSessionState{}
-	}
-	legacyData, err := os.ReadFile(legacyPath)
-	if err != nil || len(legacyData) == 0 {
-		return PersistedSessionState{}
-	}
-	log.Info().Str("path", legacyPath).Msg("Migrating legacy identity file to new session format")
-	state := PersistedSessionState{
-		IDSIdentity: string(legacyData),
-	}
-	// Migrate: save in new format and remove old file (already under the lock)
-	saveSessionStateLocked(log, state)
-	_ = os.Remove(legacyPath)
-	return state
-}
-
-// clearSessionBackupForAccount removes the on-disk state belonging to one
-// Apple account so tryAutoRestore can't resurrect a login after it was
-// logged out. session.json is a single bridge-wide backup (last writer wins),
-// so it is only removed when it belongs to this account — matched by DSID, or
-// by IDS users blob for backups written before DSID was recorded. Another
-// user's backup is left untouched. trustedpeers_<dsid>.plist is per-account.
-func clearSessionBackupForAccount(log zerolog.Logger, dsid, idsUsers string) {
-	removeFile := func(path string) {
-		if err := os.Remove(path); err == nil {
-			log.Info().Str("path", path).Msg("Removed session backup file on logout")
-		} else if !os.IsNotExist(err) {
-			log.Warn().Err(err).Str("path", path).Msg("Failed to remove session backup file on logout")
-		}
-	}
-
-	// Hold the lock across the ownership check and removal so another login
-	// can't write its own backup in between and have it deleted here.
-	sessionStateMu.Lock()
-	defer sessionStateMu.Unlock()
-	state := loadSessionStateLocked(log)
-	ownedByDSID := dsid != "" && state.AccountDSID == dsid
-	ownedByUsers := idsUsers != "" && state.IDSUsers == idsUsers
-	if ownedByDSID || ownedByUsers {
-		if path, err := sessionFilePath(); err == nil {
-			removeFile(path)
-		}
-	} else if state.IDSUsers != "" {
-		log.Debug().Msg("session.json belongs to another account, leaving it in place")
-	}
-
-	if dsid != "" {
-		if path, err := trustedPeersFilePath(dsid); err == nil {
-			removeFile(path)
-		}
+	if err := os.Remove(path); err == nil {
+		log.Info().Str("path", path).Msg("Removed trusted peers file on logout")
+	} else if !os.IsNotExist(err) {
+		log.Warn().Err(err).Str("path", path).Msg("Failed to remove trusted peers file on logout")
 	}
 }

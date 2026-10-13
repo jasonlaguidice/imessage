@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -1741,12 +1742,12 @@ func (c *IMClient) IsLoggedIn() bool {
 // LogoutRemote implements bridgev2.NetworkAPI. bridgev2 handles the rest of
 // the logout (login row, space, portal cleanup, bridge state); this only
 // tears down what lives outside the bridge DB for this login: the rustpush
-// connection and the on-disk session backup. Other users' logins and backups
-// are untouched.
+// connection and this account's per-DSID keychain trust file. Other users'
+// logins and files are untouched.
 func (c *IMClient) LogoutRemote(ctx context.Context) {
 	c.Disconnect()
 	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
-		clearSessionBackupForAccount(c.UserLogin.Log, meta.AccountDSID, meta.IDSUsers)
+		removeAccountFiles(c.UserLogin.Log, meta.AccountDSID)
 	}
 }
 

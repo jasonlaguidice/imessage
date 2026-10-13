@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -1138,15 +1139,16 @@ type cachedSessionState struct {
 	APSState        string
 	IDSUsers        string
 	PreferredHandle string
-	source          string // "database" or "backup file", for logging
 }
 
 // loadCachedSession looks up all three session components (identity, APS state,
-// IDS users) from the bridge database or backup session file. Returns nil if
-// nothing is found. The returned state has NOT been validated against the
-// keystore yet — call validate() before using.
+// IDS users) from the bridge database. Returns nil if nothing is found. The
+// returned state has NOT been validated against the keystore yet — call
+// validate() before using.
 func loadCachedSession(user *bridgev2.User, log zerolog.Logger) *cachedSessionState {
-	// Check DB first
+	// Per-user session state only ever comes from that user's own logins: a
+	// bridge-wide backup file would hand one Matrix user another user's Apple
+	// session, so there is deliberately no file fallback here.
 	for _, login := range user.GetCachedUserLogins() {
 		if meta, ok := login.Metadata.(*UserLoginMetadata); ok {
 			if meta.IDSUsers != "" || meta.IDSIdentity != "" || meta.APSState != "" {
@@ -1156,21 +1158,8 @@ func loadCachedSession(user *bridgev2.User, log zerolog.Logger) *cachedSessionSt
 					APSState:        meta.APSState,
 					IDSUsers:        meta.IDSUsers,
 					PreferredHandle: meta.PreferredHandle,
-					source:          "database",
 				}
 			}
-		}
-	}
-	// Fall back to session file (survives DB resets)
-	state := loadSessionState(log)
-	if state.IDSIdentity != "" || state.APSState != "" || state.IDSUsers != "" {
-		log.Info().Msg("Found existing session state in backup file")
-		return &cachedSessionState{
-			IDSIdentity:     state.IDSIdentity,
-			APSState:        state.APSState,
-			IDSUsers:        state.IDSUsers,
-			PreferredHandle: state.PreferredHandle,
-			source:          "backup file",
 		}
 	}
 	return nil
@@ -1186,12 +1175,10 @@ func (c *cachedSessionState) validate(log zerolog.Logger) bool {
 	}
 	users := rustpushgo.NewWrappedIdsUsers(&c.IDSUsers)
 	if !users.ValidateKeystore() {
-		log.Warn().
-			Str("source", c.source).
-			Msg("Cached session state references missing keystore keys — discarding (will register fresh)")
+		log.Warn().Msg("Cached session state references missing keystore keys — discarding (will register fresh)")
 		return false
 	}
-	log.Info().Str("source", c.source).Msg("Cached session state validated against keystore")
+	log.Info().Msg("Cached session state validated against keystore")
 	return true
 }
 
@@ -1200,7 +1187,7 @@ func (c *cachedSessionState) validate(log zerolog.Logger) bool {
 // The session must have been validated before calling this.
 func getExistingIdentity(session *cachedSessionState, log zerolog.Logger) *rustpushgo.WrappedIdsngmIdentity {
 	if session != nil && session.IDSIdentity != "" {
-		log.Info().Str("source", session.source).Msg("Reusing existing identity")
+		log.Info().Msg("Reusing existing identity")
 		identityStr := session.IDSIdentity
 		return rustpushgo.NewWrappedIdsngmIdentity(&identityStr)
 	}
@@ -1212,7 +1199,7 @@ func getExistingIdentity(session *cachedSessionState, log zerolog.Logger) *rustp
 // The session must have been validated before calling this.
 func getExistingAPSState(session *cachedSessionState, log zerolog.Logger) *rustpushgo.WrappedApsState {
 	if session != nil && session.APSState != "" {
-		log.Info().Str("source", session.source).Msg("Reusing existing APS state")
+		log.Info().Msg("Reusing existing APS state")
 		return rustpushgo.NewWrappedApsState(&session.APSState)
 	}
 	log.Info().Msg("No existing APS state found, will create new connection")
@@ -1224,7 +1211,7 @@ func getExistingAPSState(session *cachedSessionState, log zerolog.Logger) *rustp
 // The session must have been validated before calling this.
 func getExistingUsers(session *cachedSessionState, log zerolog.Logger) *rustpushgo.WrappedIdsUsers {
 	if session != nil && session.IDSUsers != "" {
-		log.Info().Str("source", session.source).Msg("Reusing existing IDS users")
+		log.Info().Msg("Reusing existing IDS users")
 		return rustpushgo.NewWrappedIdsUsers(&session.IDSUsers)
 	}
 	return nil
@@ -1440,8 +1427,8 @@ func parseHandleSelection(selected string, handles []string) string {
 }
 
 // completeLoginWithMeta is the shared tail of both login flows: creates the
-// IMClient, persists metadata, saves the identity backup file, and starts the
-// bridge connection.
+// IMClient, persists metadata, and starts the bridge connection.
+// Metadata is the only persistence layer for session state (see dbmeta.go).
 func completeLoginWithMeta(
 	ctx context.Context,
 	user *bridgev2.User,
@@ -1482,25 +1469,6 @@ func completeLoginWithMeta(
 	} else {
 		log.Warn().Msg("No account persist data from login — cloud services will not be available")
 	}
-
-	// Persist full session state to backup file so it survives DB resets.
-	saveSessionState(log, PersistedSessionState{
-		IDSIdentity:              meta.IDSIdentity,
-		APSState:                 meta.APSState,
-		IDSUsers:                 meta.IDSUsers,
-		PreferredHandle:          meta.PreferredHandle,
-		Platform:                 meta.Platform,
-		HardwareKey:              meta.HardwareKey,
-		DeviceID:                 meta.DeviceID,
-		AccountUsername:          meta.AccountUsername,
-		AccountHashedPasswordHex: meta.AccountHashedPasswordHex,
-		AccountPET:               meta.AccountPET,
-		AccountADSID:             meta.AccountADSID,
-		AccountDSID:              meta.AccountDSID,
-		AccountSPDBase64:         meta.AccountSPDBase64,
-		MmeDelegateJSON:          meta.MmeDelegateJSON,
-		AccountPersistBlob:       meta.AccountPersistBlob,
-	})
 
 	loginID := networkid.UserLoginID(result.Users.LoginId(0))
 

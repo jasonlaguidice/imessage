@@ -1015,7 +1015,7 @@ pub struct IDSUsersWithIdentityRecord {
 }
 
 /// Data needed to restore a TokenProvider from persisted state.
-/// Stored in session.json so it survives database resets.
+/// Stored in the login's UserLoginMetadata so it survives restarts.
 #[derive(uniffi::Record)]
 pub struct AccountPersistData {
     pub username: String,
@@ -4084,9 +4084,10 @@ pub fn init_logger() {
     // Initialize the keystore with a file-backed software keystore.
     // This must be called before any rustpush operations (APNs connect, login, etc.).
     //
-    // The keystore lives alongside session.json in the XDG data directory
-    // (~/.local/share/mautrix-imessage/) so that all session state is in one
-    // place and easy to migrate between machines.
+    // The keystore lives in the XDG data directory
+    // (~/.local/share/mautrix-imessage/) alongside the per-account
+    // trustedpeers_<dsid>.plist files, so that all session key material is in
+    // one place and easy to migrate between machines.
     let xdg_dir = resolve_xdg_data_dir();
     let state_path = format!("{}/keystore.plist", xdg_dir);
     let _ = std::fs::create_dir_all(&xdg_dir);
