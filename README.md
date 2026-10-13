@@ -176,21 +176,22 @@ Bridge-specific options live in the `network` section of `config.yaml`. These ar
 
 External CardDAV contacts (Google, Nextcloud, Fastmail, etc.) have no global setting: each user configures their own server during login or with `set-carddav`.
 
-### Recommended bridge settings
+### Bridge defaults
 
-These mautrix keys sit outside the `network` section. The bridge does not change them at runtime; it logs a warning at startup when one is below the recommended value.
+mautrix writes its own stock values for every `bridge.*` and `backfill.*` key into `config.yaml`, so the bridge cannot tell an unset key from one set to the stock value. When one of the keys below still holds mautrix's stock value, the bridge uses its own default instead (in memory only; `config.yaml` is not rewritten) and logs one info line for it. Any other value is yours and is kept. Because `false` is the stock value, `bridge.phone_numbers_in_profile`, `backfill.enabled` and `backfill.queue.enabled` cannot be turned off. These defaults apply whether or not `network.cloudkit_backfill` is on; without a history source, backfill finds no messages.
 
-- `bridge.unknown_error_auto_reconnect: 5m` (at least `1m`; lets the receive-wedge watchdog rebuild a stuck client)
-- `bridge.unknown_error_max_auto_reconnects: 100` (bridgev2 never resets this counter until restart)
-- `bridge.phone_numbers_in_profile: true` (keeps `tel:` identifiers in ghost profiles for call buttons and phone contacts)
+| Key | mautrix stock value | Bridge default | Why |
+|---|---|---|---|
+| `bridge.phone_numbers_in_profile` | `false` | `true` | Keeps `tel:` identifiers in ghost profiles, for call buttons and phone contact info |
+| `bridge.unknown_error_auto_reconnect` | `null` | `5m` | Lets the receive-wedge watchdog rebuild a stuck client |
+| `bridge.unknown_error_max_auto_reconnects` | `10` | `100` | bridgev2 never resets this counter until restart |
+| `backfill.enabled` | `false` | `true` | CloudKit backfill cannot deliver history without it |
+| `backfill.max_initial_messages` | `50` | `2147483647` | Uncapped; any smaller value is a per-chat cap and turns off backward backfill |
+| `backfill.max_catchup_messages` | `500` | `2147483647` | Catches up on every message missed while the bridge was down |
+| `backfill.queue.enabled` | `false` | `true` | Runs the backward backfill of older history |
+| `backfill.queue.batch_size` | `100` | `10000` | Small batches fragment room history |
 
-With `network.cloudkit_backfill: true`:
-
-- `backfill.enabled: true` (required: if it is `false`, the bridge enables it in memory and logs a warning, because CloudKit backfill cannot work without it)
-- `backfill.max_initial_messages: 2147483647` (uncapped; any smaller value is treated as a per-chat cap and turns off backward backfill)
-- `backfill.max_catchup_messages: 2147483647` (keep equal to `max_initial_messages`)
-- `backfill.queue.enabled: true`
-- `backfill.queue.batch_size: 10000` (more than 100; small batches fragment room history)
+If you set `bridge.unknown_error_auto_reconnect` below `1m`, the bridge logs a warning: bridgev2 treats such values as disabled.
 
 ## Development
 

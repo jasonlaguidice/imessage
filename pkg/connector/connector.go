@@ -12,7 +12,6 @@ package connector
 import (
 	"context"
 	"fmt"
-	"math"
 	"runtime"
 	"time"
 
@@ -72,16 +71,19 @@ func (c *IMConnector) Start(ctx context.Context) error {
 			Msg("Invalid statuskit_notification_style in config (expected \"topic\" or \"notice\"); falling back to \"topic\"")
 	}
 
-	// config.yaml is operator-owned. Start() never rewrites the operator's
-	// bridge/backfill values for preference reasons; it only warns when a
-	// value is below what this connector recommends. The single exception is
-	// in enforceRequiredBackfillConfig, for a value CloudKit backfill cannot
-	// function without.
-	c.warnRecommendedBridgeConfig()
-	if c.Config.CloudKitBackfill {
-		c.enforceRequiredBackfillConfig()
-		c.warnRecommendedBackfillConfig()
-	}
+	// mautrix writes its own stock values for every bridge.* and backfill.*
+	// key into config.yaml, so a key still at its stock value is treated as
+	// "not chosen" and gets this bridge's default instead (bridge_defaults.go).
+	// Any other value is the operator's and is kept. The change is in memory
+	// only; config.yaml is never rewritten. The defaults apply whatever
+	// network.cloudkit_backfill says: without a history source FetchMessages
+	// returns nothing. The boolean defaults (phone_numbers_in_profile,
+	// backfill.enabled, backfill.queue.enabled) cannot be turned off, because
+	// false is their stock value. An operator-set max_initial_messages below
+	// MaxInt32 is an explicit cap: FetchMessages skips backward backfill and
+	// the startup attachment pre-upload is skipped.
+	c.applyBridgeConfigDefaults()
+	c.warnShortUnknownErrorAutoReconnect()
 
 	// Start runs after the DB upgrade and before any login is loaded. Delete a
 	// leftover legacy carddav.key if no stored login still needs it; logins
@@ -89,101 +91,6 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	// deletes the file.
 	c.removeLegacyCardDAVKeyIfUnused(ctx, c.Bridge.Log.With().Str("component", "carddav_migration").Logger())
 	return nil
-}
-
-// recommendedMaxInitialMessages is the "uncapped" sentinel for
-// backfill.max_initial_messages. FetchMessages and preUploadCloudAttachments
-// treat any smaller value as an explicit operator cap.
-const recommendedMaxInitialMessages = math.MaxInt32
-
-// warnRecommended logs that an operator config value differs from what the
-// connector recommends. It never changes the value.
-func (c *IMConnector) warnRecommended(key string, current, recommended any, reason string) {
-	c.Bridge.Log.Warn().
-		Str("config_key", key).
-		Interface("current", current).
-		Interface("recommended", recommended).
-		Msgf("Config %s is %v; recommended %v: %s (value left unchanged)", key, current, recommended, reason)
-}
-
-// warnRecommendedBridgeConfig checks the bridge.* keys the connector relies on
-// for automatic recovery and contact display.
-func (c *IMConnector) warnRecommendedBridgeConfig() {
-	cfg := c.Bridge.Config
-	// bridgev2 treats any value < 1min as "disabled" (bridgestate.go
-	// waitForUnknownErrorReconnect), so the APNs receive-wedge watchdog's
-	// StateUnknownError would not rebuild the client.
-	if cfg.UnknownErrorAutoReconnect < time.Minute {
-		c.warnRecommended("bridge.unknown_error_auto_reconnect", cfg.UnknownErrorAutoReconnect.String(), "5m",
-			"values under 1m disable bridgev2's unknown-error auto-reconnect, so the APNs receive-wedge watchdog cannot rebuild the client")
-	}
-	// bridgev2 never resets the unknown-error reconnect counter in-process, so a
-	// low budget is exhausted after a few rebuilds on a long-uptime deploy.
-	// Rebuilds are rate-limited (10-min wedge threshold + 5-min reconnect delay)
-	// and kept light by the full-connect cooldown, so 100 stays Apple-safe.
-	if cfg.UnknownErrorMaxAutoReconnects < 100 {
-		c.warnRecommended("bridge.unknown_error_max_auto_reconnects", cfg.UnknownErrorMaxAutoReconnects, 100,
-			"bridgev2 never resets this counter until restart, so a low budget leaves wedge recovery manual-restart-only after a few rebuilds")
-	}
-	// bridgev2 strips every tel: identifier from ghost profiles unless this is
-	// set (ghost.go prepareContactInfo). Matrix clients (Beeper) gate the call
-	// button and phone-contact handling on that tel: identifier.
-	if !cfg.PhoneNumbersInProfile {
-		c.warnRecommended("bridge.phone_numbers_in_profile", false, true,
-			"phone-only iMessage contacts lose their tel: identifier in Matrix profiles (no call button, email-only contact info)")
-	}
-}
-
-// enforceRequiredBackfillConfig sets the one backfill value that CloudKit
-// backfill cannot work without. bridgev2 only calls FetchMessages
-// (portal.go doForwardBackfill on room creation and chat resync) and only
-// accepts RemoteBackfill events when backfill.enabled is true. With it off,
-// network.cloudkit_backfill would deliver no history at all, and the APNs
-// buffer that waits for the initial forward backfills (pendingInitialBackfills)
-// would hold live messages until its 5-minute no-progress timeout. The change
-// is in-memory only; config.yaml is not rewritten.
-func (c *IMConnector) enforceRequiredBackfillConfig() {
-	cfg := &c.Bridge.Config.Backfill
-	if !cfg.Enabled {
-		cfg.Enabled = true
-		c.Bridge.Log.Warn().
-			Str("config_key", "backfill.enabled").
-			Msg("network.cloudkit_backfill is true but backfill.enabled is false; enabling backfill in memory because CloudKit backfill cannot deliver history without it. Set backfill.enabled: true (or network.cloudkit_backfill: false) in config.yaml to silence this warning")
-	}
-}
-
-// warnRecommendedBackfillConfig checks the backfill.* values recommended for
-// CloudKit history. The mautrix defaults (max_initial_messages=50,
-// batch_size=100) are low for chats with tens of thousands of messages, and
-// many small backward batch_send requests create fragmented DAG branches
-// that clients cannot paginate through.
-func (c *IMConnector) warnRecommendedBackfillConfig() {
-	cfg := c.Bridge.Config.Backfill
-	if cfg.MaxInitialMessages < recommendedMaxInitialMessages {
-		reason := "any smaller value is treated as a cap: only that many messages are backfilled per chat and backward backfill is skipped"
-		if cfg.MaxInitialMessages <= 0 {
-			reason = "values <= 0 skip forward backfill entirely, so no CloudKit history is delivered and live messages wait for the 5-minute APNs buffer timeout on initial sync"
-		}
-		c.warnRecommended("backfill.max_initial_messages", cfg.MaxInitialMessages, recommendedMaxInitialMessages, reason)
-	}
-	// Catch-up should match the initial cap: unlimited when uncapped, capped
-	// when the operator caps max_initial_messages.
-	if cfg.MaxCatchupMessages != cfg.MaxInitialMessages {
-		c.warnRecommended("backfill.max_catchup_messages", cfg.MaxCatchupMessages, cfg.MaxInitialMessages,
-			"catch-up after restart should use the same limit as backfill.max_initial_messages")
-	}
-	if !cfg.Queue.Enabled {
-		c.warnRecommended("backfill.queue.enabled", false, true,
-			"bridgev2's backfill queue (backward backfill of history older than the forward batch) does not run without it")
-	}
-	if cfg.Queue.BatchSize <= 100 {
-		c.warnRecommended("backfill.queue.batch_size", cfg.Queue.BatchSize, 10000,
-			"small backward batches create fragmented room DAG branches that clients cannot paginate through")
-	}
-	// backfill.queue.max_batches is not checked: IMClient.GetBackfillMaxBatchCount
-	// always returns -1, which bridgev2 uses in place of the config value, and
-	// FetchMessages short-circuits backward requests when max_initial_messages
-	// is capped.
 }
 
 func (c *IMConnector) GetLoginFlows() []bridgev2.LoginFlow {
