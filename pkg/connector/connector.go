@@ -236,7 +236,7 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 	// One-time move of a legacy encrypted CardDAV password into plain
 	// metadata. Local file read + AES decrypt + DB save only; runs before
 	// anything below can fail, so every stored login gets migrated.
-	c.migrateLegacyCardDAVLogin(ctx, login, meta, log)
+	c.migrateLegacyCardDAVLogin(ctx, login, meta, login.Log)
 
 	rustpushgo.InitLogger()
 
