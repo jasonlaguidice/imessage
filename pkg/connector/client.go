@@ -1220,7 +1220,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			}
 		} else {
 			log.Warn().Strs("available", handles).
-				Msg("No preferred_handle configured — using first available. Run the install script to select one.")
+				Msg("No preferred_handle configured — using first available. Use the `set-identity` bot command to select one.")
 		}
 	}
 	c.setIdentity(handle, handles)

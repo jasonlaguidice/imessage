@@ -16,8 +16,6 @@ import (
 	"sync"
 
 	"github.com/rs/zerolog"
-
-	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
 // PersistedSessionState holds all the session data that needs to survive
@@ -251,63 +249,4 @@ func clearSessionBackupForAccount(log zerolog.Logger, dsid, idsUsers string) {
 			removeFile(path)
 		}
 	}
-}
-
-// ListHandles returns the available iMessage handles (phone numbers and
-// email addresses) from the backup session state. Returns nil if no valid
-// session state is found. Intended for CLI use (list-handles subcommand).
-// Reads session.json directly to avoid any logger output.
-func ListHandles() []string {
-	// InitLogger must be called before any Rust FFI (NewWrappedIdsUsers).
-	// Without it the Rust side has no logger and may panic on Linux.
-	rustpushgo.InitLogger()
-
-	path, err := sessionFilePath()
-	if err != nil {
-		return nil
-	}
-	sessionStateMu.Lock()
-	data, err := os.ReadFile(path)
-	sessionStateMu.Unlock()
-	if err != nil || len(data) == 0 {
-		return nil
-	}
-	var state PersistedSessionState
-	if err := json.Unmarshal(data, &state); err != nil || state.IDSUsers == "" {
-		return nil
-	}
-	users := rustpushgo.NewWrappedIdsUsers(&state.IDSUsers)
-	return users.GetHandles()
-}
-
-// CheckSessionRestore validates that backup session state (session.json +
-// keystore) exists and the IDS user keys are present in the keystore.
-// Returns true if login can be auto-restored without re-authentication.
-// This is intended to be called from the CLI (check-restore subcommand)
-// before starting the bridge.
-func CheckSessionRestore() bool {
-	log := zerolog.New(zerolog.NewConsoleWriter()).With().Timestamp().Logger()
-
-	// Initialize keystore (loads from XDG path, migrates if needed)
-	rustpushgo.InitLogger()
-
-	state := loadSessionState(log)
-	if state.IDSUsers == "" || state.IDSIdentity == "" || state.APSState == "" {
-		return false
-	}
-
-	session := &cachedSessionState{
-		IDSIdentity: state.IDSIdentity,
-		APSState:    state.APSState,
-		IDSUsers:    state.IDSUsers,
-		source:      "backup file (check-restore)",
-	}
-	if !session.validate(log) {
-		return false
-	}
-	if !hasKeychainCliqueState(log, state.AccountDSID) {
-		log.Info().Msg("Session restore check failed: keychain trust circle not initialized")
-		return false
-	}
-	return true
 }

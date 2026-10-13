@@ -95,7 +95,9 @@ typing_notifications: true
 # External CardDAV server for contact name resolution.
 # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
 # When configured, this is used instead of iCloud contacts.
-# Set up during install or via: ./mautrix-imessage-v2 carddav-setup
+# External CardDAV is normally configured per user during login, or later
+# with the `set-carddav` bot command. This block is only a global fallback
+# for users who haven't configured their own.
 carddav:
     # Email address — used for auto-discovery and as default username.
     email: ""
@@ -103,5 +105,7 @@ carddav:
     url: ""
     # Username for authentication (defaults to email if empty).
     username: ""
-    # Encrypted app password (set by carddav-setup command).
+    # Encrypted app password. It must be encrypted with the bridge's per-host
+    # key, so it can't be written by hand here; setting it per user (during
+    # login or with `set-carddav`) is the supported path.
     password_encrypted: ""

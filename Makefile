@@ -1,10 +1,8 @@
 APP_NAME    := matrix-rustpush
 CMD_PKG     := matrix-rustpush
-BUNDLE_ID   := com.jasonlaguidice.matrix-rustpush
 VERSION     := 0.1.0
 COMMIT      := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 BUILD_TIME  := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-DATA_DIR    ?= $(HOME)/.local/share/matrix-rustpush
 UNAME_S     := $(shell uname -s)
 
 RUST_LIB    := librustpushgo.a
@@ -34,7 +32,6 @@ RUSTPUSH_SRC:= $(shell find $(RUSTPUSH_DIR)/src $(APA_DIR) $(RUSTPUSH_DIR)/open-
 CARGO_FILES := $(shell find . -name 'Cargo.toml' -o -name 'Cargo.lock' 2>/dev/null | grep -v target)
 GO_SRC      := $(shell find pkg/ cmd/ -name '*.go' 2>/dev/null)
 
-BBCTL       := bbctl
 LDFLAGS     := -X main.Tag=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildTime=$(BUILD_TIME)
 
 # Track the git commit so ldflags changes trigger a Go rebuild.
@@ -45,7 +42,7 @@ ifneq ($(COMMIT),$(PREV_COMMIT))
   $(shell echo $(COMMIT) > $(COMMIT_FILE))
 endif
 
-.PHONY: build clean install install-beeper uninstall reset rust bindings check-deps check-deps-linux check-rust-toolchain
+.PHONY: build clean rust bindings check-deps check-deps-linux check-rust-toolchain
 
 # ===========================================================================
 # Path validation – spaces in the working directory break CGO linker flags
@@ -319,9 +316,9 @@ bindings: $(RUST_LIB)
 # ===========================================================================
 
 ifeq ($(UNAME_S),Darwin)
-build: check-deps $(RUST_LIB) $(BINARY) $(BBCTL)
+build: check-deps $(RUST_LIB) $(BINARY)
 	codesign --force --deep --sign - $(APP_BUNDLE)
-	@echo "Built $(APP_BUNDLE) + $(BBCTL) ($(VERSION)-$(COMMIT))"
+	@echo "Built $(APP_BUNDLE) ($(VERSION)-$(COMMIT))"
 
 $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | grep -v target) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
@@ -329,49 +326,12 @@ $(BINARY): $(GO_SRC) $(shell find . -name '*.m' -o -name '*.h' 2>/dev/null | gre
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
 else
-build: check-deps $(RUST_LIB) $(BINARY) $(BBCTL)
-	@echo "Built $(BINARY) + $(BBCTL) ($(VERSION)-$(COMMIT))"
+build: check-deps $(RUST_LIB) $(BINARY)
+	@echo "Built $(BINARY) ($(VERSION)-$(COMMIT))"
 
 $(BINARY): $(GO_SRC) go.mod go.sum $(RUST_LIB) $(COMMIT_FILE)
 	CGO_CFLAGS="$(CGO_CFLAGS)" CGO_LDFLAGS="$(CGO_LDFLAGS)" \
 		go build -ldflags '$(LDFLAGS)' -o $(BINARY) ./cmd/$(CMD_PKG)/
-endif
-
-$(BBCTL): $(GO_SRC) go.mod go.sum
-	go build -o $(BBCTL) ./cmd/bbctl/
-
-# ===========================================================================
-# Install / uninstall (macOS)
-# ===========================================================================
-
-install: build
-ifeq ($(UNAME_S),Darwin)
-	@scripts/install.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)"
-else
-	@scripts/install-linux.sh "$(BINARY)" "$(DATA_DIR)"
-endif
-
-install-beeper: build
-ifeq ($(UNAME_S),Darwin)
-	@scripts/install-beeper.sh "$(BINARY)" "$(DATA_DIR)" "$(BUNDLE_ID)" "$(CURDIR)/$(BBCTL)"
-else
-	@scripts/install-beeper-linux.sh "$(BINARY)" "$(DATA_DIR)" "$(CURDIR)/$(BBCTL)"
-endif
-
-reset:
-ifeq ($(UNAME_S),Darwin)
-	@scripts/reset-bridge.sh "$(BUNDLE_ID)"
-else
-	@scripts/reset-bridge.sh
-endif
-
-uninstall:
-ifeq ($(UNAME_S),Darwin)
-	-launchctl unload ~/Library/LaunchAgents/$(BUNDLE_ID).plist 2>/dev/null
-	rm -f ~/Library/LaunchAgents/$(BUNDLE_ID).plist
-	@echo "LaunchAgent removed. App bundle at $(APP_BUNDLE) left in place."
-else
-	@echo "On Linux, stop the service and remove the binary manually."
 endif
 
 # ===========================================================================
@@ -403,5 +363,5 @@ clean:
 ifeq ($(UNAME_S),Darwin)
 	rm -rf $(APP_NAME).app
 endif
-	rm -f $(APP_NAME) $(BBCTL) $(RUST_LIB) extract-key tools/extract-key/extract-key
+	rm -f $(APP_NAME) $(RUST_LIB) extract-key tools/extract-key/extract-key
 	cd pkg/rustpushgo && cargo clean 2>/dev/null || true

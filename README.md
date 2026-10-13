@@ -21,46 +21,83 @@ A Matrix-iMessage puppeting bridge. Built using [rustpush](https://github.com/Op
 
 ## Installation
 
-### Docker (Linux — recommended)
+This is a standard [mautrix bridgev2](https://docs.mau.fi/bridges/) bridge for self-hosted Matrix homeservers. Setup follows the usual mautrix flow: generate a config, edit it, generate an appservice registration, register it with your homeserver, run the bridge, then log in through the bridge bot.
 
-Docker images are available for `linux/amd64`:
+On Linux the bridge also needs a hardware key extracted from a Mac before it can connect to Apple — see [Linux Hardware Key](#linux-hardware-key) below.
+
+### 1. Get the bridge
+
+**Docker (Linux — recommended).** Images are available for `linux/amd64`:
 
 ```bash
 docker pull ghcr.io/jasonlaguidice/imessage:latest
 ```
 
-See [docker-compose.yml](docker-compose.yml) for a reference deployment.
+See [compose.yml](compose.yml) for a reference deployment. It mounts `./data` at `/data` (`config.yaml`, `registration.yaml`, database) and `./state` at `/state` (Apple session and per-user state), and publishes the appservice port `29332`.
 
-Before the bridge can connect to Apple, you need a hardware key extracted from a Mac — see [Linux Hardware Key](#linux-hardware-key) below.
-
-### macOS
+**From source (Linux or macOS).** See [Development](#development) for toolchain requirements.
 
 ```bash
 git clone https://github.com/jasonlaguidice/imessage.git
 cd imessage
-make install
+make build
 ```
 
-The installer handles dependencies, config, login, and LaunchAgent setup. Re-run it at any time to change settings (FaceTime, StatusKit, HEIC conversion, video transcoding, CardDAV, etc.) without wiping your data.
+`make build` runs `make check-deps` first, which installs missing build dependencies (Homebrew on macOS, `scripts/bootstrap-linux.sh` on Linux). It produces `./matrix-rustpush` on Linux and `matrix-rustpush.app` (binary at `matrix-rustpush.app/Contents/MacOS/matrix-rustpush`) on macOS.
 
-### Generic (Linux, self-hosted)
+### 2. Generate and edit the config
 
 ```bash
-git clone https://github.com/jasonlaguidice/imessage.git
-cd imessage
-make install
+./matrix-rustpush -c config.yaml -e
+
+# Docker
+mkdir -p data state
+docker run --rm -v "$PWD/data:/data" ghcr.io/jasonlaguidice/imessage:latest -c /data/config.yaml -e
 ```
 
-The installer builds the Rust library, walks through config, and registers a systemd user service.
+Edit `config.yaml`:
 
-### Beeper
+- `homeserver.address` / `homeserver.domain` — your homeserver's URL and server name.
+- `appservice.address` — the URL your homeserver uses to reach the bridge (default port `29332`). `appservice.hostname` / `appservice.port` set where the bridge listens; use `0.0.0.0` under Docker.
+- `database` — `sqlite3-fk-wal` or `postgres`, plus the URI.
+- `bridge.permissions` — who may use (`user`) and administer (`admin`) the bridge.
+- `network` — bridge-wide defaults (see [Configuration](#configuration)).
 
-Pass `--type bridgev2` config from `bbctl` and point it at the binary:
+### 3. Register the bridge with your homeserver
 
 ```bash
-bbctl config --type bridgev2 sh-imessage > config.yaml
-./mautrix-imessage-v2 -c config.yaml
+./matrix-rustpush -c config.yaml -g -r registration.yaml
+
+# Docker
+docker run --rm -v "$PWD/data:/data" ghcr.io/jasonlaguidice/imessage:latest -c /data/config.yaml -g -r /data/registration.yaml
 ```
+
+Add `registration.yaml` to your homeserver's appservice config (for Synapse, list it under `app_service_config_files` in `homeserver.yaml`) and restart the homeserver. Re-run `-g` whenever you change the `appservice` section.
+
+### 4. Run it
+
+**Docker:** `docker compose -f compose.yml up -d` (the image runs `matrix-rustpush -c /data/config.yaml`).
+
+**systemd:** a minimal unit:
+
+```ini
+[Unit]
+Description=matrix-rustpush iMessage bridge
+After=network-online.target
+
+[Service]
+User=matrix-rustpush
+WorkingDirectory=/opt/matrix-rustpush
+ExecStart=/opt/matrix-rustpush/matrix-rustpush -c config.yaml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Apple session state is stored in `$XDG_DATA_HOME/mautrix-imessage` (default `~/.local/share/mautrix-imessage`) of the user running the bridge.
+
+On macOS, run `matrix-rustpush.app/Contents/MacOS/matrix-rustpush -c config.yaml`.
 
 ## Linux Hardware Key
 
@@ -98,9 +135,11 @@ Paste the base64 key when the login flow asks for it.
 
 ## Login
 
-Login runs automatically at the end of `make install`. To log in later (or re-login), DM the bridge bot in the Matrix management room and run the **Apple ID (External Key)** flow.
+Start a DM with the bridge bot (`@imessagebot:<your domain>` by default) and send `login`. On Linux, pick the **Apple ID (External Key)** flow; on macOS, **Apple ID** is also offered.
 
-Prompts: Apple ID → password → 2FA (if needed) → handle selection.
+Prompts: Apple ID → password → 2FA (if needed) → handle selection. The flow also asks for your per-user settings: video transcoding, HEIC conversion, CloudKit backfill, contact source (iCloud or external CardDAV), FaceTime call notices and StatusKit notifications.
+
+Some of these can be changed later with bot commands: `set-video-transcoding on|off`, `set-heic-conversion on|off`, `set-carddav` (contact source) and `set-identity` (outgoing handle). Run `help` for the full list.
 
 ## Usage
 
@@ -122,7 +161,7 @@ In **portal rooms** (bridged DMs/groups), prefix with `!im`:
 
 ## Configuration
 
-Config lives at `~/.local/share/mautrix-imessage/config.yaml`. Key options:
+Bridge-specific options live in the `network` section of `config.yaml`. These are the global defaults; the per-user choices made during login override them. Key options:
 
 | Field | Default | Description |
 |---|---|---|
@@ -151,8 +190,8 @@ make clean
 | `pkg/rustpushgo/` | Rust FFI wrapper (uniffi → cgo) |
 | `rustpush/open-absinthe/` | NAC emulator for Linux (Intel key path) |
 | `tools/` | Key extraction and NAC relay apps |
-| `scripts/` | Install scripts for all four variants |
-| `cmd/mautrix-imessage/` | Bridge entrypoint |
+| `scripts/` | Build helpers: `patch_bindings.py` (`make bindings`), `bootstrap-linux.sh` (`make check-deps`) |
+| `cmd/matrix-rustpush/` | Bridge entrypoint |
 
 ## Support
 

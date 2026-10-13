@@ -32,9 +32,6 @@ jobs:
       - name: go vet (imessage)
         run: go vet ./imessage/...
 
-      - name: go vet (bbctl)
-        run: go vet ./cmd/bbctl/...
-
   # ───────────────────────────────────────────────────────────────
   # Unit tests – pure-Go packages (no Rust/CGO bridge needed)
   # ───────────────────────────────────────────────────────────────
@@ -210,7 +207,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/uniffi-bindgen-go
-          # Keyed on the pinned tag (AGENTS.md) so bumping the version busts it.
+          # Keyed on the --tag pinned in the bindings-sync step below; keep the two in sync.
           key: uniffi-bindgen-go-v0.2.2+v0.25.0
 
       - name: Verify pinned rustpush SHA file
@@ -237,7 +234,7 @@ jobs:
           # yet break at runtime (uniffi contract mismatch) and ship via Docker,
           # which trusts the committed bindings. No Makefile changes — this just
           # regenerates from the librustpushgo.a built above and diffs.
-          # Pinned to the version in AGENTS.md (the one the committed bindings
+          # Pinned to a fixed generator version (the one the committed bindings
           # were generated with) so the diff is stable across generator releases.
           command -v uniffi-bindgen-go >/dev/null 2>&1 || \
             cargo install uniffi-bindgen-go \

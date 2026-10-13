@@ -29,7 +29,7 @@ jobs:
       # Only scan pure-Go packages; packages importing rustpushgo need
       # the Rust static library which is impractical to build here.
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./imessage/... ./cmd/bbctl/...
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./imessage/...
 
   cargo-audit:
     name: Rust dependency audit

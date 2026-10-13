@@ -21,12 +21,15 @@
 /start
 /data/
 /build/
-/bbctl
 
 # Local external worktrees / generated app workspace
 /third_party/rustpush-upstream/
 /openbubbles-app-rustpush/
 /rustpush-master/
+
+# Local agent/dev context (not synced)
+/dev/
+/.claude/
 
 # Rust build artifacts
 librustpushgo.a

@@ -138,6 +138,9 @@ type IMConfig struct {
 
 // CardDAVConfig configures an external CardDAV server for contact name resolution.
 // Supports Google (with app passwords), Nextcloud, Radicale, Fastmail, etc.
+//
+// These values are only a global fallback: the per-user settings configured
+// during login (or with the `set-carddav` bot command) take precedence.
 type CardDAVConfig struct {
 	// Email address used for CardDAV auto-discovery (RFC 6764 .well-known/carddav).
 	// Also used as the username if Username is empty.
@@ -150,8 +153,8 @@ type CardDAVConfig struct {
 	// Username for HTTP Basic authentication. Defaults to Email if empty.
 	Username string `yaml:"username"`
 
-	// PasswordEncrypted is the AES-256-GCM encrypted app password (base64).
-	// Set by the install script via the carddav-setup subcommand.
+	// PasswordEncrypted is the AES-256-GCM encrypted app password (base64),
+	// encrypted with the bridge's per-host key (carddav.key in the data dir).
 	PasswordEncrypted string `yaml:"password_encrypted"`
 }
 
