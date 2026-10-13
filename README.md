@@ -139,7 +139,9 @@ Start a DM with the bridge bot (`@imessagebot:<your domain>` by default) and sen
 
 Prompts: Apple ID → password → 2FA (if needed) → handle selection. The flow also asks for your per-user settings: video transcoding, HEIC conversion, CloudKit backfill, contact source (iCloud or external CardDAV), FaceTime call notices and StatusKit notifications.
 
-Some of these can be changed later with bot commands: `set-video-transcoding on|off`, `set-heic-conversion on|off`, `set-carddav` (contact source) and `set-identity` (outgoing handle). Run `help` for the full list.
+All of these can be changed later with bot commands, without logging in again: `set-video-transcoding on|off`, `set-heic-conversion on|off`, `set-cloudkit-backfill on|off|reset`, `set-carddav` (contact source), `set-facetime-notices on|off|reset`, `set-statuskit on|off|reset`, `set-statuskit-style topic|notice|reset` and `set-identity` (outgoing handle). `reset` drops your override and uses the bridge's global config value. Run `help` for the full list.
+
+`set-cloudkit-backfill on` only works when the bridge admin has enabled `cloudkit_backfill` (with `backfill_source: cloudkit`), and needs your login to have joined iCloud Keychain: run `keychain-join` first if you skipped CloudKit backfill at login. Changing it reconnects your login (only yours) so the CloudKit sync starts or stops. The other settings apply immediately.
 
 ## Usage
 
