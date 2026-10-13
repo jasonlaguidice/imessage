@@ -13,7 +13,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"fmt"
 	"time"
 
 	"go.mau.fi/util/dbutil"
@@ -58,35 +57,6 @@ type pendingAttachmentStore struct {
 
 func newPendingAttachmentStore(db *dbutil.Database, loginID networkid.UserLoginID) *pendingAttachmentStore {
 	return &pendingAttachmentStore{db: db, loginID: loginID}
-}
-
-func (s *pendingAttachmentStore) ensureSchema(ctx context.Context) error {
-	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS pending_attachment_retry (
-		login_id          TEXT    NOT NULL,
-		message_guid      TEXT    NOT NULL,
-		att_index         INTEGER NOT NULL,
-		att_id            TEXT    NOT NULL,
-		portal_id         TEXT    NOT NULL,
-		sender            TEXT    NOT NULL DEFAULT '',
-		timestamp_ms      BIGINT  NOT NULL DEFAULT 0,
-		filename          TEXT    NOT NULL,
-		mime_type         TEXT    NOT NULL,
-		uti_type          TEXT    NOT NULL DEFAULT '',
-		size_bytes        BIGINT  NOT NULL,
-		mmcs_descriptor   TEXT    NOT NULL,
-		created_at        BIGINT  NOT NULL,
-		last_attempt_at   BIGINT  NOT NULL,
-		attempt_count     INTEGER NOT NULL DEFAULT 0,
-		next_attempt_at   BIGINT  NOT NULL,
-		PRIMARY KEY (login_id, message_guid, att_index)
-	)`); err != nil {
-		return fmt.Errorf("failed to create pending_attachment_retry table: %w", err)
-	}
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS pending_attachment_retry_due_idx
-		ON pending_attachment_retry (login_id, next_attempt_at)`); err != nil {
-		return fmt.Errorf("failed to create pending_attachment_retry due idx: %w", err)
-	}
-	return nil
 }
 
 // deleteAllForLogin removes every pending_attachment_retry row for this

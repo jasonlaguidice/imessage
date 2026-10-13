@@ -1,6 +1,7 @@
 package connector
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 
 	_ "github.com/lib/pq"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 )
 
@@ -42,6 +44,24 @@ func forEachTestDB(t *testing.T, fn func(t *testing.T, db *dbutil.Database)) {
 		}
 		fn(t, newTestPostgresDB(t, uri))
 	})
+}
+
+// forEachUpgradedTestDB is forEachTestDB with the connector's tables created
+// by the same versioned migrations IMConnector.Start runs.
+func forEachUpgradedTestDB(t *testing.T, fn func(t *testing.T, db *dbutil.Database)) {
+	t.Helper()
+	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+		upgradeTestDB(t, db)
+		fn(t, db)
+	})
+}
+
+// upgradeTestDB runs the connector's migrations on db.
+func upgradeTestDB(t *testing.T, db *dbutil.Database) {
+	t.Helper()
+	if err := upgradeConnectorDB(context.Background(), db, zerolog.Nop()); err != nil {
+		t.Fatalf("upgradeConnectorDB: %v", err)
+	}
 }
 
 func newTestSQLiteDB(t *testing.T) *dbutil.Database {

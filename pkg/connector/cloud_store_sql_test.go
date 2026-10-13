@@ -23,36 +23,8 @@ const (
 	testStoreLoginB = networkid.UserLoginID("login-b")
 )
 
-func newTestCloudStore(t *testing.T, db *dbutil.Database, loginID networkid.UserLoginID) *cloudBackfillStore {
-	t.Helper()
-	store := newCloudBackfillStore(db, loginID)
-	if err := store.ensureSchema(context.Background()); err != nil {
-		t.Fatalf("ensureSchema: %v", err)
-	}
-	return store
-}
-
-// TestStoreEnsureSchemaIsIdempotent runs every store's migrations twice; the
-// second pass must not try to re-add columns that already exist.
-func TestStoreEnsureSchemaIsIdempotent(t *testing.T) {
-	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
-		ctx := context.Background()
-		backfill := newCloudBackfillStore(db, testStoreLoginA)
-		profiles := newSharedProfileStore(db, testStoreLoginA)
-		pending := newPendingAttachmentStore(db, testStoreLoginA)
-		for pass := 1; pass <= 2; pass++ {
-			if err := backfill.ensureSchema(ctx); err != nil {
-				t.Fatalf("cloudBackfillStore.ensureSchema pass %d: %v", pass, err)
-			}
-			if err := profiles.ensureSchema(ctx); err != nil {
-				t.Fatalf("sharedProfileStore.ensureSchema pass %d: %v", pass, err)
-			}
-			if err := pending.ensureSchema(ctx); err != nil {
-				t.Fatalf("pendingAttachmentStore.ensureSchema pass %d: %v", pass, err)
-			}
-		}
-	})
-}
+// These tests get their tables from the connector's versioned migrations
+// (forEachUpgradedTestDB); upgrades_test.go covers the migrations themselves.
 
 func TestStoreSQLPlaceholders(t *testing.T) {
 	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
@@ -71,9 +43,9 @@ func TestStoreSQLPlaceholders(t *testing.T) {
 // ON CONFLICT update path, including the sticky-deleted and max-date_read
 // rules, and checks that rows stay scoped to their login.
 func TestStoreUpsertMessageBatch(t *testing.T) {
-	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+	forEachUpgradedTestDB(t, func(t *testing.T, db *dbutil.Database) {
 		ctx := context.Background()
-		store := newTestCloudStore(t, db, testStoreLoginA)
+		store := newCloudBackfillStore(db, testStoreLoginA)
 		other := newCloudBackfillStore(db, testStoreLoginB)
 		tapback := uint32(2000)
 
@@ -139,9 +111,9 @@ func TestStoreUpsertMessageBatch(t *testing.T) {
 // TestStoreUpsertChatBatch covers the raw-transaction chat upsert and the
 // tombstone insert, both of which used literal "?" placeholders.
 func TestStoreUpsertChatBatch(t *testing.T) {
-	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+	forEachUpgradedTestDB(t, func(t *testing.T, db *dbutil.Database) {
 		ctx := context.Background()
-		store := newTestCloudStore(t, db, testStoreLoginA)
+		store := newCloudBackfillStore(db, testStoreLoginA)
 
 		chats := []cloudChatUpsertRow{
 			{CloudChatID: "chat1", RecordName: "cr1", PortalID: "tel:+1555", Service: "iMessage", DisplayName: nil, GroupPhotoGuid: nil, ParticipantsJSON: `["tel:+1555"]`, UpdatedTS: 100},
@@ -188,9 +160,9 @@ func TestStoreUpsertChatBatch(t *testing.T) {
 // rows tied on timestamp_ms (and created_ts, since one batch stamps them all
 // identically) are broken by guid DESC, deterministically on both dialects.
 func TestStoreGetConversationReadByMe(t *testing.T) {
-	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+	forEachUpgradedTestDB(t, func(t *testing.T, db *dbutil.Database) {
 		ctx := context.Background()
-		store := newTestCloudStore(t, db, testStoreLoginA)
+		store := newCloudBackfillStore(db, testStoreLoginA)
 		tapback := uint32(2000)
 
 		if err := store.upsertMessageBatch(ctx, []cloudMessageRow{
@@ -243,9 +215,9 @@ func TestStoreGetConversationReadByMe(t *testing.T) {
 // error. Its purpose is to catch dialect-specific syntax, not to re-verify
 // each method's semantics.
 func TestStoreQueriesRunOnDialect(t *testing.T) {
-	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+	forEachUpgradedTestDB(t, func(t *testing.T, db *dbutil.Database) {
 		ctx := context.Background()
-		store := newTestCloudStore(t, db, testStoreLoginA)
+		store := newCloudBackfillStore(db, testStoreLoginA)
 		must := func(name string, err error) {
 			t.Helper()
 			if err != nil {
@@ -438,12 +410,9 @@ func TestStoreQueriesRunOnDialect(t *testing.T) {
 }
 
 func TestStoreSharedProfilesAndPendingAttachments(t *testing.T) {
-	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+	forEachUpgradedTestDB(t, func(t *testing.T, db *dbutil.Database) {
 		ctx := context.Background()
 		profiles := newSharedProfileStore(db, testStoreLoginA)
-		if err := profiles.ensureSchema(ctx); err != nil {
-			t.Fatalf("sharedProfileStore.ensureSchema: %v", err)
-		}
 		row := &sharedProfileRow{Identifier: "tel:+1555", DisplayName: "A", RecordKey: "rk", DecryptionKey: []byte{0, 0xff}, Avatar: []byte{1, 2}, HasPoster: true, UpdatedTS: 1}
 		if err := profiles.save(ctx, row); err != nil {
 			t.Fatalf("save: %v", err)
@@ -461,9 +430,6 @@ func TestStoreSharedProfilesAndPendingAttachments(t *testing.T) {
 		}
 
 		pending := newPendingAttachmentStore(db, testStoreLoginA)
-		if err := pending.ensureSchema(ctx); err != nil {
-			t.Fatalf("pendingAttachmentStore.ensureSchema: %v", err)
-		}
 		now := time.Now().Truncate(time.Millisecond)
 		p := &pendingAttachmentRow{MessageGUID: "m1", AttIndex: 0, AttID: "m1", PortalID: "p1", CreatedAt: now, NextAttemptAt: now}
 		if err := pending.Insert(ctx, p); err != nil {
@@ -524,6 +490,7 @@ func TestStoreDeleteAllForLogin(t *testing.T) {
 		must("pending deleteAllForLogin on empty DB", newPendingAttachmentStore(db, testStoreLoginA).deleteAllForLogin(ctx))
 		must("profiles deleteAllForLogin on empty DB", newSharedProfileStore(db, testStoreLoginA).deleteAllForLogin(ctx))
 
+		upgradeTestDB(t, db)
 		now := time.Now().Truncate(time.Millisecond)
 		type stores struct {
 			cloud    *cloudBackfillStore
@@ -532,12 +499,10 @@ func TestStoreDeleteAllForLogin(t *testing.T) {
 		}
 		fill := func(loginID networkid.UserLoginID) stores {
 			s := stores{
-				cloud:    newTestCloudStore(t, db, loginID),
+				cloud:    newCloudBackfillStore(db, loginID),
 				pending:  newPendingAttachmentStore(db, loginID),
 				profiles: newSharedProfileStore(db, loginID),
 			}
-			must("pending ensureSchema", s.pending.ensureSchema(ctx))
-			must("profiles ensureSchema", s.profiles.ensureSchema(ctx))
 
 			must("setSyncVersion", s.cloud.setSyncVersion(ctx, 1))
 			must("upsertChatBatch", s.cloud.upsertChatBatch(ctx, []cloudChatUpsertRow{

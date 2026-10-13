@@ -172,7 +172,7 @@ func (s *sharedProfileStore) loadAll(ctx context.Context) ([]*sharedProfileRow, 
 
 // loadSharedProfilesIntoCache hydrates the in-memory cache from the DB so a
 // bridge restart doesn't lose cached names/photos until a fresh share message
-// arrives. Called once from Connect after ensureSharedProfileSchema.
+// arrives. Called once from Connect.
 // periodicSharedProfileSync handles pushing cached state (and any CloudKit
 // edits) to Matrix ghosts on its initial pre-ticker sync.
 func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.Logger) {
@@ -190,16 +190,6 @@ func (c *IMClient) loadSharedProfilesIntoCache(ctx context.Context, log zerolog.
 	if len(rows) > 0 {
 		log.Info().Int("count", len(rows)).Msg("Loaded shared iMessage profiles from DB")
 	}
-}
-
-// ensureSharedProfileSchema runs the CREATE TABLE IF NOT EXISTS so existing
-// bridge instances pick up the feature on first run without requiring a
-// re-login or fresh database.
-func (c *IMClient) ensureSharedProfileSchema(ctx context.Context) error {
-	if c.sharedProfileStore == nil {
-		return nil
-	}
-	return c.sharedProfileStore.ensureSchema(ctx)
 }
 
 // handleSharedProfile processes an incoming ShareProfile or UpdateProfile

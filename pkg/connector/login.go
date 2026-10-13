@@ -1479,6 +1479,11 @@ func completeLoginWithMeta(
 		DeleteOnConflict: true,
 		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
 			client.UserLogin = login
+			// Re-login of an already-loaded login: Connect disconnects the
+			// client being replaced (see disconnectPredecessor).
+			if existing, ok := login.Client.(*IMClient); ok && existing != nil {
+				client.predecessor = existing
+			}
 			login.Client = client
 			return nil
 		},
