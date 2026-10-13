@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 )
@@ -419,34 +420,36 @@ func (c *IMClient) rememberAliasPortal(ctx context.Context, alias string, portal
 // resolved aliases are usable on the very first presence update after a
 // restart. Reads are bulk against the KV table.
 func (c *IMClient) hydrateAliasPortalCacheFromKV(ctx context.Context, log zerolog.Logger) {
-	// This login's rows only: "statuskit.alias_portal.<loginID>.<alias>".
-	loginPrefix := string(c.statusKitKey(statusKitAliasPortalKeyPrefix, ""))
-	rows, err := c.Main.Bridge.DB.RawDB.QueryContext(ctx,
-		"SELECT key, value FROM kv_store WHERE bridge_id=$1 AND key LIKE $2",
-		c.Main.Bridge.ID, loginPrefix+"%")
+	otherLogins, err := c.otherLoginIDs(ctx)
+	if err != nil {
+		// Without the other logins, the prefix scan could load rows of a
+		// login whose ID extends this one. The cache refills on demand.
+		log.Warn().Err(err).Msg("StatusKit alias-resolver: skipping KV hydration")
+		return
+	}
+	aliases, err := loadLoginAliasPortals(ctx, c.Main.Bridge.DB.Database, c.Main.Bridge.ID, c.UserLogin.ID, otherLogins)
 	if err != nil {
 		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration query failed")
 		return
 	}
-	defer rows.Close()
-	loaded := 0
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			continue
-		}
-		// LIKE treats "_" in a login ID as a wildcard; keep exact-prefix rows only.
-		if !strings.HasPrefix(key, loginPrefix) {
-			continue
-		}
-		alias := strings.TrimPrefix(key, loginPrefix)
-		c.statusKitPortalCache.Store(alias, networkid.PortalID(value))
-		loaded++
+	for alias, portalID := range aliases {
+		c.statusKitPortalCache.Store(alias, portalID)
 	}
-	if err := rows.Err(); err != nil {
-		log.Warn().Err(err).Msg("StatusKit alias-resolver: KV hydration row iteration error")
+	log.Info().Int("loaded", len(aliases)).Msg("StatusKit alias-resolver: hydrated alias→portal cache from KV")
+}
+
+// loadLoginAliasPortals returns loginID's persisted alias→portal mappings
+// ("statuskit.alias_portal.<loginID>.<alias>" rows), and no other login's.
+func loadLoginAliasPortals(ctx context.Context, db *dbutil.Database, bridgeID networkid.BridgeID, loginID networkid.UserLoginID, otherLoginIDs []networkid.UserLoginID) (map[string]networkid.PortalID, error) {
+	rows, err := scanLoginKVRows(ctx, db, bridgeID, loginID, statusKitAliasPortalKeyPrefix, otherLoginIDs)
+	if err != nil {
+		return nil, err
 	}
-	log.Info().Int("loaded", loaded).Msg("StatusKit alias-resolver: hydrated alias→portal cache from KV")
+	aliases := make(map[string]networkid.PortalID, len(rows))
+	for _, row := range rows {
+		aliases[row.Suffix] = networkid.PortalID(row.Value)
+	}
+	return aliases, nil
 }
 
 // prewarmAliasPortalCache scans every ghost in the bridge DB and seeds

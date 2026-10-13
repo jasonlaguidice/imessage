@@ -11,7 +11,6 @@ package connector
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
@@ -78,11 +77,6 @@ func loginExactKVKeys(loginID networkid.UserLoginID) []database.Key {
 	}
 }
 
-// likeEscaper escapes LIKE metacharacters with '!', which needs no special
-// handling in string literals on either SQLite or PostgreSQL (unlike '\',
-// whose meaning depends on PostgreSQL's standard_conforming_strings).
-var likeEscaper = strings.NewReplacer("!", "!!", "%", "!%", "_", "!_")
-
 // deleteLoginKVRows deletes loginID's rows from bridgev2's kv_store for
 // bridgeID, in one transaction, and returns how many rows were removed.
 //
@@ -110,12 +104,12 @@ func deleteLoginKVRows(ctx context.Context, db *dbutil.Database, bridgeID networ
 			}
 		}
 		for _, prefix := range loginScopedKVPrefixes {
-			keys, err := scanLoginKVKeys(ctx, db, bridgeID, loginID, prefix, otherLoginIDs)
+			rows, err := scanLoginKVRows(ctx, db, bridgeID, loginID, prefix, otherLoginIDs)
 			if err != nil {
 				return err
 			}
-			for _, key := range keys {
-				if err := del(key); err != nil {
+			for _, row := range rows {
+				if err := del(row.Key); err != nil {
 					return err
 				}
 			}
@@ -123,51 +117,6 @@ func deleteLoginKVRows(ctx context.Context, db *dbutil.Database, bridgeID networ
 		return nil
 	})
 	return total, err
-}
-
-// scanLoginKVKeys returns loginID's keys under one statusKitLoginKey prefix.
-// LIKE narrows the scan; the exact, case-sensitive prefix test in Go (SQLite
-// LIKE ignores ASCII case) and the other-login exclusion decide.
-func scanLoginKVKeys(ctx context.Context, db *dbutil.Database, bridgeID networkid.BridgeID, loginID networkid.UserLoginID, prefix string, otherLoginIDs []networkid.UserLoginID) ([]string, error) {
-	scan := string(statusKitLoginKey(loginID, prefix, ""))
-	var shadows []string
-	for _, other := range otherLoginIDs {
-		if other == loginID {
-			continue
-		}
-		for _, p := range loginScopedKVPrefixes {
-			if s := string(statusKitLoginKey(other, p, "")); strings.HasPrefix(s, scan) {
-				shadows = append(shadows, s)
-			}
-		}
-	}
-	rows, err := db.Query(ctx,
-		`SELECT key FROM kv_store WHERE bridge_id=$1 AND key LIKE $2 ESCAPE '!'`,
-		bridgeID, likeEscaper.Replace(scan)+"%")
-	if err != nil {
-		return nil, fmt.Errorf("failed to scan kv keys with prefix %q: %w", scan, err)
-	}
-	defer rows.Close()
-	var keys []string
-	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			return nil, fmt.Errorf("failed to scan kv key: %w", err)
-		}
-		if strings.HasPrefix(key, scan) && !hasAnyPrefix(key, shadows) {
-			keys = append(keys, key)
-		}
-	}
-	return keys, rows.Err()
-}
-
-func hasAnyPrefix(s string, prefixes []string) bool {
-	for _, p := range prefixes {
-		if strings.HasPrefix(s, p) {
-			return true
-		}
-	}
-	return false
 }
 
 // otherLoginIDs returns the IDs of every other login on this bridge.

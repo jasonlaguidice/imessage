@@ -479,12 +479,19 @@ func parseAssetSelection(input string, total int) ([]int, error) {
 // Dedicated album room
 // ---------------------------------------------------------------------------
 
+// getOrCreateAlbumRoom returns the dedicated room for albumGUID, creating it
+// if there is none yet or the user is no longer in the cached one. The
+// album→room mapping lives only in memory (sharedAlbumRooms).
 func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumName string) (id.RoomID, error) {
 	c.sharedAlbumRoomsMu.Lock()
 	defer c.sharedAlbumRoomsMu.Unlock()
 
 	if roomID, ok := c.sharedAlbumRooms[albumGUID]; ok {
-		return roomID, nil
+		if c.albumRoomStillUsable(ctx, albumGUID, roomID) {
+			return roomID, nil
+		}
+		delete(c.sharedAlbumRooms, albumGUID)
+		c.abandonAlbumRoom(roomID)
 	}
 
 	displayName := albumName
@@ -506,6 +513,56 @@ func (c *IMClient) getOrCreateAlbumRoom(ctx context.Context, albumGUID, albumNam
 
 	c.sharedAlbumRooms[albumGUID] = roomID
 	return roomID, nil
+}
+
+// albumRoomStillUsable reports whether the user is still in a cached album
+// room. Album rooms are not portals, so bridgev2 never tells the connector
+// when the user leaves one; the bridge's Matrix state store does know: the
+// bot creates and stays in the room, so the appservice receives the user's
+// membership events and records them (CreateRoom also records the initial
+// invite/join).
+func (c *IMClient) albumRoomStillUsable(ctx context.Context, albumGUID string, roomID id.RoomID) bool {
+	member, err := c.Main.Bridge.Matrix.GetMemberInfo(ctx, roomID, c.UserLogin.User.MXID)
+	reuse := shouldReuseAlbumRoom(member, err)
+	if !reuse || err != nil {
+		c.UserLogin.Log.Info().Err(err).
+			Str("album", albumGUID).
+			Stringer("room_id", roomID).
+			Bool("reuse", reuse).
+			Msg("Checked user membership in cached shared album room")
+	}
+	return reuse
+}
+
+// shouldReuseAlbumRoom decides from the user's membership in a cached album
+// room (as returned by MatrixConnector.GetMemberInfo) whether to keep using
+// it. A pending invite still counts: the user may not have accepted it yet.
+// A failed lookup keeps the room rather than piling up duplicates over a
+// transient error; an unknown member (nil) is treated as gone.
+func shouldReuseAlbumRoom(member *event.MemberEventContent, err error) bool {
+	if err != nil {
+		return true
+	}
+	if member == nil {
+		return false
+	}
+	return member.Membership == event.MembershipJoin || member.Membership == event.MembershipInvite
+}
+
+// abandonAlbumRoom has the bot leave an album room the user has left, in the
+// background. puppetsOnly keeps real users from being kicked; on servers
+// with room yeeting the now-empty room is deleted outright.
+func (c *IMClient) abandonAlbumRoom(roomID id.RoomID) {
+	logger := c.UserLogin.Log.With().Stringer("room_id", roomID).Logger()
+	go func() {
+		ctx, cancel := context.WithTimeout(logger.WithContext(context.Background()), 2*time.Minute)
+		defer cancel()
+		if err := c.Main.Bridge.Bot.DeleteRoom(ctx, roomID, true); err != nil {
+			logger.Warn().Err(err).Msg("Failed to clean up abandoned shared album room")
+		} else {
+			logger.Debug().Msg("Cleaned up abandoned shared album room")
+		}
+	}()
 }
 
 // ---------------------------------------------------------------------------
