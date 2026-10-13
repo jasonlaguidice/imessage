@@ -1740,15 +1740,59 @@ func (c *IMClient) IsLoggedIn() bool {
 }
 
 // LogoutRemote implements bridgev2.NetworkAPI. bridgev2 handles the rest of
-// the logout (login row, space, portal cleanup, bridge state); this only
-// tears down what lives outside the bridge DB for this login: the rustpush
-// connection and this account's per-DSID keychain trust file. Other users'
-// logins and files are untouched.
+// the logout after this returns (the user_login row, space, portals per its
+// cleanup settings, bridge state). This removes everything the connector
+// stores itself for this login, in order:
+//
+//  1. Disconnect: stops the rustpush client and this login's background
+//     work first, so nothing writes rows back after they are deleted.
+//  2. Connector DB rows keyed by login_id: cloud_sync_state, cloud_chat,
+//     cloud_message, group_photo_cache, restore_override,
+//     cloud_attachment_cache, pending_attachment_retry, shared_profiles.
+//  3. kv_store keys scoped to this login: im.last_full_connect.<id>,
+//     gsa.pet_last_refresh.<id>, statuskit.last_post_invite_share.<id>, and
+//     every "<prefix><id>.*" key under loginScopedKVPrefixes.
+//  4. On-disk state: trustedpeers_<dsid>.plist and rustpush's per-login
+//     "<name>_<state key>.plist" files (see accountFilePaths).
+//
+// A failing step is logged and the remaining steps still run. Other logins'
+// rows, keys and files are untouched.
 func (c *IMClient) LogoutRemote(ctx context.Context) {
+	log := c.UserLogin.Log.With().Str("action", "logout cleanup").Logger()
+	ctx = log.WithContext(ctx)
+
+	log.Info().Msg("Logout: disconnecting")
 	c.Disconnect()
-	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
-		removeAccountFiles(c.UserLogin.Log, meta.AccountDSID)
+
+	c.deleteLoginStoreRows(ctx)
+
+	otherLogins, listErr := c.otherLoginIDs(ctx)
+	if listErr != nil {
+		// Without the other logins, KV prefix scans could over-match a login
+		// whose ID extends this one, and a state file could be shared with a
+		// login whose ID maps to the same state key: keep both rather than
+		// risk deleting another user's data.
+		log.Err(listErr).Msg("Logout: failed to list other logins; skipping KV and rustpush state file cleanup")
+	} else {
+		log.Info().Msg("Logout: deleting KV keys")
+		if n, err := c.deleteLoginKVKeys(ctx, otherLogins); err != nil {
+			log.Err(err).Msg("Logout: failed to delete KV keys")
+		} else {
+			log.Info().Int64("keys", n).Msg("Logout: deleted KV keys")
+		}
 	}
+
+	dsid := ""
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		dsid = meta.AccountDSID
+	}
+	loginID := c.UserLogin.ID
+	if listErr != nil {
+		loginID = "" // trust file only; see above
+	}
+	log.Info().Msg("Logout: removing account state files")
+	n := removeAccountFiles(log, dsid, loginID, otherLogins)
+	log.Info().Int("files", n).Msg("Logout: removed account state files")
 }
 
 func (c *IMClient) IsThisUser(_ context.Context, userID networkid.UserID) bool {
@@ -1800,7 +1844,12 @@ const lastFullConnectKVKeyPrefix = "im.last_full_connect."
 
 // lastFullConnectKVKey returns this login's full-connect cooldown KV key.
 func (c *IMClient) lastFullConnectKVKey() database.Key {
-	return database.Key(lastFullConnectKVKeyPrefix + string(c.UserLogin.ID))
+	return lastFullConnectKVKeyFor(c.UserLogin.ID)
+}
+
+// lastFullConnectKVKeyFor returns loginID's full-connect cooldown KV key.
+func lastFullConnectKVKeyFor(loginID networkid.UserLoginID) database.Key {
+	return database.Key(lastFullConnectKVKeyPrefix + string(loginID))
 }
 
 // Must exceed the wedge-rebuild cycle (≈10-min wedge threshold + 5-min reconnect
@@ -8737,7 +8786,12 @@ const petRefreshMinInterval = 5 * time.Minute
 const petRefreshKVKeyPrefix = "gsa.pet_last_refresh."
 
 func (c *IMClient) petRefreshKVKey() database.Key {
-	return database.Key(petRefreshKVKeyPrefix + string(c.UserLogin.ID))
+	return petRefreshKVKeyFor(c.UserLogin.ID)
+}
+
+// petRefreshKVKeyFor returns loginID's PET refresh throttle KV key.
+func petRefreshKVKeyFor(loginID networkid.UserLoginID) database.Key {
+	return database.Key(petRefreshKVKeyPrefix + string(loginID))
 }
 
 // safeRefreshPetTokenThrottled is safeRefreshPetToken with a persistent

@@ -2,6 +2,7 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -489,6 +490,101 @@ func TestStoreSharedProfilesAndPendingAttachments(t *testing.T) {
 		}
 		if one, err := pending.GetOne(ctx, "m1", 0); err != nil || one != nil {
 			t.Errorf("GetOne after delete = %+v, %v", one, err)
+		}
+	})
+}
+
+func countLoginRows(t *testing.T, db *dbutil.Database, table string, loginID networkid.UserLoginID) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(context.Background(),
+		fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE login_id=$1`, table), loginID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count %s rows: %v", table, err)
+	}
+	return n
+}
+
+// TestStoreDeleteAllForLogin fills every login-keyed connector table for two
+// logins, deletes one login's rows through each store's deleteAllForLogin,
+// and checks that only that login's rows are gone.
+func TestStoreDeleteAllForLogin(t *testing.T) {
+	forEachTestDB(t, func(t *testing.T, db *dbutil.Database) {
+		ctx := context.Background()
+		must := func(what string, err error) {
+			t.Helper()
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		}
+
+		// Before any schema exists (store never used on this bridge) the
+		// delete is a no-op, not an error.
+		must("cloud deleteAllForLogin on empty DB", newCloudBackfillStore(db, testStoreLoginA).deleteAllForLogin(ctx))
+		must("pending deleteAllForLogin on empty DB", newPendingAttachmentStore(db, testStoreLoginA).deleteAllForLogin(ctx))
+		must("profiles deleteAllForLogin on empty DB", newSharedProfileStore(db, testStoreLoginA).deleteAllForLogin(ctx))
+
+		now := time.Now().Truncate(time.Millisecond)
+		type stores struct {
+			cloud    *cloudBackfillStore
+			pending  *pendingAttachmentStore
+			profiles *sharedProfileStore
+		}
+		fill := func(loginID networkid.UserLoginID) stores {
+			s := stores{
+				cloud:    newTestCloudStore(t, db, loginID),
+				pending:  newPendingAttachmentStore(db, loginID),
+				profiles: newSharedProfileStore(db, loginID),
+			}
+			must("pending ensureSchema", s.pending.ensureSchema(ctx))
+			must("profiles ensureSchema", s.profiles.ensureSchema(ctx))
+
+			must("setSyncVersion", s.cloud.setSyncVersion(ctx, 1))
+			must("upsertChatBatch", s.cloud.upsertChatBatch(ctx, []cloudChatUpsertRow{
+				{CloudChatID: "chat1", RecordName: "cr1", PortalID: "tel:+1555", Service: "iMessage", ParticipantsJSON: `["tel:+1555"]`, UpdatedTS: 100},
+			}))
+			must("upsertMessageBatch", s.cloud.upsertMessageBatch(ctx, []cloudMessageRow{
+				{GUID: "m1", RecordName: "r1", CloudChatID: "chat1", PortalID: "tel:+1555", TimestampMS: 1000, Sender: "tel:+1555", Text: "hi", Service: "iMessage", HasBody: true},
+			}))
+			must("saveGroupPhoto", s.cloud.saveGroupPhoto(ctx, "gid:g1", 1, []byte{1}))
+			must("setRestoreOverride", s.cloud.setRestoreOverride(ctx, "tel:+1555"))
+			s.cloud.saveAttachmentCacheEntry(ctx, "att1", []byte(`{}`))
+			must("pending Insert", s.pending.Insert(ctx, &pendingAttachmentRow{MessageGUID: "m1", AttID: "m1", PortalID: "tel:+1555", CreatedAt: now, NextAttemptAt: now}))
+			must("profiles save", s.profiles.save(ctx, &sharedProfileRow{Identifier: "tel:+1555", RecordKey: "rk", DecryptionKey: []byte{1}, UpdatedTS: 1}))
+			return s
+		}
+		a := fill(testStoreLoginA)
+		fill(testStoreLoginB)
+
+		// Spelled out (not cloudBackfillLoginTables) so dropping a table from
+		// the store's list fails here.
+		tables := []string{
+			"cloud_sync_state", "cloud_chat", "cloud_message", "group_photo_cache",
+			"restore_override", "cloud_attachment_cache",
+			"pending_attachment_retry", "shared_profiles",
+		}
+		before := make(map[string]int)
+		for _, table := range tables {
+			if n := countLoginRows(t, db, table, testStoreLoginA); n == 0 {
+				t.Fatalf("setup: no %s rows for login A", table)
+			}
+			before[table] = countLoginRows(t, db, table, testStoreLoginB)
+			if before[table] == 0 {
+				t.Fatalf("setup: no %s rows for login B", table)
+			}
+		}
+
+		must("cloud deleteAllForLogin", a.cloud.deleteAllForLogin(ctx))
+		must("pending deleteAllForLogin", a.pending.deleteAllForLogin(ctx))
+		must("profiles deleteAllForLogin", a.profiles.deleteAllForLogin(ctx))
+
+		for _, table := range tables {
+			if n := countLoginRows(t, db, table, testStoreLoginA); n != 0 {
+				t.Errorf("%s: %d rows left for deleted login A", table, n)
+			}
+			if n := countLoginRows(t, db, table, testStoreLoginB); n != before[table] {
+				t.Errorf("%s: login B has %d rows, want %d", table, n, before[table])
+			}
 		}
 	})
 }

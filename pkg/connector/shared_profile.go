@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -87,6 +88,12 @@ func (s *sharedProfileStore) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to create shared_profiles table: %w", err)
 	}
 	return nil
+}
+
+// deleteAllForLogin removes every shared_profiles row for this store's
+// login. Used on logout.
+func (s *sharedProfileStore) deleteAllForLogin(ctx context.Context) error {
+	return deleteLoginRows(ctx, s.db, s.loginID, []string{"shared_profiles"})
 }
 
 // sharedProfileRow is the on-disk representation; also used in-memory as the

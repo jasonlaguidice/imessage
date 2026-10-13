@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -86,6 +87,12 @@ func (s *pendingAttachmentStore) ensureSchema(ctx context.Context) error {
 		return fmt.Errorf("failed to create pending_attachment_retry due idx: %w", err)
 	}
 	return nil
+}
+
+// deleteAllForLogin removes every pending_attachment_retry row for this
+// store's login. Used on logout.
+func (s *pendingAttachmentStore) deleteAllForLogin(ctx context.Context) error {
+	return deleteLoginRows(ctx, s.db, s.loginID, []string{"pending_attachment_retry"})
 }
 
 // Insert adds a row. On PK conflict (same guid+att_index arriving twice —

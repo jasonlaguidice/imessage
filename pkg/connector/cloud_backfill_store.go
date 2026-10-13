@@ -395,6 +395,22 @@ func (s *cloudBackfillStore) clearAllData(ctx context.Context) error {
 	return nil
 }
 
+// cloudBackfillLoginTables lists every table this store keys by login_id.
+var cloudBackfillLoginTables = []string{
+	"cloud_sync_state",
+	"cloud_chat",
+	"cloud_message",
+	"group_photo_cache",
+	"restore_override",
+	"cloud_attachment_cache",
+}
+
+// deleteAllForLogin removes every row this store holds for its login, from
+// all of cloudBackfillLoginTables, in one transaction. Used on logout.
+func (s *cloudBackfillStore) deleteAllForLogin(ctx context.Context) error {
+	return deleteLoginRows(ctx, s.db, s.loginID, cloudBackfillLoginTables)
+}
+
 // hasAnySyncState checks whether any sync state rows exist for this login.
 // Used to detect an interrupted sync — if tokens exist but no portals were
 // created yet, the sync was interrupted mid-flight and should resume, NOT restart.

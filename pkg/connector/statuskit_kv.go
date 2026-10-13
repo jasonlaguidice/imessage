@@ -9,7 +9,8 @@ import (
 // "<prefix><loginID>.<suffix>". Every StatusKit latch, cooldown, presence and
 // alias row is per login: two logins that share a contact must not share
 // invite latches, presence dedup or alias mappings. Pre-scoping global rows
-// are simply never read again.
+// are simply never read again. Every prefix used with this must be listed in
+// loginScopedKVPrefixes so logout deletes its keys.
 func statusKitLoginKey(loginID networkid.UserLoginID, prefix, suffix string) database.Key {
 	return database.Key(prefix + string(loginID) + "." + suffix)
 }
@@ -28,5 +29,11 @@ const statusKitPresencePortalKeyPrefix = "statuskit.presence.portal."
 // statusKitLastPostInviteShareKVKey returns this login's post-invite
 // share_status cooldown key ("statuskit.last_post_invite_share.<loginID>").
 func (c *IMClient) statusKitLastPostInviteShareKVKey() database.Key {
-	return database.Key(statusKitLastPostInviteShareKey + "." + string(c.UserLogin.ID))
+	return statusKitLastPostInviteShareKVKeyFor(c.UserLogin.ID)
+}
+
+// statusKitLastPostInviteShareKVKeyFor returns loginID's post-invite
+// share_status cooldown key.
+func statusKitLastPostInviteShareKVKeyFor(loginID networkid.UserLoginID) database.Key {
+	return database.Key(statusKitLastPostInviteShareKey + "." + string(loginID))
 }
