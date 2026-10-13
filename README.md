@@ -171,7 +171,8 @@ Bridge-specific options live in the `network` section of `config.yaml`. These ar
 | `video_transcoding` | `false` | Auto-remux non-MP4 video to MP4 (requires `ffmpeg`) |
 | `heic_conversion` | `false` | Auto-convert HEIC images to JPEG (requires `libheif`) |
 | `preferred_handle` | *(from login)* | Fallback outgoing iMessage identity (`tel:+1...` or `mailto:...`); a user's own login / `set-identity` choice wins |
-| `carddav.*` | *(unset)* | External CardDAV for contact resolution (Google, Nextcloud, Fastmail, etc.) |
+
+External CardDAV contacts (Google, Nextcloud, Fastmail, etc.) have no global setting: each user configures their own server during login or with `set-carddav`.
 
 ### Recommended bridge settings
 

@@ -72,7 +72,7 @@ type AppleIDLogin struct {
 	cardDAVEmail               string
 	cardDAVURL                 string
 	cardDAVUsername            string
-	cardDAVPasswordEncrypted   string
+	cardDAVPassword            string
 }
 
 var _ bridgev2.LoginProcessUserInput = (*AppleIDLogin)(nil)
@@ -121,53 +121,37 @@ func (l *AppleIDLogin) SubmitUserInput(ctx context.Context, input map[string]str
 	if l.handleSelected {
 		// Other CardDAV: has carddav_url field (all 4 required)
 		if url, ok := input["carddav_url"]; ok {
-			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			l.cardDAVEmail = input["carddav_email"]
 			l.cardDAVURL = url
 			l.cardDAVUsername = input["carddav_username"]
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = input["carddav_password"]
 			return l.askFaceTimeStep()
 		}
 		// Nextcloud: has nextcloud_server_url field; derive CardDAV URL
 		if serverURL, ok := input["nextcloud_server_url"]; ok {
-			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			email := input["carddav_email"]
 			l.cardDAVEmail = email
 			l.cardDAVURL = strings.TrimRight(serverURL, "/") + "/remote.php/dav"
 			l.cardDAVUsername = email
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = input["carddav_password"]
 			return l.askFaceTimeStep()
 		}
 		// Fastmail: has fastmail_app_password field; derive CardDAV URL
 		if pw, ok := input["fastmail_app_password"]; ok {
-			encrypted, err := EncryptCardDAVPassword(pw)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			email := input["carddav_email"]
 			l.cardDAVEmail = email
 			l.cardDAVURL = "https://carddav.fastmail.com/dav/addressbooks/user/" + email + "/Default/"
 			l.cardDAVUsername = email
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = pw
 			return l.askFaceTimeStep()
 		}
 		// Google: has google_app_password field; derive CardDAV URL
 		if pw, ok := input["google_app_password"]; ok {
-			encrypted, err := EncryptCardDAVPassword(pw)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			email := input["carddav_email"]
 			l.cardDAVEmail = email
 			l.cardDAVURL = "https://www.googleapis.com/carddav/v1/principals/" + email + "/lists/default/"
 			l.cardDAVUsername = email
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = pw
 			return l.askFaceTimeStep()
 		}
 		// Contact source picker response
@@ -397,7 +381,7 @@ func (l *AppleIDLogin) completeLogin(ctx context.Context) (*bridgev2.LoginStep, 
 		CardDAVEmail:               l.cardDAVEmail,
 		CardDAVURL:                 l.cardDAVURL,
 		CardDAVUsername:            l.cardDAVUsername,
-		CardDAVPasswordEncrypted:   l.cardDAVPasswordEncrypted,
+		CardDAVPassword:            l.cardDAVPassword,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
@@ -520,7 +504,7 @@ type ExternalKeyLogin struct {
 	cardDAVEmail               string
 	cardDAVURL                 string
 	cardDAVUsername            string
-	cardDAVPasswordEncrypted   string
+	cardDAVPassword            string
 }
 
 var _ bridgev2.LoginProcessUserInput = (*ExternalKeyLogin)(nil)
@@ -549,53 +533,37 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 	if l.handleSelected {
 		// Other CardDAV: has carddav_url field (all 4 required)
 		if url, ok := input["carddav_url"]; ok {
-			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			l.cardDAVEmail = input["carddav_email"]
 			l.cardDAVURL = url
 			l.cardDAVUsername = input["carddav_username"]
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = input["carddav_password"]
 			return l.askFaceTimeStep()
 		}
 		// Nextcloud: has nextcloud_server_url field; derive CardDAV URL
 		if serverURL, ok := input["nextcloud_server_url"]; ok {
-			encrypted, err := EncryptCardDAVPassword(input["carddav_password"])
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			email := input["carddav_email"]
 			l.cardDAVEmail = email
 			l.cardDAVURL = strings.TrimRight(serverURL, "/") + "/remote.php/dav"
 			l.cardDAVUsername = email
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = input["carddav_password"]
 			return l.askFaceTimeStep()
 		}
 		// Fastmail: has fastmail_app_password field; derive CardDAV URL
 		if pw, ok := input["fastmail_app_password"]; ok {
-			encrypted, err := EncryptCardDAVPassword(pw)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			email := input["carddav_email"]
 			l.cardDAVEmail = email
 			l.cardDAVURL = "https://carddav.fastmail.com/dav/addressbooks/user/" + email + "/Default/"
 			l.cardDAVUsername = email
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = pw
 			return l.askFaceTimeStep()
 		}
 		// Google: has google_app_password field; derive CardDAV URL
 		if pw, ok := input["google_app_password"]; ok {
-			encrypted, err := EncryptCardDAVPassword(pw)
-			if err != nil {
-				return nil, fmt.Errorf("failed to encrypt CardDAV password: %w", err)
-			}
 			email := input["carddav_email"]
 			l.cardDAVEmail = email
 			l.cardDAVURL = "https://www.googleapis.com/carddav/v1/principals/" + email + "/lists/default/"
 			l.cardDAVUsername = email
-			l.cardDAVPasswordEncrypted = encrypted
+			l.cardDAVPassword = pw
 			return l.askFaceTimeStep()
 		}
 		// Contact source picker response
@@ -699,8 +667,8 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 				"Start it with: go run tools/nac-relay/main.go"
 		}
 		return &bridgev2.LoginStep{
-			Type:   bridgev2.LoginStepTypeUserInput,
-			StepID: LoginStepAppleIDPassword,
+			Type:         bridgev2.LoginStepTypeUserInput,
+			StepID:       LoginStepAppleIDPassword,
 			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
@@ -871,7 +839,7 @@ func (l *ExternalKeyLogin) completeLogin(ctx context.Context) (*bridgev2.LoginSt
 		CardDAVEmail:               l.cardDAVEmail,
 		CardDAVURL:                 l.cardDAVURL,
 		CardDAVUsername:            l.cardDAVUsername,
-		CardDAVPasswordEncrypted:   l.cardDAVPasswordEncrypted,
+		CardDAVPassword:            l.cardDAVPassword,
 	}
 
 	return completeLoginWithMeta(ctx, l.User, l.Main, l.username, l.cfg, l.conn, l.result, meta)
