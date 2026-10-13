@@ -70,9 +70,13 @@ type IMConfig struct {
 	// and outbound edits still build previews normally. Default true.
 	URLPreviewsInBackfill bool `yaml:"url_previews_in_backfill"`
 
-	// PreferredHandle overrides the outgoing iMessage identity.
+	// PreferredHandle is the global fallback for the outgoing iMessage identity.
 	// Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
-	// If empty, the handle chosen during login is used.
+	// A login's own choice (login flow or `set-identity`, stored in
+	// UserLoginMetadata.PreferredHandle) takes precedence; this is used only
+	// when that is unset or not registered on the login, and only if it is one
+	// of the login's registered handles. It is never copied into a login's
+	// metadata, so changing it applies on the next connect.
 	PreferredHandle string `yaml:"preferred_handle"`
 
 	// DisableFaceTime suppresses the incoming / missed FaceTime call notices.

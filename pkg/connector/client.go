@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1089,6 +1090,31 @@ func safeRestoreTokenProvider(
 	return rustpushgo.RestoreTokenProvider(config, conn, username, hashedPwHex, pet, spdBase64, blob)
 }
 
+// choosePreferredHandle picks the outgoing handle for a login. Precedence:
+// the per-user metadata choice, then the global config fallback, then the
+// first registered handle. A candidate is used only if it is one of the
+// login's registered handles. Returns "" when there are no handles.
+func choosePreferredHandle(metaPref, cfgPref string, handles []string) string {
+	if len(handles) == 0 {
+		return ""
+	}
+	for _, candidate := range []string{metaPref, cfgPref} {
+		if candidate != "" && slices.Contains(handles, candidate) {
+			return candidate
+		}
+	}
+	return handles[0]
+}
+
+// shouldPersistHandle reports whether the handle chosen by
+// choosePreferredHandle should be written to UserLoginMetadata.PreferredHandle.
+// Only the first-handle fallback (no user choice, no config fallback) is
+// persisted, so a user's choice is never clobbered and the config value is
+// never frozen into per-user metadata.
+func shouldPersistHandle(metaPref, cfgPref string) bool {
+	return metaPref == "" && cfgPref == ""
+}
+
 func (c *IMClient) Connect(ctx context.Context) {
 	c.startupTime = time.Now()
 	log := c.UserLogin.Log.With().Str("component", "imessage").Logger()
@@ -1200,42 +1226,42 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// (unused) so re-enabling is a one-line change if we ever find a safe
 	// device_name / services combination that doesn't disturb FT.
 
-	// Get our handle (precedence: config > login metadata > first handle)
+	// Get our handle (precedence: login metadata > config > first handle).
+	// The per-user choice (login flow / `set-identity`) wins; the global
+	// network.preferred_handle is only a fallback. Each candidate is used only
+	// if it is one of this login's registered handles.
 	handles := client.GetHandles()
-	var handle string
+	var metaPref string
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		metaPref = meta.PreferredHandle
+	}
+	cfgPref := c.Main.Config.PreferredHandle
+	handle := choosePreferredHandle(metaPref, cfgPref, handles)
 	if len(handles) > 0 {
-		handle = handles[0]
-		preferred := c.Main.Config.PreferredHandle
-		if preferred == "" {
-			if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
-				preferred = meta.PreferredHandle
-			}
+		if metaPref != "" && handle != metaPref {
+			log.Warn().Str("preferred", metaPref).Str("using", handle).Strs("available", handles).
+				Msg("Per-user preferred handle not found among registered handles, falling back")
 		}
-		if preferred != "" {
-			found := false
-			for _, h := range handles {
-				if h == preferred {
-					handle = h
-					found = true
-					break
-				}
-			}
-			if !found {
-				log.Warn().Str("preferred", preferred).Strs("available", handles).
-					Msg("Preferred handle not found among registered handles, using first available")
-			}
-		} else {
+		if metaPref == "" && cfgPref != "" && handle != cfgPref {
+			log.Warn().Str("preferred", cfgPref).Str("using", handle).Strs("available", handles).
+				Msg("Configured preferred_handle not found among registered handles, using first available")
+		}
+		if metaPref == "" && cfgPref == "" {
 			log.Warn().Strs("available", handles).
-				Msg("No preferred_handle configured — using first available. Use the `set-identity` bot command to select one.")
+				Msg("No preferred handle set — using first available. Use the `set-identity` bot command to select one.")
 		}
 	}
 	c.setIdentity(handle, handles)
 
-	// Persist the selected handle to metadata so it's stable across restarts.
-	if c.getHandle() != "" {
-		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.PreferredHandle != c.getHandle() {
+	// Persist the first-handle fallback to metadata so it stays stable across
+	// restarts. Only done when neither the user nor the config named a handle:
+	// a user's choice is never overwritten (it may just be missing from
+	// Apple's handle list right now), and the config fallback is never copied
+	// in (so later config changes still reach this login).
+	if c.getHandle() != "" && shouldPersistHandle(metaPref, cfgPref) {
+		if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
 			meta.PreferredHandle = c.getHandle()
-			log.Info().Str("handle", c.getHandle()).Msg("Persisted selected handle to metadata")
+			log.Info().Str("handle", c.getHandle()).Msg("Persisted first-handle fallback to metadata")
 		}
 	}
 

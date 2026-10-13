@@ -170,8 +170,24 @@ Bridge-specific options live in the `network` section of `config.yaml`. These ar
 | `statuskit_notifications` | `true` | Post Focus/DND notices when contacts silence notifications |
 | `video_transcoding` | `false` | Auto-remux non-MP4 video to MP4 (requires `ffmpeg`) |
 | `heic_conversion` | `false` | Auto-convert HEIC images to JPEG (requires `libheif`) |
-| `preferred_handle` | *(from login)* | Outgoing iMessage identity (`tel:+1...` or `mailto:...`) |
+| `preferred_handle` | *(from login)* | Fallback outgoing iMessage identity (`tel:+1...` or `mailto:...`); a user's own login / `set-identity` choice wins |
 | `carddav.*` | *(unset)* | External CardDAV for contact resolution (Google, Nextcloud, Fastmail, etc.) |
+
+### Recommended bridge settings
+
+These mautrix keys sit outside the `network` section. The bridge does not change them at runtime; it logs a warning at startup when one is below the recommended value.
+
+- `bridge.unknown_error_auto_reconnect: 5m` (at least `1m`; lets the receive-wedge watchdog rebuild a stuck client)
+- `bridge.unknown_error_max_auto_reconnects: 100` (bridgev2 never resets this counter until restart)
+- `bridge.phone_numbers_in_profile: true` (keeps `tel:` identifiers in ghost profiles for call buttons and phone contacts)
+
+With `network.cloudkit_backfill: true`:
+
+- `backfill.enabled: true` (required: if it is `false`, the bridge enables it in memory and logs a warning, because CloudKit backfill cannot work without it)
+- `backfill.max_initial_messages: 2147483647` (uncapped; any smaller value is treated as a per-chat cap and turns off backward backfill)
+- `backfill.max_catchup_messages: 2147483647` (keep equal to `max_initial_messages`)
+- `backfill.queue.enabled: true`
+- `backfill.queue.batch_size: 10000` (more than 100; small batches fragment room history)
 
 ## Development
 

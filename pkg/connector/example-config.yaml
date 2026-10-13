@@ -43,9 +43,11 @@ max_attachment_size_mb: 100
 # edits still build previews normally.
 url_previews_in_backfill: true
 
-# Override the outgoing iMessage identity (what recipients see your messages "from").
+# Fallback outgoing iMessage identity (what recipients see your messages "from").
 # Use the full URI format: "tel:+15551234567" or "mailto:user@example.com".
-# Leave empty to use the handle chosen during login.
+# Each user's own choice (login flow or `set-identity`) takes precedence; this
+# is used only when a login has none, and only if it is one of its handles.
+# It is never saved into a login, so changes apply on the next connect.
 # Available handles are logged on startup.
 preferred_handle: ""
 
