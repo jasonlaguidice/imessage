@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -15,8 +16,8 @@ import (
 type PortalMetadata struct {
 	ThreadID   string `json:"thread_id,omitempty"`
 	SenderGuid string `json:"sender_guid,omitempty"` // Persistent iMessage group UUID
-	GroupName  string `json:"group_name,omitempty"`   // iMessage cv_name for outbound routing
-	IsSms      bool   `json:"is_sms,omitempty"`       // True if this portal routes through SMS
+	GroupName  string `json:"group_name,omitempty"`  // iMessage cv_name for outbound routing
+	IsSms      bool   `json:"is_sms,omitempty"`      // True if this portal routes through SMS
 }
 
 type GhostMetadata struct{}
@@ -66,10 +67,17 @@ type UserLoginMetadata struct {
 	StatusKitNotificationStyle *string `json:"statuskit_notification_style,omitempty"`
 
 	// Per-user external CardDAV configuration (optional).
-	// When set, used instead of iCloud contacts and the global config.yaml carddav section.
-	CardDAVEmail             string `json:"carddav_email,omitempty"`
-	CardDAVURL               string `json:"carddav_url,omitempty"`
-	CardDAVUsername          string `json:"carddav_username,omitempty"`
+	// When set, used instead of iCloud contacts. The password is stored like
+	// the Apple account tokens below: as a plain field in the bridge DB.
+	CardDAVEmail    string `json:"carddav_email,omitempty"`
+	CardDAVURL      string `json:"carddav_url,omitempty"`
+	CardDAVUsername string `json:"carddav_username,omitempty"`
+	CardDAVPassword string `json:"carddav_password,omitempty"`
+
+	// CardDAVPasswordEncrypted is LEGACY: the AES-GCM ciphertext written by
+	// older versions, encrypted with the bridge-wide carddav.key file. It is
+	// only read by migrateLegacyCardDAVPassword, which moves it into
+	// CardDAVPassword (or clears it) on LoadUserLogin. Never write it.
 	CardDAVPasswordEncrypted string `json:"carddav_password_encrypted,omitempty"`
 
 	// iCloud account persist data for TokenProvider restoration.

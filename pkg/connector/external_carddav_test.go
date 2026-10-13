@@ -3,8 +3,98 @@ package connector
 import (
 	"testing"
 
+	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
+
 	"github.com/lrhodin/imessage/imessage"
 )
+
+func TestCardDAVConfig_IsConfigured(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  CardDAVConfig
+		want bool
+	}{
+		{"both set", CardDAVConfig{Email: "a@b.com", Password: "pw"}, true},
+		{"no email", CardDAVConfig{Password: "pw"}, false},
+		{"no password", CardDAVConfig{Email: "a@b.com"}, false},
+		{"empty", CardDAVConfig{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsConfigured(); got != tt.want {
+				t.Errorf("IsConfigured() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCardDAVConfig_GetUsername(t *testing.T) {
+	t.Run("explicit username", func(t *testing.T) {
+		cfg := CardDAVConfig{Email: "a@b.com", Username: "user"}
+		if got := cfg.GetUsername(); got != "user" {
+			t.Errorf("GetUsername() = %q, want %q", got, "user")
+		}
+	})
+	t.Run("falls back to email", func(t *testing.T) {
+		cfg := CardDAVConfig{Email: "a@b.com"}
+		if got := cfg.GetUsername(); got != "a@b.com" {
+			t.Errorf("GetUsername() = %q, want %q", got, "a@b.com")
+		}
+	})
+}
+
+func TestNewExternalCardDAVClient_UsesPlainPassword(t *testing.T) {
+	// URL set, so no discovery (no network): the client must carry the
+	// metadata password as-is.
+	cfg := CardDAVConfig{Email: "a@b.com", URL: "https://dav.example.com/", Password: "app-pw"}
+	client := newExternalCardDAVClient(cfg, nil, zerolog.Nop())
+	if client == nil {
+		t.Fatal("newExternalCardDAVClient returned nil for a configured login")
+	}
+	if client.password != "app-pw" || client.username != "a@b.com" || client.baseURL != "https://dav.example.com" {
+		t.Errorf("client = {%q %q %q}, want {https://dav.example.com a@b.com app-pw}", client.baseURL, client.username, client.password)
+	}
+}
+
+func TestNewExternalCardDAVClient_NotConfigured(t *testing.T) {
+	cfg := CardDAVConfig{Email: "a@b.com", URL: "https://dav.example.com/"}
+	if client := newExternalCardDAVClient(cfg, nil, zerolog.Nop()); client != nil {
+		t.Error("newExternalCardDAVClient should return nil without a password")
+	}
+}
+
+func TestIMClient_ExternalCardDAVConfig_PerUserOnly(t *testing.T) {
+	t.Run("from metadata", func(t *testing.T) {
+		c := &IMClient{Main: &IMConnector{}, UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{Metadata: &UserLoginMetadata{
+			CardDAVEmail:    "a@b.com",
+			CardDAVURL:      "https://dav.example.com/",
+			CardDAVUsername: "user",
+			CardDAVPassword: "pw",
+		}}}}
+		want := CardDAVConfig{Email: "a@b.com", URL: "https://dav.example.com/", Username: "user", Password: "pw"}
+		if got := c.externalCardDAVConfig(); got != want {
+			t.Errorf("externalCardDAVConfig() = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("legacy encrypted only is not configured", func(t *testing.T) {
+		c := &IMClient{Main: &IMConnector{}, UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{Metadata: &UserLoginMetadata{
+			CardDAVEmail:             "a@b.com",
+			CardDAVPasswordEncrypted: "enc",
+		}}}}
+		cfg := c.externalCardDAVConfig()
+		if cfg.IsConfigured() {
+			t.Errorf("externalCardDAVConfig() = %+v, should not be configured from the legacy field", cfg)
+		}
+	})
+	t.Run("no metadata, no global fallback", func(t *testing.T) {
+		c := &IMClient{Main: &IMConnector{}, UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{}}}
+		if got := c.externalCardDAVConfig(); got != (CardDAVConfig{}) {
+			t.Errorf("externalCardDAVConfig() = %+v, want zero value", got)
+		}
+	})
+}
 
 func TestResolveProviderURL(t *testing.T) {
 	tests := []struct {

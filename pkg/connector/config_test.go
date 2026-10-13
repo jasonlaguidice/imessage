@@ -6,41 +6,6 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func TestCardDAVConfig_IsConfigured(t *testing.T) {
-	tests := []struct {
-		name string
-		cfg  CardDAVConfig
-		want bool
-	}{
-		{"both set", CardDAVConfig{Email: "a@b.com", PasswordEncrypted: "enc"}, true},
-		{"no email", CardDAVConfig{PasswordEncrypted: "enc"}, false},
-		{"no password", CardDAVConfig{Email: "a@b.com"}, false},
-		{"empty", CardDAVConfig{}, false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.cfg.IsConfigured(); got != tt.want {
-				t.Errorf("IsConfigured() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestCardDAVConfig_GetUsername(t *testing.T) {
-	t.Run("explicit username", func(t *testing.T) {
-		cfg := CardDAVConfig{Email: "a@b.com", Username: "user"}
-		if got := cfg.GetUsername(); got != "user" {
-			t.Errorf("GetUsername() = %q, want %q", got, "user")
-		}
-	})
-	t.Run("falls back to email", func(t *testing.T) {
-		cfg := CardDAVConfig{Email: "a@b.com"}
-		if got := cfg.GetUsername(); got != "a@b.com" {
-			t.Errorf("GetUsername() = %q, want %q", got, "a@b.com")
-		}
-	})
-}
-
 func TestIMConfig_PostProcess(t *testing.T) {
 	c := &IMConfig{DisplaynameTemplate: "{{.FirstName}} {{.LastName}}"}
 	if err := c.PostProcess(); err != nil {
@@ -110,9 +75,9 @@ func TestIMConfig_FormatDisplayname_DefaultTemplate(t *testing.T) {
 
 func TestIMConfig_UseChatDBBackfill(t *testing.T) {
 	tests := []struct {
-		name    string
-		cfg     IMConfig
-		want    bool
+		name string
+		cfg  IMConfig
+		want bool
 	}{
 		{"enabled chatdb", IMConfig{CloudKitBackfill: true, BackfillSource: "chatdb"}, true},
 		{"enabled cloudkit", IMConfig{CloudKitBackfill: true, BackfillSource: "cloudkit"}, false},
@@ -161,6 +126,36 @@ disable_facetime: true
 	}
 	if !c.DisableFaceTime {
 		t.Error("DisableFaceTime should still be read")
+	}
+}
+
+func TestIMConfig_UnmarshalYAML_RemovedCardDAVBlock(t *testing.T) {
+	// The global carddav: block was removed (CardDAV is per user only). An
+	// old config.yaml that still has it must keep loading.
+	yamlData := `
+carddav:
+    email: "a@b.com"
+    url: ""
+    username: ""
+    password_encrypted: "enc"
+read_receipts: true
+`
+	var c IMConfig
+	if err := yaml.Unmarshal([]byte(yamlData), &c); err != nil {
+		t.Fatalf("config with removed carddav block failed to load: %v", err)
+	}
+	if !c.ReadReceipts {
+		t.Error("ReadReceipts should still be read")
+	}
+}
+
+func TestExampleConfig_NoCardDAVBlock(t *testing.T) {
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(ExampleConfig), &raw); err != nil {
+		t.Fatalf("example config failed to parse: %v", err)
+	}
+	if _, ok := raw["carddav"]; ok {
+		t.Error("example config should not have a global carddav block")
 	}
 }
 

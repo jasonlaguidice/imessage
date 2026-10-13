@@ -1455,7 +1455,7 @@ func setCardDAVAskOtherPassword(ce *commands.Event, email, url, username string)
 	})
 }
 
-// setCardDAVApplyConfig encrypts the password, updates UserLoginMetadata, saves,
+// setCardDAVApplyConfig stores the settings in UserLoginMetadata, saves,
 // and tells the user to restart. Pass empty email to switch back to iCloud.
 func setCardDAVApplyConfig(ce *commands.Event, email, url, username, plainPassword string) {
 	login := commandLogin(ce)
@@ -1473,6 +1473,7 @@ func setCardDAVApplyConfig(ce *commands.Event, email, url, username, plainPasswo
 		meta.CardDAVEmail = ""
 		meta.CardDAVURL = ""
 		meta.CardDAVUsername = ""
+		meta.CardDAVPassword = ""
 		meta.CardDAVPasswordEncrypted = ""
 		if err := login.Save(ce.Ctx); err != nil {
 			ce.Reply("Failed to save settings: %v", err)
@@ -1482,15 +1483,11 @@ func setCardDAVApplyConfig(ce *commands.Event, email, url, username, plainPasswo
 		return
 	}
 
-	encrypted, err := EncryptCardDAVPassword(plainPassword)
-	if err != nil {
-		ce.Reply("Failed to encrypt password: %v", err)
-		return
-	}
 	meta.CardDAVEmail = email
 	meta.CardDAVURL = url
 	meta.CardDAVUsername = username
-	meta.CardDAVPasswordEncrypted = encrypted
+	meta.CardDAVPassword = plainPassword
+	meta.CardDAVPasswordEncrypted = ""
 	if err := login.Save(ce.Ctx); err != nil {
 		ce.Reply("Failed to save settings: %v", err)
 		return

@@ -73,6 +73,12 @@ func (c *IMConnector) Start(ctx context.Context) error {
 		c.enforceRequiredBackfillConfig()
 		c.warnRecommendedBackfillConfig()
 	}
+
+	// Start runs after the DB upgrade and before any login is loaded. Delete a
+	// leftover legacy carddav.key if no stored login still needs it; logins
+	// that do are migrated one by one in LoadUserLogin, and the last one
+	// deletes the file.
+	c.removeLegacyCardDAVKeyIfUnused(ctx, c.Bridge.Log.With().Str("component", "carddav_migration").Logger())
 	return nil
 }
 
@@ -205,6 +211,11 @@ func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flow
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	meta := login.Metadata.(*UserLoginMetadata)
 	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
+
+	// One-time move of a legacy encrypted CardDAV password into plain
+	// metadata. Local file read + AES decrypt + DB save only; runs before
+	// anything below can fail, so every stored login gets migrated.
+	c.migrateLegacyCardDAVLogin(ctx, login, meta, log)
 
 	rustpushgo.InitLogger()
 

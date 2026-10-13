@@ -166,16 +166,19 @@ func (c *IMClient) useCloudKitBackfill() bool {
 	return true
 }
 
+// externalCardDAVConfig returns this login's external CardDAV settings. There
+// is no global fallback: each user configures their own server during login
+// or with `set-carddav`. The zero value means "not configured".
 func (c *IMClient) externalCardDAVConfig() CardDAVConfig {
-	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.CardDAVEmail != "" && meta.CardDAVPasswordEncrypted != "" {
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
 		return CardDAVConfig{
-			Email:             meta.CardDAVEmail,
-			URL:               meta.CardDAVURL,
-			Username:          meta.CardDAVUsername,
-			PasswordEncrypted: meta.CardDAVPasswordEncrypted,
+			Email:    meta.CardDAVEmail,
+			URL:      meta.CardDAVURL,
+			Username: meta.CardDAVUsername,
+			Password: meta.CardDAVPassword,
 		}
 	}
-	return c.Main.Config.CardDAV
+	return CardDAVConfig{}
 }
 
 // disableFaceTime reports whether this login suppresses FaceTime call
@@ -1564,7 +1567,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	go c.maybeSendManagementRoomWelcome(context.Background(), log)
 
-	// Set up contact source: external CardDAV (per-user or global) > local macOS > iCloud CardDAV
+	// Set up contact source: per-user external CardDAV > local macOS > iCloud CardDAV
 	cardDAVCfg := c.externalCardDAVConfig()
 	if cardDAVCfg.IsConfigured() {
 		extContacts := newExternalCardDAVClient(cardDAVCfg, &c.deadContactPhotos, log)
@@ -8167,7 +8170,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		origMime := mimeType
 		origSize := len(data)
 		log.Info().Str("guid", row.GUID).Str("mime", origMime).Int("bytes", origSize).
-		Msg("Starting video transcoding")
+			Msg("Starting video transcoding")
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -8176,7 +8179,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 			// Remux failed — try full re-encode
 			method = "re-encode"
 			log.Info().Str("guid", row.GUID).Str("mime", origMime).Int("bytes", origSize).
-			Msg("Video remux failed, falling back to re-encode")
+				Msg("Video remux failed, falling back to re-encode")
 			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},
@@ -8350,7 +8353,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		if c.videoTranscoding() && ffmpeg.Supported() {
 			origSize := len(avidData)
 			log.Info().Str("guid", row.GUID).Str("mime", avidMime).Int("bytes", origSize).
-			Msg("Starting Live Photo avid video transcoding")
+				Msg("Starting Live Photo avid video transcoding")
 			method := "remux"
 			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
 				[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -8358,7 +8361,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 			if convertErr != nil {
 				method = "re-encode"
 				log.Info().Str("guid", row.GUID).Str("mime", avidMime).Int("bytes", origSize).
-				Msg("Live Photo remux failed, falling back to re-encode")
+					Msg("Live Photo remux failed, falling back to re-encode")
 				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
 					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 						"-c:a", "aac", "-movflags", "+faststart"},
@@ -10981,7 +10984,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		origMime := mimeType
 		origSize := len(inlineData)
 		log.Info().Str("file", fileName).Str("mime", origMime).Int("bytes", origSize).
-		Msg("Starting video transcoding")
+			Msg("Starting video transcoding")
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -10990,7 +10993,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			// Remux failed — try full re-encode
 			method = "re-encode"
 			log.Info().Str("file", fileName).Str("mime", origMime).Int("bytes", origSize).
-			Msg("Video remux failed, falling back to re-encode")
+				Msg("Video remux failed, falling back to re-encode")
 			converted, convertErr = ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},

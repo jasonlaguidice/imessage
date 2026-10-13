@@ -42,6 +42,37 @@ type externalCardDAVClient struct {
 	deadPhotoURLs *deadPhotoURLCache
 }
 
+// CardDAVConfig is one login's resolved external CardDAV settings, built from
+// UserLoginMetadata by IMClient.externalCardDAVConfig. Supports Google (with
+// app passwords), Nextcloud, Radicale, Fastmail, etc.
+type CardDAVConfig struct {
+	// Email address used for CardDAV auto-discovery (RFC 6764 .well-known/carddav).
+	// Also used as the username if Username is empty.
+	Email string
+
+	// URL is the CardDAV server URL. Empty means auto-discover from Email.
+	URL string
+
+	// Username for HTTP Basic authentication. Defaults to Email if empty.
+	Username string
+
+	// Password for HTTP Basic authentication (usually an app password).
+	Password string
+}
+
+// IsConfigured returns true if the CardDAV config has enough info to connect.
+func (c *CardDAVConfig) IsConfigured() bool {
+	return c.Email != "" && c.Password != ""
+}
+
+// GetUsername returns the effective username (falls back to Email).
+func (c *CardDAVConfig) GetUsername() string {
+	if c.Username != "" {
+		return c.Username
+	}
+	return c.Email
+}
+
 // newExternalCardDAVClient creates an external CardDAV client.
 // Performs auto-discovery if url is empty. Returns nil if configuration is insufficient.
 func newExternalCardDAVClient(cfg CardDAVConfig, deadPhotoURLs *deadPhotoURLCache, log zerolog.Logger) *externalCardDAVClient {
@@ -49,13 +80,7 @@ func newExternalCardDAVClient(cfg CardDAVConfig, deadPhotoURLs *deadPhotoURLCach
 		return nil
 	}
 
-	// Decrypt password
-	password, err := DecryptCardDAVPassword(cfg.PasswordEncrypted)
-	if err != nil {
-		log.Warn().Err(err).Msg("Failed to decrypt CardDAV password")
-		return nil
-	}
-
+	password := cfg.Password
 	username := cfg.GetUsername()
 	url := cfg.URL
 
