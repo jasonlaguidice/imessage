@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -77,7 +78,7 @@ func fnContacts(ce *commands.Event) {
 		return
 	}
 
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return
@@ -228,7 +229,7 @@ func fnContacts(ce *commands.Event) {
 			commands.StoreCommandState(ce.User, nil)
 
 			chosen := matches[n-1]
-			login := ce.User.GetDefaultLogin()
+			login := commandLogin(ce)
 			if login == nil {
 				ce.Reply("No active login found.")
 				return

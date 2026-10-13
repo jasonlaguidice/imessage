@@ -45,7 +45,7 @@ type keychainJoinState struct {
 }
 
 func fnKeychainJoin(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("Not logged in.")
 		return

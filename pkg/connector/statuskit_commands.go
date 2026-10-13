@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -44,10 +45,11 @@ var cmdStatuskitState = &commands.FullHandler{
 	Name: "statuskit-state",
 	Func: fnStatuskitState,
 	Help: commands.HelpMeta{
-		Section:     HelpSectionStatusKit,
+		Section:     commands.HelpSectionAdmin,
 		Description: "Dump raw StatusKit client state (channels, keys, interest tokens) as JSON — debugging only.",
 	},
 	RequiresLogin: true,
+	RequiresAdmin: true,
 }
 
 var cmdStatuskitShare = &commands.FullHandler{
@@ -125,7 +127,7 @@ var cmdStatuskitClearLatch = &commands.FullHandler{
 }
 
 func statusKitClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedStatusKitClient, bool) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return nil, false
@@ -154,7 +156,7 @@ func statusKitClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedStatusKitC
 // AnnounceAppleDeviceIfNeeded path already uses this prime for the
 // happy-birthday token — same mechanism, different consumer.
 func primeGsaTokensForStatuskit(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		return
 	}
@@ -370,7 +372,7 @@ func fnStatuskitClearLatch(ce *commands.Event) {
 		ce.Reply("Empty handle.")
 		return
 	}
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return

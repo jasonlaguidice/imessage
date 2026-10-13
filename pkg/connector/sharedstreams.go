@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -92,21 +93,23 @@ var cmdSharedState = &commands.FullHandler{
 	Name: "shared-state",
 	Func: fnSharedState,
 	Help: commands.HelpMeta{
-		Section:     HelpSectionSharedStreams,
+		Section:     commands.HelpSectionAdmin,
 		Description: "Dump raw Shared Streams state (subscriptions, asset metadata) as JSON — debugging only.",
 	},
 	RequiresLogin: true,
+	RequiresAdmin: true,
 }
 
 var cmdSharedAssetsJSON = &commands.FullHandler{
 	Name: "shared-assets-json",
 	Func: fnSharedAssetsJSON,
 	Help: commands.HelpMeta{
-		Section:     HelpSectionSharedStreams,
+		Section:     commands.HelpSectionAdmin,
 		Description: "Export full asset metadata as JSON for specific assets in an album — debugging only.",
 		Args:        "<album-id> <asset-guid...>",
 	},
 	RequiresLogin: true,
+	RequiresAdmin: true,
 }
 
 var cmdSharedDeleteAssets = &commands.FullHandler{
@@ -118,51 +121,6 @@ var cmdSharedDeleteAssets = &commands.FullHandler{
 		Args:        "<album-id> <asset-guid...>",
 	},
 	RequiresLogin: true,
-}
-
-var cmdDeleteRoom = &commands.FullHandler{
-	Name: "delete-room",
-	Func: fnDeleteRoom,
-	Help: commands.HelpMeta{
-		Section:     HelpSectionSharedStreams,
-		Description: "Delete this shared album download room. Run from inside the album room.",
-	},
-	RequiresLogin: true,
-}
-
-func fnDeleteRoom(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
-	if login == nil {
-		ce.Reply("No active login found.")
-		return
-	}
-	client, ok := login.Client.(*IMClient)
-	if !ok || client == nil {
-		ce.Reply("Bridge client not available.")
-		return
-	}
-
-	client.sharedAlbumRoomsMu.Lock()
-	var foundAlbum string
-	for albumGUID, roomID := range client.sharedAlbumRooms {
-		if roomID == ce.RoomID {
-			foundAlbum = albumGUID
-			break
-		}
-	}
-	if foundAlbum == "" {
-		client.sharedAlbumRoomsMu.Unlock()
-		ce.Reply("This is not a shared album download room.")
-		return
-	}
-	delete(client.sharedAlbumRooms, foundAlbum)
-	client.sharedAlbumRoomsMu.Unlock()
-
-	err := client.Main.Bridge.Bot.DeleteRoom(ce.Ctx, ce.RoomID, false)
-	if err != nil {
-		ce.Reply("Failed to delete room: %v", err)
-		return
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +220,7 @@ func albumProvenance(a rustpushgo.SharedAlbumInfo) string {
 // ---------------------------------------------------------------------------
 
 func fnSharedAlbums(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return
@@ -563,7 +521,7 @@ func (c *IMClient) downloadSharedAlbumAssets(ctx context.Context, ss *rustpushgo
 
 	// Send a welcome/help notice into the album room.
 	welcome := format.RenderMarkdown(fmt.Sprintf(
-		"Downloading %d asset(s) from **%s**.\n\nWhen you're done, send `!im delete-room` here to delete this room.",
+		"Downloading %d asset(s) from **%s**.",
 		len(assetGUIDs), albumName), true, false)
 	welcome.MsgType = event.MsgNotice
 	_, _ = intent.SendMessage(ctx, roomID, event.EventMessage, &event.Content{Parsed: welcome}, nil)
@@ -995,7 +953,7 @@ func (c *IMClient) recordSharedStreamAssets(albumID string, assets []string) boo
 // ---------------------------------------------------------------------------
 
 func sharedStreamsClientFromEvent(ce *commands.Event) (*rustpushgo.WrappedSharedStreamsClient, bool) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return nil, false

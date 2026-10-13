@@ -1,5 +1,6 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
 // Copyright (C) 2024 Ludvig Rhodin
+// Copyright (C) 2026 Jason LaGuidice
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -83,7 +84,6 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdSharedState,
 		cmdSharedAssetsJSON,
 		cmdSharedDeleteAssets,
-		cmdDeleteRoom,
 		cmdStatuskitState,
 		cmdStatuskitShare,
 		cmdStatuskitResetKeys,
@@ -133,13 +133,13 @@ var cmdResolveIdentifierRedirect = &commands.FullHandler{
 	Name: "resolve-identifier",
 	Func: func(ce *commands.Event) {
 		ce.Reply("`resolve-identifier` is gone — use `$cmdprefix start-chat` instead. It does the IDS lookup and opens the chat in one step.\n\n" +
-			"For lookup-only diagnostics (IDS validity + cloud_message stats) use `$cmdprefix msg-debug <phone|email>`.")
+			"For lookup-only diagnostics (IDS validity + cloud_message stats), bridge admins can use `$cmdprefix msg-debug <phone|email>`.")
 	},
 	// Description deliberately empty so help.go's FormatHelp skips this entry.
 }
 
 func fnStartChat(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("You're not signed in to iMessage. Run `$cmdprefix login` first.")
 		return
@@ -316,7 +316,7 @@ var cmdRestoreChat = &commands.FullHandler{
 }
 
 func fnRestoreChat(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return
@@ -344,7 +344,15 @@ func fnRestoreChat(ce *commands.Event) {
 
 // fnRestoreChatFromChatDB handles restore-chat using the local macOS chat.db.
 // Lists all chats in chat.db that don't have an active Matrix room.
+//
+// chat.db is the Mac's machine-wide ~/Library/Messages/chat.db, which belongs
+// to the Mac's owner rather than to whichever bridge user runs the command,
+// so this path is limited to bridge admins.
 func fnRestoreChatFromChatDB(ce *commands.Event, login *bridgev2.UserLogin, client *IMClient) {
+	if !ce.User.Permissions.Admin {
+		ce.Reply("Restoring chats from the local Messages database (chat.db) is limited to bridge admins, because that database belongs to the Mac's owner.")
+		return
+	}
 	chats, err := client.chatDB.api.GetChatsWithMessagesAfter(time.Time{})
 	if err != nil {
 		ce.Reply("Failed to query chat.db: %v", err)
@@ -919,15 +927,16 @@ var cmdRestoreDebug = &commands.FullHandler{
 	Aliases: []string{"rdebug", "chat-debug"},
 	Func:    fnRestoreDebug,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionChats,
+		Section:     commands.HelpSectionAdmin,
 		Description: "Dump cloud_chat + recycle-bin state for all portals to diagnose missing or failed restores.",
 		Args:        "",
 	},
 	RequiresLogin: true,
+	RequiresAdmin: true,
 }
 
 func fnRestoreDebug(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("Not logged in.")
 		return
@@ -1041,15 +1050,16 @@ var cmdMsgDebug = &commands.FullHandler{
 	Aliases:       []string{"msgdbg"},
 	Func:          fnMsgDebug,
 	RequiresLogin: true,
+	RequiresAdmin: true,
 	Help: commands.HelpMeta{
-		Section:     commands.HelpSectionChats,
+		Section:     commands.HelpSectionAdmin,
 		Description: "Check cloud_message sync status and IDS registration for a contact. Shows sync progress, per-participant UUID routing splits, and which handles Apple's IDS confirms as iMessage. Pass an identifier to avoid accidentally opening a chat room.",
 		Args:        "[phone|email|gid:uuid]",
 	},
 }
 
 func fnMsgDebug(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("Not logged in.")
 		return
@@ -1294,14 +1304,17 @@ func setCardDAVAskEmail(ce *commands.Event, provider string) {
 func setCardDAVAskPassword(ce *commands.Event, provider, email string) {
 	if provider == "google" {
 		ce.Reply("Enter your Google App Password (not your regular Google password).\n\n" +
-			"Create one at myaccount.google.com/apppasswords — remove all spaces from the generated password.")
+			"Create one at myaccount.google.com/apppasswords — remove all spaces from the generated password.\n\n" +
+			"Your message will be deleted after it's read.")
 	} else {
 		ce.Reply("Enter your Fastmail App Password (not your regular Fastmail password).\n\n" +
-			"Create one at Settings → Privacy & Security → App Passwords.")
+			"Create one at Settings → Privacy & Security → App Passwords.\n\n" +
+			"Your message will be deleted after it's read.")
 	}
 	commands.StoreCommandState(ce.User, &commands.CommandState{
 		Action: "enter password",
 		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			ce.Redact()
 			commands.StoreCommandState(ce.User, nil)
 			password := strings.TrimSpace(ce.RawArgs)
 			if password == "" {
@@ -1355,10 +1368,11 @@ func setCardDAVAskNextcloudServerURL(ce *commands.Event, email string) {
 }
 
 func setCardDAVAskNextcloudPassword(ce *commands.Event, email, serverURL string) {
-	ce.Reply("Enter your Nextcloud password:")
+	ce.Reply("Enter your Nextcloud password (your message will be deleted after it's read):")
 	commands.StoreCommandState(ce.User, &commands.CommandState{
 		Action: "enter nextcloud password",
 		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			ce.Redact()
 			commands.StoreCommandState(ce.User, nil)
 			password := strings.TrimSpace(ce.RawArgs)
 			if password == "" {
@@ -1424,10 +1438,11 @@ func setCardDAVAskOtherUsername(ce *commands.Event, email, url string) {
 }
 
 func setCardDAVAskOtherPassword(ce *commands.Event, email, url, username string) {
-	ce.Reply("Enter your CardDAV password:")
+	ce.Reply("Enter your CardDAV password (your message will be deleted after it's read):")
 	commands.StoreCommandState(ce.User, &commands.CommandState{
 		Action: "enter carddav password",
 		Next: commands.MinimalCommandHandlerFunc(func(ce *commands.Event) {
+			ce.Redact()
 			commands.StoreCommandState(ce.User, nil)
 			password := strings.TrimSpace(ce.RawArgs)
 			if password == "" {
@@ -1443,7 +1458,7 @@ func setCardDAVAskOtherPassword(ce *commands.Event, email, url, username string)
 // setCardDAVApplyConfig encrypts the password, updates UserLoginMetadata, saves,
 // and tells the user to restart. Pass empty email to switch back to iCloud.
 func setCardDAVApplyConfig(ce *commands.Event, email, url, username, plainPassword string) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return
@@ -1529,7 +1544,7 @@ func setBoolSetting(
 	set func(*UserLoginMetadata, *bool),
 	get func(*UserLoginMetadata) *bool,
 ) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("No active login found.")
 		return
@@ -1604,7 +1619,7 @@ var cmdClearIdentityCache = &commands.FullHandler{
 }
 
 func fnClearIdentityCache(ce *commands.Event) {
-	login := ce.User.GetDefaultLogin()
+	login := commandLogin(ce)
 	if login == nil {
 		ce.Reply("You're not signed in to iMessage. Run `$cmdprefix login` first.")
 		return
@@ -1673,6 +1688,19 @@ func resolvePortalLogin(ce *commands.Event) *bridgev2.UserLogin {
 		}
 	}
 	return nil
+}
+
+// commandLogin returns the login a command should act on. In a portal room
+// that is the login owning the portal, so a user with several logins acts on
+// the right account; otherwise (management room, or a portal whose receiver
+// isn't one of the user's cached logins) it falls back to the default login.
+func commandLogin(ce *commands.Event) *bridgev2.UserLogin {
+	if ce.Portal != nil {
+		if login := resolvePortalLogin(ce); login != nil {
+			return login
+		}
+	}
+	return ce.User.GetDefaultLogin()
 }
 
 // formatHandleList renders a numbered list of handles, one per line, marking
