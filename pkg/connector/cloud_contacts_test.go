@@ -1,4 +1,5 @@
 // mautrix-imessage - A Matrix-iMessage puppeting bridge.
+// Copyright (C) 2026 Jason LaGuidice
 //
 // Tests for contact-photo failure classification and the ghost profile
 // helpers built from address-book contacts. Adapted from upstream
@@ -153,16 +154,12 @@ func TestContactAvatar(t *testing.T) {
 // TestDownloadContactPhotosKeepsURLAndCachesOnlyDead checks that a successful
 // download keeps AvatarURL (so carryOverAvatars can match it next sync), that
 // an Apple-host 403 is retried rather than dead-cached, and that a 404 is
-// dead-cached.
+// dead-cached in the calling user's cache only.
 func TestDownloadContactPhotosKeepsURLAndCachesOnlyDead(t *testing.T) {
 	okURL := "https://p1.icloud.com/test/ok"
 	limitedURL := "https://p1.icloud.com/test/ratelimited"
 	goneURL := "https://p1.icloud.com/test/gone"
-	t.Cleanup(func() {
-		for _, u := range []string{okURL, limitedURL, goneURL} {
-			deadContactPhotoURLs.Delete(u)
-		}
-	})
+	var dead, otherUser deadPhotoURLCache
 
 	fetch := func(_ context.Context, url string) ([]byte, error) {
 		switch url {
@@ -177,18 +174,21 @@ func TestDownloadContactPhotosKeepsURLAndCachesOnlyDead(t *testing.T) {
 	ok := &imessage.Contact{AvatarURL: okURL}
 	limited := &imessage.Contact{AvatarURL: limitedURL}
 	gone := &imessage.Contact{AvatarURL: goneURL}
-	downloadContactPhotos([]*imessage.Contact{ok, limited, gone}, zerolog.Nop(), fetch)
+	downloadContactPhotos([]*imessage.Contact{ok, limited, gone}, &dead, zerolog.Nop(), fetch)
 
 	if string(ok.Avatar) != "jpeg" || ok.AvatarURL != okURL {
 		t.Errorf("successful download: Avatar=%q AvatarURL=%q, want bytes and URL kept", ok.Avatar, ok.AvatarURL)
 	}
-	if contactPhotoURLDead(limitedURL) {
+	if dead.isDead(limitedURL) {
 		t.Error("Apple-host 403 must not be dead-cached")
 	}
 	if limited.AvatarURL == "" {
 		t.Error("Apple-host 403 must keep AvatarURL so the ghost gets a deferred avatar")
 	}
-	if !contactPhotoURLDead(goneURL) {
+	if !dead.isDead(goneURL) {
 		t.Error("404 should be dead-cached")
+	}
+	if otherUser.isDead(goneURL) {
+		t.Error("a dead URL must not leak into another user's cache")
 	}
 }

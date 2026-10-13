@@ -200,17 +200,16 @@ func (c *IMClient) statusKitNotifications() bool {
 	return c.Main.Config.StatusKitNotifications
 }
 
-// statusKitNotificationStyle returns "topic" or "notice", defaulting to
-// "topic" when the per-user override and global config are both unset or
-// hold an unrecognized value.
+// statusKitNotificationStyle returns "topic" or "notice". A non-empty
+// per-user override wins over the global config; either value is matched
+// case-insensitively after trimming whitespace, and anything other than
+// "topic" or "notice" (or both being unset) yields "topic".
 func (c *IMClient) statusKitNotificationStyle() string {
-	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.StatusKitNotificationStyle != nil && *meta.StatusKitNotificationStyle != "" {
-		return *meta.StatusKitNotificationStyle
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.StatusKitNotificationStyle != nil && strings.TrimSpace(*meta.StatusKitNotificationStyle) != "" {
+		style, _ := normalizeStatusKitNotificationStyle(*meta.StatusKitNotificationStyle)
+		return style
 	}
-	style := c.Main.Config.StatusKitNotificationStyle
-	if style != "topic" && style != "notice" {
-		return "topic"
-	}
+	style, _ := normalizeStatusKitNotificationStyle(c.Main.Config.StatusKitNotificationStyle)
 	return style
 }
 
@@ -248,6 +247,12 @@ type IMClient struct {
 
 	// Contact source for name resolution (iCloud or external CardDAV)
 	contacts contactSource
+
+	// deadContactPhotos is this user's skip set of contact photo URLs that
+	// failed permanently. It lives on the client rather than on the contact
+	// source so it survives the source being rebuilt on reconnect, and is
+	// per user so one user's dead photo host never affects another user.
+	deadContactPhotos deadPhotoURLCache
 
 	// sharedProfiles is the in-memory cache of shared iMessage profile records
 	// (Name & Photo Sharing) received via ShareProfile / UpdateProfile
@@ -1536,7 +1541,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 	// Set up contact source: external CardDAV (per-user or global) > local macOS > iCloud CardDAV
 	cardDAVCfg := c.externalCardDAVConfig()
 	if cardDAVCfg.IsConfigured() {
-		extContacts := newExternalCardDAVClient(cardDAVCfg, log)
+		extContacts := newExternalCardDAVClient(cardDAVCfg, &c.deadContactPhotos, log)
 		if extContacts != nil {
 			c.contacts = extContacts
 			log.Info().Str("email", cardDAVCfg.Email).Msg("Using external CardDAV for contacts")
@@ -1562,7 +1567,7 @@ func (c *IMClient) Connect(ctx context.Context) {
 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
 		}
 	} else {
-		cloudContacts := newCloudContactsClient(c.client, log)
+		cloudContacts := newCloudContactsClient(c.client, &c.deadContactPhotos, log)
 		if cloudContacts != nil {
 			c.contacts = cloudContacts
 			log.Info().Str("url", cloudContacts.baseURL).Msg("Cloud contacts available (iCloud CardDAV)")
@@ -8933,7 +8938,7 @@ func (c *IMClient) retryCloudContacts(log zerolog.Logger) {
 			log.Info().Msg("Retrying cloud contacts initialization...")
 			// Assign through a concrete-typed local: a nil *cloudContactsClient
 			// stored in the contactSource interface would be non-nil.
-			if cloudContacts := newCloudContactsClient(c.client, log); cloudContacts != nil {
+			if cloudContacts := newCloudContactsClient(c.client, &c.deadContactPhotos, log); cloudContacts != nil {
 				c.contacts = cloudContacts
 			}
 			if c.contacts != nil {

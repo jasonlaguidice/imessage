@@ -93,6 +93,15 @@ func (c *IMConnector) Start(ctx context.Context) error {
 		c.Bridge.Log.Info().Msg("Forcing phone_numbers_in_profile=true so contact phone numbers stay in Matrix profiles (call button + contact resolution)")
 	}
 
+	// Warn once about an unrecognized global StatusKit notification style.
+	// Logged here rather than in IMConfig.PostProcess because PostProcess
+	// runs during YAML unmarshalling, before the bridge logger is available.
+	if c.Config.invalidStatusKitNotificationStyle() {
+		c.Bridge.Log.Warn().
+			Str("statuskit_notification_style", c.Config.StatusKitNotificationStyle).
+			Msg("Invalid statuskit_notification_style in config (expected \"topic\" or \"notice\"); falling back to \"topic\"")
+	}
+
 	// Override backfill defaults for iMessage CloudKit sync.
 	// Applied in Start() because Init() runs before config YAML is loaded.
 	// Only apply when CloudKit backfill is enabled — otherwise leave the
