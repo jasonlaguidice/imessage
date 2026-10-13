@@ -4005,11 +4005,14 @@ func (c *IMClient) createPortalsFromCloudSync(ctx context.Context, log zerolog.L
 	}
 }
 
+// ensureCloudSyncStore checks that this login's cloud store exists and runs
+// its per-login startup cleanup. The tables themselves are created by the
+// versioned migrations in IMConnector.Start.
 func (c *IMClient) ensureCloudSyncStore(ctx context.Context) error {
 	if c.cloudStore == nil {
 		return fmt.Errorf("cloud store not initialized")
 	}
-	return c.cloudStore.ensureSchema(ctx)
+	return c.cloudStore.deleteLeakedSystemMessages(ctx)
 }
 
 // filenameBase returns the filename without its extension.

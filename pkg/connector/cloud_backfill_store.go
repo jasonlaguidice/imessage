@@ -72,138 +72,20 @@ func newCloudBackfillStore(db *dbutil.Database, loginID networkid.UserLoginID) *
 	return &cloudBackfillStore{db: db, loginID: loginID}
 }
 
-// migrateColumns adds missing columns to the given table. Postgres supports
-// ADD COLUMN IF NOT EXISTS natively; SQLite requires a pragma existence check
-// first since it has no IF NOT EXISTS on ALTER TABLE.
-func (s *cloudBackfillStore) migrateColumns(ctx context.Context, table string, cols []struct{ name, def string }) error {
-	for _, col := range cols {
-		var err error
-		if s.db.Dialect == dbutil.Postgres {
-			_, err = s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s %s`, table, col.name, col.def))
-		} else {
-			var exists int
-			_ = s.db.QueryRow(ctx, fmt.Sprintf(`SELECT COUNT(*) FROM pragma_table_info('%s') WHERE name=$1`, table), col.name).Scan(&exists)
-			if exists == 0 {
-				_, err = s.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN %s %s`, table, col.name, col.def))
-			}
-		}
-		if err != nil {
-			return fmt.Errorf("failed to add %s column to %s: %w", col.name, table, err)
-		}
-	}
-	return nil
-}
-
-func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
-	queries := []string{
-		`CREATE TABLE IF NOT EXISTS cloud_sync_state (
-			login_id TEXT NOT NULL,
-			zone TEXT NOT NULL,
-			continuation_token TEXT,
-			last_success_ts BIGINT,
-			last_error TEXT,
-			updated_ts BIGINT NOT NULL,
-			PRIMARY KEY (login_id, zone)
-		)`,
-		`CREATE TABLE IF NOT EXISTS cloud_chat (
-			login_id TEXT NOT NULL,
-			cloud_chat_id TEXT NOT NULL,
-			record_name TEXT NOT NULL DEFAULT '',
-			group_id TEXT NOT NULL DEFAULT '',
-			portal_id TEXT NOT NULL,
-			service TEXT,
-			display_name TEXT,
-			group_photo_guid TEXT,
-			participants_json TEXT,
-			updated_ts BIGINT,
-			created_ts BIGINT NOT NULL,
-			PRIMARY KEY (login_id, cloud_chat_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS cloud_message (
-			login_id TEXT NOT NULL,
-			guid TEXT NOT NULL,
-			chat_id TEXT,
-			portal_id TEXT,
-			timestamp_ms BIGINT NOT NULL,
-			sender TEXT,
-			is_from_me BOOLEAN NOT NULL,
-			text TEXT,
-			subject TEXT,
-			service TEXT,
-			deleted BOOLEAN NOT NULL DEFAULT FALSE,
-			tapback_type INTEGER,
-			tapback_target_guid TEXT,
-			tapback_emoji TEXT,
-			attachments_json TEXT,
-			created_ts BIGINT NOT NULL,
-			updated_ts BIGINT NOT NULL,
-			PRIMARY KEY (login_id, guid)
-		)`,
-		`CREATE TABLE IF NOT EXISTS group_photo_cache (
-			login_id TEXT NOT NULL,
-			portal_id TEXT NOT NULL,
-			ts BIGINT NOT NULL,
-			data BYTEA NOT NULL,
-			PRIMARY KEY (login_id, portal_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS restore_override (
-			login_id TEXT NOT NULL,
-			portal_id TEXT NOT NULL,
-			updated_ts BIGINT NOT NULL,
-			PRIMARY KEY (login_id, portal_id)
-		)`,
-		`CREATE INDEX IF NOT EXISTS cloud_chat_portal_idx
-			ON cloud_chat (login_id, portal_id, cloud_chat_id)`,
-		`CREATE INDEX IF NOT EXISTS cloud_message_portal_ts_idx
-			ON cloud_message (login_id, portal_id, timestamp_ms, guid)`,
-		`CREATE INDEX IF NOT EXISTS cloud_message_chat_ts_idx
-			ON cloud_message (login_id, chat_id, timestamp_ms, guid)`,
-	}
-
-	// Run table creation queries first (without indexes that depend on migrations)
-	for _, query := range queries {
-		if _, err := s.db.Exec(ctx, query); err != nil {
-			return fmt.Errorf("failed to ensure cloud backfill schema: %w", err)
-		}
-	}
-
-	// Migrations: add missing columns to cloud_chat and cloud_message.
-	// Postgres supports ADD COLUMN IF NOT EXISTS; SQLite does not, so we check
-	// pragma_table_info first on that dialect.
-	if err := s.migrateColumns(ctx, "cloud_chat", []struct{ name, def string }{
-		{"record_name", "TEXT NOT NULL DEFAULT ''"},
-		{"group_id", "TEXT NOT NULL DEFAULT ''"},
-		{"group_photo_guid", "TEXT"},
-		{"deleted", "BOOLEAN NOT NULL DEFAULT FALSE"},
-		{"is_filtered", "INTEGER NOT NULL DEFAULT 0"},
-		{"fwd_backfill_done", "BOOLEAN NOT NULL DEFAULT FALSE"},
-	}); err != nil {
-		return err
-	}
-	if err := s.migrateColumns(ctx, "cloud_message", []struct{ name, def string }{
-		{"subject", "TEXT"},
-		{"tapback_type", "INTEGER"},
-		{"tapback_target_guid", "TEXT"},
-		{"tapback_emoji", "TEXT"},
-		{"attachments_json", "TEXT"},
-		{"date_read_ms", "BIGINT NOT NULL DEFAULT 0"},
-		{"record_name", "TEXT NOT NULL DEFAULT ''"},
-		{"has_body", "BOOLEAN NOT NULL DEFAULT TRUE"},
-	}); err != nil {
-		return err
-	}
-
-	// Cleanup: permanently delete system/rename message rows that slipped into
-	// the DB before the MsgType==0 ingest filter was added.  Two conditions
-	// catch different eras of the DB:
-	//   1. has_body=FALSE + no attachments + no tapback — rows that were stored
-	//      after the has_body column was added but before the MsgType filter;
-	//      their has_body is correctly FALSE (no attributedBody).
-	//   2. text matches the portal's display_name + no attachments + no tapback
-	//      — older rows whose has_body defaulted to TRUE but whose content
-	//      reveals them as group-rename notifications.
-	// This runs every startup and is idempotent: after the first pass it
-	// matches zero rows.
+// deleteLeakedSystemMessages permanently deletes system/rename message rows
+// that slipped into the DB before the MsgType==0 ingest filter was added.
+// Two conditions catch different eras of the DB:
+//  1. has_body=FALSE + no attachments + no tapback — rows that were stored
+//     after the has_body column was added but before the MsgType filter;
+//     their has_body is correctly FALSE (no attributedBody).
+//  2. text matches the portal's display_name + no attachments + no tapback
+//     — older rows whose has_body defaulted to TRUE but whose content
+//     reveals them as group-rename notifications.
+//
+// Connect runs this for its login on every start (it used to be part of the
+// per-login schema setup); it is idempotent: after the first pass it matches
+// zero rows. The tables themselves are created by pkg/connector/upgrades.
+func (s *cloudBackfillStore) deleteLeakedSystemMessages(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `
 		DELETE FROM cloud_message
 		WHERE login_id = $1
@@ -224,33 +106,6 @@ func (s *cloudBackfillStore) ensureSchema(ctx context.Context) error {
 	`, s.loginID); err != nil {
 		return fmt.Errorf("failed to delete system messages: %w", err)
 	}
-
-	// Migration: add cloud_attachment_cache table if missing.
-	// Persists record_name → MessageEventContent JSON so mxc URIs survive
-	// bridge restarts. Pre-upload loads this at startup and skips already-cached
-	// attachments, so a 27k-message thread never re-downloads across restarts.
-	if _, err := s.db.Exec(ctx, `CREATE TABLE IF NOT EXISTS cloud_attachment_cache (
-		login_id    TEXT    NOT NULL,
-		record_name TEXT    NOT NULL,
-		content_json BYTEA   NOT NULL,
-		created_ts  BIGINT  NOT NULL,
-		PRIMARY KEY (login_id, record_name)
-	)`); err != nil {
-		return fmt.Errorf("failed to create cloud_attachment_cache table: %w", err)
-	}
-
-	// Create index that depends on record_name column (must be after migration)
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_record_name_idx
-		ON cloud_chat (login_id, record_name) WHERE record_name <> ''`); err != nil {
-		return fmt.Errorf("failed to create record_name index: %w", err)
-	}
-
-	// Create index for group_id lookups (messages reference chats by group_id UUID)
-	if _, err := s.db.Exec(ctx, `CREATE INDEX IF NOT EXISTS cloud_chat_group_id_idx
-		ON cloud_chat (login_id, group_id) WHERE group_id <> ''`); err != nil {
-		return fmt.Errorf("failed to create group_id index: %w", err)
-	}
-
 	return nil
 }
 
@@ -2864,11 +2719,11 @@ func (s *cloudBackfillStore) debugFindPortalsByIdentifierSuffix(ctx context.Cont
 // record has synced, and whether it's filtered/deleted). Used by !msg-debug
 // to distinguish "chat not synced yet" from "chat synced but messages missing".
 type debugChatInfo struct {
-	Found      bool
-	Deleted    bool
-	IsFiltered int64
+	Found       bool
+	Deleted     bool
+	IsFiltered  int64
 	CloudChatID string
-	GroupID    string
+	GroupID     string
 }
 
 func (s *cloudBackfillStore) debugChatInfo(ctx context.Context, portalID string) (debugChatInfo, error) {

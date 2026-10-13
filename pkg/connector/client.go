@@ -231,13 +231,18 @@ type IMClient struct {
 	UserLogin *bridgev2.UserLogin
 
 	// Rustpush (primary — real-time send/receive)
-	client     *rustpushgo.Client
-	config     *rustpushgo.WrappedOsConfig
-	users      *rustpushgo.WrappedIdsUsers
-	identity   *rustpushgo.WrappedIdsngmIdentity
+	client   *rustpushgo.Client
+	config   *rustpushgo.WrappedOsConfig
+	users    *rustpushgo.WrappedIdsUsers
+	identity *rustpushgo.WrappedIdsngmIdentity
+	// connection is opened by Connect (openConnection), or handed over by the
+	// login flow; nil until then.
 	connection *rustpushgo.WrappedApsConnection
-	handle     string   // Primary iMessage handle used for sending (e.g., tel:+1234567890)
-	allHandles []string // All registered handles (for IsThisUser checks)
+	// predecessor is the client this one replaced when LoadUserLogin rebuilt
+	// an already-loaded login; Connect disconnects it (disconnectPredecessor).
+	predecessor *IMClient
+	handle      string   // Primary iMessage handle used for sending (e.g., tel:+1234567890)
+	allHandles  []string // All registered handles (for IsThisUser checks)
 	// identityMu guards handle and allHandles together — they're always read
 	// and written as a pair. Use getHandle/getAllHandles/setIdentity rather
 	// than accessing the fields directly.
@@ -1122,6 +1127,12 @@ func (c *IMClient) Connect(ctx context.Context) {
 
 	rustpushgo.InitLogger()
 
+	// A rebuilt client (LoadUserLogin on an already-loaded login) first tears
+	// down the client it replaced. Done here, not in LoadUserLogin, because
+	// Disconnect can block for up to clientStopTimeout and LoadUserLogin runs
+	// under bridgev2's global cache lock.
+	c.disconnectPredecessor(log)
+
 	// Validate that the software keystore still has the signing keys referenced
 	// by the saved user state.  If the keystore file was deleted/reset while the
 	// bridge DB kept the old state, every IDS operation would fail with
@@ -1142,6 +1153,10 @@ func (c *IMClient) Connect(ctx context.Context) {
 		})
 		return
 	}
+
+	// Open the APNs connection: first needed by the token provider restore
+	// and rustpushgo.NewClient below.
+	c.openConnection(log)
 
 	// Restore token provider from persisted credentials if not already set
 	if c.tokenProvider == nil || *c.tokenProvider == nil {
@@ -1503,38 +1518,27 @@ func (c *IMClient) Connect(ctx context.Context) {
 	go c.periodicStatusSharingReinvite(log)
 	go c.startSharedStreamsWatcher(log)
 
-	// Ensure shared-profile schema and hydrate the in-memory cache from the
-	// DB. Runs on every bridge start so existing installs pick up the table
-	// without needing a fresh login or reconfiguration.
-	if err := c.ensureSharedProfileSchema(context.Background()); err != nil {
-		log.Warn().Err(err).Msg("Failed to ensure shared_profiles schema")
-	} else {
-		c.loadSharedProfilesIntoCache(context.Background(), log)
-		// Independent of CardDAV: push cached state to ghosts immediately
-		// and re-fetch each row from CloudKit. Decoupled from
-		// setContactsReady so a slow MobileMe-delegate retry doesn't gate
-		// the share-profile path (it only depends on ProfilesClient /
-		// keychain init, not on contacts).
-		go c.refreshSharedProfilesOnConnect(log)
-	}
+	// Hydrate the shared-profile cache from the DB. The connector's tables
+	// are created by the versioned migrations in IMConnector.Start.
+	c.loadSharedProfilesIntoCache(context.Background(), log)
+	// Independent of CardDAV: push cached state to ghosts immediately and
+	// re-fetch each row from CloudKit. Decoupled from setContactsReady so a
+	// slow MobileMe-delegate retry doesn't gate the share-profile path (it
+	// only depends on ProfilesClient / keychain init, not on contacts).
+	go c.refreshSharedProfilesOnConnect(log)
 
-	// Ensure Layer-2 MMCS attachment retry schema and spawn the background
-	// worker. The worker is cheap when the queue is empty (one DB SELECT per
-	// tick) so running it unconditionally matches the shared_profiles pattern.
+	// Spawn the Layer-2 MMCS attachment retry worker. The worker is cheap when
+	// the queue is empty (one DB SELECT per tick) so it runs unconditionally.
 	// sync.Once guards against Connect being re-invoked (reconnect, relogin,
 	// session restore) — two retrier goroutines on the same table would race
 	// on GetDue and emit duplicate edits for the same attachment.
 	if c.pendingAttachments != nil {
-		if err := c.pendingAttachments.ensureSchema(context.Background()); err != nil {
-			log.Warn().Err(err).Msg("Failed to ensure pending_attachment_retry schema")
-		} else {
-			c.retrierOnce.Do(func() {
-				go (&attachmentRetrier{Client: c}).Run(c.stopChan)
-			})
-		}
+		c.retrierOnce.Do(func() {
+			go (&attachmentRetrier{Client: c}).Run(c.stopChan)
+		})
 	}
 
-	// Ensure CloudKit backfill schema/storage is available.
+	// Ensure CloudKit backfill storage is available.
 	cloudStoreReady := true
 	if err = c.ensureCloudSyncStore(context.Background()); err != nil {
 		cloudStoreReady = false
@@ -1709,9 +1713,46 @@ Run ` + "`help`" + ` any time for the full command list.
 // clientStopTimeout bounds client.Stop() during Disconnect (upstream 298fb05b).
 const clientStopTimeout = 10 * time.Second
 
+// disconnectPredecessor fully disconnects the client this one replaced, if
+// it is still live, BEFORE this client opens its own APNs connection on the
+// same device token. bridgev2's recreateClient does not disconnect the old
+// client itself (its callers normally do, which makes this a no-op), and a
+// lingering old connection makes the new one a duplicate that Apple drops
+// ("early eof"), which rustpush's no-backoff reconnect loop turns into the
+// self-sustaining receive-stall storm.
+func (c *IMClient) disconnectPredecessor(log zerolog.Logger) {
+	prev := c.predecessor
+	c.predecessor = nil
+	if prev == nil || prev == c || prev.client == nil {
+		return
+	}
+	log.Info().Msg("Disconnecting the replaced client before reconnecting (avoids a duplicate APNs connection on the same device token)")
+	prev.Disconnect()
+}
+
+// openConnection opens the APNs connection from the persisted APS state
+// unless the client already has one (a fresh login hands over the connection
+// its login flow opened). rustpushgo.Connect waits for the first connection
+// attempt, so it belongs here rather than in LoadUserLogin.
+func (c *IMClient) openConnection(log zerolog.Logger) {
+	c.disconnectMu.Lock()
+	haveConnection := c.connection != nil
+	c.disconnectMu.Unlock()
+	if haveConnection {
+		return
+	}
+	meta := c.UserLogin.Metadata.(*UserLoginMetadata)
+	log.Debug().Msg("Opening APNs connection")
+	conn := rustpushgo.Connect(c.config, rustpushgo.NewWrappedApsState(&meta.APSState))
+	// Disconnect reads c.connection under this lock.
+	c.disconnectMu.Lock()
+	c.connection = conn
+	c.disconnectMu.Unlock()
+}
+
 func (c *IMClient) Disconnect() {
-	// bridgev2 serializes its own Disconnect calls, but LogoutRemote and
-	// LoadUserLogin (disconnect-before-rebuild) invoke this directly, so two
+	// bridgev2 serializes its own Disconnect calls, but LogoutRemote and a
+	// rebuilt client's Connect (disconnectPredecessor) invoke this directly, so two
 	// teardowns can overlap: double-close of stopChan, or one frame nil-ing
 	// c.client while the other's Stop() goroutine still reads it. Serialize
 	// here; the second caller no-ops on the already-nil'd fields
@@ -7748,7 +7789,7 @@ func (c *IMClient) cloudRowToBackfillMessages(ctx context.Context, row cloudMess
 	//     text, so don't drop those.
 	//   text==groupDisplayName: for older rows whose has_body defaulted to
 	//     TRUE, the rename-notification text exactly matches the group name.
-	// The startup DB cleanup (ensureSchema) hard-deletes matching rows so
+	// The startup DB cleanup (deleteLeakedSystemMessages) hard-deletes matching rows so
 	// this filter is a second line of defence for any that slipped through.
 	isSystemByHasBody := !row.HasBody && strings.TrimSpace(row.Text) == "" && row.AttachmentsJSON == "" && row.TapbackType == nil
 	isSystemByName := row.Text != "" && groupDisplayName != "" && row.Text == groupDisplayName && row.AttachmentsJSON == "" && row.TapbackType == nil
@@ -8167,7 +8208,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		origMime := mimeType
 		origSize := len(data)
 		log.Info().Str("guid", row.GUID).Str("mime", origMime).Int("bytes", origSize).
-		Msg("Starting video transcoding")
+			Msg("Starting video transcoding")
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -8176,7 +8217,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 			// Remux failed — try full re-encode
 			method = "re-encode"
 			log.Info().Str("guid", row.GUID).Str("mime", origMime).Int("bytes", origSize).
-			Msg("Video remux failed, falling back to re-encode")
+				Msg("Video remux failed, falling back to re-encode")
 			converted, convertErr = ffmpeg.ConvertBytes(ctx, data, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},
@@ -8350,7 +8391,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 		if c.videoTranscoding() && ffmpeg.Supported() {
 			origSize := len(avidData)
 			log.Info().Str("guid", row.GUID).Str("mime", avidMime).Int("bytes", origSize).
-			Msg("Starting Live Photo avid video transcoding")
+				Msg("Starting Live Photo avid video transcoding")
 			method := "remux"
 			converted, convertErr := ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
 				[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -8358,7 +8399,7 @@ func (c *IMClient) downloadAndUploadAttachment(
 			if convertErr != nil {
 				method = "re-encode"
 				log.Info().Str("guid", row.GUID).Str("mime", avidMime).Int("bytes", origSize).
-				Msg("Live Photo remux failed, falling back to re-encode")
+					Msg("Live Photo remux failed, falling back to re-encode")
 				converted, convertErr = ffmpeg.ConvertBytes(ctx, avidData, ".mp4", nil,
 					[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 						"-c:a", "aac", "-movflags", "+faststart"},
@@ -10981,7 +11022,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 		origMime := mimeType
 		origSize := len(inlineData)
 		log.Info().Str("file", fileName).Str("mime", origMime).Int("bytes", origSize).
-		Msg("Starting video transcoding")
+			Msg("Starting video transcoding")
 		method := "remux"
 		converted, convertErr := ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
 			[]string{"-c", "copy", "-movflags", "+faststart"},
@@ -10990,7 +11031,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 			// Remux failed — try full re-encode
 			method = "re-encode"
 			log.Info().Str("file", fileName).Str("mime", origMime).Int("bytes", origSize).
-			Msg("Video remux failed, falling back to re-encode")
+				Msg("Video remux failed, falling back to re-encode")
 			converted, convertErr = ffmpeg.ConvertBytes(ctx, inlineData, ".mp4", nil,
 				[]string{"-c:v", "libx264", "-preset", "fast", "-crf", "23",
 					"-c:a", "aac", "-movflags", "+faststart"},

@@ -16,10 +16,13 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/lrhodin/imessage/pkg/connector/upgrades"
 	"github.com/lrhodin/imessage/pkg/rustpushgo"
 )
 
@@ -54,6 +57,12 @@ func (c *IMConnector) Init(bridge *bridgev2.Bridge) {
 }
 
 func (c *IMConnector) Start(ctx context.Context) error {
+	// Create or upgrade the connector's own tables before any login loads.
+	// bridgev2 has already upgraded its own schema by now.
+	if err := upgradeConnectorDB(ctx, c.Bridge.DB.Database, c.Bridge.Log); err != nil {
+		return bridgev2.DBUpgradeError{Err: err, Section: "imessage"}
+	}
+
 	// Warn once about an unrecognized global StatusKit notification style.
 	// Logged here rather than in IMConfig.PostProcess because PostProcess
 	// runs during YAML unmarshalling, before the bridge logger is available.
@@ -202,24 +211,23 @@ func (c *IMConnector) CreateLogin(ctx context.Context, user *bridgev2.User, flow
 	}
 }
 
+// upgradeConnectorDB creates or upgrades the tables the connector owns in the
+// bridge database. They are versioned in their own table (imessage_version),
+// next to bridgev2's, on a child of the bridge's database handle.
+func upgradeConnectorDB(ctx context.Context, db *dbutil.Database, log zerolog.Logger) error {
+	child := db.Child(upgrades.VersionTable, upgrades.Table,
+		dbutil.ZeroLogger(log.With().Str("db_section", "imessage").Logger()))
+	return child.Upgrade(ctx)
+}
+
+// LoadUserLogin builds the login's IMClient without touching the network:
+// bridgev2 calls it under its global cache lock. The APNs connection is
+// opened by IMClient.Connect, and the connector's tables are created once by
+// the migrations in Start.
 func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
 	meta := login.Metadata.(*UserLoginMetadata)
-	log := c.Bridge.Log.With().Str("component", "imessage").Logger()
 
 	rustpushgo.InitLogger()
-
-	// If this login already has a live client, this is a reconnect/recreate
-	// (not first startup) — fully disconnect it BEFORE opening a new APNs
-	// connection on the same device token. bridgev2's recreateClient does NOT
-	// disconnect the old client (it only reassigns login.Client), so without
-	// this the old connection lingers and the new one becomes a duplicate that
-	// Apple drops ("early eof"), which rustpush's no-backoff reconnect loop
-	// turns into the self-sustaining receive-stall storm. Disconnect closes the
-	// old connection and stops its goroutines, so the rebuild starts clean.
-	if existing, ok := login.Client.(*IMClient); ok && existing != nil && existing.client != nil {
-		log.Info().Msg("LoadUserLogin: disconnecting existing client before reconnect (avoids a duplicate APNs connection on the same device token)")
-		existing.Disconnect()
-	}
 
 	var cfg *rustpushgo.WrappedOsConfig
 	var err error
@@ -247,7 +255,6 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 
 	usersStr := &meta.IDSUsers
 	identityStr := &meta.IDSIdentity
-	apsStateStr := &meta.APSState
 
 	client := &IMClient{
 		Main:                    c,
@@ -255,7 +262,6 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		config:                  cfg,
 		users:                   rustpushgo.NewWrappedIdsUsers(usersStr),
 		identity:                rustpushgo.NewWrappedIdsngmIdentity(identityStr),
-		connection:              rustpushgo.Connect(cfg, rustpushgo.NewWrappedApsState(apsStateStr)),
 		contactsReady:           false,
 		contactsReadyCh:         make(chan struct{}),
 		cloudStore:              newCloudBackfillStore(c.Bridge.DB.Database, login.ID),
@@ -275,6 +281,12 @@ func (c *IMConnector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLog
 		lastGroupForMember:      make(map[string]networkid.PortalKey),
 		restorePipelines:        make(map[string]bool),
 		forwardBackfillSem:      make(chan struct{}, 3),
+	}
+	// A login that already has a client is being rebuilt (unknown-error
+	// reconnect, network reset). The new client's Connect disconnects the
+	// old one, if still live, before opening its own APNs connection.
+	if existing, ok := login.Client.(*IMClient); ok && existing != nil {
+		client.predecessor = existing
 	}
 
 	login.Client = client

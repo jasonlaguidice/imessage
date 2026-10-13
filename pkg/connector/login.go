@@ -699,8 +699,8 @@ func (l *ExternalKeyLogin) SubmitUserInput(ctx context.Context, input map[string
 				"Start it with: go run tools/nac-relay/main.go"
 		}
 		return &bridgev2.LoginStep{
-			Type:   bridgev2.LoginStepTypeUserInput,
-			StepID: LoginStepAppleIDPassword,
+			Type:         bridgev2.LoginStepTypeUserInput,
+			StepID:       LoginStepAppleIDPassword,
 			Instructions: "Enter your Apple ID credentials.\n" + nacNote,
 			UserInputParams: &bridgev2.LoginUserInputParams{
 				Fields: []bridgev2.LoginInputDataField{{
@@ -1511,6 +1511,11 @@ func completeLoginWithMeta(
 		DeleteOnConflict: true,
 		LoadUserLogin: func(ctx context.Context, login *bridgev2.UserLogin) error {
 			client.UserLogin = login
+			// Re-login of an already-loaded login: Connect disconnects the
+			// client being replaced (see disconnectPredecessor).
+			if existing, ok := login.Client.(*IMClient); ok && existing != nil {
+				client.predecessor = existing
+			}
 			login.Client = client
 			return nil
 		},
