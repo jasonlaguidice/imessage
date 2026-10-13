@@ -147,6 +147,10 @@ func (s *keychainJoinState) submitPasscode(ce *commands.Event) {
 			ce.Reply("Keychain join failed: %v", err)
 			return
 		}
-		ce.Reply("Joined iCloud Keychain. Restart the bridge to start CloudKit backfill.")
+		if s.client.useCloudKitBackfill() {
+			ce.Reply("Joined iCloud Keychain. Restart the bridge to start CloudKit backfill.")
+		} else {
+			ce.Reply("Joined iCloud Keychain. Run `$cmdprefix set-cloudkit-backfill on` to start CloudKit backfill.")
+		}
 	}()
 }

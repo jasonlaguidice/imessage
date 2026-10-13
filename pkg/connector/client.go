@@ -156,14 +156,15 @@ func (c *IMClient) heicConversion() bool {
 	return c.Main.Config.HEICConversion
 }
 
+// useCloudKitBackfill reports whether CloudKit backfill is on for this login:
+// the global switch must be on, and the per-user override can only turn it
+// off (see effectiveCloudKitBackfill).
 func (c *IMClient) useCloudKitBackfill() bool {
-	if !c.Main.Config.UseCloudKitBackfill() {
-		return false
+	var override *bool
+	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok {
+		override = meta.CloudKitBackfill
 	}
-	if meta, ok := c.UserLogin.Metadata.(*UserLoginMetadata); ok && meta.CloudKitBackfill != nil {
-		return *meta.CloudKitBackfill
-	}
-	return true
+	return effectiveCloudKitBackfill(c.Main.Config.UseCloudKitBackfill(), override)
 }
 
 // externalCardDAVConfig returns this login's external CardDAV settings. There

@@ -74,6 +74,10 @@ func BridgeCommands() []*commands.FullHandler {
 		cmdSetCardDAV,
 		cmdSetVideoTranscoding,
 		cmdSetHEICConversion,
+		cmdSetCloudKitBackfill,
+		cmdSetFaceTimeNotices,
+		cmdSetStatusKit,
+		cmdSetStatusKitStyle,
 		cmdClearIdentityCache,
 	}
 	cmds = append(cmds,
@@ -1552,8 +1556,8 @@ func setBoolSetting(
 		return
 	}
 
-	arg := strings.ToLower(strings.TrimSpace(ce.RawArgs))
-	if arg == "" {
+	arg := parseToggleArg(ce.RawArgs)
+	if arg == toggleQuery {
 		cur := get(meta)
 		if cur == nil {
 			ce.Reply("%s is using the global config default. Use `$cmdprefix %s on` or `off` to override.", name, ce.Command)
@@ -1565,19 +1569,11 @@ func setBoolSetting(
 		return
 	}
 
-	switch arg {
-	case "on", "yes", "enable", "true", "1":
-		v := true
-		set(meta, &v)
-	case "off", "no", "disable", "false", "0":
-		v := false
-		set(meta, &v)
-	case "reset", "default", "unset":
-		set(meta, nil)
-	default:
-		ce.Reply("Unknown value %q — use `on`, `off`, or `reset` (to use global config default).", arg)
+	if arg == toggleInvalid {
+		ce.Reply("Unknown value %q — use `on`, `off`, or `reset` (to use global config default).", strings.ToLower(strings.TrimSpace(ce.RawArgs)))
 		return
 	}
+	set(meta, arg.override())
 
 	if err := login.Save(ce.Ctx); err != nil {
 		ce.Reply("Failed to save settings: %v", err)
