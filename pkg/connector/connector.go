@@ -82,6 +82,13 @@ func (c *IMConnector) Start(ctx context.Context) error {
 	// false is their stock value. An operator-set max_initial_messages below
 	// MaxInt32 is an explicit cap: FetchMessages skips backward backfill and
 	// the startup attachment pre-upload is skipped.
+	//
+	// The backfill.queue.enabled default only applies when the homeserver
+	// supports Beeper batch sending (com.beeper.batch_sending): bridgev2 does
+	// not run the queue without it, and history comes in through forward
+	// backfill instead. bridgev2 starts the Matrix connector (which fetches
+	// /versions and sets the capabilities) before this Start, so the
+	// capabilities are already known here.
 	c.applyBridgeConfigDefaults()
 	c.warnShortUnknownErrorAutoReconnect()
 

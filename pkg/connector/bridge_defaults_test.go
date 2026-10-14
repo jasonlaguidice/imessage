@@ -100,14 +100,27 @@ func mautrixStockBridgeConfig() *bridgeconfig.BridgeConfig {
 	}
 }
 
-func newDefaultsTestConnector(cfg *bridgeconfig.BridgeConfig, logOut *bytes.Buffer) *IMConnector {
-	return &IMConnector{Bridge: &bridgev2.Bridge{Config: cfg, Log: zerolog.New(logOut)}}
+// capsOnlyMatrix is a bridgev2.MatrixConnector that only implements
+// GetCapabilities; any other method call panics on the nil embedded interface.
+type capsOnlyMatrix struct {
+	bridgev2.MatrixConnector
+	caps bridgev2.MatrixCapabilities
+}
+
+func (m *capsOnlyMatrix) GetCapabilities() *bridgev2.MatrixCapabilities { return &m.caps }
+
+func newDefaultsTestConnector(cfg *bridgeconfig.BridgeConfig, logOut *bytes.Buffer, batchSending bool) *IMConnector {
+	return &IMConnector{Bridge: &bridgev2.Bridge{
+		Config: cfg,
+		Log:    zerolog.New(logOut),
+		Matrix: &capsOnlyMatrix{caps: bridgev2.MatrixCapabilities{BatchSending: batchSending}},
+	}}
 }
 
 func TestApplyBridgeConfigDefaultsOnStockConfig(t *testing.T) {
 	cfg := mautrixStockBridgeConfig()
 	var logOut bytes.Buffer
-	newDefaultsTestConnector(cfg, &logOut).applyBridgeConfigDefaults()
+	newDefaultsTestConnector(cfg, &logOut, true).applyBridgeConfigDefaults()
 
 	if !cfg.PhoneNumbersInProfile {
 		t.Error("phone_numbers_in_profile not defaulted to true")
@@ -152,8 +165,104 @@ func TestApplyBridgeConfigDefaultsOnStockConfig(t *testing.T) {
 	}
 
 	// A second pass changes nothing: the values are no longer stock.
-	if applied := applyConfigDefaults(cfg, bridgeConfigDefaults); len(applied) != 0 {
-		t.Errorf("second pass applied %d defaults, want 0", len(applied))
+	if applied, skipped := applyConfigDefaults(cfg, bridgeConfigDefaults, homeserverFeatures{BatchSending: true}); len(applied) != 0 || len(skipped) != 0 {
+		t.Errorf("second pass applied %d and skipped %d defaults, want 0 and 0", len(applied), len(skipped))
+	}
+}
+
+// On a homeserver without batch sending (e.g. Synapse) bridgev2 does not run
+// the backfill queue, so the queue default is skipped; the others still apply.
+func TestApplyBridgeConfigDefaultsWithoutBatchSending(t *testing.T) {
+	cfg := mautrixStockBridgeConfig()
+	var logOut bytes.Buffer
+	newDefaultsTestConnector(cfg, &logOut, false).applyBridgeConfigDefaults()
+
+	if cfg.Backfill.Queue.Enabled {
+		t.Error("backfill.queue.enabled defaulted to true on a homeserver without batch sending")
+	}
+	if !cfg.PhoneNumbersInProfile || !cfg.Backfill.Enabled ||
+		cfg.UnknownErrorAutoReconnect != 5*time.Minute || cfg.UnknownErrorMaxAutoReconnects != 100 ||
+		cfg.Backfill.MaxInitialMessages != math.MaxInt32 || cfg.Backfill.MaxCatchupMessages != math.MaxInt32 ||
+		cfg.Backfill.Queue.BatchSize != 10000 {
+		t.Errorf("other stock keys not defaulted: %+v phone_numbers_in_profile=%v auto_reconnect=%s max_auto_reconnects=%d",
+			cfg.Backfill, cfg.PhoneNumbersInProfile, cfg.UnknownErrorAutoReconnect, cfg.UnknownErrorMaxAutoReconnects)
+	}
+
+	// One info line per applied default, and a single debug line for the
+	// skipped queue default.
+	var infos, debugs []string
+	for _, line := range strings.Split(strings.TrimSpace(logOut.String()), "\n") {
+		switch {
+		case strings.Contains(line, `"level":"info"`):
+			infos = append(infos, line)
+		case strings.Contains(line, `"level":"debug"`):
+			debugs = append(debugs, line)
+		default:
+			t.Errorf("unexpected log line: %s", line)
+		}
+	}
+	if len(infos) != len(bridgeConfigDefaults)-1 {
+		t.Errorf("got %d info lines, want %d:\n%s", len(infos), len(bridgeConfigDefaults)-1, logOut.String())
+	}
+	for _, line := range infos {
+		if strings.Contains(line, `"config_key":"backfill.queue.enabled"`) {
+			t.Errorf("logged an applied queue default: %s", line)
+		}
+	}
+	if len(debugs) != 1 || !strings.Contains(debugs[0], `"config_key":"backfill.queue.enabled"`) ||
+		!strings.Contains(debugs[0], "com.beeper.batch_sending") {
+		t.Errorf("want one debug line for backfill.queue.enabled mentioning com.beeper.batch_sending, got:\n%s", strings.Join(debugs, "\n"))
+	}
+}
+
+// An operator's explicit backfill.queue.enabled: true is kept, and not logged,
+// whether or not the homeserver supports batch sending (bridgev2 warns itself
+// when it does not).
+func TestApplyBridgeConfigDefaultsKeepsExplicitQueueEnabled(t *testing.T) {
+	for _, batchSending := range []bool{false, true} {
+		cfg := mautrixStockBridgeConfig()
+		cfg.Backfill.Queue.Enabled = true
+		var logOut bytes.Buffer
+		newDefaultsTestConnector(cfg, &logOut, batchSending).applyBridgeConfigDefaults()
+
+		if !cfg.Backfill.Queue.Enabled {
+			t.Errorf("batch_sending=%v: explicit backfill.queue.enabled=true was changed", batchSending)
+		}
+		if strings.Contains(logOut.String(), `"config_key":"backfill.queue.enabled"`) {
+			t.Errorf("batch_sending=%v: logged a line for operator-set backfill.queue.enabled:\n%s", batchSending, logOut.String())
+		}
+	}
+}
+
+func TestStockDefaultRequires(t *testing.T) {
+	var queue configDefault
+	for _, d := range bridgeConfigDefaults {
+		if sd, ok := d.(stockDefault[bool]); ok && sd.key == "backfill.queue.enabled" {
+			queue = sd
+		}
+	}
+	if queue == nil {
+		t.Fatal("backfill.queue.enabled missing from bridgeConfigDefaults")
+	}
+	tests := []struct {
+		name         string
+		current      bool
+		batchSending bool
+		want         bool
+		wantOutcome  defaultOutcome
+	}{
+		{"stock, no batch sending: skipped", false, false, false, defaultSkipped},
+		{"stock, batch sending: applied", false, true, true, defaultApplied},
+		{"explicit true, no batch sending: kept", true, false, true, defaultKept},
+		{"explicit true, batch sending: kept", true, true, true, defaultKept},
+	}
+	for _, tt := range tests {
+		cfg := mautrixStockBridgeConfig()
+		cfg.Backfill.Queue.Enabled = tt.current
+		_, outcome := queue.apply(cfg, homeserverFeatures{BatchSending: tt.batchSending})
+		if cfg.Backfill.Queue.Enabled != tt.want || outcome != tt.wantOutcome {
+			t.Errorf("%s: got (%v, %d), want (%v, %d)", tt.name, cfg.Backfill.Queue.Enabled, outcome, tt.want, tt.wantOutcome)
+		}
 	}
 }
 
@@ -164,7 +273,7 @@ func TestApplyBridgeConfigDefaultsKeepsOperatorValues(t *testing.T) {
 	cfg.UnknownErrorAutoReconnect = 2 * time.Minute
 	cfg.UnknownErrorMaxAutoReconnects = 5
 	var logOut bytes.Buffer
-	newDefaultsTestConnector(cfg, &logOut).applyBridgeConfigDefaults()
+	newDefaultsTestConnector(cfg, &logOut, true).applyBridgeConfigDefaults()
 
 	if cfg.Backfill.MaxInitialMessages != 1000 {
 		t.Errorf("backfill.max_initial_messages = %d, want 1000", cfg.Backfill.MaxInitialMessages)

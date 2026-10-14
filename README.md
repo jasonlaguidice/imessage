@@ -178,7 +178,7 @@ External CardDAV contacts (Google, Nextcloud, Fastmail, etc.) have no global set
 
 ### Bridge defaults
 
-mautrix writes its own stock values for every `bridge.*` and `backfill.*` key into `config.yaml`, so the bridge cannot tell an unset key from one set to the stock value. When one of the keys below still holds mautrix's stock value, the bridge uses its own default instead (in memory only; `config.yaml` is not rewritten) and logs one info line for it. Any other value is yours and is kept. Because `false` is the stock value, `bridge.phone_numbers_in_profile`, `backfill.enabled` and `backfill.queue.enabled` cannot be turned off. These defaults apply whether or not `network.cloudkit_backfill` is on; without a history source, backfill finds no messages.
+mautrix writes its own stock values for every `bridge.*` and `backfill.*` key into `config.yaml`, so the bridge cannot tell an unset key from one set to the stock value. When one of the keys below still holds mautrix's stock value, the bridge uses its own default instead (in memory only; `config.yaml` is not rewritten) and logs one info line for it. Any other value is yours and is kept. Because `false` is the stock value, `bridge.phone_numbers_in_profile`, `backfill.enabled` and `backfill.queue.enabled` cannot be turned off. The `backfill.queue.enabled` default only applies when the homeserver supports Beeper batch sending (`com.beeper.batch_sending`), which bridgev2's backfill queue requires; on other homeservers (such as Synapse) it stays `false` unless you set it, and history comes in through forward backfill. These defaults apply whether or not `network.cloudkit_backfill` is on; without a history source, backfill finds no messages.
 
 | Key | mautrix stock value | Bridge default | Why |
 |---|---|---|---|
@@ -188,7 +188,7 @@ mautrix writes its own stock values for every `bridge.*` and `backfill.*` key in
 | `backfill.enabled` | `false` | `true` | CloudKit backfill cannot deliver history without it |
 | `backfill.max_initial_messages` | `50` | `2147483647` | Uncapped; any smaller value is a per-chat cap and turns off backward backfill |
 | `backfill.max_catchup_messages` | `500` | `2147483647` | Catches up on every message missed while the bridge was down |
-| `backfill.queue.enabled` | `false` | `true` | Runs the backward backfill of older history |
+| `backfill.queue.enabled` | `false` | `true` (only if the homeserver supports `com.beeper.batch_sending`) | Runs the backward backfill of older history; other homeservers get history through forward backfill |
 | `backfill.queue.batch_size` | `100` | `10000` | Small batches fragment room history |
 
 If you set `bridge.unknown_error_auto_reconnect` below `1m`, the bridge logs a warning: bridgev2 treats such values as disabled.

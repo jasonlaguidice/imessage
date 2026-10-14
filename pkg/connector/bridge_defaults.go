@@ -64,19 +64,44 @@ func applyStockDefault[T comparable](current, stock, def T) (value T, changed bo
 	return current, false
 }
 
-// appliedDefault describes one bridge default that replaced a stock value.
+// homeserverFeatures are the homeserver capabilities a bridge default can
+// depend on. bridgev2 starts the Matrix connector, which fetches /versions,
+// before the network connector, so they are known when IMConnector.Start
+// applies the defaults.
+type homeserverFeatures struct {
+	// BatchSending is Beeper batch sending (com.beeper.batch_sending), which
+	// bridgev2's backfill queue requires.
+	BatchSending bool
+}
+
+// appliedDefault describes one bridge default that replaced a stock value, or
+// (for a skipped default) one that was not applied on this homeserver.
 type appliedDefault struct {
 	Key     string
 	Stock   string
 	Default string
-	Reason  string
+	Reason  string // why the default applies, or why it was skipped
 }
+
+// defaultOutcome is what configDefault.apply did.
+type defaultOutcome int
+
+const (
+	// defaultKept: the key holds the operator's value (or the default equals
+	// the stock value), so nothing changed.
+	defaultKept defaultOutcome = iota
+	// defaultApplied: the key held the stock value and now holds the default.
+	defaultApplied
+	// defaultSkipped: the key holds the stock value, but the default does not
+	// apply on this homeserver, so the stock value is kept.
+	defaultSkipped
+)
 
 // configDefault is one bridge default for a mautrix config key.
 type configDefault interface {
 	// apply sets the bridge default in cfg when the key holds mautrix's stock
-	// value, and reports whether it did.
-	apply(cfg *bridgeconfig.BridgeConfig) (appliedDefault, bool)
+	// value and the default applies on a homeserver with features hs.
+	apply(cfg *bridgeconfig.BridgeConfig, hs homeserverFeatures) (appliedDefault, defaultOutcome)
 }
 
 // stockDefault is a configDefault for one field of type T.
@@ -86,21 +111,31 @@ type stockDefault[T comparable] struct {
 	stock  T                                   // mautrix's stock value
 	def    T                                   // this bridge's default
 	reason string
+	// requires, when set, limits the default to homeservers for which it
+	// returns true; elsewhere a stock value is left as is. unmet says why,
+	// for the debug log.
+	requires func(homeserverFeatures) bool
+	unmet    string
 }
 
-func (d stockDefault[T]) apply(cfg *bridgeconfig.BridgeConfig) (appliedDefault, bool) {
+func (d stockDefault[T]) apply(cfg *bridgeconfig.BridgeConfig, hs homeserverFeatures) (appliedDefault, defaultOutcome) {
 	ptr := d.field(cfg)
 	value, changed := applyStockDefault(*ptr, d.stock, d.def)
 	if !changed {
-		return appliedDefault{}, false
+		return appliedDefault{}, defaultKept
 	}
-	*ptr = value
-	return appliedDefault{
+	info := appliedDefault{
 		Key:     d.key,
 		Stock:   formatConfigValue(d.stock),
 		Default: formatConfigValue(d.def),
 		Reason:  d.reason,
-	}, true
+	}
+	if d.requires != nil && !d.requires(hs) {
+		info.Reason = d.unmet
+		return info, defaultSkipped
+	}
+	*ptr = value
+	return info, defaultApplied
 }
 
 // formatConfigValue renders a value the way it would be written in
@@ -183,11 +218,17 @@ var bridgeConfigDefaults = []configDefault{
 		reason: "catches up on every message missed while the bridge was down",
 	},
 	stockDefault[bool]{
-		key:    "backfill.queue.enabled",
-		field:  func(c *bridgeconfig.BridgeConfig) *bool { return &c.Backfill.Queue.Enabled },
-		stock:  mautrixStockBackfillQueueEnabled,
-		def:    true,
-		reason: "bridgev2's backfill queue backfills history older than the first forward batch" + cannotDisableNote,
+		key:   "backfill.queue.enabled",
+		field: func(c *bridgeconfig.BridgeConfig) *bool { return &c.Backfill.Queue.Enabled },
+		stock: mautrixStockBackfillQueueEnabled,
+		def:   true,
+		// bridgev2 only runs the queue when the homeserver supports batch
+		// sending (backfillqueue.go RunBackfillQueue) and otherwise warns at
+		// every start. Forward backfill works without it (sendLegacyBackfill).
+		// An operator's explicit true is kept either way.
+		reason:   "bridgev2's backfill queue backfills history older than the first forward batch; the homeserver supports Beeper batch sending (com.beeper.batch_sending), which the queue requires" + cannotDisableNote,
+		requires: func(hs homeserverFeatures) bool { return hs.BatchSending },
+		unmet:    "the homeserver does not support Beeper batch sending (com.beeper.batch_sending), which bridgev2's backfill queue requires; history comes in through forward backfill",
 	},
 	stockDefault[int]{
 		key:    "backfill.queue.batch_size",
@@ -198,22 +239,32 @@ var bridgeConfigDefaults = []configDefault{
 	},
 }
 
-// applyConfigDefaults applies every default in defaults to cfg and returns the
-// ones it applied, in order.
-func applyConfigDefaults(cfg *bridgeconfig.BridgeConfig, defaults []configDefault) []appliedDefault {
-	var applied []appliedDefault
+// applyConfigDefaults applies every default in defaults to cfg for a
+// homeserver with features hs. It returns the defaults it applied and the ones
+// it skipped because they do not apply on this homeserver, each in order.
+func applyConfigDefaults(cfg *bridgeconfig.BridgeConfig, defaults []configDefault, hs homeserverFeatures) (applied, skipped []appliedDefault) {
 	for _, d := range defaults {
-		if a, ok := d.apply(cfg); ok {
+		switch a, outcome := d.apply(cfg, hs); outcome {
+		case defaultApplied:
 			applied = append(applied, a)
+		case defaultSkipped:
+			skipped = append(skipped, a)
 		}
 	}
-	return applied
+	return applied, skipped
 }
 
 // applyBridgeConfigDefaults applies bridgeConfigDefaults to the live bridge
-// config (in memory only) and logs one info line per applied default.
+// config (in memory only), logging one info line per applied default and one
+// debug line per default skipped on this homeserver. It must run after the
+// Matrix connector has started, so the homeserver capabilities are known.
 func (c *IMConnector) applyBridgeConfigDefaults() {
-	logAppliedDefaults(c.Bridge.Log, applyConfigDefaults(c.Bridge.Config, bridgeConfigDefaults))
+	hs := homeserverFeatures{
+		BatchSending: c.Bridge.Matrix.GetCapabilities().BatchSending,
+	}
+	applied, skipped := applyConfigDefaults(c.Bridge.Config, bridgeConfigDefaults, hs)
+	logAppliedDefaults(c.Bridge.Log, applied)
+	logSkippedDefaults(c.Bridge.Log, skipped)
 }
 
 func logAppliedDefaults(log zerolog.Logger, applied []appliedDefault) {
@@ -223,6 +274,16 @@ func logAppliedDefaults(log zerolog.Logger, applied []appliedDefault) {
 			Str("mautrix_default", a.Stock).
 			Str("bridge_default", a.Default).
 			Msgf("%s is at mautrix's default (%s); using this bridge's default %s: %s", a.Key, a.Stock, a.Default, a.Reason)
+	}
+}
+
+func logSkippedDefaults(log zerolog.Logger, skipped []appliedDefault) {
+	for _, a := range skipped {
+		log.Debug().
+			Str("config_key", a.Key).
+			Str("mautrix_default", a.Stock).
+			Str("bridge_default", a.Default).
+			Msgf("%s is at mautrix's default (%s); not using this bridge's default %s: %s", a.Key, a.Stock, a.Default, a.Reason)
 	}
 }
 
