@@ -1,15 +1,12 @@
 name: Security
 
 on:
-  push:
-    branches: [master]
-  pull_request:
-    branches: [master]
+  workflow_dispatch: {}
   schedule:
-    - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
+    - cron: '0 6 1 * *'  # 1st of each month at 06:00 UTC
 
 permissions:
-  security-events: write
+  contents: read
 
 jobs:
   govulncheck:
@@ -29,7 +26,7 @@ jobs:
       # Only scan pure-Go packages; packages importing rustpushgo need
       # the Rust static library which is impractical to build here.
       - name: Run govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./imessage/...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./imessage/...
 
   cargo-audit:
     name: Rust dependency audit
@@ -38,13 +35,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"  # keep in sync with RUST_MIN_VERSION in the Makefile
 
       - name: Fetch and prepare rustpush source
         run: make ensure-rustpush-source
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
 
       - name: Audit Rust dependencies
         working-directory: pkg/rustpushgo

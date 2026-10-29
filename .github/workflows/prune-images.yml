@@ -1,0 +1,49 @@
+name: Prune images
+
+# Docker builds push every branch, so ghcr.io accumulates images. This deletes
+# old ones. snok/container-retention-policy understands multi-arch manifests
+# and will not delete the per-platform images a kept tag still references.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: 'Only log what would be deleted'
+        type: boolean
+        default: true
+  schedule:
+    - cron: '0 5 * * 0'  # Sundays at 05:00 UTC
+
+permissions:
+  packages: write
+
+jobs:
+  prune:
+    name: Prune old images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete old untagged images
+        uses: snok/container-retention-policy@v3.0.0
+        with:
+          account: user
+          # Needs a PAT with read:packages + delete:packages; GITHUB_TOKEN
+          # cannot delete user-owned packages.
+          token: ${{ secrets.GHCR_CLEANUP_TOKEN }}
+          image-names: imessage
+          tag-selection: untagged
+          cut-off: 7d
+          # Scheduled runs are always real; manual runs default to dry-run.
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}
+
+      - name: Delete old branch-tagged images
+        uses: snok/container-retention-policy@v3.0.0
+        with:
+          account: user
+          token: ${{ secrets.GHCR_CLEANUP_TOKEN }}
+          image-names: imessage
+          tag-selection: tagged
+          # Never touches latest or release tags (v*)
+          skip-tags: latest, v*
+          keep-n-most-recent: 5
+          cut-off: 30d
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run }}

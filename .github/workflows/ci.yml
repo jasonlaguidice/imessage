@@ -1,10 +1,14 @@
 name: CI
 
+permissions:
+  contents: read
+
+# Push runs only on master; any other branch is covered by its pull request,
+# so a branch with an open PR isn't built twice.
 on:
   push:
-    branches: [master, refactor]
+    branches: [master]
   pull_request:
-    branches: [master, refactor]
   # Manual trigger — useful when bumping third_party/rustpush-upstream.sha
   # locally and wanting to re-run the full verify pipeline on a branch
   # without pushing a test commit.
@@ -132,7 +136,9 @@ jobs:
           check-latest: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"  # keep in sync with RUST_MIN_VERSION in the Makefile
 
       - name: Install dependencies
         run: |
@@ -183,7 +189,9 @@ jobs:
           check-latest: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"  # keep in sync with RUST_MIN_VERSION in the Makefile
 
       - name: Install system dependencies
         run: |

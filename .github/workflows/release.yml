@@ -1,105 +1,23 @@
 name: Release
 
+# Pushing a v* tag runs tests, builds the Linux binary and the macOS
+# extract-key helper, and publishes a GitHub Release. The Docker image for the
+# same tag is built by docker.yml.
+
 on:
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: 'Release tag to build (e.g. v1.2.3)'
-        required: true
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: write
 
 jobs:
-  # ───────────────────────────────────────────────────────────────
-  # Run the full test suite before releasing
-  # ───────────────────────────────────────────────────────────────
-  test:
-    name: Pre-release tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          check-latest: true
-
-      - name: Install libolm-dev
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libolm-dev
-
-      - name: Test imessage/
-        run: go test -v -count=1 ./imessage/...
-
-      # pkg/connector/ tests require the Rust lib – they run in the build jobs
-
-  # ───────────────────────────────────────────────────────────────
-  # Build macOS universal binary + app bundle
-  # ───────────────────────────────────────────────────────────────
-  build-macos:
-    name: Build macOS (arm64)
-    needs: test
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
-          fetch-depth: 0
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          check-latest: true
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        run: brew install libolm protobuf
-
-      - name: Cache Cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            pkg/rustpushgo/target
-          key: cargo-release-macos-arm64-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-release-macos-arm64-
-
-      - name: Build
-        run: make build
-
-      - name: Test pkg/connector/
-        env:
-          CGO_CFLAGS: -I/opt/homebrew/include
-          CGO_LDFLAGS: -L/opt/homebrew/lib
-        run: go test -v -count=1 ./pkg/connector/...
-
-      - name: Create tarball
-        run: |
-          tar czf matrix-rustpush-macos-arm64.tar.gz \
-            matrix-rustpush.app/
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-arm64
-          path: matrix-rustpush-macos-arm64.tar.gz
-
-  # ───────────────────────────────────────────────────────────────
-  # Build Linux amd64 binary
-  # ───────────────────────────────────────────────────────────────
   build-linux:
-    name: Build Linux
-    needs: test
+    name: Test and build (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - uses: actions/setup-go@v5
@@ -108,7 +26,9 @@ jobs:
           check-latest: true
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"  # keep in sync with RUST_MIN_VERSION in the Makefile
 
       - name: Install system dependencies
         run: |
@@ -125,95 +45,76 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             pkg/rustpushgo/target
-          key: cargo-release-linux-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-release-linux-
+          key: cargo-linux-${{ hashFiles('**/Cargo.lock', 'third_party/rustpush-upstream.sha') }}
+          restore-keys: cargo-linux-
 
       - name: Build
         run: make build
 
-      - name: Create tarball
-        run: |
-          tar czf matrix-rustpush-linux-amd64.tar.gz \
-            matrix-rustpush \
-            scripts/bootstrap-linux.sh
+      - name: Test
+        run: go test -count=1 ./imessage/... ./pkg/connector/...
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Create tarball
+        run: tar czf matrix-rustpush-linux-amd64.tar.gz matrix-rustpush scripts/bootstrap-linux.sh
+
+      - uses: actions/upload-artifact@v4
         with:
           name: linux-amd64
           path: matrix-rustpush-linux-amd64.tar.gz
+          retention-days: 1
 
-  # ───────────────────────────────────────────────────────────────
-  # Build extract-key tool (macOS only)
-  # ───────────────────────────────────────────────────────────────
   build-extract-key:
     name: Build extract-key (macOS)
-    needs: test
+    needs: build-linux  # don't spend macOS minutes if tests fail
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag }}
 
       - uses: actions/setup-go@v5
         with:
           go-version-file: tools/extract-key/go.mod
           check-latest: true
 
-      - name: Build extract-key
-        run: make extract-key
+      - run: make extract-key
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: extract-key-macos
           path: extract-key
+          retention-days: 1
 
-  # ───────────────────────────────────────────────────────────────
-  # Create GitHub Release
-  # ───────────────────────────────────────────────────────────────
   release:
     name: Create Release
-    needs: [build-macos, build-linux, build-extract-key]
+    needs: [build-linux, build-extract-key]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
       - name: Generate changelog
-        id: changelog
         run: |
-          # Get previous tag
           PREV_TAG=$(git tag --sort=-version:refname | head -2 | tail -1)
-          if [ -z "$PREV_TAG" ]; then
+          if [ -z "$PREV_TAG" ] || [ "$PREV_TAG" = "$GITHUB_REF_NAME" ]; then
             PREV_TAG=$(git rev-list --max-parents=0 HEAD)
           fi
-          echo "## Changes" > changelog.md
-          echo "" >> changelog.md
-          git log --pretty=format:"- %s (%h)" "$PREV_TAG"..HEAD >> changelog.md
-          echo "" >> changelog.md
-          echo "" >> changelog.md
-          echo "## Checksums" >> changelog.md
-          echo '```' >> changelog.md
-          sha256sum artifacts/**/*.tar.gz artifacts/**//extract-key >> changelog.md
-          echo '```' >> changelog.md
+          {
+            echo "## Changes"; echo
+            git log --pretty=format:"- %s (%h)" "$PREV_TAG"..HEAD
+            echo; echo; echo "## Checksums"; echo '```'
+            sha256sum artifacts/linux-amd64/*.tar.gz artifacts/extract-key-macos/extract-key
+            echo '```'
+          } > changelog.md
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
           body_path: changelog.md
-          draft: false
-          prerelease: ${{ contains(inputs.tag, '-rc') || contains(inputs.tag, '-beta') || contains(inputs.tag, '-alpha') }}
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           generate_release_notes: true
           files: |
-            artifacts/macos-arm64/matrix-rustpush-macos-arm64.tar.gz
             artifacts/linux-amd64/matrix-rustpush-linux-amd64.tar.gz
             artifacts/extract-key-macos/extract-key
