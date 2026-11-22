@@ -3227,11 +3227,18 @@ func (c *IMClient) handleMessage(log zerolog.Logger, msg rustpushgo.WrappedMessa
 		}
 	}
 
-	// Persist this message UUID so cross-restart echoes are detected.
-	// hasMessageUUID checks cloud_message regardless of the deleted flag,
-	// so soft-deleted UUIDs from prior portal deletions still match.
+	// Persist this message UUID (and text, when present) so cross-restart echoes
+	// are detected and subsequent tapbacks/replies can look up the target text
+	// and exact UTF-16 length.
 	if c.cloudStore != nil {
-		if err := c.cloudStore.persistMessageUUID(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe); err != nil {
+		msgText := ""
+		if msg.Text != nil {
+			msgText = strings.TrimSpace(strings.ReplaceAll(*msg.Text, "\uFFFC", ""))
+		}
+		if msgText == "" && len(msg.Attachments) > 0 {
+			msgText = "\uFFFC"
+		}
+		if err := c.cloudStore.persistMessageUUIDWithText(context.Background(), msg.Uuid, string(portalKey.ID), int64(msg.TimestampMs), sender.IsFromMe, msgText); err != nil {
 			log.Warn().Err(err).Str("uuid", msg.Uuid).Msg("Failed to persist message UUID; duplicates may occur on restart")
 		}
 	}
@@ -5755,7 +5762,11 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 
 	textToSend := c.convertURLPreviewToIMessage(ctx, msg.Content)
 
-	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	replyTarget := msg.ReplyTo
+	if replyTarget == nil {
+		replyTarget = msg.ThreadRoot
+	}
+	replyGuid, replyPart := c.extractReplyInfoForClient(ctx, replyTarget)
 	// Bodies large enough to need splitting do reach us: 45,000 bytes of content
 	// still encrypts to well under the homeserver's 65,536-byte PDU cap, and an
 	// unencrypted room has more room still. Measured after the link-preview
@@ -5778,11 +5789,15 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 		Str("uuid", uuid).
 		Str("portal_id", string(msg.Portal.ID)).
 		Bool("is_sms", conv.IsSms).
+		Str("reply_guid", ptrStringOr(replyGuid, "")).
+		Str("reply_part", ptrStringOr(replyPart, "")).
 		Msg("Message sent, storing UUID in bridge DB")
-	// Persist UUID immediately so echo detection works even if the portal
-	// is deleted before the APNs echo arrives.
+	plainFirstChunk := stripRichLinkEnvelope(outbound[0])
+	// Persist UUID and plain text immediately so echo detection works even if
+	// the portal is deleted before the APNs echo arrives, and so later
+	// tapbacks/replies to this message have the exact text & UTF-16 length.
 	if c.cloudStore != nil {
-		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+		if err := c.cloudStore.persistMessageUUIDWithText(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true, plainFirstChunk); err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent message UUID; echo may be delivered as duplicate")
 		}
 	}
@@ -5853,7 +5868,11 @@ func (c *IMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matrix
 			ID:        makeMessageID(uuid),
 			SenderID:  makeUserID(c.getHandle()),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{ContinuationUUIDs: continuationUUIDs},
+			Metadata: &MessageMetadata{
+				ContinuationUUIDs: continuationUUIDs,
+				Text:              truncateForMetadata(plainFirstChunk),
+				UTF16Len:          utf16Len(plainFirstChunk),
+			},
 		},
 	}, nil
 }
@@ -5965,8 +5984,12 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		mimeType = msg.Content.Info.MimeType
 	}
 
-	// Convert OGG Opus voice recordings to CAF Opus for native iMessage playback
-	data, mimeType, fileName = convertAudioForIMessage(data, mimeType, fileName)
+	origMime := mimeType
+	isVoiceEvent := msg.Content.MSC3245Voice != nil
+	// Convert voice recordings (OGG Opus or any MSC3245 voice audio such as M4A/WebM/AAC)
+	// into Apple CoreAudio CAF Opus ("Audio Message.caf") for native iMessage playback.
+	var isVoice bool
+	data, mimeType, fileName, isVoice = convertVoiceForIMessage(ctx, data, mimeType, fileName, isVoiceEvent)
 
 	// Process outbound images: detect actual format, convert non-JPEG to JPEG,
 	// correct MIME type, and edit the Matrix event so all clients see it right.
@@ -6016,32 +6039,50 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	}
 	_ = matrixEdited
 
-	replyGuid, replyPart := extractReplyInfo(msg.ReplyTo)
+	replyTarget := msg.ReplyTo
+	if replyTarget == nil {
+		replyTarget = msg.ThreadRoot
+	}
+	replyGuid, replyPart := c.extractReplyInfoForClient(ctx, replyTarget)
 
+	utiType := mimeToUTI(mimeType)
 	// Rust-side send_with_flap_retry handles SendTimedOut retry with a stable
 	// UUID — no Go-side retry here (would orphan delivery receipts).
-	uuid, err := c.client.SendAttachment(conv, data, mimeType, mimeToUTI(mimeType), fileName, c.getHandle(), replyGuid, replyPart, nil)
+	uuid, err := c.client.SendAttachment(conv, data, mimeType, utiType, fileName, c.getHandle(), replyGuid, replyPart, nil)
 	if err != nil {
 		if errors.Is(err, rustpushgo.ErrWrappedErrorNoSmsRelay) {
 			return nil, errNoCarrierRoute
 		}
 		return nil, fmt.Errorf("failed to send attachment: %w", err)
 	}
+	zerolog.Ctx(ctx).Info().
+		Str("uuid", uuid).
+		Str("portal_id", string(msg.Portal.ID)).
+		Str("orig_mime", origMime).
+		Str("mime", mimeType).
+		Str("uti", utiType).
+		Str("file", fileName).
+		Bool("is_voice", isVoice).
+		Bool("msc3245_voice", isVoiceEvent).
+		Int("bytes", len(data)).
+		Str("reply_guid", ptrStringOr(replyGuid, "")).
+		Str("reply_part", ptrStringOr(replyPart, "")).
+		Msg("Attachment sent, storing UUID in bridge DB")
 	// Persist UUID immediately so echo detection works even if the portal
 	// is deleted before the APNs echo arrives.
 	if c.cloudStore != nil {
-		if err := c.cloudStore.persistMessageUUID(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true); err != nil {
+		if err := c.cloudStore.persistMessageUUIDWithText(ctx, uuid, string(msg.Portal.ID), time.Now().UnixMilli(), true, "\uFFFC"); err != nil {
 			zerolog.Ctx(ctx).Warn().Err(err).Str("uuid", uuid).Msg("Failed to persist sent attachment UUID; echo may be delivered as duplicate")
 		}
 	}
 
 	// If the Matrix event has body text alongside the attachment, send it as a
 	// separate iMessage so the text is editable, reactable, etc. — like every
-	// other chat app. Skip when body duplicates the filename (no real caption).
+	// other chat app. Skip for voice messages and when body duplicates the filename.
 	textUUID := ""
 	textMXID := id.EventID("")
 	siblingUUID := ""
-	if msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
+	if !isVoice && !isVoiceEvent && msg.Content.FileName != "" && msg.Content.Body != "" && msg.Content.Body != msg.Content.FileName {
 		tUUID, textErr := c.client.SendMessage(conv, msg.Content.Body, nil, c.getHandle(), nil, nil, nil)
 		if textErr != nil {
 			zerolog.Ctx(ctx).Warn().Err(textErr).Str("attachment_uuid", uuid).Msg("Failed to send caption as follow-up text; attachment was delivered")
@@ -6095,13 +6136,14 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 		userLogin := c.UserLogin
 		portalKey := msg.Portal.PortalKey
 		senderID := makeUserID(c.getHandle())
+		captionText := msg.Content.Body
 		now := time.Now()
 		return &bridgev2.MatrixMessageResponse{
 			DB: &database.Message{
 				ID:        makeMessageID(uuid),
 				SenderID:  senderID,
 				Timestamp: now,
-				Metadata:  &MessageMetadata{HasAttachments: true},
+				Metadata:  &MessageMetadata{HasAttachments: true, Text: "\uFFFC", UTF16Len: 1},
 			},
 			PostSave: func(ctx context.Context, primary *database.Message) {
 				textRow := &database.Message{
@@ -6111,7 +6153,10 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 					SenderID:   senderID,
 					SenderMXID: userLogin.UserMXID,
 					Timestamp:  now,
-					Metadata:   &MessageMetadata{},
+					Metadata: &MessageMetadata{
+						Text:     truncateForMetadata(captionText),
+						UTF16Len: utf16Len(captionText),
+					},
 				}
 				if err := bridgeRef.DB.Message.Insert(ctx, textRow); err != nil {
 					zerolog.Ctx(ctx).Warn().Err(err).Str("text_uuid", textUUID).Msg("Failed to insert DB row for bridged caption text")
@@ -6125,16 +6170,25 @@ func (c *IMClient) handleMatrixFile(ctx context.Context, msg *bridgev2.MatrixMes
 	// at least redact unsends both halves on iMessage.
 	finalUUID := uuid
 	hasAttachments := true
+	metaText := "\uFFFC"
+	metaUTF16Len := 1
 	if textUUID != "" {
 		finalUUID = textUUID
 		hasAttachments = false
+		metaText = truncateForMetadata(msg.Content.Body)
+		metaUTF16Len = utf16Len(msg.Content.Body)
 	}
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        makeMessageID(finalUUID),
 			SenderID:  makeUserID(c.getHandle()),
 			Timestamp: time.Now(),
-			Metadata:  &MessageMetadata{HasAttachments: hasAttachments, SiblingUUID: siblingUUID},
+			Metadata: &MessageMetadata{
+				HasAttachments: hasAttachments,
+				SiblingUUID:    siblingUUID,
+				Text:           metaText,
+				UTF16Len:       metaUTF16Len,
+			},
 		},
 	}, nil
 }
@@ -6227,6 +6281,13 @@ func (c *IMClient) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdi
 	if err == nil {
 		// Work around mautrix-go bridgev2 not incrementing EditCount before saving.
 		msg.EditTarget.EditCount++
+		if meta, ok := msg.EditTarget.Metadata.(*MessageMetadata); ok && meta != nil {
+			meta.Text = truncateForMetadata(msg.Content.Body)
+			meta.UTF16Len = utf16Len(msg.Content.Body)
+		}
+		if c.cloudStore != nil {
+			_ = c.cloudStore.updateMessageTextByGUID(ctx, targetGUID, msg.Content.Body)
+		}
 	}
 	return err
 }
@@ -6366,10 +6427,32 @@ func (c *IMClient) HandleMatrixReaction(ctx context.Context, msg *bridgev2.Matri
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetMessage.ID))
+	targetUUID = strings.ToUpper(targetUUID)
+	if meta, ok := msg.TargetMessage.Metadata.(*MessageMetadata); ok && meta != nil && meta.PartIndex != nil && *meta.PartIndex >= 0 {
+		targetPart = uint64(*meta.PartIndex)
+	}
+	toText, toUTF16Len := c.resolveTargetTextAndLen(ctx, msg.TargetMessage, targetUUID)
+	targetParam := targetUUID
+	if toText != "" {
+		targetParam = targetUUID + "\x00" + toText
+	}
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, false, c.getHandle())
+	tapbackUUID, err := c.client.SendTapback(conv, targetParam, targetPart, reaction, emoji, false, c.getHandle())
 	if err != nil {
 		return nil, fmt.Errorf("failed to send tapback: %w", err)
+	}
+	zerolog.Ctx(ctx).Info().
+		Str("tapback_uuid", tapbackUUID).
+		Str("target_uuid", targetUUID).
+		Uint64("target_part", targetPart).
+		Uint32("reaction", reaction).
+		Int("target_utf16_len", toUTF16Len).
+		Str("portal_id", string(msg.Portal.ID)).
+		Msg("Tapback sent")
+	if c.cloudStore != nil && tapbackUUID != "" {
+		if err := c.cloudStore.persistTapbackUUID(ctx, tapbackUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true, reaction); err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Str("tapback_uuid", tapbackUUID).Msg("Failed to persist sent tapback UUID")
+		}
 	}
 
 	return &database.Reaction{
@@ -6412,8 +6495,31 @@ func (c *IMClient) HandleMatrixReactionRemove(ctx context.Context, msg *bridgev2
 	}
 
 	targetUUID, targetPart := extractTapbackTarget(string(msg.TargetReaction.MessageID))
+	targetUUID = strings.ToUpper(targetUUID)
+	toText := ""
+	if c.cloudStore != nil {
+		if origText, err := c.cloudStore.getMessageTextByGUID(ctx, targetUUID); err == nil && origText != "" {
+			toText = origText
+		}
+	}
+	targetParam := targetUUID
+	if toText != "" {
+		targetParam = targetUUID + "\x00" + toText
+	}
 	// Rust-side retry handles SendTimedOut with stable UUID.
-	_, err := c.client.SendTapback(conv, targetUUID, targetPart, reaction, emoji, true, c.getHandle())
+	tapbackUUID, err := c.client.SendTapback(conv, targetParam, targetPart, reaction, emoji, true, c.getHandle())
+	if err == nil {
+		zerolog.Ctx(ctx).Info().
+			Str("tapback_uuid", tapbackUUID).
+			Str("target_uuid", targetUUID).
+			Uint64("target_part", targetPart).
+			Uint32("reaction", reaction).
+			Str("portal_id", string(msg.Portal.ID)).
+			Msg("Tapback removal sent")
+		if c.cloudStore != nil && tapbackUUID != "" {
+			_ = c.cloudStore.persistTapbackUUID(ctx, tapbackUUID, string(msg.Portal.ID), time.Now().UnixMilli(), true, reaction+1000)
+		}
+	}
 	return err
 }
 
@@ -10854,7 +10960,7 @@ func convertAttachment(ctx context.Context, portal *bridgev2.Portal, intent brid
 	zerolog.Ctx(ctx).Debug().Bool("is_inline", att.IsInline).Bool("has_data", att.InlineData != nil).Str("mime", mimeType).Str("file", fileName).Uint64("size", att.Size).Msg("convertAttachment called")
 	if att.IsInline && att.InlineData != nil {
 		inlineData = *att.InlineData
-		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" {
+		if att.UtiType == "com.apple.coreaudio-format" || mimeType == "audio/x-caf" || mimeType == "audio/caf" {
 			inlineData, mimeType, fileName, durationMs = convertAudioForMatrix(inlineData, mimeType, fileName)
 		}
 	}
@@ -11107,28 +11213,111 @@ func extractTapbackTarget(messageID string) (string, uint64) {
 	return messageID, 0
 }
 
+// utf16Len returns the UTF-16 code unit count of s, matching Apple's NSString.length
+// used by iMessage NSRange fields (thread_originator_part length and tapback amrln).
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// truncateForMetadata caps cached message text stored in bridgev2 MessageMetadata
+// to keep DB rows compact while preserving the full quote for normal messages.
+func truncateForMetadata(s string) string {
+	const maxRunes = 512
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	i := 0
+	for pos := range s {
+		if i == maxRunes {
+			return s[:pos]
+		}
+		i++
+	}
+	return s
+}
+
+// stripRichLinkEnvelope removes the internal "\x00RL\x01...\x00" rich-link prefix
+// used on the Go->Rust FFI boundary, returning the plain iMessage text body.
+func stripRichLinkEnvelope(s string) string {
+	if !strings.HasPrefix(s, "\x00RL\x01") {
+		return s
+	}
+	rest := s[4:]
+	if end := strings.IndexByte(rest, 0); end >= 0 {
+		return rest[end+1:]
+	}
+	return s
+}
+
+// resolveTargetTextAndLen resolves the original message text and its UTF-16 code-unit
+// length for tapbacks (amrln/to_text) and inline replies (thread_originator_part).
+// Always returns utf16Length >= 1 because Apple Messages.app rejects zero-length ranges.
+func (c *IMClient) resolveTargetTextAndLen(ctx context.Context, target *database.Message, targetGUID string) (string, int) {
+	if target != nil {
+		if meta, ok := target.Metadata.(*MessageMetadata); ok && meta != nil {
+			if meta.Text != "" || meta.UTF16Len > 0 {
+				l := meta.UTF16Len
+				if l <= 0 {
+					l = utf16Len(meta.Text)
+				}
+				if l <= 0 {
+					l = 1
+				}
+				return meta.Text, l
+			}
+			if meta.HasAttachments {
+				return "\uFFFC", 1
+			}
+		}
+	}
+	if c != nil && c.cloudStore != nil && targetGUID != "" {
+		if text, err := c.cloudStore.getMessageTextByGUID(ctx, targetGUID); err == nil && text != "" {
+			l := utf16Len(text)
+			if l <= 0 {
+				l = 1
+			}
+			return text, l
+		}
+	}
+	return "", 1
+}
+
 // extractReplyInfo converts a bridgev2 reply-to database message into the
 // iMessage reply_guid and reply_part strings expected by rustpush.
-// reply_guid is the message UUID; reply_part uses the iMessage format "bp:type:length".
-// We don't have the original text length, so we use 0 as a placeholder.
+// reply_guid is the uppercase message UUID; reply_part uses the Apple iMessage
+// "part:location:length" format where length is the UTF-16 code unit count (>= 1).
 func extractReplyInfo(replyTo *database.Message) (*string, *string) {
+	return (*IMClient)(nil).extractReplyInfoForClient(context.Background(), replyTo)
+}
+
+func (c *IMClient) extractReplyInfoForClient(ctx context.Context, replyTo *database.Message) (*string, *string) {
 	if replyTo == nil {
 		return nil, nil
 	}
 	guid := string(replyTo.ID)
 	// Strip attachment suffixes like _att0, _att1 — iMessage expects a pure UUID,
-	// but we derive the balloon-part index from the suffix to set reply_part correctly.
+	// and derive the part index from metadata (when available) or the suffix.
 	bp := 0
 	if idx := strings.Index(guid, "_att"); idx > 0 {
 		bp = parseBalloonPart(guid[idx+4:], "%d") + 1
 		guid = guid[:idx]
 	}
-	// iMessage thread_originator_part format is "bp:type:length" where:
-	//   bp = balloon part index (0 for text body, ≥1 for attachments)
-	//   type = part type (0 for text)
-	//   length = character count of the original message text
-	// We use 0 as the length since we don't have the original text available.
-	part := fmt.Sprintf("%d:0:0", bp)
+	if meta, ok := replyTo.Metadata.(*MessageMetadata); ok && meta != nil && meta.PartIndex != nil && *meta.PartIndex >= 0 {
+		bp = *meta.PartIndex
+	}
+	guid = strings.ToUpper(guid)
+	_, length := c.resolveTargetTextAndLen(ctx, replyTo, guid)
+	// iMessage thread_originator_part format is "part:location:length" (UTF-16 range).
+	// Apple Messages.app rejects or drops inline replies with length 0 ("0:0:0").
+	part := fmt.Sprintf("%d:0:%d", bp, length)
 	return &guid, &part
 }
 
@@ -11249,7 +11438,7 @@ func tapbackTypeToEmoji(tapbackType *uint32, tapbackEmoji *string) string {
 
 func emojiToTapbackType(emoji string) (uint32, *string) {
 	switch emoji {
-	case "❤️", "♥️":
+	case "❤️", "❤", "♥️", "♥":
 		return 0, nil
 	case "👍":
 		return 1, nil
@@ -11257,9 +11446,9 @@ func emojiToTapbackType(emoji string) (uint32, *string) {
 		return 2, nil
 	case "😂":
 		return 3, nil
-	case "❗", "‼️":
+	case "❗", "❗️", "‼️", "‼":
 		return 4, nil
-	case "❓":
+	case "❓", "❔":
 		return 5, nil
 	default:
 		return 6, &emoji
@@ -11344,9 +11533,11 @@ func mimeToUTI(mime string) string {
 		return "com.apple.quicktime-movie"
 	case mime == "audio/mpeg", mime == "audio/mp3":
 		return "public.mp3"
-	case mime == "audio/aac", mime == "audio/mp4":
+	case mime == "audio/aac":
 		return "public.aac-audio"
-	case mime == "audio/x-caf":
+	case mime == "audio/mp4":
+		return "public.mpeg-4-audio"
+	case mime == "audio/x-caf", mime == "audio/caf":
 		return "com.apple.coreaudio-format"
 	case mime == "text/vcard", mime == "text/x-vcard", mime == "text/directory":
 		return "public.vcard"

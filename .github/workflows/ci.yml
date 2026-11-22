@@ -111,6 +111,7 @@ jobs:
           check "register XML dump"        "$BASE/src/ids/user.rs"                                  "RUSTPUSH_LOG_REGISTER_BODY"
           check "statuskit no-saved-channel softened"  "$BASE/src/statuskit.rs"                     "no saved channel for identifier — using last_msg_ns=0"
           check "statuskit channel-not-found softened" "$BASE/src/statuskit.rs"                     "presence msg arrived before keysharing"
+          check "tapback amrln utf16 min 1"            "$BASE/src/imessage/messages.rs"             "react.to_text.encode_utf16().count()"
           exit $FAIL
 
   # ───────────────────────────────────────────────────────────────

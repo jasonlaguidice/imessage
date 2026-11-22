@@ -293,6 +293,11 @@ ensure-rustpush-source:
 	@$(RP_PATCH) rp_patch "statuskit channel-not-found panic" $(RUSTPUSH_DIR)/src/statuskit.rs \
 	  's/let Some\(referenced_channel\) = state\.keys\.get_mut\(&base64_encode\(&channel\.id\)\) else \{ panic!\("Channel not found!"\) \};/let Some(referenced_channel) = state.keys.get_mut(&base64_encode(&channel.id)) else { warn!("StatusKit: presence msg arrived before keysharing for channel={} — dropping", encode_hex(&channel.id)); return Ok(None); };/' \
 	  'presence msg arrived before keysharing'
+# Tapback amrln must be UTF-16 code units (Apple NSRange) and >= 1 for part-targeted tapbacks
+# (Messages.app drops tapbacks with associatedMessageRange = {0, 0}).
+	@$(RP_PATCH) rp_patch "tapback amrln utf16 min 1" $(RUSTPUSH_DIR)/src/imessage/messages.rs \
+	  's/amrln: if react\.to_part\.is_none\(\) \{ u64::MAX \} else \{ react\.to_text\.len\(\) as u64 \},/amrln: if react.to_part.is_none() { u64::MAX } else { (react.to_text.encode_utf16().count() as u64).max(1) },/' \
+	  'react\.to_text\.encode_utf16\(\)\.count\(\)'
 
 # `ensure-rustpush-source` is an order-only prereq (the `|` separator):
 # it runs before the recipe when needed, but its phony "always-dirty"

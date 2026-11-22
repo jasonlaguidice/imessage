@@ -2141,12 +2141,40 @@ func (s *cloudBackfillStore) reKeyPortalID(ctx context.Context, oldPortalID, new
 // already stored via upsertMessageBatch; this covers the realtime path.
 // Uses ON CONFLICT DO NOTHING so it's safe to call even if the message already exists.
 func (s *cloudBackfillStore) persistMessageUUID(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool) error {
+	return s.persistMessageUUIDWithText(ctx, uuid, portalID, timestampMS, isFromMe, "")
+}
+
+// persistMessageUUIDWithText inserts a minimal cloud_message record for a
+// realtime APNs or outbound message and populates its text column when non-empty
+// (without overwriting an existing non-empty text value on conflict).
+func (s *cloudBackfillStore) persistMessageUUIDWithText(ctx context.Context, uuid, portalID string, timestampMS int64, isFromMe bool, text string) error {
+	nowMS := time.Now().UnixMilli()
+	var textArg any
+	if text != "" {
+		textArg = text
+	}
+	_, err := s.db.Exec(ctx, `
+		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, text, created_ts, updated_ts)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		ON CONFLICT (login_id, guid) DO UPDATE SET
+			text = COALESCE(NULLIF(cloud_message.text, ''), excluded.text),
+			updated_ts = CASE
+				WHEN (cloud_message.text IS NULL OR cloud_message.text = '') AND excluded.text IS NOT NULL AND excluded.text <> ''
+				THEN excluded.updated_ts
+				ELSE cloud_message.updated_ts
+			END
+	`, s.loginID, uuid, portalID, timestampMS, isFromMe, textArg, nowMS, nowMS)
+	return err
+}
+
+// updateMessageTextByGUID updates the cached text of an existing message row
+// (used after an outbound or incoming edit so tapbacks/replies use the new length).
+func (s *cloudBackfillStore) updateMessageTextByGUID(ctx context.Context, uuid, text string) error {
 	nowMS := time.Now().UnixMilli()
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO cloud_message (login_id, guid, portal_id, timestamp_ms, is_from_me, created_ts, updated_ts)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT DO NOTHING
-	`, s.loginID, uuid, portalID, timestampMS, isFromMe, nowMS, nowMS)
+		UPDATE cloud_message SET text=$1, updated_ts=$2
+		WHERE login_id=$3 AND UPPER(guid)=UPPER($4) AND tapback_type IS NULL
+	`, text, nowMS, s.loginID, uuid)
 	return err
 }
 
