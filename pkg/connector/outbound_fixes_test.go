@@ -34,19 +34,42 @@ func TestWriteCAFOpus_CoreAudioChunksAndRemainder(t *testing.T) {
 		t.Fatalf("missing caff header")
 	}
 
-	// Walk chunks and verify CoreAudio structure.
+	// Walk chunks and verify CoreAudio structure and chunk ordering.
 	pos := 8
 	chunks := map[string][]byte{}
+	var order []string
 	for pos+12 <= len(cafData) {
 		ct := string(cafData[pos : pos+4])
 		sz := int(int64(binary.BigEndian.Uint64(cafData[pos+4 : pos+12])))
 		pos += 12
 		chunks[ct] = cafData[pos : pos+sz]
+		order = append(order, ct)
 		pos += sz
+	}
+
+	wantOrder := []string{"desc", "kuki", "chan", "pakt", "data"}
+	if len(order) != len(wantOrder) {
+		t.Fatalf("chunk order = %v, want %v", order, wantOrder)
+	}
+	for i := range wantOrder {
+		if order[i] != wantOrder[i] {
+			t.Fatalf("chunk[%d] = %q, want %q (full order: %v)", i, order[i], wantOrder[i], order)
+		}
 	}
 
 	if _, hasMagc := chunks["magc"]; hasMagc {
 		t.Error("CAF output must not contain non-standard 'magc' chunk")
+	}
+	kukiData := chunks["kuki"]
+	if len(kukiData) != 28 {
+		t.Fatalf("kuki chunk len = %d, want 28", len(kukiData))
+	}
+	wantKuki := [7]int32{2048, 48000, 960, -1000, 1, 0, 0}
+	for i, want := range wantKuki {
+		got := int32(binary.BigEndian.Uint32(kukiData[i*4 : (i+1)*4]))
+		if got != want {
+			t.Errorf("kuki word[%d] = %d, want %d", i, got, want)
+		}
 	}
 	chanData, hasChan := chunks["chan"]
 	if !hasChan || len(chanData) != 12 {
@@ -74,6 +97,16 @@ func TestWriteCAFOpus_CoreAudioChunksAndRemainder(t *testing.T) {
 	if int64(primingFrames)+validFrames+int64(remainderFrames) != 48000 {
 		t.Errorf("CoreAudio frame invariant violated: %d + %d + %d != 48000",
 			primingFrames, validFrames, remainderFrames)
+	}
+
+	// Verify round-trip preserves PreSkip from pakt when kuki is Apple's 28-byte cookie.
+	parsed, err := parseCAFOpus(cafData)
+	if err != nil {
+		t.Fatalf("parseCAFOpus roundtrip error: %v", err)
+	}
+	if parsed.PreSkip != 312 || parsed.Channels != 1 || len(parsed.Packets) != 50 {
+		t.Errorf("roundtrip = (preSkip=%d, ch=%d, pkts=%d), want (312, 1, 50)",
+			parsed.PreSkip, parsed.Channels, len(parsed.Packets))
 	}
 }
 

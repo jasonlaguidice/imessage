@@ -76,28 +76,58 @@ func convertVoiceForIMessage(ctx context.Context, data []byte, mimeType, fileNam
 	// Already a CAF file.
 	if looksLikeCAF(data) || mimeType == "audio/x-caf" || mimeType == "audio/caf" {
 		if looksLikeCAF(data) {
+			log.Info().
+				Str("path", "caf-passthrough").
+				Str("orig_mime", mimeType).
+				Int("caf_bytes", len(data)).
+				Msg("Prepared voice message for iMessage")
 			return data, "audio/x-caf", "Audio Message.caf", true
 		}
 	}
 
-	// Fast path: lossless OGG Opus -> CAF Opus remux (no re-encoding).
+	// Fast path: lossless OGG Opus -> CAF Opus remux (no re-encoding) when
+	// packets have uniform frame duration (Apple's CoreAudio Opus decoder
+	// requires a non-zero mFramesPerPacket in desc for reliable playback).
 	if mimeType == "audio/ogg" || strings.HasPrefix(mimeType, "audio/ogg;") || looksLikeOGGOpus(data) {
 		info, err := parseOGGOpus(data)
 		if err == nil {
-			cafData, err := writeCAFOpus(info)
-			if err == nil {
-				return cafData, "audio/x-caf", "Audio Message.caf", true
+			uniform, fpp := checkUniformOpusFrames(info.Packets)
+			if (uniform && info.Channels >= 1 && info.Channels <= 2) || !ffmpeg.Supported() {
+				cafData, err := writeCAFOpus(info)
+				if err == nil {
+					log.Info().
+						Str("path", "ogg-remux").
+						Str("orig_mime", mimeType).
+						Int("orig_bytes", len(data)).
+						Int("caf_bytes", len(cafData)).
+						Int("channels", info.Channels).
+						Int("pre_skip", info.PreSkip).
+						Int("packets", len(info.Packets)).
+						Int("frames_per_packet", fpp).
+						Bool("uniform_frames", uniform).
+						Int64("granule_pos", info.GranulePos).
+						Msg("Remuxed OGG Opus voice message to Apple CAF Opus")
+					return cafData, "audio/x-caf", "Audio Message.caf", true
+				}
+				log.Warn().Err(err).Msg("Failed to write CAF Opus from OGG Opus")
+			} else {
+				log.Info().
+					Str("orig_mime", mimeType).
+					Int("channels", info.Channels).
+					Int("packets", len(info.Packets)).
+					Bool("uniform_frames", uniform).
+					Msg("OGG Opus has non-uniform packets or >2 channels; transcoding via ffmpeg for Apple CoreAudio compatibility")
 			}
-			log.Warn().Err(err).Msg("Failed to write CAF Opus from OGG Opus")
 		} else {
 			log.Warn().Err(err).Str("mime", mimeType).Msg("Failed to parse OGG Opus for voice conversion")
 		}
 	}
 
 	// Transcode path: Matrix voice message in a non-OGG container (e.g. audio/mp4,
-	// audio/webm, audio/aac, audio/mpeg from Beeper Desktop/Android/iOS).
-	// Encode to clean 20ms mono 48kHz OGG Opus via ffmpeg, then remux to CAF Opus.
-	if isVoiceEvent && ffmpeg.Supported() {
+	// audio/webm, audio/aac, audio/mpeg from Beeper Desktop/Android/iOS) or
+	// non-uniform OGG Opus. Encode to clean 20ms mono 48kHz OGG Opus via ffmpeg,
+	// then remux to CAF Opus.
+	if (isVoiceEvent || looksLikeOGGOpus(data)) && ffmpeg.Supported() {
 		oggData, err := ffmpeg.ConvertBytes(
 			ctx,
 			data,
@@ -129,11 +159,18 @@ func convertVoiceForIMessage(ctx context.Context, data []byte, mimeType, fileNam
 			log.Warn().Err(err).Msg("Failed to wrap transcoded Opus in CAF")
 			return data, mimeType, fileName, false
 		}
+		uniform, fpp := checkUniformOpusFrames(info.Packets)
 		log.Info().
+			Str("path", "ffmpeg-transcode").
 			Str("orig_mime", mimeType).
 			Int("orig_bytes", len(data)).
 			Int("caf_bytes", len(cafData)).
+			Int("channels", info.Channels).
+			Int("pre_skip", info.PreSkip).
 			Int("packets", len(info.Packets)).
+			Int("frames_per_packet", fpp).
+			Bool("uniform_frames", uniform).
+			Int64("granule_pos", info.GranulePos).
 			Msg("Transcoded voice message to Apple CAF Opus")
 		return cafData, "audio/x-caf", "Audio Message.caf", true
 	}
@@ -275,6 +312,9 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 
 	if channels == 0 {
 		channels = 1
+	}
+	if preSkip == 0 && primingFrames > 0 {
+		preSkip = int(primingFrames)
 	}
 
 	// Build OpusHead if not found in magic cookie
@@ -605,6 +645,48 @@ const (
 	cafChannelLayoutTagStereo uint32 = (101 << 16) | 2 // kCAFChannelLayoutTag_Stereo
 )
 
+// checkUniformOpusFrames reports whether all Opus packets share the same frame
+// duration (at 48kHz), returning (uniform, firstPacketFrames).
+func checkUniformOpusFrames(packets [][]byte) (bool, int) {
+	if len(packets) == 0 {
+		return false, 0
+	}
+	first := opusPacketFrames(packets[0])
+	for _, pkt := range packets[1:] {
+		if opusPacketFrames(pkt) != first {
+			return false, first
+		}
+	}
+	return true, first
+}
+
+// appleOpusMagicCookie builds the 28-byte 'kuki' chunk that Apple's CoreAudio
+// (`afconvert -f caff -d opus` / AVAudioRecorder) writes for Opus-in-CAF:
+// 7 big-endian int32 words: application (2048 = VOIP), sampleRate (48000),
+// framesPerPacket, bitrate (-1000 = auto), channels, reserved0, reserved1.
+func appleOpusMagicCookie(framesPerPacket, channels int) []byte {
+	if framesPerPacket <= 0 {
+		framesPerPacket = 960
+	}
+	if channels <= 0 {
+		channels = 1
+	}
+	var kuki bytes.Buffer
+	words := [7]int32{
+		2048,
+		48000,
+		int32(framesPerPacket),
+		-1000,
+		int32(channels),
+		0,
+		0,
+	}
+	for _, w := range words {
+		binary.Write(&kuki, binary.BigEndian, w)
+	}
+	return kuki.Bytes()
+}
+
 func writeCAFOpus(info *oggOpusInfo) ([]byte, error) {
 	if len(info.Packets) == 0 {
 		return nil, fmt.Errorf("no audio packets")
@@ -669,9 +751,13 @@ func writeCAFOpus(info *oggOpusInfo) ([]byte, error) {
 	binary.Write(&desc, binary.BigEndian, uint32(0))                  // bits per channel (compressed=0)
 	cafWriteChunk(&buf, "desc", desc.Bytes())
 
+	// -- Magic Cookie chunk ('kuki') --
+	// Apple's CoreAudio Opus decoder expects the 28-byte 'kuki' cookie emitted
+	// by afconvert / AVAudioRecorder (and NOT a non-standard 'magc' chunk).
+	cafWriteChunk(&buf, "kuki", appleOpusMagicCookie(int(descFramesPerPacket), channels))
+
 	// -- Channel Layout chunk ('chan') --
-	// Apple CoreAudio CAF Opus files declare explicit channel layout (Mono/Stereo)
-	// and do NOT use a non-standard 'magc' chunk.
+	// Apple CoreAudio CAF Opus files declare explicit channel layout (Mono/Stereo).
 	var layoutTag uint32
 	switch channels {
 	case 1:
