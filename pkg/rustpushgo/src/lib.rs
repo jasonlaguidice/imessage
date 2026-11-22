@@ -8416,6 +8416,13 @@ impl Client {
             None
         };
 
+        let reply_guid = reply_guid.map(|g| g.to_uppercase());
+        let reply_part = if reply_guid.is_some() {
+            Some(reply_part.filter(|p| !p.is_empty()).unwrap_or_else(|| "0:0:1".to_string()))
+        } else {
+            None
+        };
+
         let schedule = scheduled_ms.map(|ms| ScheduleMode { ms, schedule: true });
 
         let normal = if let Some(parts) = parts {
@@ -8486,6 +8493,13 @@ impl Client {
         handle: String,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
+        // Optional \x00-delimited original message text ("UUID\x00to_text") so Go can
+        // populate ReactMessage.to_text (and therefore Apple's amrln/msi/fallback text)
+        // without changing the UniFFI ABI signature.
+        let (target_uuid, to_text) = match target_uuid.split_once('\x00') {
+            Some((uuid, text)) => (uuid.to_uppercase(), text.to_string()),
+            None => (target_uuid.to_uppercase(), String::new()),
+        };
         let reaction_val = match (reaction, &emoji) {
             (0, _) => Reaction::Heart,
             (1, _) => Reaction::Like,
@@ -8496,6 +8510,14 @@ impl Client {
             (6, Some(em)) => Reaction::Emoji(em.clone()),
             _ => Reaction::Heart,
         };
+        info!(
+            "send_tapback: target_uuid={} target_part={} reaction={} remove={} to_text_utf16_len={}",
+            target_uuid,
+            target_part,
+            reaction,
+            remove,
+            to_text.encode_utf16().count()
+        );
         let mut msg = MessageInst::new(
             conv,
             &handle,
@@ -8503,7 +8525,7 @@ impl Client {
                 to_uuid: target_uuid,
                 to_part: Some(target_part),
                 reaction: ReactMessageType::React { reaction: reaction_val, enable: !remove },
-                to_text: String::new(),
+                to_text,
                 embedded_profile: None,
             }),
         );
@@ -9182,8 +9204,18 @@ impl Client {
         body: Option<String>,
     ) -> Result<String, WrappedError> {
         let conv: ConversationData = (&conversation).into();
-        // Detect voice messages by UTI (CAF files from OGG→CAF remux are voice recordings)
-        let is_voice = uti_type == "com.apple.coreaudio-format";
+        let reply_guid = reply_guid.map(|g| g.to_uppercase());
+        let reply_part = if reply_guid.is_some() {
+            Some(reply_part.filter(|p| !p.is_empty()).unwrap_or_else(|| "0:0:1".to_string()))
+        } else {
+            None
+        };
+        // Detect voice messages by UTI/MIME (CAF files from OGG/audio→CAF conversion are voice recordings)
+        let is_voice = uti_type == "com.apple.coreaudio-format" || mime == "audio/x-caf" || mime == "audio/caf";
+        info!(
+            "send_attachment: filename={} mime={} uti={} size={} is_voice={} reply_guid={:?} reply_part={:?}",
+            filename, mime, uti_type, data.len(), is_voice, reply_guid, reply_part
+        );
         let service = if conversation.is_sms {
             MessageType::SMS {
                 is_phone: false,

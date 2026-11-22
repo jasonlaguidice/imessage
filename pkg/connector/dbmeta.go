@@ -35,6 +35,15 @@ type MessageMetadata struct {
 	// Without this a Matrix redaction would unsend only the first chunk, leaving
 	// the rest on the recipient's device while Matrix shows the message deleted.
 	ContinuationUUIDs []string `json:"continuation_uuids,omitempty"`
+
+	// Text and UTF16Len cache the message body and its UTF-16 code-unit length
+	// so outbound tapbacks (amrln / notification summary) and inline replies
+	// (thread_originator_part "bp:0:len") supply non-zero, Apple-valid ranges.
+	Text     string `json:"text,omitempty"`
+	UTF16Len int    `json:"utf16_len,omitempty"`
+
+	// PartIndex records the iMessage part index (message-part) when known.
+	PartIndex *int `json:"part_index,omitempty"`
 }
 
 type UserLoginMetadata struct {

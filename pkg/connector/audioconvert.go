@@ -17,19 +17,37 @@ package connector
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
 	"path/filepath"
 	"strings"
+
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/ffmpeg"
 )
+
+// looksLikeOGGOpus reports whether data starts with an OGG page header ("OggS")
+// carrying an OpusHead identification packet.
+func looksLikeOGGOpus(data []byte) bool {
+	if len(data) < 36 || string(data[:4]) != "OggS" {
+		return false
+	}
+	return bytes.Contains(data[:min(len(data), 128)], []byte("OpusHead"))
+}
+
+// looksLikeCAF reports whether data starts with a Core Audio Format ("caff") header.
+func looksLikeCAF(data []byte) bool {
+	return len(data) >= 8 && string(data[:4]) == "caff"
+}
 
 // convertAudioForIMessage remuxes OGG Opus audio to CAF Opus for native
 // iMessage voice message playback. Non-OGG formats are returned unchanged
 // since iOS can play most other audio formats directly.
 func convertAudioForIMessage(data []byte, mimeType, fileName string) ([]byte, string, string) {
-	if mimeType != "audio/ogg" && !strings.HasPrefix(mimeType, "audio/ogg;") {
+	if mimeType != "audio/ogg" && !strings.HasPrefix(mimeType, "audio/ogg;") && !looksLikeOGGOpus(data) {
 		return data, mimeType, fileName
 	}
 
@@ -45,6 +63,119 @@ func convertAudioForIMessage(data []byte, mimeType, fileName string) ([]byte, st
 
 	newName := strings.TrimSuffix(fileName, filepath.Ext(fileName)) + ".caf"
 	return cafData, "audio/x-caf", newName
+}
+
+// convertVoiceForIMessage converts Matrix voice messages (any format, including
+// OGG Opus, M4A/MP4, WebM Opus, AAC, MP3, WAV, or magic-byte-sniffed OGG Opus)
+// into Apple CoreAudio CAF Opus ("Audio Message.caf", "audio/x-caf") so
+// iOS/macOS Messages.app renders and plays them as native voice messages.
+// Returns (data, mimeType, fileName, isVoice).
+func convertVoiceForIMessage(ctx context.Context, data []byte, mimeType, fileName string, isVoiceEvent bool) ([]byte, string, string, bool) {
+	log := zerolog.Ctx(ctx)
+
+	// Already a CAF file.
+	if looksLikeCAF(data) || mimeType == "audio/x-caf" || mimeType == "audio/caf" {
+		if looksLikeCAF(data) {
+			log.Info().
+				Str("path", "caf-passthrough").
+				Str("orig_mime", mimeType).
+				Int("caf_bytes", len(data)).
+				Msg("Prepared voice message for iMessage")
+			return data, "audio/x-caf", "Audio Message.caf", true
+		}
+	}
+
+	// Fast path: lossless OGG Opus -> CAF Opus remux (no re-encoding) when
+	// packets have uniform frame duration (Apple's CoreAudio Opus decoder
+	// requires a non-zero mFramesPerPacket in desc for reliable playback).
+	if mimeType == "audio/ogg" || strings.HasPrefix(mimeType, "audio/ogg;") || looksLikeOGGOpus(data) {
+		info, err := parseOGGOpus(data)
+		if err == nil {
+			uniform, fpp := checkUniformOpusFrames(info.Packets)
+			if (uniform && info.Channels >= 1 && info.Channels <= 2) || !ffmpeg.Supported() {
+				cafData, err := writeCAFOpus(info)
+				if err == nil {
+					log.Info().
+						Str("path", "ogg-remux").
+						Str("orig_mime", mimeType).
+						Int("orig_bytes", len(data)).
+						Int("caf_bytes", len(cafData)).
+						Int("channels", info.Channels).
+						Int("pre_skip", info.PreSkip).
+						Int("packets", len(info.Packets)).
+						Int("frames_per_packet", fpp).
+						Bool("uniform_frames", uniform).
+						Int64("granule_pos", info.GranulePos).
+						Msg("Remuxed OGG Opus voice message to Apple CAF Opus")
+					return cafData, "audio/x-caf", "Audio Message.caf", true
+				}
+				log.Warn().Err(err).Msg("Failed to write CAF Opus from OGG Opus")
+			} else {
+				log.Info().
+					Str("orig_mime", mimeType).
+					Int("channels", info.Channels).
+					Int("packets", len(info.Packets)).
+					Bool("uniform_frames", uniform).
+					Msg("OGG Opus has non-uniform packets or >2 channels; transcoding via ffmpeg for Apple CoreAudio compatibility")
+			}
+		} else {
+			log.Warn().Err(err).Str("mime", mimeType).Msg("Failed to parse OGG Opus for voice conversion")
+		}
+	}
+
+	// Transcode path: Matrix voice message in a non-OGG container (e.g. audio/mp4,
+	// audio/webm, audio/aac, audio/mpeg from Beeper Desktop/Android/iOS) or
+	// non-uniform OGG Opus. Encode to clean 20ms mono 48kHz OGG Opus via ffmpeg,
+	// then remux to CAF Opus.
+	if (isVoiceEvent || looksLikeOGGOpus(data)) && ffmpeg.Supported() {
+		oggData, err := ffmpeg.ConvertBytes(
+			ctx,
+			data,
+			".ogg",
+			nil,
+			[]string{
+				"-vn",
+				"-c:a", "libopus",
+				"-b:a", "24k",
+				"-ar", "48000",
+				"-ac", "1",
+				"-frame_duration", "20",
+				"-application", "voip",
+			},
+			mimeType,
+		)
+		if err != nil {
+			log.Warn().Err(err).Str("mime", mimeType).Str("file", fileName).
+				Msg("FFmpeg voice transcode to OGG Opus failed; sending original audio")
+			return data, mimeType, fileName, false
+		}
+		info, err := parseOGGOpus(oggData)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to parse ffmpeg-transcoded OGG Opus")
+			return data, mimeType, fileName, false
+		}
+		cafData, err := writeCAFOpus(info)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to wrap transcoded Opus in CAF")
+			return data, mimeType, fileName, false
+		}
+		uniform, fpp := checkUniformOpusFrames(info.Packets)
+		log.Info().
+			Str("path", "ffmpeg-transcode").
+			Str("orig_mime", mimeType).
+			Int("orig_bytes", len(data)).
+			Int("caf_bytes", len(cafData)).
+			Int("channels", info.Channels).
+			Int("pre_skip", info.PreSkip).
+			Int("packets", len(info.Packets)).
+			Int("frames_per_packet", fpp).
+			Bool("uniform_frames", uniform).
+			Int64("granule_pos", info.GranulePos).
+			Msg("Transcoded voice message to Apple CAF Opus")
+		return cafData, "audio/x-caf", "Audio Message.caf", true
+	}
+
+	return data, mimeType, fileName, false
 }
 
 // convertAudioForMatrix remuxes CAF Opus audio to OGG Opus for Matrix clients.
@@ -126,7 +257,7 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 				io.CopyN(io.Discard, r, chunkSize-32)
 			}
 
-		case "magc":
+		case "kuki", "magc":
 			cookie := make([]byte, chunkSize)
 			if _, err := io.ReadFull(r, cookie); err != nil {
 				return nil, err
@@ -181,6 +312,9 @@ func parseCAFOpus(data []byte) (*oggOpusInfo, error) {
 
 	if channels == 0 {
 		channels = 1
+	}
+	if preSkip == 0 && primingFrames > 0 {
+		preSkip = int(primingFrames)
 	}
 
 	// Build OpusHead if not found in magic cookie
@@ -506,16 +640,97 @@ func readOGGPackets(data []byte) ([][]byte, int64, error) {
 // CAF Opus writer
 // ============================================================================
 
+const (
+	cafChannelLayoutTagMono   uint32 = (100 << 16) | 1 // kCAFChannelLayoutTag_Mono
+	cafChannelLayoutTagStereo uint32 = (101 << 16) | 2 // kCAFChannelLayoutTag_Stereo
+)
+
+// checkUniformOpusFrames reports whether all Opus packets share the same frame
+// duration (at 48kHz), returning (uniform, firstPacketFrames).
+func checkUniformOpusFrames(packets [][]byte) (bool, int) {
+	if len(packets) == 0 {
+		return false, 0
+	}
+	first := opusPacketFrames(packets[0])
+	for _, pkt := range packets[1:] {
+		if opusPacketFrames(pkt) != first {
+			return false, first
+		}
+	}
+	return true, first
+}
+
+// appleOpusMagicCookie builds the 28-byte 'kuki' chunk that Apple's CoreAudio
+// (`afconvert -f caff -d opus` / AVAudioRecorder) writes for Opus-in-CAF:
+// 7 big-endian int32 words: application (2048 = VOIP), sampleRate (48000),
+// framesPerPacket, bitrate (-1000 = auto), channels, reserved0, reserved1.
+func appleOpusMagicCookie(framesPerPacket, channels int) []byte {
+	if framesPerPacket <= 0 {
+		framesPerPacket = 960
+	}
+	if channels <= 0 {
+		channels = 1
+	}
+	var kuki bytes.Buffer
+	words := [7]int32{
+		2048,
+		48000,
+		int32(framesPerPacket),
+		-1000,
+		int32(channels),
+		0,
+		0,
+	}
+	for _, w := range words {
+		binary.Write(&kuki, binary.BigEndian, w)
+	}
+	return kuki.Bytes()
+}
+
 func writeCAFOpus(info *oggOpusInfo) ([]byte, error) {
 	if len(info.Packets) == 0 {
 		return nil, fmt.Errorf("no audio packets")
 	}
 
-	framesPerPacket := opusPacketFrames(info.Packets[0])
+	channels := info.Channels
+	if channels <= 0 {
+		channels = 1
+	}
 
-	validFrames := info.GranulePos - int64(info.PreSkip)
-	if validFrames <= 0 {
-		validFrames = int64(len(info.Packets)) * int64(framesPerPacket)
+	// Determine whether all Opus packets share the same frame count (constant
+	// frames-per-packet, e.g. 960 = 20ms at 48kHz) or vary across packets.
+	// In CAF, mFramesPerPacket = 0 means variable frames per packet and requires
+	// each pakt entry to encode (byteSize, frameCount) VLQ pairs.
+	packetFrames := make([]int, len(info.Packets))
+	firstFrames := opusPacketFrames(info.Packets[0])
+	constantFrames := true
+	var totalFrames int64
+	for i, pkt := range info.Packets {
+		f := opusPacketFrames(pkt)
+		packetFrames[i] = f
+		totalFrames += int64(f)
+		if f != firstFrames {
+			constantFrames = false
+		}
+	}
+	descFramesPerPacket := uint32(0)
+	if constantFrames {
+		descFramesPerPacket = uint32(firstFrames)
+	}
+
+	// CoreAudio CAF requires: mPrimingFrames + mNumberValidFrames + mRemainderFrames == totalFrames.
+	primingFrames := int32(info.PreSkip)
+	if primingFrames < 0 || int64(primingFrames) >= totalFrames {
+		primingFrames = 0
+	}
+	var validFrames int64
+	var remainderFrames int32
+	if info.GranulePos > int64(primingFrames) && info.GranulePos <= totalFrames {
+		validFrames = info.GranulePos - int64(primingFrames)
+		remainderFrames = int32(totalFrames - info.GranulePos)
+	} else {
+		validFrames = totalFrames - int64(primingFrames)
+		remainderFrames = 0
 	}
 
 	var buf bytes.Buffer
@@ -531,22 +746,44 @@ func writeCAFOpus(info *oggOpusInfo) ([]byte, error) {
 	desc.WriteString("opus")                                          // format ID
 	binary.Write(&desc, binary.BigEndian, uint32(0))                  // format flags
 	binary.Write(&desc, binary.BigEndian, uint32(0))                  // bytes per packet (VBR=0)
-	binary.Write(&desc, binary.BigEndian, uint32(framesPerPacket))    // frames per packet
-	binary.Write(&desc, binary.BigEndian, uint32(info.Channels))      // channels per frame
+	binary.Write(&desc, binary.BigEndian, descFramesPerPacket)        // frames per packet (0 if variable)
+	binary.Write(&desc, binary.BigEndian, uint32(channels))           // channels per frame
 	binary.Write(&desc, binary.BigEndian, uint32(0))                  // bits per channel (compressed=0)
 	cafWriteChunk(&buf, "desc", desc.Bytes())
 
-	// -- Magic Cookie chunk ('magc') = OpusHead packet --
-	cafWriteChunk(&buf, "magc", info.OpusHead)
+	// -- Magic Cookie chunk ('kuki') --
+	// Apple's CoreAudio Opus decoder expects the 28-byte 'kuki' cookie emitted
+	// by afconvert / AVAudioRecorder (and NOT a non-standard 'magc' chunk).
+	cafWriteChunk(&buf, "kuki", appleOpusMagicCookie(int(descFramesPerPacket), channels))
+
+	// -- Channel Layout chunk ('chan') --
+	// Apple CoreAudio CAF Opus files declare explicit channel layout (Mono/Stereo).
+	var layoutTag uint32
+	switch channels {
+	case 1:
+		layoutTag = cafChannelLayoutTagMono
+	case 2:
+		layoutTag = cafChannelLayoutTagStereo
+	}
+	if layoutTag != 0 {
+		var chanChunk bytes.Buffer
+		binary.Write(&chanChunk, binary.BigEndian, layoutTag)
+		binary.Write(&chanChunk, binary.BigEndian, uint32(0)) // mChannelBitmap
+		binary.Write(&chanChunk, binary.BigEndian, uint32(0)) // mNumberChannelDescriptions
+		cafWriteChunk(&buf, "chan", chanChunk.Bytes())
+	}
 
 	// -- Packet Table chunk ('pakt') --
 	var pakt bytes.Buffer
 	binary.Write(&pakt, binary.BigEndian, int64(len(info.Packets))) // number of packets
 	binary.Write(&pakt, binary.BigEndian, validFrames)               // valid frames
-	binary.Write(&pakt, binary.BigEndian, int32(info.PreSkip))       // priming frames
-	binary.Write(&pakt, binary.BigEndian, int32(0))                  // remainder frames
-	for _, pkt := range info.Packets {
+	binary.Write(&pakt, binary.BigEndian, primingFrames)             // priming frames
+	binary.Write(&pakt, binary.BigEndian, remainderFrames)           // remainder frames
+	for i, pkt := range info.Packets {
 		pakt.Write(cafVLQ(int64(len(pkt))))
+		if !constantFrames {
+			pakt.Write(cafVLQ(int64(packetFrames[i])))
+		}
 	}
 	cafWriteChunk(&buf, "pakt", pakt.Bytes())
 
